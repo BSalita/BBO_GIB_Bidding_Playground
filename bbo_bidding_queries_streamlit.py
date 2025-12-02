@@ -93,7 +93,6 @@ def render_aggrid(records: Any, key: str, height: int | None = None) -> None:
 
 if st.session_state.get("first_run", True):
     st.session_state.app_datetime = datetime.fromtimestamp(pathlib.Path(__file__).stat().st_mtime, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
-    st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
     st.session_state.first_run = False
 
 def app_info() -> None:
@@ -140,6 +139,7 @@ if bt_df_rows is not None and deal_df_rows is not None:
 # Main UI – function selector and controls
 # ---------------------------------------------------------------------------
 
+st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
 st.sidebar.header("Settings")
 func_choice = st.sidebar.selectbox(
     "Function",

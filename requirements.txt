@@ -24,7 +24,7 @@ psutil
 
 # Streamlit app
 streamlit
-streamlit-aggrid
+streamlit-aggrid==1.1.7 # 1.2.1 gave object errors
 requests
 
 # Web scraping
