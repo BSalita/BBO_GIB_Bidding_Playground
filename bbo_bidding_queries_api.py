@@ -31,7 +31,7 @@ import psutil
 
 def _fast_exit_handler(signum, frame):
     """Exit immediately without Python's slow garbage collection cleanup."""
-    print("\n[shutdown] Received signal, exiting immediately (skipping GC cleanup)...")
+    print("\n[shutdown] Received signal, exiting immediately (skipping GC cleanup). Takes about 20 seconds.")
     os._exit(0)
 
 
@@ -147,21 +147,21 @@ class OpeningBidDetailsRequest(BaseModel):
 
 class BiddingSequencesRequest(BaseModel):
     n_samples: int = 5
-    # If None, the backend will not pass a seed to polars.sample (non-deterministic)
-    seed: Optional[int] = 42
+    # seed=0 means non-reproducible, any other value is reproducible
+    seed: Optional[int] = 0
 
 
 class AuctionsMatchingRequest(BaseModel):
     pattern: str
     n_samples: int = 5
-    seed: Optional[int] = 42
+    seed: Optional[int] = 0
 
 
 class DealsForAuctionRequest(BaseModel):
     pattern: str
     n_auction_samples: int = 2
     n_deal_samples: int = 10
-    seed: Optional[int] = 42
+    seed: Optional[int] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +474,9 @@ def bidding_sequences(req: BiddingSequencesRequest) -> Dict[str, Any]:
         return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(req.n_samples, completed_df.height)
-    sampled_df = completed_df.sample(n=sample_n, seed=req.seed)
+    # seed=0 means non-reproducible (None), any other value is reproducible
+    effective_seed = None if req.seed == 0 else req.seed
+    sampled_df = completed_df.sample(n=sample_n, seed=effective_seed)
 
     agg_expr_cols = [f"Agg_Expr_Seat_{i}" for i in range(1, 5)]
     extra_cols = ["Expr"] + agg_expr_cols
@@ -579,7 +581,9 @@ def auctions_matching(req: AuctionsMatchingRequest) -> Dict[str, Any]:
         return {"samples": [], "pattern": pattern, "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(req.n_samples, filtered_df.height)
-    sampled_df = filtered_df.sample(n=sample_n, seed=req.seed)
+    # seed=0 means non-reproducible (None), any other value is reproducible
+    effective_seed = None if req.seed == 0 else req.seed
+    sampled_df = filtered_df.sample(n=sample_n, seed=effective_seed)
 
     agg_expr_cols = [f"Agg_Expr_Seat_{i}" for i in range(1, 5)]
     extra_cols = ["Expr"] + agg_expr_cols
@@ -680,7 +684,9 @@ def deals_for_auction(req: DealsForAuctionRequest) -> Dict[str, Any]:
         return {"pattern": pattern, "auctions": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(req.n_auction_samples, filtered_df.height)
-    sampled_auctions = filtered_df.sample(n=sample_n, seed=req.seed)
+    # seed=0 means non-reproducible (None), any other value is reproducible
+    effective_seed = None if req.seed == 0 else req.seed
+    sampled_auctions = filtered_df.sample(n=sample_n, seed=effective_seed)
 
     dirs = ["N", "E", "S", "W"]
     deal_display_cols = ["index", "Dealer", "Hand_N", "Hand_E", "Hand_S", "Hand_W"]

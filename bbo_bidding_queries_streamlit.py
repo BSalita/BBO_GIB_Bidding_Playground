@@ -144,21 +144,26 @@ st.sidebar.header("Settings")
 func_choice = st.sidebar.selectbox(
     "Function",
     [
-        "Opening Bid Details",
-        "Bidding Sequences (Random)",
-        "Auctions Matching Pattern",
-        "Deals for Auction Pattern",
+        "Openings by Deal Index",
+        "Random Auction Sequences",
+        "Auction Sequences Matching",
+        "Deals Matching Auction",
     ],
 )
 
-# Optional fixed seed: when disabled, backend will use nondeterministic sampling
-use_seed = st.sidebar.checkbox("Use fixed random seed", value=True)
-seed = None
-if use_seed:
-    seed = int(st.sidebar.number_input("Random Seed", value=42))
+# Auction Regex input - shown for pattern-based functions
+pattern = None
+if func_choice in ["Auction Sequences Matching", "Deals Matching Auction"]:
+    pattern = st.sidebar.text_input("Auction Regex", value="^1N-p-3N$")
+    st.sidebar.divider()
+else:
+    st.sidebar.divider()
 
-if func_choice == "Opening Bid Details":
-    st.sidebar.subheader("Opening Bid Filters")
+# Random seed: 0 = non-reproducible, any other value = reproducible
+seed = int(st.sidebar.number_input("Random Seed (0=random-random)", value=0, min_value=0))
+
+if func_choice == "Openings by Deal Index":
+    #st.sidebar.subheader("Opening Bid Filters")
     sample_size = st.sidebar.number_input("Sample Deals", value=6, min_value=1, max_value=100)
 
     all_seats = st.sidebar.checkbox("All Seats", value=True)
@@ -182,7 +187,7 @@ if func_choice == "Opening Bid Details":
         "opening_directions": opening_directions,
     }
 
-    with st.spinner("Fetching opening bid details from backend. Takes about 20 seconds..."):
+    with st.spinner("Fetching Openings by Deal Index from backend. Takes about 20 seconds."):
         data = api_post("/opening-bid-details", payload)
 
     deals = data.get("deals", [])
@@ -190,7 +195,7 @@ if func_choice == "Opening Bid Details":
         st.info("No deals matched the specified filters.")
     else:
         for d in deals:
-            st.subheader(f"Dealer {d['dealer']} – deal index {d['index']}")
+            st.subheader(f"Dealer {d['dealer']} – Deal Index {d['index']}")
             st.write(f"Opening seat: {d.get('opening_seat')}")
             st.write(f"Opening bid indices: {d.get('opening_bid_indices', [])}")
 
@@ -215,11 +220,11 @@ if func_choice == "Opening Bid Details":
                 render_aggrid(df_hands, key=f"hands_{d['dealer']}_{d['index']}")
             st.divider()
 
-elif func_choice == "Bidding Sequences (Random)":
+elif func_choice == "Random Auction Sequences":
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
 
     payload = {"n_samples": int(n_samples), "seed": seed}
-    with st.spinner("Fetching bidding sequences from backend..."):
+    with st.spinner("Fetching bidding sequences from backend. Takes about 10 seconds."):
         data = api_post("/bidding-sequences", payload)
 
     samples = data.get("samples", [])
@@ -227,16 +232,15 @@ elif func_choice == "Bidding Sequences (Random)":
         st.info("No completed auctions found.")
     else:
         for i, s in enumerate(samples, start=1):
-            st.subheader(f"Sample {i}: Auction='{s['auction']}', seat={s['seat']}")
+            st.subheader(f"Sample {i}: {s['auction']}")
             render_aggrid(s["sequence"], key=f"seq_random_{i}")
             st.divider()
 
-elif func_choice == "Auctions Matching Pattern":
-    pattern = st.sidebar.text_input("Auction Pattern (Prefix or Regex)", value="^1N-p-3N$")
+elif func_choice == "Auction Sequences Matching":
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
 
     payload = {"pattern": pattern, "n_samples": int(n_samples), "seed": seed}
-    with st.spinner("Fetching auctions from backend..."):
+    with st.spinner("Fetching auctions from backend. Takes about 10 seconds."):
         data = api_post("/auctions-matching", payload)
 
     st.caption(f"Effective pattern: {data.get('pattern', pattern)}")
@@ -245,12 +249,11 @@ elif func_choice == "Auctions Matching Pattern":
         st.info("No auctions matched the pattern.")
     else:
         for i, s in enumerate(samples, start=1):
-            st.subheader(f"Sample {i}: Auction='{s['auction']}', seat={s['seat']}")
+            st.subheader(f"Sample {i}: {s['auction']}")
             render_aggrid(s["sequence"], key=f"seq_pattern_{i}")
             st.divider()
 
-elif func_choice == "Deals for Auction Pattern":
-    pattern = st.sidebar.text_input("Auction Pattern", value="^1N-p-3N$")
+elif func_choice == "Deals Matching Auction":
     n_auction_samples = st.sidebar.number_input("Auction Samples", value=2, min_value=1)
     n_deal_samples = st.sidebar.number_input("Deal Samples per Auction", value=10, min_value=1)
 
@@ -261,7 +264,7 @@ elif func_choice == "Deals for Auction Pattern":
         "seed": seed,
     }
 
-    with st.spinner("Fetching deals for auction pattern from backend..."):
+    with st.spinner("Fetching Deals Matching Auction from backend. Takes about 10 seconds."):
         data = api_post("/deals-for-auction", payload)
 
     st.caption(f"Effective pattern: {data.get('pattern', pattern)}")
@@ -270,7 +273,7 @@ elif func_choice == "Deals for Auction Pattern":
         st.info("No auctions matched the pattern.")
     else:
         for i, a in enumerate(auctions, start=1):
-            st.subheader(f"Auction {i}: '{a['auction']}' (seat {a['seat']})")
+            st.subheader(f"Auction {i}: {a['auction']}")
             expr = a.get("expr")
             if expr:
                 # Expr is typically a list of criteria strings; show as a small DataFrame
