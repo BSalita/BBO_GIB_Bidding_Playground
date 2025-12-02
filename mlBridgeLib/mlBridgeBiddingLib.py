@@ -918,6 +918,10 @@ class AuctionFinder:
 # ---------------------------------------------------------------------------
 
 rootPath = pathlib.Path("e:/bridge/data")
+if not rootPath.exists():
+    rootPath = pathlib.Path('.')
+    if not rootPath.exists():
+        raise ValueError(f'rootPath does not exist: {rootPath}')
 bboPath = rootPath.joinpath("bbo")
 dataPath = bboPath.joinpath("data")
 biddingPath = bboPath.joinpath("bidding")

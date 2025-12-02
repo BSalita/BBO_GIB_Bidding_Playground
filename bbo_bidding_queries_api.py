@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import pathlib
 
 # Add mlBridgeLib to path so its internal imports work (append, not insert, to avoid shadowing the package)
 sys.path.append(os.path.join(os.path.dirname(__file__), "mlBridgeLib"))
@@ -55,8 +56,6 @@ from pydantic import BaseModel
 
 from mlBridgeLib.mlBridgeBiddingLib import (
     DIRECTIONS,
-    biddingPath,
-    dataPath,
     load_bt_df,
     load_deal_df,
     load_execution_plan_data,
@@ -64,6 +63,15 @@ from mlBridgeLib.mlBridgeBiddingLib import (
     build_or_load_directional_criteria_bitmaps,
     process_opening_bids,
 )
+
+rootPath = pathlib.Path("e:/bridge/data")
+if not rootPath.exists():
+    rootPath = pathlib.Path('.')
+    if not rootPath.exists():
+        raise ValueError(f'rootPath does not exist: {rootPath}')
+bboPath = rootPath.joinpath("bbo")
+dataPath = bboPath.joinpath("data")
+biddingPath = bboPath.joinpath("bidding")
 
 
 # ---------------------------------------------------------------------------
