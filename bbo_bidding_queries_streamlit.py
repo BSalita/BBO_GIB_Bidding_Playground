@@ -130,6 +130,12 @@ if not status["initialized"]:
 if status.get("error"):
     st.warning(f"Backend reported an initialization error: {status['error']}")
 
+# Display dataset info
+bt_df_rows = status.get("bt_df_rows")
+deal_df_rows = status.get("deal_df_rows")
+if bt_df_rows is not None and deal_df_rows is not None:
+    st.info(f"📊 Loaded data: **{deal_df_rows:,}** deals, **{bt_df_rows:,}** bidding table entries")
+
 # ---------------------------------------------------------------------------
 # Main UI – function selector and controls
 # ---------------------------------------------------------------------------
@@ -226,7 +232,7 @@ elif func_choice == "Bidding Sequences (Random)":
             st.divider()
 
 elif func_choice == "Auctions Matching Pattern":
-    pattern = st.sidebar.text_input("Auction Pattern (Prefix or Regex)", value="^1N-p-3N")
+    pattern = st.sidebar.text_input("Auction Pattern (Prefix or Regex)", value="^1N-p-3N$")
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
 
     payload = {"pattern": pattern, "n_samples": int(n_samples), "seed": seed}
@@ -244,7 +250,7 @@ elif func_choice == "Auctions Matching Pattern":
             st.divider()
 
 elif func_choice == "Deals for Auction Pattern":
-    pattern = st.sidebar.text_input("Auction Pattern", value="^1N-p-3N")
+    pattern = st.sidebar.text_input("Auction Pattern", value="^1N-p-3N$")
     n_auction_samples = st.sidebar.number_input("Auction Samples", value=2, min_value=1)
     n_deal_samples = st.sidebar.number_input("Deal Samples per Auction", value=10, min_value=1)
 

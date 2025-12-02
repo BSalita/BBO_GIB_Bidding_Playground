@@ -130,6 +130,8 @@ class StatusResponse(BaseModel):
     initialized: bool
     initializing: bool
     error: Optional[str]
+    bt_df_rows: Optional[int] = None
+    deal_df_rows: Optional[int] = None
 
 
 class InitResponse(BaseModel):
@@ -310,10 +312,19 @@ def _heavy_init() -> None:
 @app.get("/status", response_model=StatusResponse)
 def get_status() -> StatusResponse:
     with _STATE_LOCK:
+        bt_df_rows = None
+        deal_df_rows = None
+        if STATE["initialized"]:
+            if STATE["bt_df"] is not None:
+                bt_df_rows = STATE["bt_df"].height
+            if STATE["deal_df"] is not None:
+                deal_df_rows = STATE["deal_df"].height
         return StatusResponse(
             initialized=bool(STATE["initialized"]),
             initializing=bool(STATE["initializing"]),
             error=STATE["error"],
+            bt_df_rows=bt_df_rows,
+            deal_df_rows=deal_df_rows,
         )
 
 
@@ -556,9 +567,11 @@ def auctions_matching(req: AuctionsMatchingRequest) -> Dict[str, Any]:
 
     is_regex = pattern.startswith("^") or pattern.endswith("$")
     if is_regex:
-        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(pattern))
+        # Use (?i) for case-insensitive matching
+        regex_pattern = f"(?i){pattern}"
+        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(regex_pattern))
     else:
-        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.starts_with(pattern))
+        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(f"(?i){pattern}"))
 
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -655,9 +668,11 @@ def deals_for_auction(req: DealsForAuctionRequest) -> Dict[str, Any]:
 
     is_regex = pattern.startswith("^") or pattern.endswith("$")
     if is_regex:
-        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(pattern))
+        # Use (?i) for case-insensitive matching
+        regex_pattern = f"(?i){pattern}"
+        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(regex_pattern))
     else:
-        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.starts_with(pattern))
+        filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(f"(?i){pattern}"))
 
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
