@@ -73,7 +73,7 @@ else:
     rootPath = pathlib.Path('.')
     if not rootPath.exists():
         raise ValueError(f'rootPath does not exist: {rootPath}')
-    bboPath = rootPath.joinpath("data")
+    bboPath = rootPath.joinpath("")
     dataPath = bboPath.joinpath("data")
     biddingPath = bboPath.joinpath("data")
 print(f'rootPath: {rootPath}')
