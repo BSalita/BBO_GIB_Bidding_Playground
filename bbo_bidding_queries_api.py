@@ -86,10 +86,14 @@ print(f'biddingPath: {biddingPath}')
 # Required files check
 # ---------------------------------------------------------------------------
 
+exec_plan_file = biddingPath.joinpath("execution_plan_data.pkl")
+bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
+bbo_bidding_table_augmented_file = biddingPath.joinpath("bbo_bidding_table_augmented.parquet")
+
 REQUIRED_FILES = [
-    biddingPath.joinpath("execution_plan_data.pkl"),
-    dataPath.joinpath("bbo_mldf_augmented.parquet"),
-    biddingPath.joinpath("bbo_bidding_table_augmented.parquet"),
+    exec_plan_file,
+    bbo_mldf_augmented_file,
+    bbo_bidding_table_augmented_file,
 ]
 
 
@@ -211,11 +215,11 @@ def _heavy_init() -> None:
             expr_map_by_direction,
             valid_deal_columns,
             pythonized_exprs_by_direction,
-        ) = load_execution_plan_data()
+        ) = load_execution_plan_data(exec_plan_file)
         _log_memory("after load_execution_plan_data")
 
         # Load deals
-        deal_df = load_deal_df(valid_deal_columns, mldf_n_rows=None)
+        deal_df = load_deal_df(bbo_mldf_augmented_file, valid_deal_columns, mldf_n_rows=None)
         _log_memory("after load_deal_df")
 
         # Build criteria bitmaps and derive per-seat/per-dealer views
@@ -237,10 +241,8 @@ def _heavy_init() -> None:
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load bidding table
-        bt_df = load_bt_df(include_expr_and_sequences=True)
+        bt_df = load_bt_df(bbo_bidding_table_augmented_file, include_expr_and_sequences=True)
         _log_memory("after load_bt_df")
-
-        bbo_bidding_table_augmented_file = biddingPath.joinpath("bbo_bidding_table_augmented.parquet")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
         results = process_opening_bids(
