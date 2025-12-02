@@ -1,0 +1,38 @@
+# Core data processing
+polars[rt64]
+pandas
+numpy
+scikit-learn
+matplotlib
+endplay
+
+# Expression evaluation
+asteval
+
+# Progress bars and visualization
+tqdm
+
+# Notebook support
+IPython
+xlsxwriter
+
+# API server
+fastapi
+uvicorn
+pydantic
+psutil
+
+# Streamlit app
+streamlit
+streamlit-aggrid
+requests
+
+# Web scraping
+beautifulsoup4
+
+# Database
+sqlalchemy
+sqlalchemy-utils
+
+# Standard library (included with Python, listed for reference)
+# pathlib, multiprocessing, pickle, re, gc, time, sys, datetime, collections, operator
