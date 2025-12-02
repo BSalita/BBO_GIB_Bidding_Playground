@@ -65,13 +65,21 @@ from mlBridgeLib.mlBridgeBiddingLib import (
 )
 
 rootPath = pathlib.Path("e:/bridge/data")
-if not rootPath.exists():
+if rootPath.exists():
+    bboPath = rootPath.joinpath("bbo")
+    dataPath = bboPath.joinpath("data")
+    biddingPath = bboPath.joinpath("bidding")
+else:
     rootPath = pathlib.Path('.')
     if not rootPath.exists():
         raise ValueError(f'rootPath does not exist: {rootPath}')
-bboPath = rootPath.joinpath("bbo")
-dataPath = bboPath.joinpath("data")
-biddingPath = bboPath.joinpath("bidding")
+    bboPath = rootPath.joinpath("data")
+    dataPath = bboPath.joinpath("data")
+    biddingPath = bboPath.joinpath("data")
+print(f'rootPath: {rootPath}')
+print(f'bboPath: {bboPath}')
+print(f'dataPath: {dataPath}')
+print(f'biddingPath: {biddingPath}')
 
 
 # ---------------------------------------------------------------------------
