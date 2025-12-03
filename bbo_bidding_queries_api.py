@@ -1,5 +1,5 @@
 """
-FastAPI backend for BBO bidding queries.
+FastAPI server for BBO bidding queries.
 
 This service loads bidding data using the helpers, then exposes
 HTTP endpoints that Streamlit (or other clients) can call.

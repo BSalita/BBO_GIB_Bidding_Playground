@@ -3,11 +3,11 @@
 All heavy work is delegated to the FastAPI service defined in
 `bbo_bidding_queries_api.py`.
 
-Run the backend first (takes about 8-10 minutes to complete):
+Run the server first (takes about 8-10 minutes to complete):
 
     python bbo_bidding_queries_api.py
 
-Then run this app (may wait for the backend to finish loading data):
+Then run this app (may wait for the server to finish loading data):
 
     streamlit run bbo_bidding_queries_streamlit.py
 """
@@ -107,27 +107,27 @@ st.title("BBO GIB Bidding Playground")
 st.caption(app_info())
 
 # ---------------------------------------------------------------------------
-# Backend initialization / maintenance gate
+# server initialization / maintenance gate
 # ---------------------------------------------------------------------------
 
 try:
     status = api_get("/status")
 except Exception as exc:  # pragma: no cover - connectivity issues
-    st.error(f"Cannot reach backend at {API_BASE}: {exc}")
+    st.error(f"Cannot reach server at {API_BASE}: {exc}")
     st.stop()
 
 if not status["initialized"]:
     st.header("Maintenance in progress")
-    st.write("Backend is loading data; please wait...")
+    st.write("Server is loading data; please wait...")
     st.json(status)
 
     # Auto-poll: wait then rerun to check if ready
-    with st.spinner("Waiting for backend to finish loading..."):
+    with st.spinner("Waiting for server to finish loading..."):
         time.sleep(30)
     st.rerun()
 
 if status.get("error"):
-    st.warning(f"Backend reported an initialization error: {status['error']}")
+    st.warning(f"Server reported an initialization error: {status['error']}")
 
 # Display dataset info
 bt_df_rows = status.get("bt_df_rows")
@@ -187,7 +187,7 @@ if func_choice == "Openings by Deal Index":
         "opening_directions": opening_directions,
     }
 
-    with st.spinner("Fetching Openings by Deal Index from backend. Takes about 20 seconds."):
+    with st.spinner("Fetching Openings by Deal Index from server. Takes about 20 seconds."):
         data = api_post("/opening-bid-details", payload)
 
     deals = data.get("deals", [])
@@ -224,7 +224,7 @@ elif func_choice == "Random Auction Sequences":
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
 
     payload = {"n_samples": int(n_samples), "seed": seed}
-    with st.spinner("Fetching bidding sequences from backend. Takes about 10 seconds."):
+    with st.spinner("Fetching bidding sequences from server. Takes about 10 seconds."):
         data = api_post("/bidding-sequences", payload)
 
     samples = data.get("samples", [])
@@ -240,7 +240,7 @@ elif func_choice == "Auction Sequences Matching":
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
 
     payload = {"pattern": pattern, "n_samples": int(n_samples), "seed": seed}
-    with st.spinner("Fetching auctions from backend. Takes about 10 seconds."):
+    with st.spinner("Fetching auctions from server. Takes about 10 seconds."):
         data = api_post("/auctions-matching", payload)
 
     st.caption(f"Effective pattern: {data.get('pattern', pattern)}")
@@ -264,7 +264,7 @@ elif func_choice == "Deals Matching Auction":
         "seed": seed,
     }
 
-    with st.spinner("Fetching Deals Matching Auction from backend. Takes about 10 seconds."):
+    with st.spinner("Fetching Deals Matching Auction from server. Takes about 10 seconds."):
         data = api_post("/deals-for-auction", payload)
 
     st.caption(f"Effective pattern: {data.get('pattern', pattern)}")
