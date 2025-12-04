@@ -138,26 +138,26 @@ class InitResponse(BaseModel):
     status: str
 
 
-class OpeningBidDetailsRequest(BaseModel):
+class OpeningsByDealIndexRequest(BaseModel):
     sample_size: int = 6
     seats: Optional[List[int]] = None
     directions: Optional[List[str]] = None
     opening_directions: Optional[List[str]] = None
 
 
-class BiddingSequencesRequest(BaseModel):
+class RandomAuctionSequencesRequest(BaseModel):
     n_samples: int = 5
     # seed=0 means non-reproducible, any other value is reproducible
     seed: Optional[int] = 0
 
 
-class AuctionsMatchingRequest(BaseModel):
+class AuctionSequencesMatchingRequest(BaseModel):
     pattern: str
     n_samples: int = 5
     seed: Optional[int] = 0
 
 
-class DealsForAuctionRequest(BaseModel):
+class DealsMatchingAuctionRequest(BaseModel):
     pattern: str
     n_auction_samples: int = 2
     n_deal_samples: int = 10
@@ -271,18 +271,18 @@ def _heavy_init() -> None:
         # This does a tiny sample query on each endpoint's core logic.
         # ------------------------------------------------------------------
         try:
-            print("[init] Pre-warming opening-bid-details endpoint ...")
-            _ = opening_bid_details(OpeningBidDetailsRequest(sample_size=1))
+            print("[init] Pre-warming openings-by-deal-index endpoint ...")
+            _ = openings_by_deal_index(OpeningsByDealIndexRequest(sample_size=1))
 
-            print("[init] Pre-warming bidding-sequences endpoint ...")
-            _ = bidding_sequences(BiddingSequencesRequest(n_samples=1, seed=42))
+            print("[init] Pre-warming random-auction-sequences endpoint ...")
+            _ = random_auction_sequences(RandomAuctionSequencesRequest(n_samples=1, seed=42))
 
-            print("[init] Pre-warming auctions-matching endpoint ...")
-            _ = auctions_matching(AuctionsMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))
+            print("[init] Pre-warming auction-sequences-matching endpoint ...")
+            _ = auction_sequences_matching(AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))
 
-            print("[init] Pre-warming deals-for-auction endpoint ...")
-            _ = deals_for_auction(
-                DealsForAuctionRequest(
+            print("[init] Pre-warming deals-matching-auction endpoint ...")
+            _ = deals_matching_auction(
+                DealsMatchingAuctionRequest(
                     pattern="^1N-p-3N$",
                     n_auction_samples=1,
                     n_deal_samples=3,
@@ -363,8 +363,8 @@ def _ensure_ready() -> Tuple[pl.DataFrame, pl.DataFrame, Dict[int, Dict[str, pl.
 # ---------------------------------------------------------------------------
 
 
-@app.post("/opening-bid-details")
-def opening_bid_details(req: OpeningBidDetailsRequest) -> Dict[str, Any]:
+@app.post("/openings-by-deal-index")
+def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
     t0 = time.perf_counter()
     deal_df, bt_df, _deal_criteria_by_seat_dfs, results = _ensure_ready()
 
@@ -450,7 +450,7 @@ def opening_bid_details(req: OpeningBidDetailsRequest) -> Dict[str, Any]:
         )
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[opening-bid-details] {elapsed_ms:.1f}ms")
+    print(f"[openings-by-deal-index] {elapsed_ms:.1f}ms")
     return {"deals": out_deals, "elapsed_ms": round(elapsed_ms, 1)}
 
 
@@ -459,8 +459,8 @@ def opening_bid_details(req: OpeningBidDetailsRequest) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/bidding-sequences")
-def bidding_sequences(req: BiddingSequencesRequest) -> Dict[str, Any]:
+@app.post("/random-auction-sequences")
+def random_auction_sequences(req: RandomAuctionSequencesRequest) -> Dict[str, Any]:
     t0 = time.perf_counter()
     _, bt_df, _, _ = _ensure_ready()
 
@@ -470,7 +470,7 @@ def bidding_sequences(req: BiddingSequencesRequest) -> Dict[str, Any]:
     completed_df = bt_df.filter(pl.col("is_completed_auction"))
     if completed_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[bidding-sequences] {elapsed_ms:.1f}ms (empty)")
+        print(f"[random-auction-sequences] {elapsed_ms:.1f}ms (empty)")
         return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(req.n_samples, completed_df.height)
@@ -536,7 +536,7 @@ def bidding_sequences(req: BiddingSequencesRequest) -> Dict[str, Any]:
         )
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[bidding-sequences] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
+    print(f"[random-auction-sequences] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
     return {"samples": out_samples, "elapsed_ms": round(elapsed_ms, 1)}
 
 
@@ -545,8 +545,8 @@ def bidding_sequences(req: BiddingSequencesRequest) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/auctions-matching")
-def auctions_matching(req: AuctionsMatchingRequest) -> Dict[str, Any]:
+@app.post("/auction-sequences-matching")
+def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str, Any]:
     t0 = time.perf_counter()
     _, bt_df, _, _ = _ensure_ready()
 
@@ -577,7 +577,7 @@ def auctions_matching(req: AuctionsMatchingRequest) -> Dict[str, Any]:
 
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[auctions-matching] {elapsed_ms:.1f}ms (no matches)")
+        print(f"[auction-sequences-matching] {elapsed_ms:.1f}ms (no matches)")
         return {"samples": [], "pattern": pattern, "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(req.n_samples, filtered_df.height)
@@ -642,7 +642,7 @@ def auctions_matching(req: AuctionsMatchingRequest) -> Dict[str, Any]:
         )
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[auctions-matching] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
+    print(f"[auction-sequences-matching] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
     return {"pattern": pattern, "samples": out_samples, "elapsed_ms": round(elapsed_ms, 1)}
 
 
@@ -651,8 +651,8 @@ def auctions_matching(req: AuctionsMatchingRequest) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/deals-for-auction")
-def deals_for_auction(req: DealsForAuctionRequest) -> Dict[str, Any]:
+@app.post("/deals-matching-auction")
+def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
     t0 = time.perf_counter()
     deal_df, bt_df, deal_criteria_by_seat_dfs, _results = _ensure_ready()
 
@@ -680,7 +680,7 @@ def deals_for_auction(req: DealsForAuctionRequest) -> Dict[str, Any]:
 
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[deals-for-auction] {elapsed_ms:.1f}ms (no matches)")
+        print(f"[deals-matching-auction] {elapsed_ms:.1f}ms (no matches)")
         return {"pattern": pattern, "auctions": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(req.n_auction_samples, filtered_df.height)
@@ -752,7 +752,7 @@ def deals_for_auction(req: DealsForAuctionRequest) -> Dict[str, Any]:
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     total_deals = sum(len(a.get("deals", [])) for a in out_auctions)
-    print(f"[deals-for-auction] {elapsed_ms:.1f}ms ({len(out_auctions)} auctions, {total_deals} deals)")
+    print(f"[deals-matching-auction] {elapsed_ms:.1f}ms ({len(out_auctions)} auctions, {total_deals} deals)")
     return {"pattern": pattern, "auctions": out_auctions, "elapsed_ms": round(elapsed_ms, 1)}
 
 

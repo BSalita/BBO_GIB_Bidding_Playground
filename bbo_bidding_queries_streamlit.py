@@ -103,7 +103,7 @@ def app_info() -> None:
     return
 
 st.set_page_config(layout="wide")
-st.title("BBO GIB Bidding Playground")
+st.title("BBO GIB Bidding Playground (Proof of Concept)")
 st.caption(app_info())
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ if func_choice == "Openings by Deal Index":
     }
 
     with st.spinner("Fetching Openings by Deal Index from server. Takes about 20 seconds."):
-        data = api_post("/opening-bid-details", payload)
+        data = api_post("/openings-by-deal-index", payload)
 
     deals = data.get("deals", [])
     if not deals:
@@ -225,7 +225,7 @@ elif func_choice == "Random Auction Sequences":
 
     payload = {"n_samples": int(n_samples), "seed": seed}
     with st.spinner("Fetching bidding sequences from server. Takes about 10 seconds."):
-        data = api_post("/bidding-sequences", payload)
+        data = api_post("/random-auction-sequences", payload)
 
     samples = data.get("samples", [])
     if not samples:
@@ -241,7 +241,7 @@ elif func_choice == "Auction Sequences Matching":
 
     payload = {"pattern": pattern, "n_samples": int(n_samples), "seed": seed}
     with st.spinner("Fetching auctions from server. Takes about 10 seconds."):
-        data = api_post("/auctions-matching", payload)
+        data = api_post("/auction-sequences-matching", payload)
 
     st.caption(f"Effective pattern: {data.get('pattern', pattern)}")
     samples = data.get("samples", [])
@@ -265,7 +265,7 @@ elif func_choice == "Deals Matching Auction":
     }
 
     with st.spinner("Fetching Deals Matching Auction from server. Takes about 10 seconds."):
-        data = api_post("/deals-for-auction", payload)
+        data = api_post("/deals-matching-auction", payload)
 
     st.caption(f"Effective pattern: {data.get('pattern', pattern)}")
     auctions = data.get("auctions", [])
