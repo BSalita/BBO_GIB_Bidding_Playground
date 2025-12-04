@@ -213,7 +213,7 @@ def _heavy_init() -> None:
     _log_memory("start")
     try:
         (
-            unique_criteria_cols_l,
+            directionless_criteria_cols,
             expr_map_by_direction,
             valid_deal_columns,
             pythonized_exprs_by_direction,
@@ -238,7 +238,7 @@ def _heavy_init() -> None:
         _log_memory("after directional_to_directionless")
 
         # We no longer need these large helper objects
-        del criteria_deal_dfs_directional, pythonized_exprs_by_direction, unique_criteria_cols_l
+        del criteria_deal_dfs_directional, pythonized_exprs_by_direction, directionless_criteria_cols
         gc.collect()
         _log_memory("after gc.collect (criteria cleanup)")
 
