@@ -72,26 +72,6 @@ from mlBridgeLib.mlBridgeBiddingLib import (
 # Data directory resolution (supports --data-dir command line arg)
 # ---------------------------------------------------------------------------
 
-# Candidate directories for data files (first existing path wins)
-DATA_PATH_CANDIDATES = [
-    pathlib.Path("e:/bridge/data/bbo/data"),
-    pathlib.Path("data"),
-]
-BIDDING_PATH_CANDIDATES = [
-    pathlib.Path("e:/bridge/data/bbo/bidding"),
-    pathlib.Path("data"),
-]
-
-def _find_existing_path(candidates: list[pathlib.Path], name: str) -> pathlib.Path:
-    """Find first existing path from candidates, or return last candidate."""
-    for path in candidates:
-        if path.exists():
-            print(f'{name}: {path} (found)')
-            return path
-    # Return last candidate as fallback (will fail later with clear error)
-    print(f'{name}: {candidates[-1]} (fallback, not found)')
-    return candidates[-1]
-
 def _parse_data_dir_arg() -> pathlib.Path | None:
     """Parse --data-dir from sys.argv early (before full argparse)."""
     import sys
@@ -105,27 +85,22 @@ def _parse_data_dir_arg() -> pathlib.Path | None:
 # Check for --data-dir command line argument
 _cli_data_dir = _parse_data_dir_arg()
 
-if _cli_data_dir is not None:
-    # Use specified directory for both data and bidding paths
-    if not _cli_data_dir.exists():
-        print(f"WARNING: Specified --data-dir does not exist: {_cli_data_dir}")
-    dataPath = _cli_data_dir
-    biddingPath = _cli_data_dir
-    print(f"dataPath: {dataPath} (from --data-dir)")
-    print(f"biddingPath: {biddingPath} (from --data-dir)")
+# Default to 'data' subdirectory if --data-dir not specified
+dataPath = _cli_data_dir if _cli_data_dir is not None else pathlib.Path("data")
+
+if not dataPath.exists():
+    print(f"WARNING: Data directory does not exist: {dataPath}")
 else:
-    # Use candidate directory fallback
-    dataPath = _find_existing_path(DATA_PATH_CANDIDATES, "dataPath")
-    biddingPath = _find_existing_path(BIDDING_PATH_CANDIDATES, "biddingPath")
+    print(f"dataPath: {dataPath} (exists)")
 
 
 # ---------------------------------------------------------------------------
 # Required files check
 # ---------------------------------------------------------------------------
 
-exec_plan_file = biddingPath.joinpath("bbo_bt_execution_plan_data.pkl") # todo: rename to bbo_bt_execution_plan_data.pkl
+exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
 bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
-bbo_bidding_table_augmented_file = biddingPath.joinpath("bbo_bt_augmented.parquet")
+bbo_bidding_table_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 
 REQUIRED_FILES = [
@@ -260,8 +235,8 @@ STATE: Dict[str, Any] = {
     "bt_aggregates": None,  # bbo_bt_aggregate.parquet
 }
 
-# Additional data file paths (bt_aggregates_file defined above with REQUIRED_FILES)
-bt_criteria_file = biddingPath.joinpath("bt_criteria.parquet")
+# Additional optional data file paths
+bt_criteria_file = dataPath.joinpath("bt_criteria.parquet")
 
 _STATE_LOCK = threading.Lock()
 
