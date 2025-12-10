@@ -68,6 +68,10 @@ from mlBridgeLib.mlBridgeBiddingLib import (
     process_opening_bids,
 )
 
+# ---------------------------------------------------------------------------
+# Data directory resolution (supports --data-dir command line arg)
+# ---------------------------------------------------------------------------
+
 # Candidate directories for data files (first existing path wins)
 DATA_PATH_CANDIDATES = [
     pathlib.Path("e:/bridge/data/bbo/data"),
@@ -88,8 +92,31 @@ def _find_existing_path(candidates: list[pathlib.Path], name: str) -> pathlib.Pa
     print(f'{name}: {candidates[-1]} (fallback, not found)')
     return candidates[-1]
 
-dataPath = _find_existing_path(DATA_PATH_CANDIDATES, "dataPath")
-biddingPath = _find_existing_path(BIDDING_PATH_CANDIDATES, "biddingPath")
+def _parse_data_dir_arg() -> pathlib.Path | None:
+    """Parse --data-dir from sys.argv early (before full argparse)."""
+    import sys
+    for i, arg in enumerate(sys.argv):
+        if arg == "--data-dir" and i + 1 < len(sys.argv):
+            return pathlib.Path(sys.argv[i + 1])
+        if arg.startswith("--data-dir="):
+            return pathlib.Path(arg.split("=", 1)[1])
+    return None
+
+# Check for --data-dir command line argument
+_cli_data_dir = _parse_data_dir_arg()
+
+if _cli_data_dir is not None:
+    # Use specified directory for both data and bidding paths
+    if not _cli_data_dir.exists():
+        print(f"WARNING: Specified --data-dir does not exist: {_cli_data_dir}")
+    dataPath = _cli_data_dir
+    biddingPath = _cli_data_dir
+    print(f"dataPath: {dataPath} (from --data-dir)")
+    print(f"biddingPath: {biddingPath} (from --data-dir)")
+else:
+    # Use candidate directory fallback
+    dataPath = _find_existing_path(DATA_PATH_CANDIDATES, "dataPath")
+    biddingPath = _find_existing_path(BIDDING_PATH_CANDIDATES, "biddingPath")
 
 
 # ---------------------------------------------------------------------------
@@ -1588,6 +1615,12 @@ if __name__ == "__main__":  # pragma: no cover
         type=int,
         default=8000,
         help="Port to bind to (default: 8000)",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Data directory containing parquet files (overrides auto-detection)",
     )
     args = parser.parse_args()
 
