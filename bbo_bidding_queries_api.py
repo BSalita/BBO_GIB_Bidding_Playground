@@ -68,22 +68,28 @@ from mlBridgeLib.mlBridgeBiddingLib import (
     process_opening_bids,
 )
 
-rootPath = pathlib.Path("e:/bridge/data")
-if rootPath.exists():
-    bboPath = rootPath.joinpath("bbo")
-    dataPath = bboPath.joinpath("data")
-    biddingPath = bboPath.joinpath("bidding")
-else:
-    rootPath = pathlib.Path('.')
-    if not rootPath.exists():
-        raise ValueError(f'rootPath does not exist: {rootPath}')
-    bboPath = rootPath.joinpath("")
-    dataPath = bboPath.joinpath("data")
-    biddingPath = bboPath.joinpath("data")
-print(f'rootPath: {rootPath}')
-print(f'bboPath: {bboPath}')
-print(f'dataPath: {dataPath}')
-print(f'biddingPath: {biddingPath}')
+# Candidate directories for data files (first existing path wins)
+DATA_PATH_CANDIDATES = [
+    pathlib.Path("e:/bridge/data/bbo/data"),
+    pathlib.Path("data"),
+]
+BIDDING_PATH_CANDIDATES = [
+    pathlib.Path("e:/bridge/data/bbo/bidding"),
+    pathlib.Path("data"),
+]
+
+def _find_existing_path(candidates: list[pathlib.Path], name: str) -> pathlib.Path:
+    """Find first existing path from candidates, or return last candidate."""
+    for path in candidates:
+        if path.exists():
+            print(f'{name}: {path} (found)')
+            return path
+    # Return last candidate as fallback (will fail later with clear error)
+    print(f'{name}: {candidates[-1]} (fallback, not found)')
+    return candidates[-1]
+
+dataPath = _find_existing_path(DATA_PATH_CANDIDATES, "dataPath")
+biddingPath = _find_existing_path(BIDDING_PATH_CANDIDATES, "biddingPath")
 
 
 # ---------------------------------------------------------------------------
