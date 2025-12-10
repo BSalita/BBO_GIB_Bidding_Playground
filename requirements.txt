@@ -31,6 +31,7 @@ requests
 beautifulsoup4
 
 # Database
+duckdb
 sqlalchemy
 sqlalchemy-utils
 
