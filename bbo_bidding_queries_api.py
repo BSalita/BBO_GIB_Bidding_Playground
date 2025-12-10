@@ -236,7 +236,7 @@ STATE: Dict[str, Any] = {
 }
 
 # Additional optional data file paths
-bt_criteria_file = dataPath.joinpath("bt_criteria.parquet")
+bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
 
 _STATE_LOCK = threading.Lock()
 
