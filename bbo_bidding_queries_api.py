@@ -172,6 +172,8 @@ class StatusResponse(BaseModel):
     error: Optional[str]
     bt_df_rows: Optional[int] = None
     deal_df_rows: Optional[int] = None
+    loading_step: Optional[str] = None  # Current loading step
+    loaded_files: Optional[Dict[str, int]] = None  # File name -> row count
 
 
 class InitResponse(BaseModel):
@@ -246,6 +248,8 @@ STATE: Dict[str, Any] = {
     "initializing": False,
     "warming": False,  # True while pre-warming endpoints
     "error": None,
+    "loading_step": None,  # Current loading step description
+    "loaded_files": {},  # File name -> row count (updated as files load)
     "deal_df": None,
     "bt_df": None,
     "bt_completed_df": None,  # Cached: bt_df.filter(is_completed_auction)
@@ -290,7 +294,16 @@ def _heavy_init() -> None:
     t0 = time.time()
     print("[init] Starting initialization...")
     _log_memory("start")
+    
+    def _update_loading_status(step: str, file_name: str | None = None, row_count: int | None = None):
+        """Update loading progress in STATE (thread-safe)."""
+        with _STATE_LOCK:
+            STATE["loading_step"] = step
+            if file_name and row_count is not None:
+                STATE["loaded_files"][file_name] = row_count
+    
     try:
+        _update_loading_status("Loading execution plan...")
         (
             directionless_criteria_cols,
             expr_map_by_direction,
@@ -300,7 +313,9 @@ def _heavy_init() -> None:
         _log_memory("after load_execution_plan_data")
 
         # Load deals
+        _update_loading_status("Loading deal_df (bbo_mldf_augmented.parquet)...")
         deal_df = load_deal_df(bbo_mldf_augmented_file, valid_deal_columns, mldf_n_rows=None)
+        _update_loading_status("Building criteria bitmaps...", "deal_df", deal_df.height)
         _log_memory("after load_deal_df")
 
         # Build criteria bitmaps and derive per-seat/per-dealer views
@@ -311,6 +326,7 @@ def _heavy_init() -> None:
         )
         _log_memory("after build_or_load_directional_criteria_bitmaps")
 
+        _update_loading_status("Processing criteria views...")
         deal_criteria_by_direction_dfs, deal_criteria_by_seat_dfs = directional_to_directionless(
             criteria_deal_dfs_directional, expr_map_by_direction
         )
@@ -322,7 +338,9 @@ def _heavy_init() -> None:
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load bidding table
+        _update_loading_status("Loading bt_df (bbo_bt_augmented.parquet)...")
         bt_df = load_bt_df(bbo_bidding_table_augmented_file, include_expr_and_sequences=True)
+        _update_loading_status("Processing opening bids...", "bt_df", bt_df.height)
         _log_memory("after load_bt_df")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
@@ -339,15 +357,19 @@ def _heavy_init() -> None:
         bt_aggregates = None
         
         if bt_criteria_file.exists():
+            _update_loading_status("Loading bt_criteria.parquet...")
             print(f"[init] Loading bt_criteria from {bt_criteria_file}...")
             bt_criteria = pl.read_parquet(bt_criteria_file)
+            _update_loading_status("Loading bt_criteria.parquet...", "bt_criteria", bt_criteria.height)
             _log_memory("after load bt_criteria")
         else:
             print(f"[init] bt_criteria not found at {bt_criteria_file} (optional)")
         
         if bt_aggregates_file.exists():
+            _update_loading_status("Loading bt_aggregates.parquet...")
             print(f"[init] Loading bt_aggregates from {bt_aggregates_file}...")
             bt_aggregates = pl.read_parquet(bt_aggregates_file)
+            _update_loading_status("Loading bt_aggregates.parquet...", "bt_aggregates", bt_aggregates.height)
             _log_memory("after load bt_aggregates")
         else:
             print(f"[init] bt_aggregates not found at {bt_aggregates_file} (optional)")
@@ -355,8 +377,10 @@ def _heavy_init() -> None:
         # Cache the completed auctions filter (expensive: ~2 min on 541M rows)
         bt_completed_df = None
         if "is_completed_auction" in bt_df.columns:
+            _update_loading_status("Filtering completed auctions (bt_completed_df)...")
             print("[init] Caching bt_completed_df (is_completed_auction filter)...")
             bt_completed_df = bt_df.filter(pl.col("is_completed_auction"))
+            _update_loading_status("Filtering completed auctions...", "bt_completed_df", bt_completed_df.height)
             print(f"[init] bt_completed_df: {bt_completed_df.height:,} rows (from {bt_df.height:,})")
             _log_memory("after bt_completed_df filter")
 
@@ -465,6 +489,8 @@ def get_status() -> StatusResponse:
             error=STATE["error"],
             bt_df_rows=bt_df_rows,
             deal_df_rows=deal_df_rows,
+            loading_step=STATE.get("loading_step"),
+            loaded_files=STATE.get("loaded_files") or None,
         )
 
 

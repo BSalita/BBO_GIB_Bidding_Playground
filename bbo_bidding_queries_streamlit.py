@@ -617,11 +617,26 @@ if not status["initialized"] or status.get("warming", False):
         st.write("Server is warming up endpoints; please wait...")
     else:
         st.write("Server is loading data; please wait...")
-    st.json(status)
+    
+    # Show current loading step
+    loading_step = status.get("loading_step")
+    if loading_step:
+        st.info(f"📍 **Current step:** {loading_step}")
+    
+    # Show loaded files with row counts
+    loaded_files = status.get("loaded_files")
+    if loaded_files:
+        st.subheader("Files loaded:")
+        for file_name, row_count in loaded_files.items():
+            st.write(f"✅ **{file_name}**: {row_count:,} rows")
+    
+    # Show raw status in expander
+    with st.expander("Raw status JSON"):
+        st.json(status)
 
     # Auto-poll: wait then rerun to check if ready
     with st.spinner("Waiting for server to finish loading..."):
-        time.sleep(5)
+        time.sleep(30)
     st.rerun()
 
 if status.get("error"):
