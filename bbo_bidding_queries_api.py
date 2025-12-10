@@ -315,16 +315,17 @@ def _heavy_init() -> None:
         # Load bidding table
         _update_loading_status("Loading bt_df (bbo_bt_augmented.parquet)...")
         bt_df = load_bt_df(bbo_bidding_table_augmented_file, include_expr_and_sequences=True)
-        _update_loading_status("Processing opening bids...", "bt_df", bt_df.height)
         _log_memory("after load_bt_df")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
+        _update_loading_status("Processing opening bids (may take several minutes)...", "bt_df", bt_df.height)
         results = process_opening_bids(
             deal_df,
             bt_df,
             deal_criteria_by_seat_dfs,
             bbo_bidding_table_augmented_file,
         )
+        _update_loading_status("Loading optional files...")
         _log_memory("after process_opening_bids")
 
         # Load optional aggregates files (non-blocking if missing)
