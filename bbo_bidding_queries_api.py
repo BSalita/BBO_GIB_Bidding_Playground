@@ -69,6 +69,23 @@ from mlBridgeLib.mlBridgeBiddingLib import (
     process_opening_bids,
 )
 
+from bbo_bidding_queries_lib import (
+    calculate_imp,
+    parse_contract_from_auction,
+    get_declarer_for_auction,
+    get_ai_contract,
+    get_dd_score_for_auction,
+    compute_hand_features,
+    compute_par_score,
+    parse_pbn_deal,
+    parse_distribution_pattern,
+    parse_sorted_shape,
+    build_distribution_sql_for_bt,
+    build_distribution_sql_for_deals,
+    add_suit_length_columns,
+    evaluate_criterion_for_hand,
+)
+
 # ---------------------------------------------------------------------------
 # Data directory resolution (supports --data-dir command line arg)
 # ---------------------------------------------------------------------------
@@ -530,7 +547,18 @@ def _heavy_init() -> None:
         _log_memory("after load_execution_plan_data")
 
         # Add additional columns needed for PBN Lookup (game results)
-        additional_cols = ['PBN', 'Vul', 'Declarer', 'bid', 'Result', 'Tricks', 'Score', 'ParScore']
+        # DD_Score_Declarer = double-dummy score for the actual contract played
+        # Contract = actual contract played (e.g., "4SN" = 4S by North)
+        additional_cols = ['PBN', 'Vul', 'Declarer', 'bid', 'Contract', 'Result', 'Tricks', 'Score', 
+                           'ParScore', 'DD_Score_Declarer', 'ParContracts']
+        
+        # Add DD_Score columns for all contracts (for DD_Score_AI computation)
+        # Format: DD_Score_{level}{strain}_{direction} e.g. DD_Score_3N_N
+        for level in range(1, 8):
+            for strain in ['C', 'D', 'H', 'S', 'N']:
+                for direction in ['N', 'E', 'S', 'W']:
+                    additional_cols.append(f"DD_Score_{level}{strain}_{direction}")
+        
         for col in additional_cols:
             if col not in valid_deal_columns:
                 valid_deal_columns.append(col)
@@ -1124,8 +1152,9 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
     sampled_auctions = filtered_df.sample(n=sample_n, seed=effective_seed)
 
     dirs = ["N", "E", "S", "W"]
-    deal_display_cols = ["index", "Dealer", "bid", "Hand_N", "Hand_E", "Hand_S", "Hand_W", 
-                         "Result", "Tricks", "ParScore", "Par_Contract"]
+    deal_display_cols = ["index", "Dealer", "bid", "Contract", "Hand_N", "Hand_E", "Hand_S", "Hand_W", 
+                         "Declarer", "Result", "Tricks", "Score", "DD_Score_Declarer", 
+                         "ParScore", "ParContracts"]
 
     out_auctions: List[Dict[str, Any]] = []
 
@@ -1239,10 +1268,10 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                 direction = req.dist_direction.upper()
                 if direction in 'NESW':
                     # Add suit length columns for filtering
-                    combined_df = _add_suit_length_columns(combined_df, direction)
+                    combined_df = add_suit_length_columns(combined_df, direction)
                     
                     # Build and apply filter
-                    dist_where = _build_distribution_sql_for_deals(
+                    dist_where = build_distribution_sql_for_deals(
                         req.dist_pattern, req.sorted_shape, direction
                     )
                     if dist_where:
@@ -1257,9 +1286,32 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                     sl_cols = [f"SL_{s}_{direction}" for s in ['S', 'H', 'D', 'C']]
                     combined_df = combined_df.drop([c for c in sl_cols if c in combined_df.columns])
             
-            auction_info["deals"] = combined_df.select(
-                [c for c in deal_display_cols if c in combined_df.columns]
-            ).to_dicts()
+            # Compute AI (Auction Intelligence) derived columns for each deal
+            deals_list = combined_df.to_dicts()
+            for deal_row in deals_list:
+                dealer = deal_row.get("Dealer", "N")
+                # AI contract (final contract including declarer and doubles/redoubles)
+                deal_row["AI_Contract"] = get_ai_contract(auction, dealer)
+                # DD score for the AI's contract
+                dd_score_ai = get_dd_score_for_auction(auction, dealer, deal_row)
+                deal_row["DD_Score_AI"] = dd_score_ai
+                
+                # IMP difference between AI contract DD score and actual contract DD score
+                # Positive = AI contract scores better, Negative = actual contract scores better
+                dd_score_actual = deal_row.get("DD_Score_Declarer")
+                if dd_score_actual is not None and dd_score_ai is not None:
+                    score_diff = int(dd_score_ai) - int(dd_score_actual)
+                    imp_diff = calculate_imp(abs(score_diff))
+                    deal_row["IMP_AI_vs_Actual"] = imp_diff if score_diff >= 0 else -imp_diff
+                else:
+                    deal_row["IMP_AI_vs_Actual"] = None
+            
+            # Filter to display columns (keeping computed columns we just added)
+            display_cols_set = set(deal_display_cols) | {"DD_Score_AI", "AI_Contract", "IMP_AI_vs_Actual"}
+            auction_info["deals"] = [
+                {k: v for k, v in d.items() if k in display_cols_set}
+                for d in deals_list
+            ]
 
         out_auctions.append(auction_info)
 
@@ -1398,7 +1450,7 @@ def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, An
     dist_sql_query = None
     pre_dist_count = len(result_df)
     if (req.dist_pattern or req.sorted_shape) and bt_criteria is not None:
-        dist_where = _build_distribution_sql_for_bt(
+        dist_where = build_distribution_sql_for_bt(
             req.dist_pattern, req.sorted_shape, req.dist_seat, result_df.columns
         )
         if dist_where:
@@ -1431,205 +1483,8 @@ def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, An
     }
 
 
-# ---------------------------------------------------------------------------
-# Distribution filter utilities
-# ---------------------------------------------------------------------------
 
-def _parse_distribution_pattern(pattern: str) -> dict | None:
-    """Parse a suit distribution pattern into filter criteria (S-H-D-C order)."""
-    import re
-    
-    if not pattern or not pattern.strip():
-        return None
-    
-    pattern = pattern.strip()
-    suits = ['S', 'H', 'D', 'C']
-    result: dict[str, tuple[int, int] | None] = {s: None for s in suits}
-    
-    # Try compact numeric format (e.g., '4333', '5332')
-    if re.match(r'^[0-9]{4}$', pattern):
-        for i, suit in enumerate(suits):
-            val = int(pattern[i])
-            result[suit] = (val, val)
-        return result
-    
-    # Split by dash for other formats
-    parts = pattern.split('-')
-    if len(parts) != 4:
-        return None
-    
-    for i, (part, suit) in enumerate(zip(parts, suits)):
-        part = part.strip()
-        
-        if part.lower() == 'x' or part in ('.*', '.+', '*', ''):
-            result[suit] = None
-            continue
-        
-        bracket_match = re.match(r'^\[(\d+)[-:](\d+)\]$', part)
-        if bracket_match:
-            result[suit] = (int(bracket_match.group(1)), int(bracket_match.group(2)))
-            continue
-        
-        colon_match = re.match(r'^(\d+):(\d+)$', part)
-        if colon_match:
-            result[suit] = (int(colon_match.group(1)), int(colon_match.group(2)))
-            continue
-        
-        plus_match = re.match(r'^(\d+)\+$', part)
-        if plus_match:
-            result[suit] = (int(plus_match.group(1)), 13)
-            continue
-        
-        minus_match = re.match(r'^(\d+)-$', part)
-        if minus_match:
-            result[suit] = (0, int(minus_match.group(1)))
-            continue
-        
-        if re.match(r'^\d+$', part):
-            val = int(part)
-            result[suit] = (val, val)
-            continue
-        
-        result[suit] = None
-    
-    return result
-
-
-def _parse_sorted_shape(pattern: str) -> list[int] | None:
-    """Parse a sorted shape pattern (e.g., '5431', '4432')."""
-    import re
-    
-    if not pattern or not pattern.strip():
-        return None
-    
-    pattern = pattern.strip()
-    
-    if re.match(r'^[0-9]{4}$', pattern):
-        lengths = [int(c) for c in pattern]
-        if sum(lengths) == 13:
-            return sorted(lengths, reverse=True)
-        return None
-    
-    parts = pattern.split('-')
-    if len(parts) == 4:
-        try:
-            lengths = [int(p.strip()) for p in parts]
-            if sum(lengths) == 13:
-                return sorted(lengths, reverse=True)
-        except ValueError:
-            pass
-    
-    return None
-
-
-def _build_distribution_sql_for_bt(
-    dist_pattern: str | None,
-    sorted_shape: str | None,
-    seat: int,
-    available_columns: list[str]
-) -> str:
-    """Build SQL WHERE clause for bt_df distribution filtering."""
-    from itertools import permutations
-    
-    conditions = []
-    suits = ['S', 'H', 'D', 'C']
-    
-    if dist_pattern:
-        parsed = _parse_distribution_pattern(dist_pattern)
-        if parsed:
-            for suit, constraint in parsed.items():
-                if constraint is None:
-                    continue
-                min_val, max_val = constraint
-                min_col = f"SL_{suit}_min_S{seat}"
-                max_col = f"SL_{suit}_max_S{seat}"
-                
-                if min_col in available_columns and max_col in available_columns:
-                    conditions.append(f'"{min_col}" <= {max_val}')
-                    conditions.append(f'"{max_col}" >= {min_val}')
-    
-    if sorted_shape:
-        shape = _parse_sorted_shape(sorted_shape)
-        if shape:
-            perm_conditions = []
-            unique_perms = set(permutations(shape))
-            
-            for perm in unique_perms:
-                perm_parts = []
-                for suit, expected_len in zip(suits, perm):
-                    min_col = f"SL_{suit}_min_S{seat}"
-                    max_col = f"SL_{suit}_max_S{seat}"
-                    if min_col in available_columns and max_col in available_columns:
-                        perm_parts.append(
-                            f'("{min_col}" <= {expected_len} AND "{max_col}" >= {expected_len})'
-                        )
-                if len(perm_parts) == 4:
-                    perm_conditions.append(f"({' AND '.join(perm_parts)})")
-            
-            if perm_conditions:
-                conditions.append(f"({' OR '.join(perm_conditions)})")
-    
-    return " AND ".join(conditions) if conditions else ""
-
-
-def _build_distribution_sql_for_deals(
-    dist_pattern: str | None,
-    sorted_shape: str | None,
-    direction: str
-) -> str:
-    """Build SQL WHERE clause for deal_df distribution filtering (Hand_* columns)."""
-    from itertools import permutations
-    
-    conditions = []
-    suits = ['S', 'H', 'D', 'C']
-    
-    if dist_pattern:
-        parsed = _parse_distribution_pattern(dist_pattern)
-        if parsed:
-            for suit, constraint in parsed.items():
-                if constraint is None:
-                    continue
-                min_val, max_val = constraint
-                col = f"SL_{suit}_{direction}"
-                
-                if min_val == max_val:
-                    conditions.append(f'"{col}" = {min_val}')
-                else:
-                    conditions.append(f'"{col}" >= {min_val} AND "{col}" <= {max_val}')
-    
-    if sorted_shape:
-        shape = _parse_sorted_shape(sorted_shape)
-        if shape:
-            perm_conditions = []
-            unique_perms = set(permutations(shape))
-            
-            for perm in unique_perms:
-                perm_parts = []
-                for suit, expected_len in zip(suits, perm):
-                    col = f"SL_{suit}_{direction}"
-                    perm_parts.append(f'"{col}" = {expected_len}')
-                perm_conditions.append(f"({' AND '.join(perm_parts)})")
-            
-            if perm_conditions:
-                conditions.append(f"({' OR '.join(perm_conditions)})")
-    
-    return " AND ".join(conditions) if conditions else ""
-
-
-def _add_suit_length_columns(df: pl.DataFrame, direction: str) -> pl.DataFrame:
-    """Add suit length columns for a specific direction's hand."""
-    hand_col = f"Hand_{direction}"
-    if hand_col not in df.columns:
-        return df
-    
-    suits = ['S', 'H', 'D', 'C']
-    for suit_idx, suit in enumerate(suits):
-        col_name = f"SL_{suit}_{direction}"
-        df = df.with_columns(
-            pl.col(hand_col).str.split('.').list.get(suit_idx).str.len_chars().alias(col_name)
-        )
-    
-    return df
+# Distribution filter utilities and helper functions are now imported from bbo_bidding_queries_lib
 
 
 # ---------------------------------------------------------------------------
@@ -1676,109 +1531,9 @@ def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[s
     return pbn_deals, deal_vuls
 
 
-def _parse_pbn_deal(pbn_str: str) -> dict | None:
-    """Parse a PBN deal string into hands and dealer."""
-    try:
-        pbn_str = pbn_str.strip()
-        if ':' not in pbn_str:
-            return None
-        
-        dealer = pbn_str[0].upper()
-        if dealer not in 'NESW':
-            return None
-        
-        hands_str = pbn_str[2:].strip()
-        hands = hands_str.split()
-        if len(hands) != 4:
-            return None
-        
-        dealer_order = {'N': 0, 'E': 1, 'S': 2, 'W': 3}
-        directions = ['N', 'E', 'S', 'W']
-        start_idx = dealer_order[dealer]
-        
-        result = {'Dealer': dealer, 'PBN': pbn_str}
-        for i, hand in enumerate(hands):
-            direction = directions[(start_idx + i) % 4]
-            result[f'Hand_{direction}'] = hand
-        
-        return result
-    except Exception:
-        return None
 
-
-def _compute_hand_features(hand_str: str) -> dict:
-    """Compute HCP, suit lengths, and total points for a hand."""
-    hcp_values = {'A': 4, 'K': 3, 'Q': 2, 'J': 1}
-    
-    suits = hand_str.split('.')
-    if len(suits) != 4:
-        return {}
-    
-    suit_names = ['S', 'H', 'D', 'C']
-    result = {}
-    total_hcp = 0
-    dp = 0  # Distribution points
-    
-    for suit_name, suit_cards in zip(suit_names, suits):
-        length = len(suit_cards)
-        result[f'SL_{suit_name}'] = length
-        
-        suit_hcp = sum(hcp_values.get(c.upper(), 0) for c in suit_cards)
-        total_hcp += suit_hcp
-        
-        # Distribution points: void=3, singleton=2, doubleton=1
-        if length == 0:
-            dp += 3
-        elif length == 1:
-            dp += 2
-        elif length == 2:
-            dp += 1
-    
-    result['HCP'] = total_hcp
-    result['Total_Points'] = total_hcp + dp
-    
-    return result
-
-
-def _compute_par_score(pbn_str: str, dealer: str, vul: str = "None") -> dict:
-    """Compute par score and contracts using endplay."""
-    try:
-        deal = Deal(pbn_str)
-        
-        dealer_map = {'N': Player.north, 'E': Player.east, 'S': Player.south, 'W': Player.west}
-        dealer_player = dealer_map.get(dealer, Player.north)
-        
-        vul_map = {
-            'None': Vul.none, 'Both': Vul.both, 'All': Vul.both,
-            'NS': Vul.ns, 'N-S': Vul.ns,
-            'EW': Vul.ew, 'E-W': Vul.ew
-        }
-        vul_enum = vul_map.get(vul, Vul.none)
-        
-        dd_table = calc_dd_table(deal)
-        parlist = par(dd_table, vul_enum, dealer_player)
-        
-        par_score = parlist.score
-        
-        # endplay Denom enum: spades=0, hearts=1, diamonds=2, clubs=3, nt=4
-        strain_map = {0: 'S', 1: 'H', 2: 'D', 3: 'C', 4: 'N'}
-        contracts_list = []
-        for contract in parlist:
-            level = contract.level
-            strain = strain_map.get(int(contract.denom), '?')
-            declarer = contract.declarer.abbr
-            penalty = contract.penalty.abbr if contract.penalty.abbr != 'U' else ''
-            result = contract.result
-            
-            result_str = f"+{result}" if result > 0 else str(result) if result < 0 else "="
-            contract_str = f"{level}{strain}{penalty} {declarer} {result_str}"
-            contracts_list.append(contract_str)
-        
-        par_contracts = ", ".join(contracts_list) if contracts_list else "Pass"
-        
-        return {'Par_Score': par_score, 'Par_Contract': par_contracts}
-    except Exception as e:
-        return {'Par_Score': None, 'Par_Contract': f"Error: {e}"}
+# PBN parsing, hand features, auction parsing, and par score functions 
+# are now imported from bbo_bidding_queries_lib
 
 
 @app.post("/process-pbn")
@@ -1868,7 +1623,7 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
     
     results = []
     for deal_idx, pbn_str in enumerate(pbn_deals):
-        deal = _parse_pbn_deal(pbn_str)
+        deal = parse_pbn_deal(pbn_str)
         if not deal:
             results.append({"error": f"Invalid PBN: {pbn_str[:50]}..."})
             continue
@@ -1877,7 +1632,7 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
         for direction in 'NESW':
             hand_col = f'Hand_{direction}'
             if hand_col in deal:
-                features = _compute_hand_features(deal[hand_col])
+                features = compute_hand_features(deal[hand_col])
                 for key, value in features.items():
                     deal[f'{key}_{direction}'] = value
         
@@ -1886,7 +1641,7 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
             # Use vulnerability from PBN file if available, otherwise use request
             vul = deal_vuls.get(deal_idx, req.vul)
             deal['Vulnerability'] = vul
-            par_info = _compute_par_score(pbn_str, deal['Dealer'], vul)
+            par_info = compute_par_score(pbn_str, deal['Dealer'], vul)
             deal.update(par_info)
         
         # Try to find matching deal in deal_df by PBN hands
@@ -1940,50 +1695,7 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
 # API: find matching auctions
 # ---------------------------------------------------------------------------
 
-def _evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, int]) -> bool:
-    """
-    Evaluate a criterion string like 'SL_S >= SL_H' against specific hand values.
-    
-    hand_values should have keys: HCP, SL_S, SL_H, SL_D, SL_C, Total_Points
-    Returns True if the criterion is satisfied, False otherwise.
-    """
-    
-    pattern = r'(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+)'
-    match = re.match(pattern, criterion.strip())
-    if not match:
-        return True  # Can't parse, don't filter
-    
-    left, op, right = match.groups()
-    
-    # Get left value
-    left_val = hand_values.get(left)
-    if left_val is None:
-        return True  # Unknown column, don't filter
-    
-    # Get right value (either from hand_values or as a number)
-    try:
-        right_val = float(right)
-    except ValueError:
-        right_val = hand_values.get(right)
-        if right_val is None:
-            return True  # Unknown column, don't filter
-    
-    # Evaluate
-    if op == '>=':
-        return left_val >= right_val
-    elif op == '<=':
-        return left_val <= right_val
-    elif op == '>':
-        return left_val > right_val
-    elif op == '<':
-        return left_val < right_val
-    elif op == '==':
-        return left_val == right_val
-    elif op == '!=':
-        return left_val != right_val
-    
-    return True
-
+# evaluate_criterion_for_hand is now imported from bbo_bidding_queries_lib
 
 def _filter_auctions_by_hand_criteria(
     df: pl.DataFrame, 
@@ -2026,7 +1738,7 @@ def _filter_auctions_by_hand_criteria(
                 if criteria_seat == seat:
                     matched_partial = partial_auction
                     for criterion in criteria:
-                        if not _evaluate_criterion_for_hand(criterion, hand_values):
+                        if not evaluate_criterion_for_hand(criterion, hand_values):
                             keep_row = False
                             failed_criteria.append(criterion)
                     
@@ -2269,7 +1981,7 @@ def pbn_lookup(req: PBNLookupRequest) -> Dict[str, Any]:
     pbn_input = req.pbn.strip()
     
     # Parse PBN to get individual hands
-    parsed = _parse_pbn_deal(pbn_input)
+    parsed = parse_pbn_deal(pbn_input)
     if not parsed:
         raise HTTPException(status_code=400, detail=f"Invalid PBN format: {pbn_input[:100]}")
     
@@ -2303,34 +2015,7 @@ def pbn_lookup(req: PBNLookupRequest) -> Dict[str, Any]:
 # API: Group by Bid
 # ---------------------------------------------------------------------------
 
-def _calculate_imp(score_diff: int) -> int:
-    """Calculate IMPs for a given score difference."""
-    diff = abs(int(score_diff))
-    if diff < 20: return 0
-    if diff < 50: return 1
-    if diff < 90: return 2
-    if diff < 130: return 3
-    if diff < 170: return 4
-    if diff < 220: return 5
-    if diff < 270: return 6
-    if diff < 320: return 7
-    if diff < 370: return 8
-    if diff < 430: return 9
-    if diff < 500: return 10
-    if diff < 600: return 11
-    if diff < 750: return 12
-    if diff < 900: return 13
-    if diff < 1100: return 14
-    if diff < 1300: return 15
-    if diff < 1500: return 16
-    if diff < 1750: return 17
-    if diff < 2000: return 18
-    if diff < 2250: return 19
-    if diff < 2500: return 20
-    if diff < 3000: return 21
-    if diff < 3500: return 22
-    if diff < 4000: return 23
-    return 24
+# calculate_imp is now imported from bbo_bidding_queries_lib
 
 @app.post("/group-by-bid")
 def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
@@ -2413,7 +2098,8 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
     available_deal_cols = [c for c in deal_cols if c in filtered_df.columns]
     
     # Get bt_df columns for joining (Expr, Agg_Expr_Seat_*)
-    bt_cols = ["Auction", "Announcement", "seat", "Expr", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"]
+    # todo: add "Announcement" column after 'Auction' column.
+    bt_cols = ["Auction", "seat", "Expr", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"]
     available_bt_cols = [c for c in bt_cols if c in bt_df.columns]
     
     # Use completed auctions for bt lookup
@@ -2533,7 +2219,7 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
                     
                     # Validate each criterion
                     for criterion in criteria:
-                        if not _evaluate_criterion_for_hand(criterion, hand_values):  # type: ignore[arg-type]
+                        if not evaluate_criterion_for_hand(criterion, hand_values):  # type: ignore[arg-type]
                             is_valid = False
                             # Format violation: "HCP(14) < 15"
                             # Parse criterion to get LHS
@@ -2570,7 +2256,7 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
             # Calculate IMPs from Score_Delta
             group_deals = group_deals.with_columns(
                 pl.col("Score_Delta").map_elements(
-                    lambda x: _calculate_imp(x) * (1 if x >= 0 else -1) if x is not None else None, 
+                    lambda x: calculate_imp(x) * (1 if x >= 0 else -1) if x is not None else None, 
                     return_dtype=pl.Int64
                 ).alias("Score_IMP")
             )

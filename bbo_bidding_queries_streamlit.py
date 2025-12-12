@@ -797,7 +797,7 @@ elif func_choice == "Auction Sequences Matching":
         with st.expander(f"🚫 Rejected auctions due to custom criteria. {len(criteria_rejected)} shown.", expanded=False):
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
-            rejected_df = pl.DataFrame(criteria_rejected)
+                rejected_df = pl.DataFrame(criteria_rejected)
                 st.dataframe(rejected_df.to_pandas(), use_container_width=True)
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
@@ -882,7 +882,7 @@ elif func_choice == "Deals Matching Auction":
             expr = a.get("expr")
             if expr:
                 # Flatten expr to a simple list of strings
-                    if isinstance(expr, list):
+                if isinstance(expr, list):
                     # Filter out None/empty and flatten nested lists
                     flat_expr = []
                     for item in expr:
@@ -893,8 +893,8 @@ elif func_choice == "Deals Matching Auction":
                     if flat_expr:
                         with st.expander(f"Expr criteria ({len(flat_expr)})"):
                             df_expr = pl.DataFrame({"Expr": flat_expr})
-                        render_aggrid(df_expr, key=f"expr_{i}", height=200)
-                    else:
+                            render_aggrid(df_expr, key=f"expr_{i}", height=200)
+                else:
                     # expr is a single value, not a list
                     with st.expander("Expr criteria"):
                         st.write(str(expr))
@@ -906,7 +906,7 @@ elif func_choice == "Deals Matching Auction":
                     criteria_str = ", ".join(str(c) for c in crit_list) if isinstance(crit_list, list) else str(crit_list)
                     rows.append({"Seat": seat, "Criteria": criteria_str})
                 if rows:
-                st.write("Criteria by seat:")
+                    st.write("Criteria by seat:")
                 df_criteria = pl.DataFrame(rows)
                 render_aggrid(df_criteria, key=f"criteria_{i}", height=220)
             
@@ -961,7 +961,7 @@ elif func_choice == "Deals Matching Auction":
         with st.expander(f"🚫 Rejected auctions due to custom criteria. {len(criteria_rejected)} shown.", expanded=False):
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
-            rejected_df = pl.DataFrame(criteria_rejected)
+                rejected_df = pl.DataFrame(criteria_rejected)
                 st.dataframe(rejected_df.to_pandas(), use_container_width=True)
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
