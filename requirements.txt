@@ -1,5 +1,6 @@
 # Core data processing
 polars[rt64]
+pyarrow  # Parquet file support
 pandas
 numpy
 scikit-learn

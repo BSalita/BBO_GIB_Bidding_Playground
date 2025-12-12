@@ -798,7 +798,7 @@ elif func_choice == "Auction Sequences Matching":
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
                 rejected_df = pl.DataFrame(criteria_rejected)
-                st.dataframe(rejected_df.to_pandas(), use_container_width=True)
+                st.dataframe(rejected_df.to_pandas(), use_container_width="stretch")
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
@@ -962,7 +962,7 @@ elif func_choice == "Deals Matching Auction":
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
                 rejected_df = pl.DataFrame(criteria_rejected)
-                st.dataframe(rejected_df.to_pandas(), use_container_width=True)
+                st.dataframe(rejected_df.to_pandas(), use_container_width="stretch")
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
@@ -1308,7 +1308,7 @@ elif func_choice == "Auction AI":
                                 try:
                                     rejected_df = pl.DataFrame(criteria_rejected)
                                     st.caption(f"Debug: DataFrame shape: {rejected_df.shape}, columns: {rejected_df.columns}")
-                                    st.dataframe(rejected_df.to_pandas(), use_container_width=True)
+                                    st.dataframe(rejected_df.to_pandas(), use_container_width="stretch")
                                 except Exception as e:
                                     st.warning(f"Could not render as table: {e}")
                                     st.json(criteria_rejected)
