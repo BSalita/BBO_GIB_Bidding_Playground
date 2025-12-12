@@ -798,7 +798,7 @@ elif func_choice == "Auction Sequences Matching":
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
                 rejected_df = pl.DataFrame(criteria_rejected)
-                st.dataframe(rejected_df.to_pandas(), use_container_width='stretch') # use_container_width=True/False has been deprecated
+                st.dataframe(rejected_df.to_pandas(), width='stretch')
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
@@ -951,7 +951,7 @@ elif func_choice == "Deals Matching Auction":
             if contract_summary:
                 st.write("**Contract Summary:**")
                 summary_df = pl.DataFrame(contract_summary)
-                st.dataframe(summary_df.to_pandas(), use_container_width='content', hide_index=True) # use_container_width=True/False has been deprecated
+                st.dataframe(summary_df.to_pandas(), width='content', hide_index=True) # width=True/False has been deprecated
                 
                 # Show grand totals
                 total_imp = a.get("total_imp_ai", 0)
@@ -992,7 +992,7 @@ elif func_choice == "Deals Matching Auction":
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
                 rejected_df = pl.DataFrame(criteria_rejected)
-                st.dataframe(rejected_df.to_pandas(), use_container_width='stretch') # use_container_width=True/False has been deprecated
+                st.dataframe(rejected_df.to_pandas(), width='stretch')
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
@@ -1338,7 +1338,7 @@ elif func_choice == "Auction AI":
                                 try:
                                     rejected_df = pl.DataFrame(criteria_rejected)
                                     st.caption(f"Debug: DataFrame shape: {rejected_df.shape}, columns: {rejected_df.columns}")
-                                    st.dataframe(rejected_df.to_pandas(), use_container_width='stretch') # use_container_width=True/False has been deprecated
+                                    st.dataframe(rejected_df.to_pandas(), width='stretch')
                                 except Exception as e:
                                     st.warning(f"Could not render as table: {e}")
                                     st.json(criteria_rejected)
