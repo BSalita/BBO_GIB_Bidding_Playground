@@ -1306,6 +1306,54 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                 else:
                     deal_row["IMP_AI_vs_Actual"] = None
             
+            # Create summary by Contract
+            deals_with_computed = pl.DataFrame(deals_list)
+            if "Contract" in deals_with_computed.columns and "IMP_AI_vs_Actual" in deals_with_computed.columns:
+                contract_summary = (
+                    deals_with_computed
+                    .group_by("Contract")
+                    .agg([
+                        pl.len().alias("Count"),
+                        pl.col("IMP_AI_vs_Actual").mean().alias("Avg_IMP_AI"),
+                        # Percentage where Contract makes (DD_Score_Declarer >= 0)
+                        (pl.col("DD_Score_Declarer").cast(pl.Int64, strict=False).ge(0).sum() * 100.0 / pl.len()).alias("Contract_Makes%"),
+                        # Percentage where AI_Contract makes (DD_Score_AI >= 0)
+                        (pl.col("DD_Score_AI").cast(pl.Int64, strict=False).ge(0).sum() * 100.0 / pl.len()).alias("AI_Makes%"),
+                        # Percentage where Contract achieves par (DD_Score_Declarer == ParScore)
+                        (pl.col("DD_Score_Declarer").cast(pl.Int64, strict=False).eq(pl.col("ParScore").cast(pl.Int64, strict=False)).sum() * 100.0 / pl.len()).alias("Contract_Par%"),
+                        # Percentage where AI_Contract achieves par (DD_Score_AI == ParScore)
+                        (pl.col("DD_Score_AI").cast(pl.Int64, strict=False).eq(pl.col("ParScore").cast(pl.Int64, strict=False)).sum() * 100.0 / pl.len()).alias("AI_Par%"),
+                    ])
+                    .sort("Count", descending=True)
+                )
+                # Round to 1 decimal place
+                contract_summary = contract_summary.with_columns([
+                    pl.col("Avg_IMP_AI").round(1),
+                    pl.col("Contract_Makes%").round(1),
+                    pl.col("AI_Makes%").round(1),
+                    pl.col("Contract_Par%").round(1),
+                    pl.col("AI_Par%").round(1),
+                ])
+                auction_info["contract_summary"] = contract_summary.to_dicts()
+                
+                # Calculate grand totals across all deals
+                total_deals = deals_with_computed.height
+                total_imp = deals_with_computed["IMP_AI_vs_Actual"].sum()
+                auction_info["total_imp_ai"] = int(total_imp) if total_imp is not None else 0
+                auction_info["total_deals"] = total_deals
+                
+                # Count where contracts make (DD score >= 0)
+                dd_actual = deals_with_computed["DD_Score_Declarer"].cast(pl.Int64, strict=False)
+                dd_ai = deals_with_computed["DD_Score_AI"].cast(pl.Int64, strict=False)
+                par_score = deals_with_computed["ParScore"].cast(pl.Int64, strict=False)
+                
+                auction_info["contract_makes_count"] = int((dd_actual >= 0).sum())
+                auction_info["ai_makes_count"] = int((dd_ai >= 0).sum())
+                
+                # Count where contracts achieve par
+                auction_info["contract_par_count"] = int((dd_actual == par_score).sum())
+                auction_info["ai_par_count"] = int((dd_ai == par_score).sum())
+            
             # Filter to display columns (keeping computed columns we just added)
             display_cols_set = set(deal_display_cols) | {"DD_Score_AI", "AI_Contract", "IMP_AI_vs_Actual"}
             auction_info["deals"] = [

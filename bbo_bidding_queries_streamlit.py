@@ -798,7 +798,7 @@ elif func_choice == "Auction Sequences Matching":
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
                 rejected_df = pl.DataFrame(criteria_rejected)
-                st.dataframe(rejected_df.to_pandas(), use_container_width="stretch")
+                st.dataframe(rejected_df.to_pandas(), use_container_width='stretch') # use_container_width=True/False has been deprecated
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
@@ -946,6 +946,36 @@ elif func_choice == "Deals Matching Auction":
                 with st.expander("🔍 Distribution SQL Query", expanded=False):
                     st.code(dist_sql, language="sql")
             
+            # Contract summary table
+            contract_summary = a.get("contract_summary", [])
+            if contract_summary:
+                st.write("**Contract Summary:**")
+                summary_df = pl.DataFrame(contract_summary)
+                st.dataframe(summary_df.to_pandas(), use_container_width='content', hide_index=True) # use_container_width=True/False has been deprecated
+                
+                # Show grand totals
+                total_imp = a.get("total_imp_ai", 0)
+                total_deals = a.get("total_deals", 0)
+                ai_makes = a.get("ai_makes_count", 0)
+                contract_makes = a.get("contract_makes_count", 0)
+                ai_par = a.get("ai_par_count", 0)
+                contract_par = a.get("contract_par_count", 0)
+                
+                # Calculate percentages
+                ai_makes_pct = (ai_makes / total_deals * 100) if total_deals > 0 else 0
+                contract_makes_pct = (contract_makes / total_deals * 100) if total_deals > 0 else 0
+                ai_par_pct = (ai_par / total_deals * 100) if total_deals > 0 else 0
+                contract_par_pct = (contract_par / total_deals * 100) if total_deals > 0 else 0
+                
+                won_lost = "won" if total_imp >= 0 else "lost"
+                emoji = "🤖" if total_imp >= 0 else "👤"
+                
+                st.info(
+                    f"{emoji} AI **{won_lost} {abs(total_imp)} IMPs** overall vs actual in **{total_deals}** contracts. "
+                    f"AI made contracts **{ai_makes_pct:.1f}%** vs **{contract_makes_pct:.1f}%**. "
+                    f"AI achieved par **{ai_par_pct:.1f}%** vs **{contract_par_pct:.1f}%**."
+                )
+            
             deals = a.get("deals", [])
             if deals:
                 deals_df = pl.DataFrame(deals)
@@ -962,7 +992,7 @@ elif func_choice == "Deals Matching Auction":
             st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
             try:
                 rejected_df = pl.DataFrame(criteria_rejected)
-                st.dataframe(rejected_df.to_pandas(), use_container_width="stretch")
+                st.dataframe(rejected_df.to_pandas(), use_container_width='stretch') # use_container_width=True/False has been deprecated
             except Exception as e:
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
@@ -1308,7 +1338,7 @@ elif func_choice == "Auction AI":
                                 try:
                                     rejected_df = pl.DataFrame(criteria_rejected)
                                     st.caption(f"Debug: DataFrame shape: {rejected_df.shape}, columns: {rejected_df.columns}")
-                                    st.dataframe(rejected_df.to_pandas(), use_container_width="stretch")
+                                    st.dataframe(rejected_df.to_pandas(), use_container_width='stretch') # use_container_width=True/False has been deprecated
                                 except Exception as e:
                                     st.warning(f"Could not render as table: {e}")
                                     st.json(criteria_rejected)
