@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 import signal
 import sys
 import threading
@@ -82,8 +83,27 @@ def _parse_data_dir_arg() -> pathlib.Path | None:
             return pathlib.Path(arg.split("=", 1)[1])
     return None
 
+
+def _parse_deal_rows_arg() -> int | None:
+    """Parse --deal-rows from sys.argv early (before full argparse).
+    
+    Use this to limit deal_df rows for faster debugging startup.
+    """
+    import sys
+    for i, arg in enumerate(sys.argv):
+        if arg == "--deal-rows" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+        if arg.startswith("--deal-rows="):
+            return int(arg.split("=", 1)[1])
+    return None
+
+
 # Check for --data-dir command line argument
 _cli_data_dir = _parse_data_dir_arg()
+# Check for --deal-rows (limit deal_df rows for faster debugging)
+_cli_deal_rows = _parse_deal_rows_arg()
+if _cli_deal_rows is not None:
+    print(f"DEBUG MODE: Limiting deal_df to {_cli_deal_rows:,} rows")
 
 # Default to 'data' subdirectory if --data-dir not specified
 dataPath = _cli_data_dir if _cli_data_dir is not None else pathlib.Path("data")
@@ -102,6 +122,212 @@ exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
 bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
 bbo_bidding_table_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
+auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic auction criteria filtering (from criteria.csv)
+# ---------------------------------------------------------------------------
+
+def _load_auction_criteria() -> list[tuple[str, list[str]]]:
+    """Load criteria.csv and return list of (partial_auction, [criteria...]).
+    
+    CSV format: partial_auction,criterion1,criterion2,...
+    Example row: 1c,SL_S >= SL_H,HCP >= 12
+    """
+    if not auction_criteria_file.exists():
+        return []
+    
+    import csv
+    criteria_list = []
+    try:
+        with open(auction_criteria_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row or row[0].startswith('#'):  # Skip empty lines and comments
+                    continue
+                partial_auction = row[0].strip().lower()
+                criteria = [c.strip() for c in row[1:] if c.strip()]
+                if partial_auction and criteria:
+                    criteria_list.append((partial_auction, criteria))
+    except Exception as e:
+        print(f"[auction-criteria] Error loading {auction_criteria_file}: {e}")
+    
+    return criteria_list
+
+
+def _get_direction_for_partial_auction(partial_auction: str, dealer: str) -> str:
+    """Get the direction (N/E/S/W) for the bidder of the last bid in partial_auction.
+    
+    The seat number = number of dashes + 1
+    Direction = ['N', 'E', 'S', 'W'][(dealer_index + seat - 1) % 4]
+    """
+    directions = ['N', 'E', 'S', 'W']
+    dealer_idx = directions.index(dealer.upper()) if dealer.upper() in directions else 0
+    num_dashes = partial_auction.count('-')
+    seat = num_dashes + 1  # 1-based seat number
+    direction_idx = (dealer_idx + seat - 1) % 4
+    return directions[direction_idx]
+
+
+def _parse_criterion_to_polars(criterion: str, direction: str) -> pl.Expr | None:
+    """Parse a criterion string like 'SL_S >= SL_H' into a Polars expression.
+    
+    Supports:
+    - Column comparisons: SL_S >= SL_H, HCP > Total_Points
+    - Value comparisons: HCP >= 12, SL_S <= 5
+    - Operators: >=, <=, >, <, ==, !=
+    """
+    
+    # Match: COL OP COL or COL OP VALUE
+    pattern = r'(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+)'
+    match = re.match(pattern, criterion.strip())
+    if not match:
+        print(f"[auction-criteria] Could not parse criterion: {criterion}")
+        return None
+    
+    left, op, right = match.groups()
+    
+    # Append direction to column names if they're bridge columns
+    bridge_cols = ['SL_S', 'SL_H', 'SL_D', 'SL_C', 'HCP', 'Total_Points']
+    
+    left_col = f"{left}_{direction}" if left in bridge_cols else left
+    left_expr = pl.col(left_col)
+    
+    # Check if right is a number or column name
+    right_val: float | None = None
+    try:
+        right_val = float(right)
+    except ValueError:
+        pass
+    
+    if right_val is not None:
+        # Compare against a numeric value
+        if op == '>=':
+            return left_expr >= right_val
+        elif op == '<=':
+            return left_expr <= right_val
+        elif op == '>':
+            return left_expr > right_val
+        elif op == '<':
+            return left_expr < right_val
+        elif op == '==':
+            return left_expr == right_val
+        elif op == '!=':
+            return left_expr != right_val
+    else:
+        # Compare against another column
+        right_col = f"{right}_{direction}" if right in bridge_cols else right
+        right_expr = pl.col(right_col)
+        if op == '>=':
+            return left_expr >= right_expr
+        elif op == '<=':
+            return left_expr <= right_expr
+        elif op == '>':
+            return left_expr > right_expr
+        elif op == '<':
+            return left_expr < right_expr
+        elif op == '==':
+            return left_expr == right_expr
+        elif op == '!=':
+            return left_expr != right_expr
+    
+    return None
+
+
+def _apply_auction_criteria(
+    df: pl.DataFrame, 
+    dealer_col: str = 'Dealer', 
+    auction_col: str = 'Auction',
+    track_rejected: bool = False
+) -> tuple[pl.DataFrame, pl.DataFrame | None]:
+    """Apply dynamic auction criteria from criteria.csv to filter the DataFrame.
+    
+    For each row, checks if Auction starts with any partial_auction in criteria.csv.
+    If so, applies the additional criteria filters based on the seat's direction.
+    
+    Returns:
+        (filtered_df, rejected_df) - rejected_df is None if track_rejected=False
+        rejected_df has columns: Auction, Partial_Auction, Failed_Criteria, Dealer, Seat, Direction
+    """
+    criteria_list = _load_auction_criteria()
+    if not criteria_list:
+        return df, None
+    
+    if auction_col not in df.columns or dealer_col not in df.columns:
+        return df, None
+    
+    # Track rejected rows for debugging
+    rejected_rows: list[dict] = []
+    
+    # For each criterion set, filter out rows that match the partial
+    # auction but don't satisfy the criteria
+    for partial_auction, criteria in criteria_list:
+        auction_lower = pl.col(auction_col).cast(pl.Utf8).str.to_lowercase()
+        matches_partial = auction_lower.str.starts_with(partial_auction)
+        
+        # For each dealer, build the criteria check
+        for dealer in ['N', 'E', 'S', 'W']:
+            direction = _get_direction_for_partial_auction(partial_auction, dealer)
+            num_dashes = partial_auction.count('-')
+            seat = num_dashes + 1
+            
+            criteria_exprs = []
+            criteria_strs = []
+            for criterion in criteria:
+                criterion_expr = _parse_criterion_to_polars(criterion, direction)
+                if criterion_expr is not None:
+                    criteria_exprs.append((criterion, criterion_expr))
+                    criteria_strs.append(criterion)
+            
+            if criteria_exprs:
+                # Find rows that match partial auction and dealer
+                matching_mask = matches_partial & (pl.col(dealer_col) == dealer)
+                matching_rows = df.filter(matching_mask)
+                
+                if track_rejected and matching_rows.height > 0:
+                    # For each matching row, check which criteria fail
+                    for row_idx in range(matching_rows.height):
+                        row = matching_rows.row(row_idx, named=True)
+                        failed_criteria = []
+                        
+                        for criterion_str, criterion_expr in criteria_exprs:
+                            # Check if this single row passes the criterion
+                            try:
+                                single_row_df = matching_rows.slice(row_idx, 1)
+                                passes = single_row_df.filter(criterion_expr).height > 0
+                                if not passes:
+                                    failed_criteria.append(criterion_str)
+                            except Exception:
+                                failed_criteria.append(f"{criterion_str} (eval error)")
+                        
+                        if failed_criteria:
+                            rejected_rows.append({
+                                'Auction': str(row.get(auction_col, '')),
+                                'Partial_Auction': str(partial_auction),
+                                'Failed_Criteria': ', '.join(failed_criteria),  # Convert list to string for display
+                                'Dealer': str(dealer),
+                                'Seat': int(seat),
+                                'Direction': str(direction),
+                            })
+                
+                # Build combined filter
+                combined_criteria = criteria_exprs[0][1]
+                for _, expr in criteria_exprs[1:]:
+                    combined_criteria = combined_criteria & expr
+                
+                # Keep row if: not (matches_partial AND dealer matches AND NOT criteria_satisfied)
+                df = df.filter(
+                    ~(matches_partial & (pl.col(dealer_col) == dealer)) | combined_criteria
+                )
+    
+    # Build rejected DataFrame
+    rejected_df = None
+    if track_rejected and rejected_rows:
+        rejected_df = pl.DataFrame(rejected_rows)
+    
+    return df, rejected_df
+
 
 REQUIRED_FILES = [
     exec_plan_file,
@@ -148,7 +374,7 @@ class StatusResponse(BaseModel):
     bt_df_rows: Optional[int] = None
     deal_df_rows: Optional[int] = None
     loading_step: Optional[str] = None  # Current loading step
-    loaded_files: Optional[Dict[str, int]] = None  # File name -> row count
+    loaded_files: Optional[Dict[str, Any]] = None  # File name -> row count (int or str like "100 of 1000")
 
 
 class InitResponse(BaseModel):
@@ -197,7 +423,7 @@ class BiddingTableStatisticsRequest(BaseModel):
 
 
 class ProcessPBNRequest(BaseModel):
-    pbn: str  # PBN string or URL
+    pbn: str  # PBN or LIN string, or URL to .pbn/.lin file
     include_par: bool = True
     vul: str = "None"  # None, Both, NS, EW
 
@@ -211,6 +437,20 @@ class FindMatchingAuctionsRequest(BaseModel):
     total_points: int
     seat: int = 1  # Which seat to match (1-4)
     max_results: int = 50
+
+
+class PBNLookupRequest(BaseModel):
+    pbn: str  # PBN deal string to look up
+    max_results: int = 100
+
+
+class GroupByBidRequest(BaseModel):
+    """Request for grouping deals by their actual auction (bid column)."""
+    auction_pattern: str = ".*"  # Regex pattern to filter auctions
+    n_auction_groups: int = 10  # Number of unique auctions to show
+    n_deals_per_group: int = 5  # Number of sample deals per auction
+    seed: Optional[int] = 0  # Random seed (0 = non-reproducible)
+    min_deals: int = 1  # Minimum deals required per auction group
 
 
 # ---------------------------------------------------------------------------
@@ -270,15 +510,17 @@ def _heavy_init() -> None:
     print("[init] Starting initialization...")
     _log_memory("start")
     
-    def _update_loading_status(step: str, file_name: str | None = None, row_count: int | None = None):
+    TOTAL_STEPS = 10  # Total number of loading steps
+    
+    def _update_loading_status(step_num: int, step: str, file_name: str | None = None, row_count: int | str | None = None):
         """Update loading progress in STATE (thread-safe)."""
         with _STATE_LOCK:
-            STATE["loading_step"] = step
+            STATE["loading_step"] = f"[{step_num}/{TOTAL_STEPS}] {step}"
             if file_name and row_count is not None:
                 STATE["loaded_files"][file_name] = row_count
     
     try:
-        _update_loading_status("Loading execution plan...")
+        _update_loading_status(1, "Loading execution plan...")
         (
             directionless_criteria_cols,
             expr_map_by_direction,
@@ -287,12 +529,32 @@ def _heavy_init() -> None:
         ) = load_execution_plan_data(exec_plan_file)
         _log_memory("after load_execution_plan_data")
 
-        # Load deals
-        _update_loading_status("Loading deal_df (bbo_mldf_augmented.parquet)...")
-        deal_df = load_deal_df(bbo_mldf_augmented_file, valid_deal_columns, mldf_n_rows=None)
-        _update_loading_status("Building criteria bitmaps...", "deal_df", deal_df.height)
+        # Add additional columns needed for PBN Lookup (game results)
+        additional_cols = ['PBN', 'Vul', 'Declarer', 'bid', 'Result', 'Tricks', 'Score', 'ParScore']
+        for col in additional_cols:
+            if col not in valid_deal_columns:
+                valid_deal_columns.append(col)
+
+        # Load deals (optionally limited by --deal-rows for faster debugging)
+        n_rows_msg = f" (limited to {_cli_deal_rows:,} rows)" if _cli_deal_rows else ""
+        _update_loading_status(2, f"Loading deal_df (bbo_mldf_augmented.parquet){n_rows_msg}...")
+        deal_df = load_deal_df(bbo_mldf_augmented_file, valid_deal_columns, mldf_n_rows=_cli_deal_rows)
+        
+        # Get total row count for display (when using --deal-rows)
+        if _cli_deal_rows:
+            import pyarrow.parquet as pq
+            total_rows = pq.read_metadata(bbo_mldf_augmented_file).num_rows
+            row_info = f"{deal_df.height:,} of {total_rows:,}"
+        else:
+            row_info = f"{deal_df.height:,}"
+        _update_loading_status(3, "Building criteria bitmaps...", "deal_df", row_info)
         _log_memory("after load_deal_df")
 
+        # todo: do this earlier in the pipeline?
+        # Convert 'bid' from pl.List(pl.Utf8) to pl.Utf8 by joining with '-'
+        if 'bid' in deal_df.columns and deal_df['bid'].dtype == pl.List(pl.Utf8):
+            deal_df = deal_df.with_columns(pl.col('bid').list.join('-'))
+        
         # Build criteria bitmaps and derive per-seat/per-dealer views
         criteria_deal_dfs_directional = build_or_load_directional_criteria_bitmaps(
             deal_df,
@@ -301,7 +563,7 @@ def _heavy_init() -> None:
         )
         _log_memory("after build_or_load_directional_criteria_bitmaps")
 
-        _update_loading_status("Processing criteria views...")
+        _update_loading_status(4, "Processing criteria views...")
         deal_criteria_by_direction_dfs, deal_criteria_by_seat_dfs = directional_to_directionless(
             criteria_deal_dfs_directional, expr_map_by_direction
         )
@@ -313,19 +575,19 @@ def _heavy_init() -> None:
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load bidding table
-        _update_loading_status("Loading bt_df (bbo_bt_augmented.parquet)...")
+        _update_loading_status(5, "Loading bt_df (bbo_bt_augmented.parquet)...")
         bt_df = load_bt_df(bbo_bidding_table_augmented_file, include_expr_and_sequences=True)
         _log_memory("after load_bt_df")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
-        _update_loading_status("Processing opening bids (may take several minutes)...", "bt_df", bt_df.height)
+        _update_loading_status(6, "Processing opening bids (may take several minutes)...", "bt_df", bt_df.height)
         results = process_opening_bids(
             deal_df,
             bt_df,
             deal_criteria_by_seat_dfs,
             bbo_bidding_table_augmented_file,
         )
-        _update_loading_status("Loading optional files...")
+        _update_loading_status(7, "Loading optional files...")
         _log_memory("after process_opening_bids")
 
         # Load optional aggregates files (non-blocking if missing)
@@ -333,19 +595,19 @@ def _heavy_init() -> None:
         bt_aggregates = None
         
         if bt_criteria_file.exists():
-            _update_loading_status("Loading bt_criteria.parquet...")
+            _update_loading_status(7, "Loading bt_criteria.parquet...")
             print(f"[init] Loading bt_criteria from {bt_criteria_file}...")
             bt_criteria = pl.read_parquet(bt_criteria_file)
-            _update_loading_status("Loading bt_criteria.parquet...", "bt_criteria", bt_criteria.height)
+            _update_loading_status(7, "Loading bt_criteria.parquet...", "bt_criteria", bt_criteria.height)
             _log_memory("after load bt_criteria")
         else:
             print(f"[init] bt_criteria not found at {bt_criteria_file} (optional)")
         
         if bt_aggregates_file.exists():
-            _update_loading_status("Loading bt_aggregates.parquet...")
+            _update_loading_status(8, "Loading bt_aggregates.parquet...")
             print(f"[init] Loading bt_aggregates from {bt_aggregates_file}...")
             bt_aggregates = pl.read_parquet(bt_aggregates_file)
-            _update_loading_status("Loading bt_aggregates.parquet...", "bt_aggregates", bt_aggregates.height)
+            _update_loading_status(8, "Loading bt_aggregates.parquet...", "bt_aggregates", bt_aggregates.height)
             _log_memory("after load bt_aggregates")
         else:
             print(f"[init] bt_aggregates not found at {bt_aggregates_file} (optional)")
@@ -353,10 +615,10 @@ def _heavy_init() -> None:
         # Cache the completed auctions filter (expensive: ~2 min on 541M rows)
         bt_completed_df = None
         if "is_completed_auction" in bt_df.columns:
-            _update_loading_status("Filtering completed auctions (bt_completed_df)...")
+            _update_loading_status(9, "Filtering completed auctions (bt_completed_df)...")
             print("[init] Caching bt_completed_df (is_completed_auction filter)...")
             bt_completed_df = bt_df.filter(pl.col("is_completed_auction"))
-            _update_loading_status("Filtering completed auctions...", "bt_completed_df", bt_completed_df.height)
+            _update_loading_status(9, "Filtering completed auctions...", "bt_completed_df", bt_completed_df.height)
             print(f"[init] bt_completed_df: {bt_completed_df.height:,} rows (from {bt_df.height:,})")
             _log_memory("after bt_completed_df filter")
 
@@ -378,6 +640,7 @@ def _heavy_init() -> None:
         # Pre-warm selected query paths so the first user request is faster.
         # This does a tiny sample query on each endpoint's core logic.
         # ------------------------------------------------------------------
+        _update_loading_status(10, "Pre-warming endpoints...")
         try:
             print("[init] Pre-warming openings-by-deal-index endpoint ...")
             _ = openings_by_deal_index(OpeningsByDealIndexRequest(sample_size=1))
@@ -421,6 +684,16 @@ def _heavy_init() -> None:
                 FindMatchingAuctionsRequest(
                     hcp=15, sl_s=4, sl_h=3, sl_d=3, sl_c=3,
                     total_points=17, seat=1, max_results=1,
+                )
+            )
+
+            print("[init] Pre-warming group-by-bid endpoint ...")
+            _ = group_by_bid(
+                GroupByBidRequest(
+                    auction_pattern="^1N-p-3N$",
+                    n_auction_groups=1,
+                    n_deals_per_group=1,
+                    seed=42,
                 )
             )
         except Exception as warm_exc:  # pragma: no cover - best-effort prewarm
@@ -721,10 +994,16 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
     else:
         filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(f"(?i){pattern}"))
 
+    # Apply dynamic auction criteria from criteria.csv (track rejected for debugging)
+    filtered_df, rejected_df = _apply_auction_criteria(filtered_df, track_rejected=True)
+
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(f"[auction-sequences-matching] {elapsed_ms:.1f}ms (no matches)")
-        return {"samples": [], "pattern": pattern, "elapsed_ms": round(elapsed_ms, 1)}
+        result = {"samples": [], "pattern": pattern, "elapsed_ms": round(elapsed_ms, 1)}
+        if rejected_df is not None and rejected_df.height > 0:
+            result["criteria_rejected"] = rejected_df.to_dicts()
+        return result
 
     sample_n = min(req.n_samples, filtered_df.height)
     # seed=0 means non-reproducible (None), any other value is reproducible
@@ -789,7 +1068,10 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"[auction-sequences-matching] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
-    return {"pattern": pattern, "samples": out_samples, "elapsed_ms": round(elapsed_ms, 1)}
+    result = {"pattern": pattern, "samples": out_samples, "elapsed_ms": round(elapsed_ms, 1)}
+    if rejected_df is not None and rejected_df.height > 0:
+        result["criteria_rejected"] = rejected_df.to_dicts()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -825,10 +1107,16 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
     else:
         filtered_df = base_df.filter(pl.col("Auction").cast(pl.Utf8).str.contains(f"(?i){pattern}"))
 
+    # Apply dynamic auction criteria from criteria.csv (track rejected for debugging)
+    filtered_df, rejected_df = _apply_auction_criteria(filtered_df, track_rejected=True)
+
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(f"[deals-matching-auction] {elapsed_ms:.1f}ms (no matches)")
-        return {"pattern": pattern, "auctions": [], "elapsed_ms": round(elapsed_ms, 1)}
+        result = {"pattern": pattern, "auctions": [], "elapsed_ms": round(elapsed_ms, 1)}
+        if rejected_df is not None and rejected_df.height > 0:
+            result["criteria_rejected"] = rejected_df.to_dicts()
+        return result
 
     sample_n = min(req.n_auction_samples, filtered_df.height)
     # seed=0 means non-reproducible (None), any other value is reproducible
@@ -836,7 +1124,8 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
     sampled_auctions = filtered_df.sample(n=sample_n, seed=effective_seed)
 
     dirs = ["N", "E", "S", "W"]
-    deal_display_cols = ["index", "Dealer", "Hand_N", "Hand_E", "Hand_S", "Hand_W"]
+    deal_display_cols = ["index", "Dealer", "bid", "Hand_N", "Hand_E", "Hand_S", "Hand_W", 
+                         "Result", "Tricks", "ParScore", "Par_Contract"]
 
     out_auctions: List[Dict[str, Any]] = []
 
@@ -850,6 +1139,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
             "expr": auction_row.get("Expr"),
             "criteria_by_seat": {},
             "deals": [],
+            "criteria_debug": {},  # Debug info for criteria matching
         }
 
         # Criteria by seat
@@ -861,6 +1151,41 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                     auction_info["criteria_by_seat"][str(s)] = crit_list
 
         matching_deals: List[pl.DataFrame] = []
+        
+        # Track criteria matching for debugging (once per seat, not per-dealer)
+        # Criteria are the same for all dealers - only which direction plays each seat changes
+        criteria_found: Dict[str, List[str]] = {}
+        criteria_missing: Dict[str, List[str]] = {}
+        
+        # Determine the actual final seat by checking which Agg_Expr_Seat_s columns have content
+        actual_final_seat = 0
+        for s in range(1, 5):
+            agg_col = f"Agg_Expr_Seat_{s}"
+            if agg_col in auction_row and auction_row[agg_col]:
+                actual_final_seat = s
+        
+        # Pre-populate criteria debug info (before dealer loop, since criteria are same for all)
+        for s in range(1, actual_final_seat + 1):
+            agg_col = f"Agg_Expr_Seat_{s}"
+            seat_key = f"Seat_{s}"
+            criteria_found[seat_key] = []
+            criteria_missing[seat_key] = []
+            
+            if agg_col in auction_row:
+                criteria_list = auction_row[agg_col]
+                if criteria_list:
+                    # Check against first available dealer's criteria df to see what's available
+                    for dealer in dirs:
+                        if s in deal_criteria_by_seat_dfs and dealer in deal_criteria_by_seat_dfs[s]:
+                            seat_criteria_df = deal_criteria_by_seat_dfs[s][dealer]
+                            for criterion in criteria_list:
+                                if criterion in seat_criteria_df.columns:
+                                    if criterion not in criteria_found[seat_key]:
+                                        criteria_found[seat_key].append(criterion)
+                                else:
+                                    if criterion not in criteria_missing[seat_key]:
+                                        criteria_missing[seat_key].append(criterion)
+                            break  # Only need to check one dealer's df
 
         for dealer in dirs:
             dealer_mask = deal_df["Dealer"] == dealer
@@ -869,7 +1194,8 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
 
             combined_mask = dealer_mask.clone()
 
-            for s in range(1, seat + 1):
+            # Loop through ALL seats that have Agg_Expr, not just up to `seat`
+            for s in range(1, actual_final_seat + 1):
                 agg_col = f"Agg_Expr_Seat_{s}"
                 if agg_col not in auction_row:
                     continue
@@ -888,9 +1214,25 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
             if len(matching_idx) > 0:
                 for idx in matching_idx[: req.n_deal_samples]:
                     matching_deals.append(deal_df[idx])
+        
+        # Add debug info - include all seats up to actual_final_seat, even if empty
+        auction_info["criteria_debug"] = {
+            "row_seat": seat,  # The seat field from the bt_df row
+            "actual_final_seat": actual_final_seat,  # Determined by which Agg_Expr columns have content
+            "found": criteria_found,  # Include all seats (even empty) for transparency
+            "missing": {k: v for k, v in criteria_missing.items() if v},
+        }
 
         if matching_deals:
             combined_df = pl.concat(matching_deals[: req.n_deal_samples])
+            
+            # Add a column showing which direction is the opener (seat 1)
+            # Seat 1 direction = Dealer
+            # Seat 2 direction = (Dealer + 1) % 4, etc.
+            if "Dealer" in combined_df.columns:
+                combined_df = combined_df.with_columns(
+                    pl.col("Dealer").alias("Opener_Direction")
+                )
             
             # Apply distribution filter if specified
             if req.dist_pattern or req.sorted_shape:
@@ -932,6 +1274,8 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
             "sorted_shape": req.sorted_shape,
             "direction": req.dist_direction,
         }
+    if rejected_df is not None and rejected_df.height > 0:
+        response["criteria_rejected"] = rejected_df.to_dicts()
     return response
 
 
@@ -1289,8 +1633,48 @@ def _add_suit_length_columns(df: pl.DataFrame, direction: str) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# API: process PBN
+# API: process PBN / LIN
 # ---------------------------------------------------------------------------
+
+def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[str], dict[int, str]]:
+    """
+    Parse PBN or LIN file content using endplay and extract all deals with vulnerabilities.
+    Returns (list of PBN strings, dict of deal_idx -> vulnerability).
+    """
+    from endplay.parsers import pbn as pbn_parser, lin as lin_parser
+    
+    pbn_deals = []
+    deal_vuls = {}
+    
+    try:
+        # Parse using appropriate endplay parser
+        if is_lin:
+            boards = lin_parser.loads(content)
+        else:
+            boards = pbn_parser.loads(content)
+        
+        for board in boards:
+            if board.deal is None:
+                continue
+            
+            # Get PBN string from deal
+            pbn_str = board.deal.to_pbn()
+            
+            # Get vulnerability
+            vul_map = {0: 'None', 1: 'NS', 2: 'EW', 3: 'Both'}  # endplay Vul enum values
+            try:
+                vul = vul_map.get(int(board.vul), 'None') if board.vul is not None else 'None'
+            except:
+                vul = 'None'
+            
+            deal_idx = len(pbn_deals)
+            pbn_deals.append(pbn_str)
+            deal_vuls[deal_idx] = vul
+    except Exception as e:
+        print(f"[parse-file] endplay parsing failed: {e}")
+    
+    return pbn_deals, deal_vuls
+
 
 def _parse_pbn_deal(pbn_str: str) -> dict | None:
     """Parse a PBN deal string into hands and dealer."""
@@ -1399,7 +1783,7 @@ def _compute_par_score(pbn_str: str, dealer: str, vul: str = "None") -> dict:
 
 @app.post("/process-pbn")
 def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
-    """Process PBN deal(s) and compute features including optional par score."""
+    """Process PBN or LIN deal(s) and compute features including optional par score."""
     t0 = time.perf_counter()
     
     pbn_input = req.pbn.strip()
@@ -1407,6 +1791,13 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
     
     # Track vulnerability per deal (for PBN files)
     deal_vuls: dict[int, str] = {}
+    
+    # Track detected input type for user feedback
+    input_type = "unknown"
+    input_source = ""
+    
+    # Auto-detect input type: URL, local file path, or direct PBN/LIN string
+    import os
     
     # Check if it's a URL
     if pbn_input.startswith('http://') or pbn_input.startswith('https://'):
@@ -1418,53 +1809,62 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
         try:
             response = http_requests.get(url, timeout=30)
             response.raise_for_status()
-            pbn_content = response.text
+            file_content = response.text
             
-            # Parse PBN file - extract deals with their vulnerabilities
-            import re
+            # Detect file type from URL or content
+            is_lin = url.lower().endswith('.lin') or 'md|' in file_content[:500]
             
-            # Split into blocks (separated by blank lines or consecutive tags)
-            current_vul = "None"
-            deal_pattern = re.compile(r'\[Deal\s+"([NESW]:[^"]+)"\]')
-            vul_pattern = re.compile(r'\[Vulnerable\s+"([^"]+)"\]')
+            # Use endplay to parse PBN or LIN file
+            pbn_deals, deal_vuls = _parse_file_with_endplay(file_content, is_lin=is_lin)
             
-            # Process line by line to pair vulnerabilities with deals
-            for line in pbn_content.split('\n'):
-                line = line.strip()
-                vul_match = vul_pattern.search(line)
-                if vul_match:
-                    vul_str = vul_match.group(1)
-                    # Normalize vulnerability
-                    if vul_str.lower() in ('none', '-'):
-                        current_vul = "None"
-                    elif vul_str.lower() in ('all', 'both'):
-                        current_vul = "Both"
-                    elif vul_str.upper() in ('NS', 'N-S'):
-                        current_vul = "NS"
-                    elif vul_str.upper() in ('EW', 'E-W'):
-                        current_vul = "EW"
-                    else:
-                        current_vul = "None"
-                
-                deal_match = deal_pattern.search(line)
-                if deal_match:
-                    deal_idx = len(pbn_deals)
-                    pbn_deals.append(deal_match.group(1))
-                    deal_vuls[deal_idx] = current_vul
+            input_type = "LIN URL" if is_lin else "PBN URL"
+            input_source = url
             
-            # Fallback if no [Deal] tags found
-            if not pbn_deals:
-                lines = [l.strip() for l in pbn_content.split('\n') 
-                        if l.strip() and ':' in l and l[0] in 'NESW']
-                pbn_deals = lines
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to fetch/parse URL: {e}")
+    
+    # Check if it's a local file path
+    elif os.path.isfile(pbn_input) or (
+        (pbn_input.lower().endswith('.pbn') or pbn_input.lower().endswith('.lin')) and 
+        (pbn_input.startswith('/') or (len(pbn_input) > 2 and pbn_input[1] == ':'))
+    ):
+        try:
+            file_path = pbn_input
+            if not os.path.isfile(file_path):
+                raise HTTPException(status_code=400, detail=f"File not found: {file_path}")
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+            
+            # Detect file type from extension or content
+            is_lin = file_path.lower().endswith('.lin') or 'md|' in file_content[:500]
+            
+            # Use endplay to parse PBN or LIN file
+            pbn_deals, deal_vuls = _parse_file_with_endplay(file_content, is_lin=is_lin)
+            
+            input_type = "LIN file" if is_lin else "PBN file"
+            input_source = file_path
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read/parse file: {e}")
+    
+    # Check if it's LIN content (not URL or file)
+    elif 'md|' in pbn_input and '|' in pbn_input:
+        # LIN string content
+        pbn_deals, deal_vuls = _parse_file_with_endplay(pbn_input, is_lin=True)
+        input_type = "LIN string"
+        input_source = f"{len(pbn_input)} chars"
+    
     else:
         # Single PBN string
         pbn_deals = [pbn_input]
+        input_type = "PBN string"
+        input_source = f"{len(pbn_input)} chars"
     
     if not pbn_deals:
-        raise HTTPException(status_code=400, detail="No valid PBN deals found")
+        raise HTTPException(status_code=400, detail="No valid PBN/LIN deals found")
     
     results = []
     for deal_idx, pbn_str in enumerate(pbn_deals):
@@ -1489,14 +1889,49 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
             par_info = _compute_par_score(pbn_str, deal['Dealer'], vul)
             deal.update(par_info)
         
+        # Try to find matching deal in deal_df by PBN hands
+        # This adds game result columns if the deal exists in bbo_mldf_augmented
+        try:
+            deal_df, _, _, _ = _ensure_ready()
+            
+            # Match by all 4 hand strings (exact PBN match)
+            match_criteria = pl.lit(True)
+            for direction in 'NESW':
+                hand_col = f'Hand_{direction}'
+                if hand_col in deal and hand_col in deal_df.columns:
+                    match_criteria = match_criteria & (pl.col(hand_col) == deal[hand_col])
+            
+            matching_deals = deal_df.filter(match_criteria)
+            
+            if matching_deals.height > 0:
+                first_match = matching_deals.row(0, named=True)
+                
+                # Override Dealer and Vulnerability from parquet if matched
+                if 'Dealer' in first_match:
+                    deal['Dealer'] = first_match['Dealer']
+                if 'Vul' in first_match:
+                    deal['Vulnerability'] = first_match['Vul']
+                
+                # Get game result columns from matched deal
+                game_result_cols = ['bid', 'Declarer', 'Result', 'Tricks', 'Score', 'ParScore', 'DD_Tricks']
+                for col in game_result_cols:
+                    if col in first_match:
+                        deal[col] = first_match[col]
+                deal['matching_deals_in_db'] = matching_deals.height
+        except Exception as e:
+            # Don't fail if lookup fails
+            print(f"[process-pbn] Deal lookup failed: {e}")
+        
         results.append(deal)
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[process-pbn] {elapsed_ms:.1f}ms ({len(results)} deals)")
+    print(f"[process-pbn] {elapsed_ms:.1f}ms ({len(results)} deals, type={input_type})")
     
     return {
         "deals": results,
         "count": len(results),
+        "input_type": input_type,
+        "input_source": input_source,
         "elapsed_ms": round(elapsed_ms, 1),
     }
 
@@ -1504,6 +1939,116 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # API: find matching auctions
 # ---------------------------------------------------------------------------
+
+def _evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, int]) -> bool:
+    """
+    Evaluate a criterion string like 'SL_S >= SL_H' against specific hand values.
+    
+    hand_values should have keys: HCP, SL_S, SL_H, SL_D, SL_C, Total_Points
+    Returns True if the criterion is satisfied, False otherwise.
+    """
+    
+    pattern = r'(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+)'
+    match = re.match(pattern, criterion.strip())
+    if not match:
+        return True  # Can't parse, don't filter
+    
+    left, op, right = match.groups()
+    
+    # Get left value
+    left_val = hand_values.get(left)
+    if left_val is None:
+        return True  # Unknown column, don't filter
+    
+    # Get right value (either from hand_values or as a number)
+    try:
+        right_val = float(right)
+    except ValueError:
+        right_val = hand_values.get(right)
+        if right_val is None:
+            return True  # Unknown column, don't filter
+    
+    # Evaluate
+    if op == '>=':
+        return left_val >= right_val
+    elif op == '<=':
+        return left_val <= right_val
+    elif op == '>':
+        return left_val > right_val
+    elif op == '<':
+        return left_val < right_val
+    elif op == '==':
+        return left_val == right_val
+    elif op == '!=':
+        return left_val != right_val
+    
+    return True
+
+
+def _filter_auctions_by_hand_criteria(
+    df: pl.DataFrame, 
+    hand_values: Dict[str, int],
+    seat: int,
+    auction_col: str = 'Auction'
+) -> tuple[pl.DataFrame, list[dict]]:
+    """
+    Filter auctions based on custom criteria from bbo_custom_auction_criteria.csv,
+    evaluated against a specific hand's values.
+    
+    Returns (filtered_df, list of rejected auction info for debugging)
+    """
+    criteria_list = _load_auction_criteria()
+    if not criteria_list:
+        return df, []
+    
+    if auction_col not in df.columns:
+        return df, []
+    
+    rejected_info = []
+    rows_to_keep = []
+    
+    for row_idx in range(df.height):
+        row = df.row(row_idx, named=True)
+        auction = str(row.get(auction_col, '')).lower()
+        keep_row = True
+        failed_criteria = []
+        matched_partial = None
+        
+        # Check each criterion set
+        for partial_auction, criteria in criteria_list:
+            if auction.startswith(partial_auction):
+                # This auction matches this partial - check criteria
+                # Determine which seat made the last bid of the partial auction
+                num_dashes = partial_auction.count('-')
+                criteria_seat = num_dashes + 1  # 1-based seat number
+                
+                # Only apply criteria if the bidder matches our seat
+                if criteria_seat == seat:
+                    matched_partial = partial_auction
+                    for criterion in criteria:
+                        if not _evaluate_criterion_for_hand(criterion, hand_values):
+                            keep_row = False
+                            failed_criteria.append(criterion)
+                    
+                    if not keep_row:
+                        break  # No need to check more partials
+        
+        if keep_row:
+            rows_to_keep.append(row_idx)
+        else:
+            rejected_info.append({
+                'Auction': str(row.get(auction_col, '')),
+                'Partial_Auction': str(matched_partial) if matched_partial else '',
+                'Failed_Criteria': ', '.join(failed_criteria),  # Convert list to string for display
+                'Seat': int(seat),
+            })
+    
+    if len(rows_to_keep) == df.height:
+        return df, rejected_info  # No filtering needed
+    
+    filtered_df = df[rows_to_keep]
+    return filtered_df, rejected_info
+
 
 @app.post("/find-matching-auctions")
 def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
@@ -1524,6 +2069,10 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
             status_code=503, 
             detail="bt_criteria not loaded. Run bt_criteria_extractor.py first."
         )
+    
+    # Load auction criteria for info
+    criteria_list = _load_auction_criteria()
+    criteria_loaded = len(criteria_list)
     
     # Use cached completed auctions filter
     if bt_completed_df is not None:
@@ -1555,8 +2104,8 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
     
     t2 = time.perf_counter()
     
-    # Apply filter using DuckDB
-    sql_query = f"SELECT * FROM joined_df WHERE {where_clause} LIMIT {req.max_results}"
+    # Apply filter using DuckDB (get more than needed to account for criteria filtering)
+    sql_query = f"SELECT * FROM joined_df WHERE {where_clause} LIMIT {req.max_results * 3}"
     
     try:
         matching_df = duckdb.sql(sql_query).pl()
@@ -1565,26 +2114,55 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
     
     t3 = time.perf_counter()
     
+    # Apply custom auction criteria from CSV
+    hand_values = {
+        'HCP': req.hcp,
+        'SL_S': req.sl_s,
+        'SL_H': req.sl_h,
+        'SL_D': req.sl_d,
+        'SL_C': req.sl_c,
+        'Total_Points': req.total_points,
+    }
+    pre_criteria_count = matching_df.height
+    matching_df, rejected_auctions = _filter_auctions_by_hand_criteria(
+        matching_df, hand_values, seat
+    )
+    post_criteria_count = matching_df.height
+    
+    # Limit to requested max
+    if matching_df.height > req.max_results:
+        matching_df = matching_df.head(req.max_results)
+    
+    t4 = time.perf_counter()
+    
     # Build result columns - Auction first, then key metrics
     result_cols = ["Auction"]
     if "matching_deal_count" in matching_df.columns:
         result_cols.append("matching_deal_count")
     
-    # Add criteria columns for the matched seat
-    for col in sorted(matching_df.columns):
-        if f"_S{seat}" in col and col not in result_cols:
-            result_cols.append(col)
+    # Add Agg_Expr for all 4 seats
+    for s in range(1, 5):
+        agg_expr_col = f"Agg_Expr_Seat_{s}"
+        if agg_expr_col in matching_df.columns:
+            result_cols.append(agg_expr_col)
+    
+    # Add criteria columns for all seats (S1-S4)
+    for s in range(1, 5):
+        for col in sorted(matching_df.columns):
+            if f"_S{s}" in col and col not in result_cols:
+                result_cols.append(col)
     
     result_cols = [c for c in result_cols if c in matching_df.columns]
-    result_df = matching_df.select(result_cols[:25])  # Limit columns
+    result_df = matching_df.select(result_cols)  # Include all columns
     
     result_rows = result_df.to_dicts()
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[find-matching-auctions] {elapsed_ms:.1f}ms ({len(result_rows)} matches)")
-    print(f"  join: {(t2-t1)*1000:.0f}ms, filter: {(t3-t2)*1000:.0f}ms")
+    criteria_filtered = pre_criteria_count - post_criteria_count
+    print(f"[find-matching-auctions] {elapsed_ms:.1f}ms ({len(result_rows)} matches, {criteria_filtered} filtered by CSV criteria)")
+    print(f"  join: {(t2-t1)*1000:.0f}ms, sql: {(t3-t2)*1000:.0f}ms, csv-criteria: {(t4-t3)*1000:.0f}ms")
     
-    return {
+    response = {
         "sql_query": f"WHERE {where_clause}",
         "auctions": result_rows,
         "total_matches": len(result_rows),
@@ -1597,6 +2175,582 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
             "SL_C": req.sl_c,
             "Total_Points": req.total_points,
         },
+        "auction_criteria_loaded": criteria_loaded,
+        "auction_criteria_filtered": criteria_filtered,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+    
+    # Include rejected auctions for debugging (limit to 10)
+    if rejected_auctions:
+        response["criteria_rejected"] = rejected_auctions[:10]
+    
+    return response
+
+
+# ---------------------------------------------------------------------------
+# API: PBN Lookup
+# ---------------------------------------------------------------------------
+
+@app.get("/pbn-sample")
+def get_pbn_sample() -> Dict[str, Any]:
+    """Get a sample PBN from the first row of deal_df for testing."""
+    t0 = time.perf_counter()
+    deal_df, _, _, _ = _ensure_ready()
+    
+    # Get first row and construct PBN string
+    if deal_df.height == 0:
+        raise HTTPException(status_code=404, detail="No deals found in dataset")
+    
+    first_row = deal_df.row(0, named=True)
+    
+    # Construct PBN string from Hand_N, Hand_E, Hand_S, Hand_W
+    dealer = first_row.get('Dealer', 'N')
+    directions = ['N', 'E', 'S', 'W']
+    dealer_idx = directions.index(dealer) if dealer in directions else 0
+    
+    hands = []
+    for i in range(4):
+        d = directions[(dealer_idx + i) % 4]
+        hand = first_row.get(f'Hand_{d}', '')
+        hands.append(hand)
+    
+    pbn = f"{dealer}:" + " ".join(hands)
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "pbn": pbn,
+        "dealer": dealer,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+@app.get("/pbn-random")
+def get_pbn_random() -> Dict[str, Any]:
+    """Get a random PBN from deal_df (YOLO mode)."""
+    import random
+    t0 = time.perf_counter()
+    deal_df, _, _, _ = _ensure_ready()
+    
+    if deal_df.height == 0:
+        raise HTTPException(status_code=404, detail="No deals found in dataset")
+    
+    # Pick a random row
+    random_idx = random.randint(0, deal_df.height - 1)
+    random_row = deal_df.row(random_idx, named=True)
+    
+    # Construct PBN string from Hand_N, Hand_E, Hand_S, Hand_W
+    dealer = random_row.get('Dealer', 'N')
+    directions = ['N', 'E', 'S', 'W']
+    dealer_idx = directions.index(dealer) if dealer in directions else 0
+    
+    hands = []
+    for i in range(4):
+        d = directions[(dealer_idx + i) % 4]
+        hand = random_row.get(f'Hand_{d}', '')
+        hands.append(hand)
+    
+    pbn = f"{dealer}:" + " ".join(hands)
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "pbn": pbn,
+        "dealer": dealer,
+        "row_idx": random_idx,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+@app.post("/pbn-lookup")
+def pbn_lookup(req: PBNLookupRequest) -> Dict[str, Any]:
+    """Look up a PBN deal in bbo_mldf_augmented.parquet and return matching rows."""
+    t0 = time.perf_counter()
+    deal_df, _, _, _ = _ensure_ready()
+    
+    pbn_input = req.pbn.strip()
+    
+    # Parse PBN to get individual hands
+    parsed = _parse_pbn_deal(pbn_input)
+    if not parsed:
+        raise HTTPException(status_code=400, detail=f"Invalid PBN format: {pbn_input[:100]}")
+    
+    # Build match criteria based on all 4 hands
+    match_criteria = pl.lit(True)
+    for direction in 'NESW':
+        hand_col = f'Hand_{direction}'
+        if hand_col in parsed and hand_col in deal_df.columns:
+            match_criteria = match_criteria & (pl.col(hand_col) == parsed[hand_col])
+    
+    # Find matching rows
+    matching = deal_df.filter(match_criteria)
+    
+    # Limit results
+    if matching.height > req.max_results:
+        matching = matching.head(req.max_results)
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[pbn-lookup] Found {matching.height} matches in {elapsed_ms:.1f}ms")
+    
+    return {
+        "matches": matching.to_dicts(),
+        "count": matching.height,
+        "total_in_df": deal_df.height,
+        "pbn_searched": pbn_input,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# API: Group by Bid
+# ---------------------------------------------------------------------------
+
+def _calculate_imp(score_diff: int) -> int:
+    """Calculate IMPs for a given score difference."""
+    diff = abs(int(score_diff))
+    if diff < 20: return 0
+    if diff < 50: return 1
+    if diff < 90: return 2
+    if diff < 130: return 3
+    if diff < 170: return 4
+    if diff < 220: return 5
+    if diff < 270: return 6
+    if diff < 320: return 7
+    if diff < 370: return 8
+    if diff < 430: return 9
+    if diff < 500: return 10
+    if diff < 600: return 11
+    if diff < 750: return 12
+    if diff < 900: return 13
+    if diff < 1100: return 14
+    if diff < 1300: return 15
+    if diff < 1500: return 16
+    if diff < 1750: return 17
+    if diff < 2000: return 18
+    if diff < 2250: return 19
+    if diff < 2500: return 20
+    if diff < 3000: return 21
+    if diff < 3500: return 22
+    if diff < 4000: return 23
+    return 24
+
+@app.post("/group-by-bid")
+def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
+    """
+    Group deals by their actual auction sequence (bid column) and show deal characteristics.
+    
+    This joins deal_df with bt_df to get bidding table info (Expr, Agg_Expr_Seat_*).
+    """
+    t0 = time.perf_counter()
+    deal_df, bt_df, _, _ = _ensure_ready()
+    
+    with _STATE_LOCK:
+        bt_completed_df = STATE.get("bt_completed_df")
+    
+    # Check if 'bid' column exists
+    if 'bid' not in deal_df.columns:
+        raise HTTPException(status_code=500, detail="Column 'bid' not found in deal_df")
+    
+    # Filter by auction pattern
+    pattern = req.auction_pattern
+    
+    # Normalize pattern: append -p-p-p if not already present (consistent with other functions)
+    three_passes = "-p-p-p"
+    pattern_core = pattern.rstrip("$")
+    if not pattern_core.endswith(three_passes):
+        if pattern.endswith("$"):
+            pattern = pattern[:-1] + three_passes + "$"
+        else:
+            pattern = pattern + three_passes
+    
+    try:
+        # Case-insensitive regex matching
+        regex_pattern = f"(?i){pattern}"
+        filtered_df = deal_df.filter(
+            pl.col("bid").cast(pl.Utf8).str.contains(regex_pattern)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid regex pattern: {e}")
+    
+    if filtered_df.height == 0:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "pattern": pattern,
+            "auction_groups": [],
+            "total_matching_deals": 0,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    
+    t1 = time.perf_counter()
+    
+    # Group by bid and count
+    bid_counts = filtered_df.group_by("bid").agg(pl.len().alias("deal_count")).sort("deal_count", descending=True)
+    
+    # Filter by minimum deals
+    if req.min_deals > 1:
+        bid_counts = bid_counts.filter(pl.col("deal_count") >= req.min_deals)
+    
+    # Sample auction groups
+    effective_seed = None if req.seed == 0 else req.seed
+    n_groups = min(req.n_auction_groups, bid_counts.height)
+    if n_groups < bid_counts.height:
+        sampled_bids = bid_counts.sample(n=n_groups, seed=effective_seed)
+    else:
+        sampled_bids = bid_counts
+    
+    t2 = time.perf_counter()
+    
+    # Define columns to include
+    deal_cols = [
+        "index", "Dealer", "Vul", "Declarer","bid",
+        "Result", "Tricks", "Score", "ParScore",
+        "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+        "HCP_N", "HCP_E", "HCP_S", "HCP_W",
+        "SL_S_N", "SL_H_N", "SL_D_N", "SL_C_N",
+        "SL_S_E", "SL_H_E", "SL_D_E", "SL_C_E",
+        "SL_S_S", "SL_H_S", "SL_D_S", "SL_C_S",
+        "SL_S_W", "SL_H_W", "SL_D_W", "SL_C_W",
+        "Total_Points_N", "Total_Points_E", "Total_Points_S", "Total_Points_W",
+    ]
+    available_deal_cols = [c for c in deal_cols if c in filtered_df.columns]
+    
+    # Get bt_df columns for joining (Expr, Agg_Expr_Seat_*)
+    bt_cols = ["Auction", "Announcement", "seat", "Expr", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"]
+    available_bt_cols = [c for c in bt_cols if c in bt_df.columns]
+    
+    # Use completed auctions for bt lookup
+    bt_lookup_df = bt_completed_df if bt_completed_df is not None else bt_df
+    
+    auction_groups = []
+    
+    for row in sampled_bids.iter_rows(named=True):
+        bid_auction = row["bid"]
+        deal_count = row["deal_count"]
+        
+        # Get all deals for this auction (before sampling)
+        group_all_deals = filtered_df.filter(pl.col("bid") == bid_auction).select(available_deal_cols)
+        
+        # Sample deals within group for display
+        n_samples = min(req.n_deals_per_group, group_all_deals.height)
+        if n_samples < group_all_deals.height:
+            group_deals = group_all_deals.sample(n=n_samples, seed=effective_seed)
+        else:
+            group_deals = group_all_deals
+        
+        # Identify board columns for duplicate / matchpoint analysis
+        board_cols = ["Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W"]
+        has_board_cols = all(col in group_deals.columns for col in board_cols)
+        max_dup_all = max_dup_sample = 0
+        boards_with_dups_all = boards_with_dups_sample = 0
+        boards_total_all = boards_total_sample = 0
+        
+        if has_board_cols and group_all_deals.height > 0:
+            board_counts_all = group_all_deals.group_by(board_cols).len()
+            boards_total_all = board_counts_all.height
+            if boards_total_all > 0:
+                max_val_all = board_counts_all["len"].max()
+                if isinstance(max_val_all, (int, float)):
+                    max_dup_all = int(max_val_all)
+                boards_with_dups_all = board_counts_all.filter(pl.col("len") > 1).height
+        
+        if has_board_cols and group_deals.height > 0:
+            board_counts_sample = group_deals.group_by(board_cols).len()
+            boards_total_sample = board_counts_sample.height
+            if boards_total_sample > 0:
+                max_val_sample = board_counts_sample["len"].max()
+                if isinstance(max_val_sample, (int, float)):
+                    max_dup_sample = int(max_val_sample)
+                boards_with_dups_sample = board_counts_sample.filter(pl.col("len") > 1).height
+        
+        # Try to find matching bt_df row for this auction
+        bt_info = None
+        bt_auction = None  # The matched Auction from bt_df (standardized format)
+        if available_bt_cols:
+            # Normalize auction for matching (add -p-p-p if needed for completed auction)
+            auction_normalized = bid_auction.lower() if bid_auction else ""
+            
+            # Try exact match first
+            bt_match = bt_lookup_df.filter(
+                pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_normalized
+            )
+            
+            # If no match, try with -p-p-p suffix
+            if bt_match.height == 0 and not auction_normalized.endswith("-p-p-p"):
+                auction_with_passes = auction_normalized + "-p-p-p"
+                bt_match = bt_lookup_df.filter(
+                    pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_with_passes
+                )
+            
+            if bt_match.height > 0:
+                bt_row = bt_match.row(0, named=True)
+                bt_info = {c: bt_row.get(c) for c in available_bt_cols if c in bt_row}
+                bt_auction = bt_row.get("Auction")  # Get the exact Auction string from bt_df
+        
+        # Add 'Auction' column from bt_df to each deal row
+        if bt_auction:
+            group_deals = group_deals.with_columns(pl.lit(bt_auction).alias("Auction"))
+        
+        # Check validation: does this deal satisfy the criteria for this auction?
+        # Only if we have criteria (Agg_Expr_Seat_*) and hand features (HCP_*, SL_*_*)
+        if bt_info:
+            # Determine which seat opened the bidding (from Auction string)
+            # Standard GIB format: dealers rotate, but we need to map hand columns to seats
+            # Seat 1 = Dealer
+            # Seat 2 = (Dealer + 1) % 4
+            # Seat 3 = (Dealer + 2) % 4
+            # Seat 4 = (Dealer + 3) % 4
+            
+            # We'll compute validation for each row
+            validation_results = []
+            violations_list = []
+            
+            for deal_row in group_deals.iter_rows(named=True):
+                dealer = deal_row.get("Dealer", "N")
+                directions = ["N", "E", "S", "W"]
+                dealer_idx = directions.index(dealer) if dealer in directions else 0
+                
+                is_valid = True
+                violations = []
+                
+                # Check criteria for each seat
+                for seat in range(1, 5):
+                    agg_col = f"Agg_Expr_Seat_{seat}"
+                    criteria = bt_info.get(agg_col)
+                    if not criteria:
+                        continue
+                        
+                    # Map seat to direction for this deal
+                    # Seat 1 is Dealer, Seat 2 is LHO, etc.
+                    direction = directions[(dealer_idx + seat - 1) % 4]
+                    
+                    # Build hand values dict for this direction
+                    hand_values = {
+                        'HCP': deal_row.get(f"HCP_{direction}"),
+                        'Total_Points': deal_row.get(f"Total_Points_{direction}"),
+                        'SL_S': deal_row.get(f"SL_S_{direction}"),
+                        'SL_H': deal_row.get(f"SL_H_{direction}"),
+                        'SL_D': deal_row.get(f"SL_D_{direction}"),
+                        'SL_C': deal_row.get(f"SL_C_{direction}"),
+                    }
+                    
+                    # Validate each criterion
+                    for criterion in criteria:
+                        if not _evaluate_criterion_for_hand(criterion, hand_values):  # type: ignore[arg-type]
+                            is_valid = False
+                            # Format violation: "HCP(14) < 15"
+                            # Parse criterion to get LHS
+                            match = re.match(r'(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+)', criterion)
+                            if match:
+                                lhs, op, rhs = match.groups()
+                                actual_val = hand_values.get(lhs)
+                                if actual_val is not None:
+                                    violations.append(f"{lhs}_{direction}({actual_val}) violated {criterion}")
+                                else:
+                                    violations.append(f"{criterion} (missing data)")
+                            else:
+                                violations.append(f"{criterion} (parse error)")
+                
+                validation_results.append(is_valid)
+                violations_list.append("; ".join(violations) if violations else "")
+            
+            # Add validation columns
+            group_deals = group_deals.with_columns([
+                pl.Series("Auctions_Match", validation_results),
+                pl.Series("Criteria_Violations", violations_list)
+            ])
+        
+        # Calculate Score_Delta (Score - ParScore) and Score_IMP
+        # (outside bt_info block - we want stats even without bidding table match)
+        if "Score" in group_deals.columns and "ParScore" in group_deals.columns:
+            group_deals = group_deals.with_columns(
+                (
+                    pl.col("Score").cast(pl.Int64, strict=False) - 
+                    pl.col("ParScore").cast(pl.Int64, strict=False)
+                ).alias("Score_Delta")
+            )
+            
+            # Calculate IMPs from Score_Delta
+            group_deals = group_deals.with_columns(
+                pl.col("Score_Delta").map_elements(
+                    lambda x: _calculate_imp(x) * (1 if x >= 0 else -1) if x is not None else None, 
+                    return_dtype=pl.Int64
+                ).alias("Score_IMP")
+            )
+
+        # Calculate matchpoint-style scores when duplicate boards exist
+        mp_board_count = 0
+        if (
+            has_board_cols
+            and boards_with_dups_sample > 0
+            and "Score" in group_deals.columns
+            and group_deals.height > 0
+        ):
+            mp_values: List[Optional[float]] = [None] * group_deals.height
+            mp_pct_values: List[Optional[float]] = [None] * group_deals.height
+            board_groups: Dict[Tuple[Any, ...], List[Tuple[int, Optional[float]]]] = {}
+            
+            for idx, deal_row in enumerate(group_deals.iter_rows(named=True)):
+                board_key = tuple(deal_row.get(col) for col in board_cols)
+                if any(val is None for val in board_key):
+                    continue
+                raw_score = deal_row.get("Score")
+                try:
+                    score_val = float(raw_score) if raw_score is not None else None
+                except (TypeError, ValueError):
+                    score_val = None
+                board_groups.setdefault(board_key, []).append((idx, score_val))
+            
+            for rows_list in board_groups.values():
+                n = len(rows_list)
+                if n < 2:
+                    continue
+                mp_board_count += 1
+                scores = [val if val is not None else float("-inf") for (_, val) in rows_list]
+                for i, (row_idx, _) in enumerate(rows_list):
+                    score_i = scores[i]
+                    beats = sum(1 for val in scores if val < score_i)
+                    ties = sum(1 for val in scores if val == score_i) - 1
+                    max_mp = 2 * (n - 1)
+                    mp = beats * 2 + max(0, ties)
+                    pct = mp / max_mp if max_mp > 0 else 0.0
+                    mp_values[row_idx] = mp
+                    mp_pct_values[row_idx] = pct
+            
+            if mp_board_count > 0:
+                group_deals = group_deals.with_columns([
+                    pl.Series("Score_MP", mp_values, dtype=pl.Float64),
+                    pl.Series("Score_MP_Pct", mp_pct_values, dtype=pl.Float64),
+                ])
+
+        # Compute statistics for this auction group
+        stats = {}
+        if has_board_cols:
+            stats["Max_Duplicates_All"] = max_dup_all
+            stats["Boards_With_Duplicates_All"] = boards_with_dups_all
+            stats["Boards_Total_All"] = boards_total_all
+            stats["Max_Duplicates_Sample"] = max_dup_sample
+            stats["Boards_With_Duplicates_Sample"] = boards_with_dups_sample
+            stats["Boards_Total_Sample"] = boards_total_sample
+            stats["Boards_With_MP_Data"] = mp_board_count
+        
+        match_rows = None
+        non_match_rows = None
+        if "Auctions_Match" in group_deals.columns:
+            match_rows = group_deals.filter(pl.col("Auctions_Match"))
+            non_match_rows = group_deals.filter(~pl.col("Auctions_Match"))
+        
+        # Score Delta & IMP stats
+        if "Score_Delta" in group_deals.columns:
+            # Overall avg & stddev
+            delta_vals = group_deals["Score_Delta"].drop_nulls().cast(pl.Float64)
+            if len(delta_vals) > 0:
+                stats["Score_Delta_Avg"] = round(delta_vals.mean(), 1)  # type: ignore[arg-type]
+                stats["Score_Delta_StdDev"] = round(delta_vals.std(), 1)  # type: ignore[arg-type]
+            
+            # IMP stats
+            if "Score_IMP" in group_deals.columns:
+                imp_vals = group_deals["Score_IMP"].drop_nulls().cast(pl.Float64)
+                if len(imp_vals) > 0:
+                    stats["Score_IMP_Avg"] = round(imp_vals.mean(), 1)  # type: ignore[arg-type]
+                    stats["Score_IMP_StdDev"] = round(imp_vals.std(), 1)  # type: ignore[arg-type]
+            
+            # By compliance
+            if match_rows is not None and non_match_rows is not None:
+                # Match stats
+                match_deltas = match_rows["Score_Delta"].drop_nulls().cast(pl.Float64)
+                if len(match_deltas) > 0:
+                    stats["Score_Delta_Match_Avg"] = round(match_deltas.mean(), 1)  # type: ignore[arg-type]
+                    stats["Score_Delta_Match_StdDev"] = round(match_deltas.std(), 1)  # type: ignore[arg-type]
+                    stats["Match_Count"] = len(match_deltas)
+                    
+                    if "Score_IMP" in match_rows.columns:
+                        match_imps = match_rows["Score_IMP"].drop_nulls().cast(pl.Float64)
+                        if len(match_imps) > 0:
+                            stats["Score_IMP_Match_Avg"] = round(match_imps.mean(), 1)  # type: ignore[arg-type]
+                
+                # No Match stats
+                non_match_deltas = non_match_rows["Score_Delta"].drop_nulls().cast(pl.Float64)
+                if len(non_match_deltas) > 0:
+                    stats["Score_Delta_NoMatch_Avg"] = round(non_match_deltas.mean(), 1)  # type: ignore[arg-type]
+                    stats["Score_Delta_NoMatch_StdDev"] = round(non_match_deltas.std(), 1)  # type: ignore[arg-type]
+                    stats["NoMatch_Count"] = len(non_match_deltas)
+                    
+                    if "Score_IMP" in non_match_rows.columns:
+                        non_match_imps = non_match_rows["Score_IMP"].drop_nulls().cast(pl.Float64)
+                        if len(non_match_imps) > 0:
+                            stats["Score_IMP_NoMatch_Avg"] = round(non_match_imps.mean(), 1)  # type: ignore[arg-type]
+
+        # Matchpoint stats
+        if "Score_MP" in group_deals.columns:
+            mp_vals = group_deals["Score_MP"].drop_nulls().cast(pl.Float64)
+            if len(mp_vals) > 0:
+                stats["Score_MP_Avg"] = round(mp_vals.mean(), 1)  # type: ignore[arg-type]
+                stats["Score_MP_StdDev"] = round(mp_vals.std(), 1)  # type: ignore[arg-type]
+            if match_rows is not None and non_match_rows is not None:
+                match_mp_vals = match_rows["Score_MP"].drop_nulls().cast(pl.Float64)
+                if len(match_mp_vals) > 0:
+                    stats["Score_MP_Match_Avg"] = round(match_mp_vals.mean(), 1)  # type: ignore[arg-type]
+                    stats["Score_MP_Match_StdDev"] = round(match_mp_vals.std(), 1)  # type: ignore[arg-type]
+                non_match_mp_vals = non_match_rows["Score_MP"].drop_nulls().cast(pl.Float64)
+                if len(non_match_mp_vals) > 0:
+                    stats["Score_MP_NoMatch_Avg"] = round(non_match_mp_vals.mean(), 1)  # type: ignore[arg-type]
+                    stats["Score_MP_NoMatch_StdDev"] = round(non_match_mp_vals.std(), 1)  # type: ignore[arg-type]
+        
+        if "Score_MP_Pct" in group_deals.columns:
+            mp_pct_vals = group_deals["Score_MP_Pct"].drop_nulls().cast(pl.Float64)
+            if len(mp_pct_vals) > 0:
+                stats["Score_MP_Pct_Avg"] = round(mp_pct_vals.mean() * 100, 1)  # type: ignore[arg-type]
+                stats["Score_MP_Pct_StdDev"] = round(mp_pct_vals.std() * 100, 1)  # type: ignore[arg-type]
+            if match_rows is not None and non_match_rows is not None:
+                match_pct_vals = match_rows["Score_MP_Pct"].drop_nulls().cast(pl.Float64)
+                if len(match_pct_vals) > 0:
+                    stats["Score_MP_Match_Pct_Avg"] = round(match_pct_vals.mean() * 100, 1)  # type: ignore[arg-type]
+                non_match_pct_vals = non_match_rows["Score_MP_Pct"].drop_nulls().cast(pl.Float64)
+                if len(non_match_pct_vals) > 0:
+                    stats["Score_MP_NoMatch_Pct_Avg"] = round(non_match_pct_vals.mean() * 100, 1)  # type: ignore[arg-type]
+
+        for direction in "NESW":
+            hcp_col = f"HCP_{direction}"
+            tp_col = f"Total_Points_{direction}"
+            if hcp_col in group_deals.columns:
+                hcp_values = group_deals[hcp_col].drop_nulls().cast(pl.Float64)
+                if len(hcp_values) > 0:
+                    hcp_mean = hcp_values.mean()
+                    hcp_min = hcp_values.min()
+                    hcp_max = hcp_values.max()
+                    if hcp_mean is not None:
+                        stats[f"HCP_{direction}_avg"] = round(hcp_mean, 1)  # type: ignore[arg-type]
+                    if hcp_min is not None:
+                        stats[f"HCP_{direction}_min"] = int(hcp_min)  # type: ignore[arg-type]
+                    if hcp_max is not None:
+                        stats[f"HCP_{direction}_max"] = int(hcp_max)  # type: ignore[arg-type]
+            if tp_col in group_deals.columns:
+                tp_values = group_deals[tp_col].drop_nulls().cast(pl.Float64)
+                if len(tp_values) > 0:
+                    tp_mean = tp_values.mean()
+                    if tp_mean is not None:
+                        stats[f"TP_{direction}_avg"] = round(tp_mean, 1)  # type: ignore[arg-type]
+        
+        auction_groups.append({
+            "auction": bid_auction,  # From deal_df 'bid' column
+            "bt_auction": bt_auction,  # Matched Auction from bt_df (with -p-p-p if completed)
+            "deal_count": deal_count,
+            "sample_count": group_deals.height,
+            "bt_info": bt_info,
+            "stats": stats,
+            "deals": group_deals.to_dicts(),
+        })
+    
+    t3 = time.perf_counter()
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    total_deals = sum(g["sample_count"] for g in auction_groups)
+    print(f"[group-by-bid] {elapsed_ms:.1f}ms ({len(auction_groups)} groups, {total_deals} deals)")
+    print(f"  filter: {(t1-t0)*1000:.0f}ms, group: {(t2-t1)*1000:.0f}ms, build: {(t3-t2)*1000:.0f}ms")
+    
+    return {
+        "pattern": pattern,
+        "auction_groups": auction_groups,
+        "total_matching_deals": filtered_df.height,
+        "unique_auctions": bid_counts.height,
         "elapsed_ms": round(elapsed_ms, 1),
     }
 
@@ -1623,6 +2777,12 @@ if __name__ == "__main__":  # pragma: no cover
         type=str,
         default=None,
         help="Data directory containing parquet files (overrides auto-detection)",
+    )
+    parser.add_argument(
+        "--deal-rows",
+        type=int,
+        default=1000,
+        help="Limit deal_df rows for faster startup (default: 1000) or None for all rows",
     )
     args = parser.parse_args()
 
