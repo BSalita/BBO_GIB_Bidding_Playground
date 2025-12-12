@@ -75,6 +75,7 @@ from bbo_bidding_queries_lib import (
     get_declarer_for_auction,
     get_ai_contract,
     get_dd_score_for_auction,
+    get_ev_for_auction,
     compute_hand_features,
     compute_par_score,
     parse_pbn_deal,
@@ -558,6 +559,22 @@ def _heavy_init() -> None:
             for strain in ['C', 'D', 'H', 'S', 'N']:
                 for direction in ['N', 'E', 'S', 'W']:
                     additional_cols.append(f"DD_Score_{level}{strain}_{direction}")
+        
+        # Add EV (Expected Value) columns for the actual contract played
+        # EV_Score_Declarer = EV for the actual contract (analogous to DD_Score_Declarer)
+        additional_cols.append('EV_Score_Declarer')
+        
+        # Add EV columns for all contracts (for EV_AI computation)
+        # Format: EV_{pair}_{declarer}_{strain}_{level}_{vul}
+        # e.g. EV_NS_N_S_3_NV = EV for 3S by North, NS pair, Not Vulnerable
+        for pair in ['NS', 'EW']:
+            # Declarers for each pair
+            declarers = ['N', 'S'] if pair == 'NS' else ['E', 'W']
+            for declarer in declarers:
+                for strain in ['C', 'D', 'H', 'S', 'N']:
+                    for level in range(1, 8):
+                        for vul in ['NV', 'V']:
+                            additional_cols.append(f"EV_{pair}_{declarer}_{strain}_{level}_{vul}")
         
         for col in additional_cols:
             if col not in valid_deal_columns:
@@ -1153,7 +1170,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
 
     dirs = ["N", "E", "S", "W"]
     deal_display_cols = ["index", "Dealer", "bid", "Contract", "Hand_N", "Hand_E", "Hand_S", "Hand_W", 
-                         "Declarer", "Result", "Tricks", "Score", "DD_Score_Declarer", 
+                         "Declarer", "Result", "Tricks", "Score", "DD_Score_Declarer", "EV_Score_Declarer",
                          "ParScore", "ParContracts"]
 
     out_auctions: List[Dict[str, Any]] = []
@@ -1303,6 +1320,10 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                 dd_score_ai = get_dd_score_for_auction(auction, dealer, deal_row)
                 deal_row["DD_Score_AI"] = dd_score_ai
                 
+                # EV (Expected Value) for the AI's contract
+                ev_ai = get_ev_for_auction(auction, dealer, deal_row)
+                deal_row["EV_AI"] = ev_ai
+                
                 # IMP difference between AI contract DD score and actual contract DD score
                 # Positive = AI contract scores better, Negative = actual contract scores better
                 dd_score_actual = deal_row.get("DD_Score_Declarer")
@@ -1313,46 +1334,107 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                 else:
                     deal_row["IMP_AI_vs_Actual"] = None
                 
-                # Convert ParContracts list to string for proper JSON serialization
+                # Convert ParContracts list of structs to readable contract strings
+                # Each struct has: Level, Strain, Double, Pair_Direction, Result
                 par_contracts = deal_row.get("ParContracts")
                 if par_contracts is not None and isinstance(par_contracts, list):
-                    deal_row["ParContracts"] = ", ".join(str(c) for c in par_contracts)
+                    formatted_contracts = []
+                    for c in par_contracts:
+                        if isinstance(c, dict):
+                            level = c.get("Level", "")
+                            strain = c.get("Strain", "")
+                            double = c.get("Double", "")
+                            pair_dir = c.get("Pair_Direction", "")
+                            result = c.get("Result", "")
+                            # Format: "4S N +1" or "3NX EW -2" or "4HXX NS ="
+                            contract_str = f"{level}{strain}{double}"
+                            if pair_dir:
+                                contract_str += f" {pair_dir}"
+                            if result is not None and result != "":
+                                # Result is typically an int: 0 = "=", positive = "+N", negative = "-N"
+                                if isinstance(result, int):
+                                    if result == 0:
+                                        contract_str += " ="
+                                    elif result > 0:
+                                        contract_str += f" +{result}"
+                                    else:
+                                        contract_str += f" {result}"
+                                else:
+                                    contract_str += f" {result}"
+                            formatted_contracts.append(contract_str.strip())
+                        else:
+                            formatted_contracts.append(str(c))
+                    deal_row["ParContracts"] = ", ".join(formatted_contracts)
             
             # Create summary by Contract
             deals_with_computed = pl.DataFrame(deals_list)
             if "Contract" in deals_with_computed.columns and "IMP_AI_vs_Actual" in deals_with_computed.columns:
+                # Build aggregation list - DD stats
+                agg_exprs = [
+                    pl.len().alias("Count"),
+                    pl.col("IMP_AI_vs_Actual").mean().alias("Avg_IMP_AI"),
+                    # Percentage where Contract makes (DD_Score_Declarer >= 0)
+                    (pl.col("DD_Score_Declarer").cast(pl.Int64, strict=False).ge(0).sum() * 100.0 / pl.len()).alias("Contract_Made%"),
+                    # Percentage where AI_Contract makes (DD_Score_AI >= 0)
+                    (pl.col("DD_Score_AI").cast(pl.Int64, strict=False).ge(0).sum() * 100.0 / pl.len()).alias("AI_Made%"),
+                    # Percentage where Contract achieves par (DD_Score_Declarer == ParScore)
+                    (pl.col("DD_Score_Declarer").cast(pl.Int64, strict=False).eq(pl.col("ParScore").cast(pl.Int64, strict=False)).sum() * 100.0 / pl.len()).alias("Contract_Par%"),
+                    # Percentage where AI_Contract achieves par (DD_Score_AI == ParScore)
+                    (pl.col("DD_Score_AI").cast(pl.Int64, strict=False).eq(pl.col("ParScore").cast(pl.Int64, strict=False)).sum() * 100.0 / pl.len()).alias("AI_Par%"),
+                ]
+                
+                # Add EV stats if columns exist
+                has_ev_contract = "EV_Score_Declarer" in deals_with_computed.columns
+                has_ev_ai = "EV_AI" in deals_with_computed.columns
+                
+                if has_ev_contract:
+                    agg_exprs.append(pl.col("EV_Score_Declarer").cast(pl.Float64, strict=False).mean().alias("Avg_EV_Contract"))
+                if has_ev_ai:
+                    agg_exprs.append(pl.col("EV_AI").cast(pl.Float64, strict=False).mean().alias("Avg_EV_AI"))
+                if has_ev_contract and has_ev_ai:
+                    # EV difference: AI EV - Actual Contract EV (positive = AI better)
+                    agg_exprs.append(
+                        (pl.col("EV_AI").cast(pl.Float64, strict=False) - pl.col("EV_Score_Declarer").cast(pl.Float64, strict=False))
+                        .mean().alias("Avg_EV_Diff")
+                    )
+                
                 contract_summary = (
                     deals_with_computed
                     .group_by("Contract")
-                    .agg([
-                        pl.len().alias("Count"),
-                        pl.col("IMP_AI_vs_Actual").mean().alias("Avg_IMP_AI"),
-                        # Percentage where Contract makes (DD_Score_Declarer >= 0)
-                        (pl.col("DD_Score_Declarer").cast(pl.Int64, strict=False).ge(0).sum() * 100.0 / pl.len()).alias("Contract_Makes%"),
-                        # Percentage where AI_Contract makes (DD_Score_AI >= 0)
-                        (pl.col("DD_Score_AI").cast(pl.Int64, strict=False).ge(0).sum() * 100.0 / pl.len()).alias("AI_Makes%"),
-                        # Percentage where Contract achieves par (DD_Score_Declarer == ParScore)
-                        (pl.col("DD_Score_Declarer").cast(pl.Int64, strict=False).eq(pl.col("ParScore").cast(pl.Int64, strict=False)).sum() * 100.0 / pl.len()).alias("Contract_Par%"),
-                        # Percentage where AI_Contract achieves par (DD_Score_AI == ParScore)
-                        (pl.col("DD_Score_AI").cast(pl.Int64, strict=False).eq(pl.col("ParScore").cast(pl.Int64, strict=False)).sum() * 100.0 / pl.len()).alias("AI_Par%"),
-                    ])
+                    .agg(agg_exprs)
                     .sort("Count", descending=True)
                 )
+                
                 # Round to 1 decimal place
-                contract_summary = contract_summary.with_columns([
+                round_cols = [
                     pl.col("Avg_IMP_AI").round(1),
-                    pl.col("Contract_Makes%").round(1),
-                    pl.col("AI_Makes%").round(1),
+                    pl.col("Contract_Made%").round(1),
+                    pl.col("AI_Made%").round(1),
                     pl.col("Contract_Par%").round(1),
                     pl.col("AI_Par%").round(1),
-                ])
+                ]
+                if has_ev_contract:
+                    round_cols.append(pl.col("Avg_EV_Contract").round(2))
+                if has_ev_ai:
+                    round_cols.append(pl.col("Avg_EV_AI").round(2))
+                if has_ev_contract and has_ev_ai:
+                    round_cols.append(pl.col("Avg_EV_Diff").round(2))
+                
+                contract_summary = contract_summary.with_columns(round_cols)
                 auction_info["contract_summary"] = contract_summary.to_dicts()
                 
                 # Calculate grand totals across all deals
                 total_deals = deals_with_computed.height
-                total_imp = deals_with_computed["IMP_AI_vs_Actual"].sum()
+                imp_values = deals_with_computed["IMP_AI_vs_Actual"].cast(pl.Int64, strict=False)
+                total_imp = imp_values.sum()
                 auction_info["total_imp_ai"] = int(total_imp) if total_imp is not None else 0
                 auction_info["total_deals"] = total_deals
+                
+                # IMP breakdown: cumulative IMPs where AI won vs where Actual won
+                imp_ai_wins = imp_values.filter(imp_values > 0).sum()
+                imp_actual_wins = (-imp_values.filter(imp_values < 0)).sum()
+                auction_info["imp_ai_advantage"] = int(imp_ai_wins) if imp_ai_wins is not None else 0
+                auction_info["imp_actual_advantage"] = int(imp_actual_wins) if imp_actual_wins is not None else 0
                 
                 # Count where contracts make (DD score >= 0)
                 dd_actual = deals_with_computed["DD_Score_Declarer"].cast(pl.Int64, strict=False)
@@ -1365,9 +1447,26 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                 # Count where contracts achieve par
                 auction_info["contract_par_count"] = int((dd_actual == par_score).sum())
                 auction_info["ai_par_count"] = int((dd_ai == par_score).sum())
+                
+                # EV grand totals
+                if has_ev_contract:
+                    ev_contract = deals_with_computed["EV_Score_Declarer"].cast(pl.Float64, strict=False)
+                    ev_contract_mean = ev_contract.mean()
+                    auction_info["avg_ev_contract"] = round(float(ev_contract_mean), 2) if ev_contract_mean is not None else None  # type: ignore[arg-type]
+                
+                if has_ev_ai:
+                    ev_ai_col = deals_with_computed["EV_AI"].cast(pl.Float64, strict=False)
+                    ev_ai_mean = ev_ai_col.mean()
+                    auction_info["avg_ev_ai"] = round(float(ev_ai_mean), 2) if ev_ai_mean is not None else None  # type: ignore[arg-type]
+                
+                if has_ev_contract and has_ev_ai:
+                    ev_diff = (deals_with_computed["EV_AI"].cast(pl.Float64, strict=False) - 
+                               deals_with_computed["EV_Score_Declarer"].cast(pl.Float64, strict=False))
+                    ev_diff_mean = ev_diff.mean()
+                    auction_info["avg_ev_diff"] = round(float(ev_diff_mean), 2) if ev_diff_mean is not None else None  # type: ignore[arg-type]
             
             # Filter to display columns (keeping computed columns we just added)
-            display_cols_set = set(deal_display_cols) | {"DD_Score_AI", "AI_Contract", "IMP_AI_vs_Actual"}
+            display_cols_set = set(deal_display_cols) | {"DD_Score_AI", "EV_AI", "AI_Contract", "IMP_AI_vs_Actual"}
             auction_info["deals"] = [
                 {k: v for k, v in d.items() if k in display_cols_set}
                 for d in deals_list
@@ -2384,74 +2483,82 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
             non_match_rows = group_deals.filter(~pl.col("Auctions_Match"))
         
         # Score Delta & IMP stats
+        # Helper to safely round values that might be None
+        def safe_round(val, decimals=1):
+            return round(float(val), decimals) if val is not None else None
+        
         if "Score_Delta" in group_deals.columns:
             # Overall avg & stddev
             delta_vals = group_deals["Score_Delta"].drop_nulls().cast(pl.Float64)
             if len(delta_vals) > 0:
-                stats["Score_Delta_Avg"] = round(delta_vals.mean(), 1)  # type: ignore[arg-type]
-                stats["Score_Delta_StdDev"] = round(delta_vals.std(), 1)  # type: ignore[arg-type]
+                stats["Score_Delta_Avg"] = safe_round(delta_vals.mean())
+                stats["Score_Delta_StdDev"] = safe_round(delta_vals.std())
             
             # IMP stats
             if "Score_IMP" in group_deals.columns:
                 imp_vals = group_deals["Score_IMP"].drop_nulls().cast(pl.Float64)
                 if len(imp_vals) > 0:
-                    stats["Score_IMP_Avg"] = round(imp_vals.mean(), 1)  # type: ignore[arg-type]
-                    stats["Score_IMP_StdDev"] = round(imp_vals.std(), 1)  # type: ignore[arg-type]
+                    stats["Score_IMP_Avg"] = safe_round(imp_vals.mean())
+                    stats["Score_IMP_StdDev"] = safe_round(imp_vals.std())
             
             # By compliance
             if match_rows is not None and non_match_rows is not None:
                 # Match stats
                 match_deltas = match_rows["Score_Delta"].drop_nulls().cast(pl.Float64)
                 if len(match_deltas) > 0:
-                    stats["Score_Delta_Match_Avg"] = round(match_deltas.mean(), 1)  # type: ignore[arg-type]
-                    stats["Score_Delta_Match_StdDev"] = round(match_deltas.std(), 1)  # type: ignore[arg-type]
+                    stats["Score_Delta_Match_Avg"] = safe_round(match_deltas.mean())
+                    stats["Score_Delta_Match_StdDev"] = safe_round(match_deltas.std())
                     stats["Match_Count"] = len(match_deltas)
                     
                     if "Score_IMP" in match_rows.columns:
                         match_imps = match_rows["Score_IMP"].drop_nulls().cast(pl.Float64)
                         if len(match_imps) > 0:
-                            stats["Score_IMP_Match_Avg"] = round(match_imps.mean(), 1)  # type: ignore[arg-type]
+                            stats["Score_IMP_Match_Avg"] = safe_round(match_imps.mean())
                 
                 # No Match stats
                 non_match_deltas = non_match_rows["Score_Delta"].drop_nulls().cast(pl.Float64)
                 if len(non_match_deltas) > 0:
-                    stats["Score_Delta_NoMatch_Avg"] = round(non_match_deltas.mean(), 1)  # type: ignore[arg-type]
-                    stats["Score_Delta_NoMatch_StdDev"] = round(non_match_deltas.std(), 1)  # type: ignore[arg-type]
+                    stats["Score_Delta_NoMatch_Avg"] = safe_round(non_match_deltas.mean())
+                    stats["Score_Delta_NoMatch_StdDev"] = safe_round(non_match_deltas.std())
                     stats["NoMatch_Count"] = len(non_match_deltas)
                     
                     if "Score_IMP" in non_match_rows.columns:
                         non_match_imps = non_match_rows["Score_IMP"].drop_nulls().cast(pl.Float64)
                         if len(non_match_imps) > 0:
-                            stats["Score_IMP_NoMatch_Avg"] = round(non_match_imps.mean(), 1)  # type: ignore[arg-type]
+                            stats["Score_IMP_NoMatch_Avg"] = safe_round(non_match_imps.mean())
 
         # Matchpoint stats
         if "Score_MP" in group_deals.columns:
             mp_vals = group_deals["Score_MP"].drop_nulls().cast(pl.Float64)
             if len(mp_vals) > 0:
-                stats["Score_MP_Avg"] = round(mp_vals.mean(), 1)  # type: ignore[arg-type]
-                stats["Score_MP_StdDev"] = round(mp_vals.std(), 1)  # type: ignore[arg-type]
+                stats["Score_MP_Avg"] = safe_round(mp_vals.mean())
+                stats["Score_MP_StdDev"] = safe_round(mp_vals.std())
             if match_rows is not None and non_match_rows is not None:
                 match_mp_vals = match_rows["Score_MP"].drop_nulls().cast(pl.Float64)
                 if len(match_mp_vals) > 0:
-                    stats["Score_MP_Match_Avg"] = round(match_mp_vals.mean(), 1)  # type: ignore[arg-type]
-                    stats["Score_MP_Match_StdDev"] = round(match_mp_vals.std(), 1)  # type: ignore[arg-type]
+                    stats["Score_MP_Match_Avg"] = safe_round(match_mp_vals.mean())
+                    stats["Score_MP_Match_StdDev"] = safe_round(match_mp_vals.std())
                 non_match_mp_vals = non_match_rows["Score_MP"].drop_nulls().cast(pl.Float64)
                 if len(non_match_mp_vals) > 0:
-                    stats["Score_MP_NoMatch_Avg"] = round(non_match_mp_vals.mean(), 1)  # type: ignore[arg-type]
-                    stats["Score_MP_NoMatch_StdDev"] = round(non_match_mp_vals.std(), 1)  # type: ignore[arg-type]
+                    stats["Score_MP_NoMatch_Avg"] = safe_round(non_match_mp_vals.mean())
+                    stats["Score_MP_NoMatch_StdDev"] = safe_round(non_match_mp_vals.std())
         
         if "Score_MP_Pct" in group_deals.columns:
             mp_pct_vals = group_deals["Score_MP_Pct"].drop_nulls().cast(pl.Float64)
             if len(mp_pct_vals) > 0:
-                stats["Score_MP_Pct_Avg"] = round(mp_pct_vals.mean() * 100, 1)  # type: ignore[arg-type]
-                stats["Score_MP_Pct_StdDev"] = round(mp_pct_vals.std() * 100, 1)  # type: ignore[arg-type]
+                mp_pct_mean = mp_pct_vals.mean()
+                mp_pct_std = mp_pct_vals.std()
+                stats["Score_MP_Pct_Avg"] = safe_round(float(mp_pct_mean) * 100) if mp_pct_mean is not None else None  # type: ignore[arg-type]
+                stats["Score_MP_Pct_StdDev"] = safe_round(float(mp_pct_std) * 100) if mp_pct_std is not None else None  # type: ignore[arg-type]
             if match_rows is not None and non_match_rows is not None:
                 match_pct_vals = match_rows["Score_MP_Pct"].drop_nulls().cast(pl.Float64)
                 if len(match_pct_vals) > 0:
-                    stats["Score_MP_Match_Pct_Avg"] = round(match_pct_vals.mean() * 100, 1)  # type: ignore[arg-type]
+                    match_pct_mean = match_pct_vals.mean()
+                    stats["Score_MP_Match_Pct_Avg"] = safe_round(float(match_pct_mean) * 100) if match_pct_mean is not None else None  # type: ignore[arg-type]
                 non_match_pct_vals = non_match_rows["Score_MP_Pct"].drop_nulls().cast(pl.Float64)
                 if len(non_match_pct_vals) > 0:
-                    stats["Score_MP_NoMatch_Pct_Avg"] = round(non_match_pct_vals.mean() * 100, 1)  # type: ignore[arg-type]
+                    non_match_pct_mean = non_match_pct_vals.mean()
+                    stats["Score_MP_NoMatch_Pct_Avg"] = safe_round(float(non_match_pct_mean) * 100) if non_match_pct_mean is not None else None  # type: ignore[arg-type]
 
         for direction in "NESW":
             hcp_col = f"HCP_{direction}"

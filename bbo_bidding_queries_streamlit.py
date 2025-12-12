@@ -577,11 +577,13 @@ def render_aggrid(records: Any, key: str, height: int | None = None) -> None:
     gb = GridOptionsBuilder.from_dataframe(df.to_pandas())
     # Disable pagination entirely to allow scrolling within the fixed height
     gb.configure_pagination(enabled=False)
-    gb.configure_default_column(resizable=True, filter=True, sortable=True)
+    # Make all columns read-only (not editable), resizable, filterable, sortable
+    gb.configure_default_column(resizable=True, filter=True, sortable=True, editable=False)
     # Enable row selection - clicking anywhere on a row highlights the entire row
-    gb.configure_selection(selection_mode="single", use_checkbox=False)
+    gb.configure_selection(selection_mode="single", use_checkbox=False, suppressRowClickSelection=False)
     # Explicitly set row/header heights to ensure consistent sizing
-    gb.configure_grid_options(rowHeight=28, headerHeight=32)
+    # suppressCellFocus prevents cell-level focus (keeps row selection clean)
+    gb.configure_grid_options(rowHeight=28, headerHeight=32, suppressCellFocus=True)
     grid_options = gb.build()
 
     AgGrid(
@@ -660,42 +662,11 @@ if bt_df_rows is not None and deal_df_rows is not None:
     st.info(f"📊 Loaded data: **{deal_df_rows:,}** deals, **{bt_df_rows:,}** bidding table entries")
 
 # ---------------------------------------------------------------------------
-# Main UI – function selector and controls
+# Page Render Functions - one per selectbox option
 # ---------------------------------------------------------------------------
 
-st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
-st.sidebar.header("Settings")
-func_choice = st.sidebar.selectbox(
-    "Function",
-    [
-        "Openings by Deal Index",
-        "Random Auction Sequences",
-        "Auction Sequences Matching",
-        "Deals Matching Auction",
-        "Bidding Table Statistics",
-        "Auction AI",
-        "PBN Lookup",
-        "Group by Bid",
-    ],
-)
-
-# Auction Regex input - shown for pattern-based functions
-pattern = None
-if func_choice in ["Auction Sequences Matching", "Deals Matching Auction"]:
-    raw_pattern = st.sidebar.text_input("Auction Regex", value="^1N-p-3N$",
-        help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')")
-    pattern = normalize_auction_pattern(raw_pattern)
-    if pattern != raw_pattern:
-        st.sidebar.caption(f"→ {pattern}")
-    st.sidebar.divider()
-else:
-    st.sidebar.divider()
-
-# Random seed: 0 = non-reproducible, any other value = reproducible
-seed = int(st.sidebar.number_input("Random Seed (0=random-random)", value=0, min_value=0))
-
-if func_choice == "Openings by Deal Index":
-    #st.sidebar.subheader("Opening Bid Filters")
+def render_opening_bids_by_deal():
+    """Browse deals by index and see which opening bids match."""
     sample_size = st.sidebar.number_input("Sample Deals", value=6, min_value=1, max_value=100)
 
     all_seats = st.sidebar.checkbox("All Seats", value=True)
@@ -711,6 +682,10 @@ if func_choice == "Openings by Deal Index":
     opening_directions = None if all_openers else st.sidebar.multiselect(
         "Opening Directions", DIRECTIONS, default=["S"]
     )
+
+    # Random seed at bottom of sidebar
+    st.sidebar.divider()
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_opening"))
 
     payload = {
         "sample_size": int(sample_size),
@@ -733,7 +708,6 @@ if func_choice == "Openings by Deal Index":
             st.write(f"Opening seat: {d.get('opening_seat')}")
             st.write(f"Opening bid indices: {d.get('opening_bid_indices', [])}")
 
-            # Display bt_df rows for opening bids (the key data!)
             opening_bids_df = d.get("opening_bids_df", [])
             if opening_bids_df:
                 st.write("Opening Bids:")
@@ -741,7 +715,6 @@ if func_choice == "Openings by Deal Index":
             else:
                 st.info("No opening bids found.")
 
-            # Display hands as a single row with all 4 hand columns
             if d.get("hands"):
                 st.write("Hands:")
                 hands_dict = d["hands"]
@@ -754,8 +727,14 @@ if func_choice == "Openings by Deal Index":
                 render_aggrid(df_hands, key=f"hands_{d['dealer']}_{d['index']}")
             st.divider()
 
-elif func_choice == "Random Auction Sequences":
+
+def render_random_auction_samples():
+    """View random completed auction sequences from the bidding table."""
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
+
+    # Random seed at bottom of sidebar
+    st.sidebar.divider()
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_random"))
 
     payload = {"n_samples": int(n_samples), "seed": seed}
     with st.spinner("Fetching bidding sequences from server. Takes about 10 seconds."):
@@ -766,14 +745,20 @@ elif func_choice == "Random Auction Sequences":
     if not samples:
         st.info(f"No completed auctions found. ({elapsed_ms/1000:.1f}s)")
     else:
-        st.success(f"Found {len(samples)} auction(s) in {elapsed_ms/1000:.1f}s")
+        st.success(f"Found {len(samples)} matching auction(s) in {elapsed_ms/1000:.1f}s")
         for i, s in enumerate(samples, start=1):
             st.subheader(f"Sample {i}: {s['auction']}")
             render_aggrid(s["sequence"], key=f"seq_random_{i}")
             st.divider()
 
-elif func_choice == "Auction Sequences Matching":
+
+def render_find_auction_sequences(pattern: str | None):
+    """Search for auction sequences matching a regex pattern."""
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
+
+    # Random seed at bottom of sidebar
+    st.sidebar.divider()
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_find"))
 
     payload = {"pattern": pattern, "n_samples": int(n_samples), "seed": seed}
     with st.spinner("Fetching auctions from server. Takes about 10 seconds."):
@@ -785,13 +770,12 @@ elif func_choice == "Auction Sequences Matching":
     if not samples:
         st.info(f"No auctions matched the pattern. ({elapsed_ms/1000:.1f}s)")
     else:
-        st.success(f"Found {len(samples)} auction(s) in {elapsed_ms/1000:.1f}s")
+        st.success(f"Found {len(samples)} matching auction(s) in {elapsed_ms/1000:.1f}s")
         for i, s in enumerate(samples, start=1):
             st.subheader(f"Sample {i}: {s['auction']}")
             render_aggrid(s["sequence"], key=f"seq_pattern_{i}")
             st.divider()
     
-    # Show criteria-rejected rows for debugging (from criteria.csv)
     criteria_rejected = data.get("criteria_rejected", [])
     if criteria_rejected:
         with st.expander(f"🚫 Rejected auctions due to custom criteria. {len(criteria_rejected)} shown.", expanded=False):
@@ -803,7 +787,9 @@ elif func_choice == "Auction Sequences Matching":
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
 
-elif func_choice == "Deals Matching Auction":
+
+def render_deals_by_auction_pattern(pattern: str | None):
+    """Find deals matching an auction pattern's criteria."""
     n_auction_samples = st.sidebar.number_input("Auction Samples", value=2, min_value=1, max_value=10)
     n_deal_samples = st.sidebar.number_input("Deal Samples per Auction", value=10, min_value=1, max_value=1000)
 
@@ -850,6 +836,10 @@ elif func_choice == "Deals Matching Auction":
     with st.sidebar.expander("Distribution notation help"):
         st.markdown(format_distribution_help())
 
+    # Random seed at bottom of sidebar
+    st.sidebar.divider()
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_deals"))
+
     # Build payload with distribution filter params (server-side filtering)
     payload = {
         "pattern": pattern,
@@ -876,41 +866,11 @@ elif func_choice == "Deals Matching Auction":
     if not auctions:
         st.info(f"No auctions matched the pattern. ({elapsed_ms/1000:.1f}s)")
     else:
-        st.success(f"Found {len(auctions)} auction(s) in {elapsed_ms/1000:.1f}s")
+        st.success(f"Found {len(auctions)} matching auction(s) in {elapsed_ms/1000:.1f}s")
         for i, a in enumerate(auctions, start=1):
             st.subheader(f"Auction {i}: {a['auction']}")
-            expr = a.get("expr")
-            if expr:
-                # Flatten expr to a simple list of strings
-                if isinstance(expr, list):
-                    # Filter out None/empty and flatten nested lists
-                    flat_expr = []
-                    for item in expr:
-                        if isinstance(item, list):
-                            flat_expr.extend([str(x) for x in item if x])
-                        elif item:
-                            flat_expr.append(str(item))
-                    if flat_expr:
-                        with st.expander(f"Expr criteria ({len(flat_expr)})"):
-                            df_expr = pl.DataFrame({"Expr": flat_expr})
-                            render_aggrid(df_expr, key=f"expr_{i}", height=200)
-                else:
-                    # expr is a single value, not a list
-                    with st.expander("Expr criteria"):
-                        st.write(str(expr))
-            criteria_by_seat = a.get("criteria_by_seat")
-            if criteria_by_seat:
-                rows = []
-                for seat, crit_list in criteria_by_seat.items():
-                    # Convert list to string for display
-                    criteria_str = ", ".join(str(c) for c in crit_list) if isinstance(crit_list, list) else str(crit_list)
-                    rows.append({"Seat": seat, "Criteria": criteria_str})
-                if rows:
-                    st.write("Criteria by seat:")
-                df_criteria = pl.DataFrame(rows)
-                render_aggrid(df_criteria, key=f"criteria_{i}", height=220)
             
-            # Show criteria debug info
+            # Show criteria debug info (Applied + Missing = all criteria for auction)
             criteria_debug = a.get("criteria_debug", {})
             row_seat = criteria_debug.get("row_seat", "?")
             actual_final_seat = criteria_debug.get("actual_final_seat", "?")
@@ -946,40 +906,67 @@ elif func_choice == "Deals Matching Auction":
                 with st.expander("🔍 Distribution SQL Query", expanded=False):
                     st.code(dist_sql, language="sql")
             
-            # Contract summary table
-            contract_summary = a.get("contract_summary", [])
-            if contract_summary:
-                st.write("**Contract Summary:**")
-                summary_df = pl.DataFrame(contract_summary)
-                st.dataframe(summary_df.to_pandas(), width='content', hide_index=True) # width=True/False has been deprecated
-                
-                # Show grand totals
-                total_imp = a.get("total_imp_ai", 0)
-                total_deals = a.get("total_deals", 0)
-                ai_makes = a.get("ai_makes_count", 0)
-                contract_makes = a.get("contract_makes_count", 0)
-                ai_par = a.get("ai_par_count", 0)
-                contract_par = a.get("contract_par_count", 0)
-                
+            # AI vs Actual Comparison table (show first as summary)
+            total_imp = a.get("total_imp_ai", 0)
+            total_deals = a.get("total_deals", 0)
+            imp_ai = a.get("imp_ai_advantage", 0)
+            imp_actual = a.get("imp_actual_advantage", 0)
+            ai_makes = a.get("ai_makes_count", 0)
+            contract_makes = a.get("contract_makes_count", 0)
+            ai_par = a.get("ai_par_count", 0)
+            contract_par = a.get("contract_par_count", 0)
+            avg_ev_contract = a.get("avg_ev_contract")
+            avg_ev_ai = a.get("avg_ev_ai")
+            avg_ev_diff = a.get("avg_ev_diff")
+            
+            if total_deals > 0:
                 # Calculate percentages
                 ai_makes_pct = (ai_makes / total_deals * 100) if total_deals > 0 else 0
                 contract_makes_pct = (contract_makes / total_deals * 100) if total_deals > 0 else 0
                 ai_par_pct = (ai_par / total_deals * 100) if total_deals > 0 else 0
                 contract_par_pct = (contract_par / total_deals * 100) if total_deals > 0 else 0
                 
-                won_lost = "won" if total_imp >= 0 else "lost"
-                emoji = "🤖" if total_imp >= 0 else "👤"
+                # Build comparison table
+                st.write(f"**Overalls: AI vs Actual Comparison** ({total_deals} deals)")
                 
-                st.info(
-                    f"{emoji} AI **{won_lost} {abs(total_imp)} IMPs** overall vs actual in **{total_deals}** contracts. "
-                    f"AI contracts make **{ai_makes_pct:.1f}%** of the time vs **{contract_makes_pct:.1f}%**. "
-                    f"AI contracts achieve par **{ai_par_pct:.1f}%** of the time vs **{contract_par_pct:.1f}%**."
-                )
+                stats_rows = []
+                
+                # IMPs row
+                imp_diff_str = f"+{total_imp}" if total_imp >= 0 else str(total_imp)
+                stats_rows.append({"Metric": "IMPs", "AI": imp_ai, "Actual": imp_actual, "Diff": imp_diff_str})
+                
+                # DD Makes row (only if data exists)
+                if ai_makes > 0 or contract_makes > 0:
+                    makes_diff = ai_makes_pct - contract_makes_pct
+                    makes_diff_str = f"+{makes_diff:.1f}%" if makes_diff >= 0 else f"{makes_diff:.1f}%"
+                    stats_rows.append({"Metric": "DD Makes", "AI": f"{ai_makes_pct:.1f}%", "Actual": f"{contract_makes_pct:.1f}%", "Diff": makes_diff_str})
+                
+                # Par Achieved row (only if data exists)
+                if ai_par > 0 or contract_par > 0:
+                    par_diff = ai_par_pct - contract_par_pct
+                    par_diff_str = f"+{par_diff:.1f}%" if par_diff >= 0 else f"{par_diff:.1f}%"
+                    stats_rows.append({"Metric": "Par Achieved", "AI": f"{ai_par_pct:.1f}%", "Actual": f"{contract_par_pct:.1f}%", "Diff": par_diff_str})
+                
+                # EV row (only if data exists)
+                if avg_ev_ai is not None and avg_ev_contract is not None:
+                    ev_diff_str = f"+{avg_ev_diff:.2f}" if avg_ev_diff >= 0 else f"{avg_ev_diff:.2f}"
+                    stats_rows.append({"Metric": "Avg EV", "AI": f"{avg_ev_ai:.2f}", "Actual": f"{avg_ev_contract:.2f}", "Diff": ev_diff_str})
+                
+                if stats_rows:
+                    stats_df = pl.DataFrame(stats_rows)
+                    render_aggrid(stats_df, key=f"stats_{i}", height=150)
+            
+            # Contract summary table (detailed breakdown by contract)
+            contract_summary = a.get("contract_summary", [])
+            if contract_summary:
+                st.write("**Contract Summary:**")
+                summary_df = pl.DataFrame(contract_summary)
+                render_aggrid(summary_df, key=f"contract_summary_{i}", height=200)
             
             deals = a.get("deals", [])
             if deals:
                 deals_df = pl.DataFrame(deals)
-                st.write(f"Matching deals (showing {len(deals_df)}):")
+                st.write(f"**Matching Deals:** (showing {len(deals_df)})")
                 render_aggrid(deals_df, key=f"deals_{i}")
             else:
                 st.info("No matching deals (criteria may be too restrictive or distribution filter removed all).")
@@ -997,38 +984,36 @@ elif func_choice == "Deals Matching Auction":
                 st.warning(f"Could not render as table: {e}")
                 st.json(criteria_rejected)
 
-elif func_choice == "Bidding Table Statistics":
+
+def render_bidding_table_explorer():
+    """Browse bidding table entries with aggregate statistics."""
     st.header("Bidding Table Statistics Viewer")
     st.caption("View bidding table entries with aggregate statistics (mean, std, min, max) for matching deals.")
     
-    # Sidebar controls
     st.sidebar.subheader("Statistics Filters")
     
-    # Auction regex filter
     raw_auction_pattern = st.sidebar.text_input("Auction Regex", value="^1N-p-3N$",
-        help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')")
+        help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')",
+        key="bt_explorer_auction_pattern")
     auction_pattern = normalize_auction_pattern(raw_auction_pattern)
     if auction_pattern != raw_auction_pattern:
         st.sidebar.caption(f"→ {auction_pattern}")
     
-    sample_size = st.sidebar.number_input("Sample Size", value=100, min_value=1, max_value=10000)
-    
-    # Filter by minimum matching deals (0 = all)
+    sample_size = st.sidebar.number_input("Sample Size", value=100, min_value=1, max_value=10000, key="bt_explorer_sample")
     min_matches = st.sidebar.number_input("Min Matching Deals (0=all)", value=0, min_value=0, max_value=100000)
     
     st.sidebar.divider()
     st.sidebar.subheader("Distribution Filter")
     
-    # Seat selector for distribution filter
     dist_seat = st.sidebar.selectbox("Filter Seat", [1, 2, 3, 4], index=0,
-        help="Which seat's distribution to filter (S1=opener in most auctions)")
+        help="Which seat's distribution to filter (S1=opener in most auctions)",
+        key="bt_explorer_dist_seat")
     
-    # Ordered distribution pattern input
     dist_pattern = st.sidebar.text_input("Ordered Distribution (S-H-D-C)", value="",
         placeholder="e.g., 5-4-3-1, 5+-4-x-x",
-        help="Filter by exact suit order. Leave empty for no filter.")
+        help="Filter by exact suit order. Leave empty for no filter.",
+        key="bt_explorer_dist_pattern")
     
-    # Validate and show parsed result for ordered distribution
     if dist_pattern:
         parsed_dist = parse_distribution_pattern(dist_pattern)
         if parsed_dist:
@@ -1045,12 +1030,11 @@ elif func_choice == "Bidding Table Statistics":
         else:
             st.sidebar.warning("Invalid distribution pattern")
     
-    # Sorted shape input (any suit order)
     sorted_shape = st.sidebar.text_input("Sorted Shape (any suit order)", value="",
         placeholder="e.g., 5431, 4432, 5332",
-        help="Filter by shape regardless of suit. E.g., '5431' matches any 5-4-3-1 hand.")
+        help="Filter by shape regardless of suit.",
+        key="bt_explorer_sorted_shape")
     
-    # Validate sorted shape
     if sorted_shape:
         parsed_shape = parse_sorted_shape(sorted_shape)
         if parsed_shape:
@@ -1058,11 +1042,13 @@ elif func_choice == "Bidding Table Statistics":
         else:
             st.sidebar.warning("Invalid sorted shape (must be 4 digits summing to 13)")
     
-    # Show help in expander
     with st.sidebar.expander("Distribution notation help"):
         st.markdown(format_distribution_help())
     
-    # Build payload with distribution filter params (server-side filtering)
+    # Random seed at bottom of sidebar
+    st.sidebar.divider()
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_explorer"))
+
     payload = {
         "auction_pattern": auction_pattern,
         "sample_size": int(sample_size),
@@ -1076,7 +1062,6 @@ elif func_choice == "Bidding Table Statistics":
     with st.spinner("Fetching Bidding Table Statistics from server..."):
         data = api_post("/bidding-table-statistics", payload)
     
-    # Show data availability info
     has_criteria = data.get("has_criteria", False)
     has_aggregates = data.get("has_aggregates", False)
     if not has_aggregates:
@@ -1098,14 +1083,12 @@ elif func_choice == "Bidding Table Statistics":
         if rows:
             display_df = pl.DataFrame(rows)
             
-            # Show distribution filter SQL if applied
             dist_sql_query = data.get("dist_sql_query")
             if dist_sql_query:
                 st.info(f"📐 Distribution filter applied (Seat {dist_seat})")
                 with st.expander("🔍 Distribution SQL Query", expanded=False):
                     st.code(dist_sql_query, language="sql")
             
-            # Reorder columns: put key columns first
             key_cols = ["row_idx", "original_idx", "Auction"]
             if "matching_deal_count" in display_df.columns:
                 key_cols.append("matching_deal_count")
@@ -1113,7 +1096,6 @@ elif func_choice == "Bidding Table Statistics":
             other_cols = [c for c in display_df.columns if c not in key_cols]
             display_df = display_df.select([c for c in key_cols if c in display_df.columns] + sorted(other_cols))
             
-            # Display summary
             st.subheader("Data Summary")
             col1, col2, col3, col4 = st.columns(4)
             with col1:
@@ -1129,11 +1111,9 @@ elif func_choice == "Bidding Table Statistics":
             with col4:
                 st.metric("Columns", len(display_df.columns))
             
-            # Display the data
             st.subheader("Bidding Table with Statistics")
             render_aggrid(display_df, key="bt_stats_grid", height=500)
             
-            # Show column info in expander
             with st.expander("Column Descriptions"):
                 st.markdown("""
                 **Key Columns**:
@@ -1143,23 +1123,23 @@ elif func_choice == "Bidding Table Statistics":
                 - `matching_deal_count`: Number of deals matching the criteria
                 
                 **Criteria Columns** (from bt_criteria.parquet):
-                - `{col}_min_S{seat}`: Minimum value constraint (e.g. HCP_min_S1)
-                - `{col}_max_S{seat}`: Maximum value constraint (e.g. HCP_max_S1)
+                - `{col}_min_S{seat}`: Minimum value constraint
+                - `{col}_max_S{seat}`: Maximum value constraint
                 
                 **Aggregate Statistics** (from bbo_bt_aggregate.parquet):
-                - `{col}_mean_S{seat}`: Mean value across matching deals (e.g. HCP_mean_S1)
-                - `{col}_std_S{seat}`: Standard deviation (e.g. HCP_std_S1)
-                - `{col}_min_S{seat}`: Minimum observed value
-                - `{col}_max_S{seat}`: Maximum observed value
+                - `{col}_mean_S{seat}`: Mean value across matching deals
+                - `{col}_std_S{seat}`: Standard deviation
+                - `{col}_min_S{seat}`, `{col}_max_S{seat}`: Min/Max observed values
                 
-                **Columns**: HCP, SL_C, SL_D, SL_H, SL_S, Total_Points (for each of 4 seats: S1-S4)
+                **Columns**: HCP, SL_C, SL_D, SL_H, SL_S, Total_Points (for each of 4 seats)
                 """)
 
-elif func_choice == "Auction AI":
+
+def render_analyze_deal():
+    """Analyze a PBN/LIN deal and find matching auctions."""
     st.header("Auction AI - Analyze Deal and Find Matching Auctions")
     st.caption("Enter a PBN/LIN deal string, file path, or URL to analyze and find matching auctions.")
     
-    # Pre-defined examples for easy testing
     PBN_EXAMPLES = {
         "Custom": "",
         "PBN String (1NT opener)": "N:AK65.KQ2.A54.K32 Q82.JT95.K62.A87 JT97.A843.QJ3.54 43.76.T987.QJT96",
@@ -1170,7 +1150,6 @@ elif func_choice == "Auction AI":
         "GitHub PBN raw URL GIB 1N": "https://raw.githubusercontent.com/ADavidBailey/Practice-Bidding-Scenarios/refs/heads/main/pbn/GIB_1N.pbn",
     }
     
-    # Selectbox for pre-defined examples
     selected_example = st.sidebar.selectbox(
         "Select Example",
         options=list(PBN_EXAMPLES.keys()),
@@ -1178,7 +1157,6 @@ elif func_choice == "Auction AI":
         help="Choose a pre-defined example or 'Custom' to enter your own"
     )
     
-    # Show text area for custom input or display selected example
     if selected_example == "Custom":
         pbn_input = st.sidebar.text_area(
             "PBN/LIN Input",
@@ -1188,7 +1166,6 @@ elif func_choice == "Auction AI":
             help="Auto-detects: PBN/LIN deal string, local file path (.pbn/.lin), or URL"
         )
     else:
-        # Show the selected example in a text area (editable)
         pbn_input = st.sidebar.text_area(
             "PBN/LIN Input",
             value=PBN_EXAMPLES[selected_example],
@@ -1196,410 +1173,234 @@ elif func_choice == "Auction AI":
             help="Auto-detects: PBN/LIN deal string, local file path (.pbn/.lin), or URL"
         )
     
-    # Seat selection for auction matching
     match_seat = st.sidebar.selectbox("Match Auction Seat", [1, 2, 3, 4], index=0,
         help="Which seat's criteria to match against the deal")
     
     max_auctions = st.sidebar.number_input("Max Auctions to Show", value=50, min_value=1, max_value=500)
     
-    # Checkbox for par calculation
     include_par = st.sidebar.checkbox("Calculate Par Score", value=True,
         help="Calculate par score using double-dummy analysis (server-side)")
     
-    # Vulnerability for par calculation
     vul_option = st.sidebar.selectbox("Vulnerability", ["None", "Both", "NS", "EW"], index=0,
         help="Vulnerability for par score calculation")
     
-    # Auto-process when input is available (no button needed)
     if not pbn_input:
         st.info("Select an example or enter a PBN/LIN string, file path, or URL to analyze.")
+        return
+    
+    with st.spinner("Processing PBN/LIN deal(s)..."):
+        try:
+            pbn_payload = {
+                "pbn": pbn_input,
+                "include_par": include_par,
+                "vul": vul_option,
+            }
+            pbn_data = api_post("/process-pbn", pbn_payload)
+        except Exception as e:
+            st.error(f"Failed to process PBN/LIN: {e}")
+            return
+    
+    deals = pbn_data.get("deals", [])
+    if not deals:
+        st.warning("No valid deals found.")
+        return
+    
+    input_type = pbn_data.get("input_type", "unknown")
+    input_source = pbn_data.get("input_source", "")
+    type_emoji = {"LIN string": "📝", "PBN string": "📝", "LIN file": "📁", "PBN file": "📁", "LIN URL": "🌐", "PBN URL": "🌐"}.get(input_type, "❓")
+    st.success(f"{type_emoji} Detected **{input_type}** — Parsed {len(deals)} deal(s) in {pbn_data.get('elapsed_ms', 0)/1000:.1f}s")
+    if input_source and len(input_source) < 200:
+        st.caption(f"Source: `{input_source}`")
+    
+    if len(deals) > 1:
+        progress_bar = st.progress(0, text="Finding matching auctions for each deal...")
     else:
-        # Call the API to process PBN (handles both string and URL)
-        with st.spinner("Processing PBN/LIN deal(s)..."):
-            try:
-                pbn_payload = {
-                    "pbn": pbn_input,
-                    "include_par": include_par,
-                    "vul": vul_option,
+        progress_bar = None
+    
+    for deal_idx, deal in enumerate(deals):
+        pbn = deal.get("pbn")
+        par_score = deal.get("par_score")
+        par_contracts = deal.get("par_contracts", [])
+        hands = deal.get("hands", {})
+        hand_stats = deal.get("hand_stats", {})
+        
+        with st.expander(f"**Deal {deal_idx + 1}**: {pbn[:50]}..." if len(pbn) > 50 else f"**Deal {deal_idx + 1}**: {pbn}", expanded=(deal_idx == 0)):
+            if par_score is not None:
+                par_contracts_str = ", ".join(par_contracts) if par_contracts else "N/A"
+                st.info(f"🎯 **Par Score**: {par_score} ({par_contracts_str}) | Vul: {vul_option}")
+            
+            st.write("**Hands:**")
+            hands_row = {f"Hand_{d}": hands.get(d, "") for d in "NESW"}
+            render_aggrid(pl.DataFrame([hands_row]), key=f"hands_deal_{deal_idx}", height=80)
+            
+            if hand_stats:
+                st.write("**Hand Statistics:**")
+                stats_rows = []
+                for d in "NESW":
+                    if d in hand_stats:
+                        row = {"Dir": d}
+                        row.update(hand_stats[d])
+                        stats_rows.append(row)
+                if stats_rows:
+                    render_aggrid(pl.DataFrame(stats_rows), key=f"stats_deal_{deal_idx}", height=150)
+            
+            with st.spinner(f"Finding matching auctions for deal {deal_idx + 1}..."):
+                match_payload = {
+                    "pbn": pbn,
+                    "seat": match_seat,
+                    "max_results": int(max_auctions),
                 }
-                pbn_data = api_post("/process-pbn", pbn_payload)
-            except Exception as e:
-                st.error(f"Failed to process PBN/LIN: {e}")
-                st.stop()
-        
-        deals = pbn_data.get("deals", [])
-        if not deals:
-            st.warning("No valid deals found.")
-            st.stop()
-        
-        # Show detected input type
-        input_type = pbn_data.get("input_type", "unknown")
-        input_source = pbn_data.get("input_source", "")
-        type_emoji = {"LIN string": "📝", "PBN string": "📝", "LIN file": "📁", "PBN file": "📁", "LIN URL": "🌐", "PBN URL": "🌐"}.get(input_type, "❓")
-        st.success(f"{type_emoji} Detected **{input_type}** — Parsed {len(deals)} deal(s) in {pbn_data.get('elapsed_ms', 0)/1000:.1f}s")
-        if input_source and len(input_source) < 200:
-            st.caption(f"Source: `{input_source}`")
-        
-        # Show progress bar for processing multiple deals
-        if len(deals) > 1:
-            progress_bar = st.progress(0, text="Finding matching auctions for each deal...")
-        else:
-            progress_bar = None
-        
-        # Process each deal
-        for deal_idx, deal in enumerate(deals):
-            # Update progress bar
-            if progress_bar:
-                progress = (deal_idx + 1) / len(deals)
-                progress_bar.progress(progress, text=f"Processing deal {deal_idx + 1} of {len(deals)}...")
-            # Check for errors
-            if "error" in deal:
-                st.warning(f"Deal {deal_idx + 1}: {deal['error']}")
-                continue
+                match_data = api_post("/match-auctions", match_payload)
             
-            dealer = deal.get('Dealer', '?')
+            matches = match_data.get("matches", [])
+            elapsed_ms = match_data.get("elapsed_ms", 0)
             
-            # Display deal header
-            st.divider()
-            st.subheader(f"📋 Deal {deal_idx + 1}: Dealer {dealer}")
-            
-            # Display par info if available
-            if include_par and 'Par_Score' in deal:
-                par_score = deal.get('Par_Score')
-                par_contract = deal.get('Par_Contract', 'N/A')
-                st.write(f"**Par:** {par_score} ({par_contract})")
-            
-            # Display hands in a compact format
-            hands_str = " | ".join([f"{d}: {deal.get(f'Hand_{d}', 'N/A')}" for d in 'NESW'])
-            st.write(f"**Hands:** {hands_str}")
-            
-            # Display full deal DataFrame
-            deal_df = pl.DataFrame([deal])
-            with st.expander(f"📊 Deal {deal_idx + 1} Features", expanded=(deal_idx == 0)):
-                render_aggrid(deal_df, key=f"deal_features_{deal_idx}")
-            
-            # Find matching auctions using API
-            # Determine which direction corresponds to the seat
-            directions = ['N', 'E', 'S', 'W']
-            dealer_idx_val = directions.index(dealer) if dealer in directions else 0
-            match_direction = directions[(dealer_idx_val + match_seat - 1) % 4]
-            
-            # Get hand features for the matched direction
-            hcp = deal.get(f'HCP_{match_direction}')
-            sl_s = deal.get(f'SL_S_{match_direction}')
-            sl_h = deal.get(f'SL_H_{match_direction}')
-            sl_d = deal.get(f'SL_D_{match_direction}')
-            sl_c = deal.get(f'SL_C_{match_direction}')
-            tp = deal.get(f'Total_Points_{match_direction}')
-            
-            if all(v is not None for v in [hcp, sl_s, sl_h, sl_d, sl_c, tp]):
-                try:
-                    auction_payload = {
-                        "hcp": hcp,
-                        "sl_s": sl_s,
-                        "sl_h": sl_h,
-                        "sl_d": sl_d,
-                        "sl_c": sl_c,
-                        "total_points": tp,
-                        "seat": match_seat,
-                        "max_results": max_auctions,
-                    }
-                    auction_data = api_post("/find-matching-auctions", auction_payload)
-                    
-                    # Display criteria info
-                    criteria_loaded = auction_data.get("auction_criteria_loaded", 0)
-                    criteria_filtered = auction_data.get("auction_criteria_filtered", 0)
-                    
-                    # Display SQL query and criteria info
-                    sql_query = auction_data.get("sql_query", "")
-                    with st.expander(f"🔍 SQL Query (Seat {match_seat} = {match_direction})", expanded=False):
-                        st.code(sql_query, language="sql")
-                        st.caption(f"Hand: HCP={hcp}, SL_S={sl_s}, SL_H={sl_h}, SL_D={sl_d}, SL_C={sl_c}, TP={tp}")
-                        if criteria_loaded > 0:
-                            st.caption(f"📋 Auction criteria: {criteria_loaded} rules loaded, {criteria_filtered} auctions filtered out")
-                        else:
-                            st.caption("⚠️ No auction criteria loaded (bbo_custom_auction_criteria.csv not found or empty)")
-                    
-                    auctions = auction_data.get("auctions", [])
-                    if auctions:
-                        filter_msg = f" ({criteria_filtered} filtered by criteria)" if criteria_filtered > 0 else ""
-                        st.success(f"Found {len(auctions)} matching auctions for Deal {deal_idx + 1}{filter_msg} ({auction_data.get('elapsed_ms', 0)/1000:.1f}s)")
-                        auctions_df = pl.DataFrame(auctions)
-                        render_aggrid(auctions_df, key=f"matching_auctions_{deal_idx}", height=300)
-                        
-                        # Show rejected auctions for debugging
-                        criteria_rejected = auction_data.get("criteria_rejected", [])
-                        if criteria_rejected:
-                            with st.expander(f"🚫 Rejected auctions due to custom criteria. {len(criteria_rejected)} shown.", expanded=False):
-                                st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
-                                # Debug: show raw data structure
-                                st.caption(f"Debug: {len(criteria_rejected)} items, first item keys: {list(criteria_rejected[0].keys()) if criteria_rejected else 'N/A'}")
-                                # Use st.dataframe for reliability (AgGrid can fail silently)
-                                try:
-                                    rejected_df = pl.DataFrame(criteria_rejected)
-                                    st.caption(f"Debug: DataFrame shape: {rejected_df.shape}, columns: {rejected_df.columns}")
-                                    st.dataframe(rejected_df.to_pandas(), width='stretch')
-                                except Exception as e:
-                                    st.warning(f"Could not render as table: {e}")
-                                    st.json(criteria_rejected)
-                    else:
-                        st.info(f"No matching auctions found for Deal {deal_idx + 1}")
-                except Exception as e:
-                    st.error(f"Error finding auctions for Deal {deal_idx + 1}: {e}")
+            if not matches:
+                st.warning(f"No matching auctions found for seat {match_seat}. ({elapsed_ms/1000:.1f}s)")
             else:
-                st.warning(f"Missing hand features for Deal {deal_idx + 1}, cannot match auctions")
+                st.success(f"Found {len(matches)} matching auction(s) for seat {match_seat} in {elapsed_ms/1000:.1f}s")
+                matches_df = pl.DataFrame(matches)
+                render_aggrid(matches_df, key=f"matches_deal_{deal_idx}", height=min(400, 50 + len(matches) * 35))
         
-        # Clear progress bar when done
         if progress_bar:
-            progress_bar.empty()
+            progress_bar.progress((deal_idx + 1) / len(deals), text=f"Processed {deal_idx + 1}/{len(deals)} deals")
+    
+    if progress_bar:
+        progress_bar.empty()
 
-elif func_choice == "PBN Lookup":
+
+def render_pbn_database_lookup():
+    """Check if a PBN deal exists in the database."""
     st.header("PBN Lookup - Find Deal in Database")
     st.caption("Look up a PBN deal string to check if it exists in bbo_mldf_augmented.parquet")
     
-    # Get sample PBN from API for prepopulation
     @st.cache_data(ttl=3600)
     def get_sample_pbn():
         try:
             data = api_get("/pbn-sample")
             return data.get("pbn", "")
         except:
-            return "N:AK65.KQ2.A54.K32 Q82.JT95.K62.A87 JT97.A843.QJ3.54 43.76.T987.QJT96"
+            return ""
     
-    # Initialize session state for PBN lookup input
-    if "pbn_lookup_input" not in st.session_state:
-        st.session_state.pbn_lookup_input = get_sample_pbn()
+    sample_pbn = get_sample_pbn()
     
-    # YOLO button - get random PBN
-    if st.sidebar.button("🎲 YOLO", help="Randomly select a PBN from the database", type="secondary"):
-        try:
-            random_data = api_get("/pbn-random")
-            st.session_state.pbn_lookup_input = random_data.get("pbn", "")
-            st.sidebar.success(f"Random row #{random_data.get('row_idx', '?'):,}")
-            st.rerun()
-        except Exception as e:
-            st.sidebar.error(f"YOLO failed: {e}")
-    
-    # PBN input with session state
     pbn_input = st.sidebar.text_area(
         "PBN Deal String",
-        value=st.session_state.pbn_lookup_input,
+        value=sample_pbn,
         height=100,
-        help="Enter a PBN deal string to look up in the database",
-        key="pbn_lookup_textarea"
+        placeholder="e.g., N:AK65.KQ2.A54.K32 Q82.JT95.K62.A87 JT97.A843.QJ3.54 43.76.T987.QJT96",
+        help="Enter a PBN deal string in format: Dealer:Hand_N Hand_E Hand_S Hand_W"
     )
-    # Update session state if user edits the text area
-    if pbn_input != st.session_state.pbn_lookup_input:
-        st.session_state.pbn_lookup_input = pbn_input
     
-    max_results = st.sidebar.number_input("Max Results", value=100, min_value=1, max_value=1000)
-    
-    # Auto-process when input is available
     if not pbn_input:
-        st.info("Enter a PBN deal string to look up in the database.")
-    else:
-        with st.spinner("Looking up PBN in database..."):
-            try:
-                lookup_data = api_post("/pbn-lookup", {
-                    "pbn": pbn_input,
-                    "max_results": int(max_results),
-                })
-            except Exception as e:
-                st.error(f"Lookup failed: {e}")
-                st.stop()
+        st.info("Enter a PBN deal string to look up.")
+        return
+    
+    with st.spinner("Looking up PBN in database..."):
+        payload = {"pbn": pbn_input.strip()}
+        data = api_post("/pbn-lookup", payload)
+    
+    found = data.get("found", False)
+    elapsed = data.get("elapsed_ms", 0)
+    total = data.get("total_rows", 0)
+    
+    if found:
+        st.success(f"✅ PBN found in database! ({elapsed/1000:.1f}s, searched {total:,} rows)")
         
-        count = lookup_data.get("count", 0)
-        total = lookup_data.get("total_in_df", 0)
-        elapsed = lookup_data.get("elapsed_ms", 0)
-        
-        if count > 0:
-            st.success(f"✅ Found {count} matching row(s) in {elapsed/1000:.1f}s (searched {total:,} rows)")
+        deal_info = data.get("deal_info", {})
+        if deal_info:
+            st.write("**Deal Information:**")
             
-            matches = lookup_data.get("matches", [])
-            if matches:
-                matches_df = pl.DataFrame(matches)
-                                
-                # Construct PBN column if not present. PBN is currently dropped to conserve resources but Hand_[NESW] are still available.
-                if 'PBN' not in matches_df.columns and all(f'Hand_{d}' in matches_df.columns for d in 'NESW'):
-                    matches_df = matches_df.with_columns(
-                        (pl.col('Dealer') + ':' + 
-                         pl.col('Hand_N') + ' ' + pl.col('Hand_E') + ' ' + 
-                         pl.col('Hand_S') + ' ' + pl.col('Hand_W')).alias('PBN')
-                    )
-                
-                # Drop columns that are all nulls to conserve horizontal space
-                non_null_cols = [c for c in matches_df.columns if matches_df[c].null_count() < matches_df.height]
-                matches_df = matches_df.select(non_null_cols)
-                
-                # Select key columns for display (if they exist)
-                display_cols = ['PBN', 'Dealer', 'Vul', 'Declarer', 'bid', 'Result', 'Tricks', 'Score', 'ParScore']
-                available_cols = [c for c in display_cols if c in matches_df.columns]
-                
-                # Show key columns first, then all columns in expander
-                if available_cols:
-                    st.subheader("Key Results")
-                    key_df = matches_df.select(available_cols)
-                    render_aggrid(key_df, key="pbn_lookup_key_results")
-                    
-                    with st.expander(f"📊 All Columns ({len(matches_df.columns)} non-null)", expanded=False):
-                        render_aggrid(matches_df, key="pbn_lookup_all_results")
-                else:
-                    render_aggrid(matches_df, key="pbn_lookup_results")
-        else:
-            st.warning(f"❌ PBN not found in database ({elapsed/1000:.1f}s, searched {total:,} rows)")
-            st.write("**Searched PBN:**")
-            st.code(pbn_input)
+            key_cols = ["PBN", "Vul", "Dealer", "bid", "Contract", "Result", "Tricks", "Score", "ParScore", "DD_Score_Declarer"]
+            key_info = {k: v for k, v in deal_info.items() if k in key_cols and v is not None}
+            if key_info:
+                render_aggrid(pl.DataFrame([key_info]), key="pbn_lookup_key", height=80)
+            
+            with st.expander("Full Deal Data", expanded=False):
+                all_info_df = pl.DataFrame([deal_info])
+                render_aggrid(all_info_df, key="pbn_lookup_full", height=200)
+    else:
+        st.warning(f"❌ PBN not found in database ({elapsed/1000:.1f}s, searched {total:,} rows)")
+        st.write("**Searched PBN:**")
+        st.code(pbn_input)
 
-elif func_choice == "Group by Bid":
+
+def render_analyze_actual_auctions():
+    """Group deals by their actual auction and analyze outcomes."""
     st.header("Group by Bid - Analyze Deals by Actual Auction")
     st.caption("Group deals from bbo_mldf_augmented by their actual auction sequence (bid column) and show deal characteristics.")
     
-    # Sidebar controls
     raw_auction_regex = st.sidebar.text_input(
         "Auction Regex",
         value="^1N-p-3N$",
-        help="Regex pattern to filter auctions. Trailing '-p-p-p' appended if not present. Use .* for all."
+        help="Regex pattern to filter auctions. Trailing '-p-p-p' appended if not present. Use .* for all.",
+        key="group_by_bid_regex"
     )
-    # Normalize pattern (same as other functions)
     auction_regex = normalize_auction_pattern(raw_auction_regex)
     if auction_regex != raw_auction_regex:
         st.sidebar.caption(f"→ {auction_regex}")
     
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        n_groups = st.number_input("Auction Groups", value=10, min_value=1, max_value=100,
-            help="Number of unique auctions to show")
-    with col2:
-        n_deals = st.number_input("Deals per Group", value=10, min_value=1, max_value=100,
-            help="Sample deals per auction")
+    max_groups = st.sidebar.number_input("Max Auction Groups", value=10, min_value=1, max_value=100)
+    deals_per_group = st.sidebar.number_input("Deals per Group", value=20, min_value=1, max_value=500)
     
-    min_deals = st.sidebar.number_input("Min Deals per Auction", value=1, min_value=1,
-        help="Only show auctions with at least this many deals")
-    
-    seed = st.sidebar.number_input("Random Seed", value=0, min_value=0,
-        help="Seed for reproducible sampling (0 = random)")
-    
-    # Make the API call
+    # Random seed at bottom of sidebar
+    st.sidebar.divider()
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_group"))
+
     payload = {
-        "auction_pattern": auction_regex,
-        "n_auction_groups": int(n_groups),
-        "n_deals_per_group": int(n_deals),
-        "min_deals": int(min_deals),
-        "seed": int(seed),
+        "auction_regex": auction_regex,
+        "max_groups": int(max_groups),
+        "deals_per_group": int(deals_per_group),
+        "seed": seed,
     }
     
-    with st.spinner("Grouping deals by auction..."):
-        try:
-            data = api_post("/group-by-bid", payload)
-        except Exception as e:
-            st.error(f"API error: {e}")
-            st.stop()
+    with st.spinner("Grouping deals by bid..."):
+        data = api_post("/group-by-bid", payload)
     
+    groups = data.get("groups", [])
     elapsed_ms = data.get("elapsed_ms", 0)
-    total_deals = data.get("total_matching_deals", 0)
-    unique_auctions = data.get("unique_auctions", 0)
-    auction_groups = data.get("auction_groups", [])
+    total_auctions = data.get("total_auctions", 0)
     
-    st.success(f"Found {unique_auctions:,} unique auctions matching pattern ({total_deals:,} total deals) in {elapsed_ms/1000:.1f}s")
+    if not groups:
+        st.warning(f"No auctions matched pattern: `{auction_regex}` ({elapsed_ms/1000:.1f}s)")
+        return
     
-    if not auction_groups:
-        st.info("No auctions match the pattern.")
-    else:
-        # Summary table of auction groups
-        summary_data = []
-        for group in auction_groups:
-            row = {
-                "bid": group.get("auction", ""),  # From deal_df
-                "Auction": group.get("bt_auction", ""),  # From bt_df (standardized)
-                "Deals": group.get("deal_count", 0),
-                "Samples": group.get("sample_count", 0),
-            }
-            # Add average HCP for each direction
-            stats = group.get("stats", {})
-            for d in "NESW":
-                key = f"HCP_{d}_avg"
-                if key in stats:
-                    row[f"HCP_{d}"] = stats[key]
-            
-            # Add Score Delta & IMP stats
-            if "Score_Delta_Match_Avg" in stats:
-                std = stats.get('Score_Delta_Match_StdDev', 0)
-                row["Delta (Match)"] = f"{stats['Score_Delta_Match_Avg']} (+/-{std})"
-                row["Match %"] = round(stats.get("Match_Count", 0) / group.get("sample_count", 1) * 100, 0)
-                if "Score_IMP_Match_Avg" in stats:
-                    row["IMP (Match)"] = stats["Score_IMP_Match_Avg"]
-            
-            if "Score_Delta_NoMatch_Avg" in stats:
-                std = stats.get('Score_Delta_NoMatch_StdDev', 0)
-                row["Delta (No Match)"] = f"{stats['Score_Delta_NoMatch_Avg']} (+/-{std})"
-                if "Score_IMP_NoMatch_Avg" in stats:
-                    row["IMP (No Match)"] = stats["Score_IMP_NoMatch_Avg"]
-            
-            if "Score_MP_Avg" in stats:
-                mp_std = stats.get("Score_MP_StdDev", 0)
-                row["MP Avg"] = f"{stats['Score_MP_Avg']} (+/-{mp_std})"
-            if "Score_MP_Match_Avg" in stats:
-                mp_std = stats.get("Score_MP_Match_StdDev", 0)
-                row["MP (Match)"] = f"{stats['Score_MP_Match_Avg']} (+/-{mp_std})"
-            if "Score_MP_NoMatch_Avg" in stats:
-                mp_std = stats.get("Score_MP_NoMatch_StdDev", 0)
-                row["MP (No Match)"] = f"{stats['Score_MP_NoMatch_Avg']} (+/-{mp_std})"
-            if "Score_MP_Match_Pct_Avg" in stats:
-                row["MP% (Match)"] = f"{stats['Score_MP_Match_Pct_Avg']:.1f}%"
-            if "Score_MP_NoMatch_Pct_Avg" in stats:
-                row["MP% (No Match)"] = f"{stats['Score_MP_NoMatch_Pct_Avg']:.1f}%"
-            if "Score_MP_Pct_Avg" in stats:
-                row["MP% Avg"] = f"{stats['Score_MP_Pct_Avg']:.1f}%"
-            if "Boards_With_Duplicates_All" in stats:
-                row["Dup Boards (All)"] = stats.get("Boards_With_Duplicates_All", 0)
-                row["Max Dups (All)"] = stats.get("Max_Duplicates_All", 0)
-            if "Boards_With_Duplicates_Sample" in stats:
-                row["Dup Boards (Sample)"] = stats.get("Boards_With_Duplicates_Sample", 0)
-                row["Max Dups (Sample)"] = stats.get("Max_Duplicates_Sample", 0)
-            if "Boards_With_MP_Data" in stats:
-                row["Boards w/MP"] = stats.get("Boards_With_MP_Data", 0)
+    st.success(f"Found {total_auctions:,} matching auctions, showing {len(groups)} groups ({elapsed_ms/1000:.1f}s)")
+    
+    for i, group in enumerate(groups):
+        bid_auction = group.get("bid_auction")
+        bt_auction = group.get("bt_auction")
+        deal_count = group.get("deal_count", 0)
+        sample_count = group.get("sample_count", 0)
+        bt_info = group.get("bt_info")
+        stats = group.get("stats", {})
+        deals = group.get("deals", [])
+        
+        label = f"**{bid_auction}**"
+        if bt_auction and bt_auction != bid_auction:
+            label += f" → {bt_auction}"
+        label += f" ({deal_count:,} deals, {sample_count} shown)"
+        
+        with st.expander(label, expanded=(i == 0)):
+            if bt_info:
+                seat_roles = {1: "Opener/Dealer", 2: "LHO", 3: "Partner", 4: "RHO"}
                 
-            summary_data.append(row)
-        
-        st.subheader(f"Auction Summary ({len(auction_groups)} groups)")
-        summary_df = pl.DataFrame(summary_data)
-        render_aggrid(summary_df, key="group_by_bid_summary", height=min(300, 50 + len(summary_data) * 35))
-        
-        # Detailed view for each auction group
-        st.subheader("Auction Details")
-        
-        for i, group in enumerate(auction_groups):
-            bid_auction = group.get("auction", f"Auction {i+1}")  # From deal_df
-            bt_auction = group.get("bt_auction")  # From bt_df (standardized)
-            deal_count = group.get("deal_count", 0)
-            sample_count = group.get("sample_count", 0)
-            bt_info = group.get("bt_info")
-            stats = group.get("stats", {})
-            deals = group.get("deals", [])
-            
-            # Build expander label showing both bid and Auction if different
-            label = f"**{bid_auction}**"
-            if bt_auction and bt_auction != bid_auction:
-                label += f" → {bt_auction}"
-            label += f" ({deal_count:,} deals, {sample_count} shown)"
-            
-            with st.expander(label, expanded=(i == 0)):
-                # Show bidding table info if available
-                if bt_info:
-                    st.caption("**Bidding Table Info:**")
-                    
-                    # Show Agg_Expr for each seat
-                    agg_exprs = []
+                total_criteria = 0
+                for s in range(1, 5):
+                    agg_col = f"Agg_Expr_Seat_{s}"
+                    if agg_col in bt_info and bt_info[agg_col]:
+                        total_criteria += len(bt_info[agg_col])
+                
+                with st.expander(f"📋 Bidding Table Criteria ({total_criteria} total)", expanded=False):
                     for s in range(1, 5):
                         agg_col = f"Agg_Expr_Seat_{s}"
+                        role = seat_roles.get(s, "")
                         if agg_col in bt_info and bt_info[agg_col]:
-                            agg_exprs.append(f"**Seat {s}:** {', '.join(str(x) for x in bt_info[agg_col])}")
+                            criteria_str = ", ".join(str(x) for x in bt_info[agg_col])
+                            st.write(f"**Seat_{s}** ({role}): {criteria_str}")
+                        else:
+                            st.write(f"**Seat_{s}** ({role}): *(no criteria)*")
                     
-                    if agg_exprs:
-                        for expr_str in agg_exprs:
-                            st.markdown(expr_str)
-                    
-                    # Show Expr if available
                     expr = bt_info.get("Expr")
                     if expr:
                         if isinstance(expr, list):
@@ -1607,42 +1408,121 @@ elif func_choice == "Group by Bid":
                         else:
                             expr_str = str(expr)
                         if expr_str:
-                            st.markdown(f"**Expr:** {expr_str}")
-                
-                # Show statistics
-                if stats:
-                    st.caption("**Statistics:**")
-                    stats_cols = st.columns(4)
-                    for idx, d in enumerate("NESW"):
-                        with stats_cols[idx]:
-                            hcp_avg = stats.get(f"HCP_{d}_avg")
-                            hcp_min = stats.get(f"HCP_{d}_min")
-                            hcp_max = stats.get(f"HCP_{d}_max")
-                            tp_avg = stats.get(f"TP_{d}_avg")
-                            
-                            if hcp_avg is not None:
-                                st.metric(f"HCP {d}", f"{hcp_avg:.1f}", f"({hcp_min}-{hcp_max})")
-                            if tp_avg is not None:
-                                st.caption(f"TP: {tp_avg:.1f}")
-                
-                # Show deals
-                if deals:
-                    deals_df = pl.DataFrame(deals)
-                    
-                    # Reorder columns for better display
-                    priority_cols = ["index", "Dealer", "Vul", "bid", "Auctions_Match", "Criteria_Violations",
-                                     "Score_IMP", "Score_Delta", "Score_MP", "Score_MP_Pct",
-                                     "Hand_N", "Hand_E", "Hand_S", "Hand_W",
-                                     "HCP_N", "HCP_E", "HCP_S", "HCP_W",
-                                     "ParScore", "Score", "Result"]
-                    available_priority = [c for c in priority_cols if c in deals_df.columns]
-                    other_cols = [c for c in deals_df.columns if c not in available_priority]
-                    ordered_cols = available_priority + other_cols
+                            st.write(f"**Expr:** {expr_str}")
+            
+            if stats:
+                st.caption("**Statistics:**")
+                stats_cols = st.columns(4)
+                for idx, d in enumerate("NESW"):
+                    with stats_cols[idx]:
+                        hcp_avg = stats.get(f"HCP_{d}_avg")
+                        hcp_min = stats.get(f"HCP_{d}_min")
+                        hcp_max = stats.get(f"HCP_{d}_max")
+                        tp_avg = stats.get(f"TP_{d}_avg")
                         
-                    deals_df = deals_df.select(ordered_cols)
+                        st.write(f"**{d}**")
+                        if hcp_avg is not None:
+                            st.write(f"HCP: {hcp_avg:.1f} ({hcp_min}-{hcp_max})")
+                        if tp_avg is not None:
+                            st.write(f"TP: {tp_avg:.1f}")
+                
+                score_stats = []
+                if "Score_Delta_Avg" in stats:
+                    score_stats.append(f"Δ Score: {stats['Score_Delta_Avg']:.1f} ± {stats.get('Score_Delta_StdDev', 0):.1f}")
+                if "Score_MP_Avg" in stats:
+                    score_stats.append(f"MP: {stats['Score_MP_Avg']:.1f}")
+                if "Score_MP_Pct_Avg" in stats:
+                    score_stats.append(f"MP%: {stats['Score_MP_Pct_Avg']:.1f}%")
+                if score_stats:
+                    st.write(" | ".join(score_stats))
+            
+            if deals:
+                st.write(f"**Sample Deals** ({len(deals)} shown):")
+                deals_df = pl.DataFrame(deals)
+                
+                priority_cols = ["PBN", "Hand_S", "Hand_N", "Vul", "Contract", "Result", "Score", 
+                               "Score_MP", "Score_MP_Pct", "DD_Score_Declarer", "ParScore"]
+                available_priority = [c for c in priority_cols if c in deals_df.columns]
+                other_cols = [c for c in deals_df.columns if c not in priority_cols]
+                ordered_cols = available_priority + other_cols
                     
-                    drop_cols = [c for c in ["Auction", "Board_ID"] if c in deals_df.columns]
-                    if drop_cols:
-                        deals_df = deals_df.drop(drop_cols)
-                    
-                    render_aggrid(deals_df, key=f"group_by_bid_deals_{i}", height=min(400, 50 + len(deals) * 35))
+                deals_df = deals_df.select(ordered_cols)
+                
+                drop_cols = [c for c in ["Auction", "Board_ID"] if c in deals_df.columns]
+                if drop_cols:
+                    deals_df = deals_df.drop(drop_cols)
+                
+                render_aggrid(deals_df, key=f"group_by_bid_deals_{i}", height=min(400, 50 + len(deals) * 35))
+
+
+# ---------------------------------------------------------------------------
+# Main UI – function selector and controls
+# ---------------------------------------------------------------------------
+
+st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
+st.sidebar.header("Settings")
+func_choice = st.sidebar.selectbox(
+    "Function",
+    [
+        "Deals by Auction Pattern",      # Primary: find deals matching auction criteria
+        "Analyze Actual Auctions",       # Group deals by bid column, analyze outcomes
+        "Analyze Deal (PBN/LIN)",        # Input a deal, find matching auctions
+        "Bidding Table Explorer",        # Browse bt_df with statistics
+        "Find Auction Sequences",        # Regex search bt_df
+        "PBN Database Lookup",           # Check if PBN exists in deal_df
+        "Random Auction Samples",        # Random completed auctions
+        "Opening Bids by Deal",          # Browse deals, see opening bid matches
+    ],
+)
+
+# Function descriptions (WIP)
+FUNC_DESCRIPTIONS = {
+    "Deals by Auction Pattern": "Find deals matching an auction pattern's criteria. Compare AI contracts vs actual using DD scores and EV.",
+    "Analyze Actual Auctions": "Group deals by their actual auction (bid column). Analyze criteria compliance, score deltas, and outcomes.",
+    "Analyze Deal (PBN/LIN)": "Input a PBN/LIN deal and find which bidding table auctions match the hand characteristics.",
+    "Bidding Table Explorer": "Browse bidding table entries with aggregate statistics (min/max ranges) for hand criteria per auction.",
+    "Find Auction Sequences": "Search for auction sequences matching a regex pattern. Shows criteria per seat.",
+    "PBN Database Lookup": "Check if a specific PBN deal exists in the database. Returns game results if found.",
+    "Random Auction Samples": "View random completed auction sequences from the bidding table.",
+    "Opening Bids by Deal": "Browse deals by index and see which opening bids match based on pre-computed criteria.",
+}
+
+# Display function description
+st.info(f"**{func_choice}:** {FUNC_DESCRIPTIONS.get(func_choice, 'No description available.')}")
+
+# Auction Regex input - shown for pattern-based functions
+pattern = None
+if func_choice in ["Find Auction Sequences", "Deals by Auction Pattern"]:
+    raw_pattern = st.sidebar.text_input("Auction Regex", value="^1N-p-3N$",
+        help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')")
+    pattern = normalize_auction_pattern(raw_pattern)
+    if pattern != raw_pattern:
+        st.sidebar.caption(f"→ {pattern}")
+    st.sidebar.divider()
+else:
+    st.sidebar.divider()
+
+# ---------------------------------------------------------------------------
+# Dispatch to appropriate render function based on selection
+# ---------------------------------------------------------------------------
+
+match func_choice:
+    case "Deals by Auction Pattern":
+        render_deals_by_auction_pattern(pattern)
+    case "Analyze Actual Auctions":
+        render_analyze_actual_auctions()
+    case "Analyze Deal (PBN/LIN)":
+        render_analyze_deal()
+    case "Bidding Table Explorer":
+        render_bidding_table_explorer()
+    case "Find Auction Sequences":
+        render_find_auction_sequences(pattern)
+    case "PBN Database Lookup":
+        render_pbn_database_lookup()
+    case "Random Auction Samples":
+        render_random_auction_samples()
+    case "Opening Bids by Deal":
+        render_opening_bids_by_deal()
+    case _:
+        st.error(f"Unknown function: {func_choice}")
+

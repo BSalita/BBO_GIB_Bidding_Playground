@@ -16,11 +16,12 @@ import polars as pl
 
 # Optional imports for par score calculation
 try:
-    from endplay.types import Deal, Vul, Player
-    from endplay.dds import calc_dd_table, par
+    from endplay.types import Deal, Vul, Player  # type: ignore[import-untyped]
+    from endplay.dds import calc_dd_table, par  # type: ignore[import-untyped]
     HAS_ENDPLAY = True
 except ImportError:
     HAS_ENDPLAY = False
+    Deal = Vul = Player = calc_dd_table = par = None  # type: ignore[misc, assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +266,53 @@ def get_dd_score_for_auction(auction: str, dealer: str, deal_row: dict) -> int |
     return deal_row.get(col_name)
 
 
+def get_ev_for_auction(auction: str, dealer: str, deal_row: dict) -> float | None:
+    """
+    Get the expected value (EV) for a contract derived from an auction.
+    
+    Args:
+        auction: Auction string like "1N-p-3N-p-p-p"
+        dealer: Dealer direction
+        deal_row: Dictionary containing EV_{pair}_{declarer}_{strain}_{level}_{vul} columns
+                  and 'Vul' column for vulnerability
+        
+    Returns:
+        The EV for the auction's contract, or None if cannot compute.
+    """
+    contract = parse_contract_from_auction(auction)
+    if not contract:
+        return None
+    
+    level, strain, _ = contract
+    declarer = get_declarer_for_auction(auction, dealer)
+    if not declarer:
+        return None
+    
+    # Determine pair from declarer
+    pair = 'NS' if declarer in ['N', 'S'] else 'EW'
+    
+    # Get vulnerability and convert to column format
+    # Vul column values: 'None', 'Both', 'NS', 'EW' (or similar)
+    vul_raw = deal_row.get('Vul', 'None')
+    if vul_raw is None:
+        vul_raw = 'None'
+    vul_raw = str(vul_raw).strip()
+    
+    # Determine if declarer's side is vulnerable
+    if vul_raw in ['Both', 'All', 'b', 'B']:
+        vul = 'V'
+    elif vul_raw == pair or (vul_raw == 'NS' and pair == 'NS') or (vul_raw == 'EW' and pair == 'EW'):
+        vul = 'V'
+    elif vul_raw in ['None', 'O', 'o', '-', '']:
+        vul = 'NV'
+    else:
+        vul = 'NV'  # Default to not vulnerable
+    
+    # Look up the EV column: EV_{pair}_{declarer}_{strain}_{level}_{vul}
+    col_name = f"EV_{pair}_{declarer}_{strain}_{level}_{vul}"
+    return deal_row.get(col_name)
+
+
 # ---------------------------------------------------------------------------
 # Hand Analysis
 # ---------------------------------------------------------------------------
@@ -331,20 +379,20 @@ def compute_par_score(pbn_str: str, dealer: str, vul: str = "None") -> dict:
         return {'Par_Score': None, 'Par_Contract': 'Error: endplay not installed'}
     
     try:
-        deal = Deal(pbn_str)
+        deal = Deal(pbn_str)  # type: ignore[misc]
         
-        dealer_map = {'N': Player.north, 'E': Player.east, 'S': Player.south, 'W': Player.west}
-        dealer_player = dealer_map.get(dealer, Player.north)
+        dealer_map = {'N': Player.north, 'E': Player.east, 'S': Player.south, 'W': Player.west}  # type: ignore[union-attr]
+        dealer_player = dealer_map.get(dealer, Player.north)  # type: ignore[union-attr]
         
         vul_map = {
-            'None': Vul.none, 'Both': Vul.both, 'All': Vul.both,
-            'NS': Vul.ns, 'N-S': Vul.ns,
-            'EW': Vul.ew, 'E-W': Vul.ew
+            'None': Vul.none, 'Both': Vul.both, 'All': Vul.both,  # type: ignore[union-attr]
+            'NS': Vul.ns, 'N-S': Vul.ns,  # type: ignore[union-attr]
+            'EW': Vul.ew, 'E-W': Vul.ew  # type: ignore[union-attr]
         }
-        vul_enum = vul_map.get(vul, Vul.none)
+        vul_enum = vul_map.get(vul, Vul.none)  # type: ignore[union-attr]
         
-        dd_table = calc_dd_table(deal)
-        parlist = par(dd_table, vul_enum, dealer_player)
+        dd_table = calc_dd_table(deal)  # type: ignore[misc]
+        parlist = par(dd_table, vul_enum, dealer_player)  # type: ignore[misc]
         
         par_score = parlist.score
         
