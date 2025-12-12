@@ -804,8 +804,8 @@ elif func_choice == "Auction Sequences Matching":
                 st.json(criteria_rejected)
 
 elif func_choice == "Deals Matching Auction":
-    n_auction_samples = st.sidebar.number_input("Auction Samples", value=2, min_value=1)
-    n_deal_samples = st.sidebar.number_input("Deal Samples per Auction", value=10, min_value=1)
+    n_auction_samples = st.sidebar.number_input("Auction Samples", value=2, min_value=1, max_value=10)
+    n_deal_samples = st.sidebar.number_input("Deal Samples per Auction", value=10, min_value=1, max_value=1000)
 
     # Distribution filter for deals
     st.sidebar.divider()
@@ -972,8 +972,8 @@ elif func_choice == "Deals Matching Auction":
                 
                 st.info(
                     f"{emoji} AI **{won_lost} {abs(total_imp)} IMPs** overall vs actual in **{total_deals}** contracts. "
-                    f"AI made contracts **{ai_makes_pct:.1f}%** vs **{contract_makes_pct:.1f}%**. "
-                    f"AI achieved par **{ai_par_pct:.1f}%** vs **{contract_par_pct:.1f}%**."
+                    f"AI contracts make **{ai_makes_pct:.1f}%** of the time vs **{contract_makes_pct:.1f}%**. "
+                    f"AI contracts achieve par **{ai_par_pct:.1f}%** of the time vs **{contract_par_pct:.1f}%**."
                 )
             
             deals = a.get("deals", [])

@@ -1241,7 +1241,14 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
 
             matching_idx = combined_mask.arg_true()
             if len(matching_idx) > 0:
-                for idx in matching_idx[: req.n_deal_samples]:
+                # Randomly sample from matching indices using the seed
+                if len(matching_idx) > req.n_deal_samples:
+                    import random as random_module_local
+                    rng = random_module_local.Random(effective_seed)
+                    sampled_indices = rng.sample(list(matching_idx), req.n_deal_samples)
+                else:
+                    sampled_indices = list(matching_idx)
+                for idx in sampled_indices:
                     matching_deals.append(deal_df[idx])
         
         # Add debug info - include all seats up to actual_final_seat, even if empty
@@ -1305,6 +1312,11 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                     deal_row["IMP_AI_vs_Actual"] = imp_diff if score_diff >= 0 else -imp_diff
                 else:
                     deal_row["IMP_AI_vs_Actual"] = None
+                
+                # Convert ParContracts list to string for proper JSON serialization
+                par_contracts = deal_row.get("ParContracts")
+                if par_contracts is not None and isinstance(par_contracts, list):
+                    deal_row["ParContracts"] = ", ".join(str(c) for c in par_contracts)
             
             # Create summary by Contract
             deals_with_computed = pl.DataFrame(deals_list)
