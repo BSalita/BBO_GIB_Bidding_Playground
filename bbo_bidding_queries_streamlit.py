@@ -526,6 +526,33 @@ def render_aggrid(records: Any, key: str, height: int | None = None) -> None:
     float_cols = [c for c in df.columns if df[c].dtype in (pl.Float32, pl.Float64)]
     if float_cols:
         df = df.with_columns([pl.col(c).round(2) for c in float_cols])
+    
+    def _stringify_ev_list(x: Any) -> str:
+        # Handle Polars Series / NumPy arrays / Python lists uniformly to avoid "shape: ..." strings.
+        if x is None:
+            return ""
+        if isinstance(x, pl.Series):
+            x = x.to_list()
+        elif hasattr(x, "tolist") and not isinstance(x, (str, bytes)):
+            # numpy.ndarray, etc.
+            try:
+                x = x.tolist()
+            except Exception:
+                pass
+        if isinstance(x, (list, tuple)):
+            return ", ".join("" if v is None else str(v) for v in x)
+        return str(x)
+
+    # AgGrid renders list/array values with commas but no spaces (e.g., "1,2,3").
+    # For EV_ParContracts (a list), display as "1, 2, 3" for readability.
+    if "EV_ParContracts" in df.columns:
+        try:
+            df = df.with_columns(
+                pl.col("EV_ParContracts").map_elements(_stringify_ev_list, return_dtype=pl.Utf8).alias("EV_ParContracts")
+            )
+        except Exception:
+            # Best-effort: leave as-is if conversion fails
+            pass
 
     # Dynamic height based on explicit row/header heights set below.
     # rowHeight=28, headerHeight=32, plus border/scrollbar buffer.
@@ -549,6 +576,14 @@ def render_aggrid(records: Any, key: str, height: int | None = None) -> None:
     # suppressCellFocus prevents cell-level focus (keeps row selection clean)
     gb.configure_grid_options(rowHeight=28, headerHeight=32, suppressCellFocus=True)
     grid_options = gb.build()
+    
+    # Make columns feel tighter (AgGrid defaults can be quite wide)
+    # - Smaller minWidth prevents excess whitespace in narrow columns
+    # - Slightly reduced padding tightens the visual layout
+    default_col_def = grid_options.get("defaultColDef") or {}
+    default_col_def.setdefault("minWidth", 60)
+    default_col_def.setdefault("cellStyle", {"padding": "2px 6px"})
+    grid_options["defaultColDef"] = default_col_def
 
     AgGrid(
         df.to_pandas(),
@@ -675,7 +710,45 @@ def render_opening_bids_by_deal():
             opening_bids_df = d.get("opening_bids_df", [])
             if opening_bids_df:
                 st.write("Opening Bids:")
-                render_aggrid(opening_bids_df, key=f"bids_{d['dealer']}_{d['index']}")
+                # Rank bids best→worst using reverse sort order of Auction (per request)
+                try:
+                    bids_df = pl.DataFrame(opening_bids_df)
+                    if "Auction" in bids_df.columns:
+                        # Sort by Seat ascending, then Auction descending
+                        if "seat" in bids_df.columns:
+                            bids_df = bids_df.sort(["seat", "Auction"], descending=[False, True])
+                        else:
+                            bids_df = bids_df.sort("Auction", descending=True)
+                        bids_df = bids_df.with_row_index("Best_Bid").with_columns(
+                            (pl.col("Best_Bid") + 1).alias("Best_Bid")
+                        )
+                        # Put Best_Bid first for readability
+                        front = [
+                            c
+                            for c in [
+                                "Best_Bid",
+                                "index",
+                                "Auction",
+                                "seat",
+                                "Dealer",
+                                "bid",
+                                "Actual_Contract",
+                                "AI_Contract",
+                                "DD_Score_Declarer",
+                                "EV_Score_Declarer",
+                                "ParScore",
+                                "ParContract",
+                                "EV_ParContracts",
+                                "Expr",
+                            ]
+                            if c in bids_df.columns
+                        ]
+                        rest = [c for c in bids_df.columns if c not in front]
+                        bids_df = bids_df.select(front + rest)
+                    render_aggrid(bids_df, key=f"bids_{d['dealer']}_{d['index']}")
+                except Exception:
+                    # Fallback: render raw payload
+                    render_aggrid(opening_bids_df, key=f"bids_{d['dealer']}_{d['index']}")
             else:
                 st.info("No opening bids found.")
 

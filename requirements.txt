@@ -5,7 +5,7 @@ pandas
 numpy
 scikit-learn
 matplotlib
-endplay
+endplay  # Bridge library (Deal, Vul, Player, dds, parsers)
 
 # Expression evaluation
 asteval
@@ -19,13 +19,13 @@ xlsxwriter
 
 # API server
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 psutil
 
 # Streamlit app
 streamlit
-streamlit-aggrid==1.1.7 # 1.2.1 gave object errors
+streamlit-aggrid==1.1.7  # 1.2.1 gave object errors
 requests
 
 # Web scraping
@@ -36,5 +36,6 @@ duckdb
 sqlalchemy
 sqlalchemy-utils
 
-# Standard library (included with Python, listed for reference)
-# pathlib, multiprocessing, pickle, re, gc, time, sys, datetime, collections, operator
+# Standard library (included with Python, no install needed):
+# pathlib, multiprocessing, pickle, re, gc, time, sys, datetime,
+# collections, operator, threading, importlib, random, typing
