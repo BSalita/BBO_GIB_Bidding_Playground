@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import os
+import random
 import re
 import signal
 import sys
@@ -51,7 +52,7 @@ def _log_memory(label: str) -> None:
 from contextlib import asynccontextmanager
 
 import polars as pl
-import duckdb
+import duckdb  # pyright: ignore[reportMissingImports]
 import requests as http_requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
@@ -71,6 +72,7 @@ from mlBridgeLib.mlBridgeBiddingLib import (
 
 from bbo_bidding_queries_lib import (
     calculate_imp,
+    normalize_auction_pattern,
     parse_contract_from_auction,
     get_declarer_for_auction,
     get_ai_contract,
@@ -86,6 +88,18 @@ from bbo_bidding_queries_lib import (
     add_suit_length_columns,
     evaluate_criterion_for_hand,
 )
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _effective_seed(seed: int | None) -> int | None:
+    """Convert seed=0 to None (non-reproducible) for Polars .sample()."""
+    if seed is None:
+        return None
+    return None if seed == 0 else seed
+
 
 # ---------------------------------------------------------------------------
 # Data directory resolution (supports --data-dir command line arg)
@@ -828,11 +842,10 @@ def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
     t0 = time.perf_counter()
     deal_df, bt_df, _deal_criteria_by_seat_dfs, results = _ensure_ready()
 
-    dirs = ["N", "E", "S", "W"]
-    dir_to_idx = {d: i for i, d in enumerate(dirs)}
+    dir_to_idx = {d: i for i, d in enumerate(DIRECTIONS)}
 
     seats_to_process = req.seats if req.seats is not None else [1, 2, 3, 4]
-    directions_to_process = req.directions if req.directions is not None else dirs
+    directions_to_process = req.directions if req.directions is not None else list(DIRECTIONS)
     opening_dirs_filter = req.opening_directions
 
     # Sample the first N deals (consistent with the notebook usage)
@@ -864,7 +877,7 @@ def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
             if pos < len(orig_indices) and int(orig_indices[pos]) == original_pos:
                 bids = results[key]["candidates"]["candidate_bids"][pos]
                 if bids is not None and len(bids) > 0:
-                    opener_for_seat = dirs[(dealer_idx + seat - 1) % 4]
+                    opener_for_seat = DIRECTIONS[(dealer_idx + seat - 1) % 4]
                     if opening_dirs_filter is None or opener_for_seat in opening_dirs_filter:
                         if opening_seat_num is None:
                             opening_seat_num = seat
@@ -873,7 +886,7 @@ def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
         if not opening_bids:
             continue
 
-        opening_seat = dirs[(dealer_idx + opening_seat_num - 1) % 4] if opening_seat_num else None
+        opening_seat = DIRECTIONS[(dealer_idx + opening_seat_num - 1) % 4] if opening_seat_num else None
         if opening_dirs_filter is not None:
             if opening_seat is None or opening_seat not in opening_dirs_filter:
                 continue
@@ -937,8 +950,7 @@ def random_auction_sequences(req: RandomAuctionSequencesRequest) -> Dict[str, An
         return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(req.n_samples, completed_df.height)
-    # seed=0 means non-reproducible (None), any other value is reproducible
-    effective_seed = None if req.seed == 0 else req.seed
+    effective_seed = _effective_seed(req.seed)
     sampled_df = completed_df.sample(n=sample_n, seed=effective_seed)
 
     agg_expr_cols = [f"Agg_Expr_Seat_{i}" for i in range(1, 5)]
@@ -1022,14 +1034,7 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
     if base_df is None:
         base_df = bt_df  # Fallback if not cached
 
-    pattern = req.pattern
-    three_passes = "-p-p-p"
-    pattern_core = pattern.rstrip("$")
-    if not pattern_core.endswith(three_passes):
-        if pattern.endswith("$"):
-            pattern = pattern[:-1] + three_passes + "$"
-        else:
-            pattern = pattern + three_passes
+    pattern = normalize_auction_pattern(req.pattern)
 
     is_regex = pattern.startswith("^") or pattern.endswith("$")
     if is_regex:
@@ -1051,8 +1056,7 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
         return result
 
     sample_n = min(req.n_samples, filtered_df.height)
-    # seed=0 means non-reproducible (None), any other value is reproducible
-    effective_seed = None if req.seed == 0 else req.seed
+    effective_seed = _effective_seed(req.seed)
     sampled_df = filtered_df.sample(n=sample_n, seed=effective_seed)
 
     agg_expr_cols = [f"Agg_Expr_Seat_{i}" for i in range(1, 5)]
@@ -1135,14 +1139,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
     if base_df is None:
         base_df = bt_df  # Fallback if not cached
 
-    pattern = req.pattern
-    three_passes = "-p-p-p"
-    pattern_core = pattern.rstrip("$")
-    if not pattern_core.endswith(three_passes):
-        if pattern.endswith("$"):
-            pattern = pattern[:-1] + three_passes + "$"
-        else:
-            pattern = pattern + three_passes
+    pattern = normalize_auction_pattern(req.pattern)
 
     is_regex = pattern.startswith("^") or pattern.endswith("$")
     if is_regex:
@@ -1164,11 +1161,9 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
         return result
 
     sample_n = min(req.n_auction_samples, filtered_df.height)
-    # seed=0 means non-reproducible (None), any other value is reproducible
-    effective_seed = None if req.seed == 0 else req.seed
+    effective_seed = _effective_seed(req.seed)
     sampled_auctions = filtered_df.sample(n=sample_n, seed=effective_seed)
 
-    dirs = ["N", "E", "S", "W"]
     deal_display_cols = ["index", "Dealer", "bid", "Contract", "Hand_N", "Hand_E", "Hand_S", "Hand_W", 
                          "Declarer", "Result", "Tricks", "Score", "DD_Score_Declarer", "EV_Score_Declarer",
                          "ParScore", "ParContracts"]
@@ -1197,6 +1192,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                     auction_info["criteria_by_seat"][str(s)] = crit_list
 
         matching_deals: List[pl.DataFrame] = []
+        total_matching_count = 0  # Count ALL matching deals before sampling
         
         # Track criteria matching for debugging (once per seat, not per-dealer)
         # Criteria are the same for all dealers - only which direction plays each seat changes
@@ -1221,7 +1217,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                 criteria_list = auction_row[agg_col]
                 if criteria_list:
                     # Check against first available dealer's criteria df to see what's available
-                    for dealer in dirs:
+                    for dealer in DIRECTIONS:
                         if s in deal_criteria_by_seat_dfs and dealer in deal_criteria_by_seat_dfs[s]:
                             seat_criteria_df = deal_criteria_by_seat_dfs[s][dealer]
                             for criterion in criteria_list:
@@ -1233,7 +1229,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
                                         criteria_missing[seat_key].append(criterion)
                             break  # Only need to check one dealer's df
 
-        for dealer in dirs:
+        for dealer in DIRECTIONS:
             dealer_mask = deal_df["Dealer"] == dealer
             if not dealer_mask.any():
                 continue
@@ -1258,10 +1254,12 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
 
             matching_idx = combined_mask.arg_true()
             if len(matching_idx) > 0:
+                # Track total matching before sampling
+                total_matching_count += len(matching_idx)
+                
                 # Randomly sample from matching indices using the seed
                 if len(matching_idx) > req.n_deal_samples:
-                    import random as random_module_local
-                    rng = random_module_local.Random(effective_seed)
+                    rng = random.Random(effective_seed)
                     sampled_indices = rng.sample(list(matching_idx), req.n_deal_samples)
                 else:
                     sampled_indices = list(matching_idx)
@@ -1275,6 +1273,9 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
             "found": criteria_found,  # Include all seats (even empty) for transparency
             "missing": {k: v for k, v in criteria_missing.items() if v},
         }
+        
+        # Record total matching deals (before sampling)
+        auction_info["total_matching_deals"] = total_matching_count
 
         if matching_deals:
             combined_df = pl.concat(matching_deals[: req.n_deal_samples])
@@ -1494,8 +1495,6 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
 # API: bidding table statistics
 # ---------------------------------------------------------------------------
 
-import random as random_module
-
 
 @app.post("/bidding-table-statistics")
 def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, Any]:
@@ -1678,7 +1677,7 @@ def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[s
             vul_map = {0: 'None', 1: 'NS', 2: 'EW', 3: 'Both'}  # endplay Vul enum values
             try:
                 vul = vul_map.get(int(board.vul), 'None') if board.vul is not None else 'None'
-            except:
+            except Exception:
                 vul = 'None'
             
             deal_idx = len(pbn_deals)
@@ -1711,8 +1710,6 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
     input_source = ""
     
     # Auto-detect input type: URL, local file path, or direct PBN/LIN string
-    import os
-    
     # Check if it's a URL
     if pbn_input.startswith('http://') or pbn_input.startswith('https://'):
         # Convert GitHub blob URLs to raw URLs
@@ -1786,6 +1783,10 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
         if not deal:
             results.append({"error": f"Invalid PBN: {pbn_str[:50]}..."})
             continue
+
+        # Ensure these keys exist for downstream UI and par-score computation.
+        deal.setdefault("pbn", pbn_str)
+        deal.setdefault("Dealer", "N")
         
         # Add features for each hand
         for direction in 'NESW':
@@ -1800,7 +1801,7 @@ def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
             # Use vulnerability from PBN file if available, otherwise use request
             vul = deal_vuls.get(deal_idx, req.vul)
             deal['Vulnerability'] = vul
-            par_info = compute_par_score(pbn_str, deal['Dealer'], vul)
+            par_info = compute_par_score(pbn_str, str(deal.get('Dealer', 'N')), vul)
             deal.update(par_info)
         
         # Try to find matching deal in deal_df by PBN hands
@@ -2098,7 +2099,6 @@ def get_pbn_sample() -> Dict[str, Any]:
 @app.get("/pbn-random")
 def get_pbn_random() -> Dict[str, Any]:
     """Get a random PBN from deal_df (YOLO mode)."""
-    import random
     t0 = time.perf_counter()
     deal_df, _, _, _ = _ensure_ready()
     
@@ -2194,23 +2194,30 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Column 'bid' not found in deal_df")
     
     # Filter by auction pattern
-    pattern = req.auction_pattern
+    pattern = normalize_auction_pattern(req.auction_pattern)
     
-    # Normalize pattern: append -p-p-p if not already present (consistent with other functions)
-    three_passes = "-p-p-p"
-    pattern_core = pattern.rstrip("$")
-    if not pattern_core.endswith(three_passes):
-        if pattern.endswith("$"):
-            pattern = pattern[:-1] + three_passes + "$"
+    # Build a dash-joined auction string for filtering/grouping.
+    # Note: `bid` is usually List[str], but can contain nulls (and we want to be robust to any odd rows).
+    try:
+        bid_dtype = deal_df.schema.get("bid")
+        if bid_dtype == pl.List(pl.Utf8):
+            deal_df_with_str = deal_df.with_columns(pl.col("bid").list.join("-").alias("bid_str"))
+        elif bid_dtype == pl.Utf8:
+            deal_df_with_str = deal_df.with_columns(pl.col("bid").fill_null("").alias("bid_str"))
         else:
-            pattern = pattern + three_passes
-    
+            # Fallback for unexpected schemas
+            bid_str_expr = pl.col("bid").map_elements(
+                lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
+                return_dtype=pl.Utf8,
+            )
+            deal_df_with_str = deal_df.with_columns(bid_str_expr.alias("bid_str"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to build bid_str from 'bid' column: {e}")
+
     try:
         # Case-insensitive regex matching
         regex_pattern = f"(?i){pattern}"
-        filtered_df = deal_df.filter(
-            pl.col("bid").cast(pl.Utf8).str.contains(regex_pattern)
-        )
+        filtered_df = deal_df_with_str.filter(pl.col("bid_str").str.contains(regex_pattern))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid regex pattern: {e}")
     
@@ -2225,15 +2232,19 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
     
     t1 = time.perf_counter()
     
-    # Group by bid and count
-    bid_counts = filtered_df.group_by("bid").agg(pl.len().alias("deal_count")).sort("deal_count", descending=True)
+    # Group by dash-joined auction string and count
+    bid_counts = (
+        filtered_df.group_by("bid_str")
+        .agg(pl.len().alias("deal_count"))
+        .sort("deal_count", descending=True)
+    )
     
     # Filter by minimum deals
     if req.min_deals > 1:
         bid_counts = bid_counts.filter(pl.col("deal_count") >= req.min_deals)
     
     # Sample auction groups
-    effective_seed = None if req.seed == 0 else req.seed
+    effective_seed = _effective_seed(req.seed)
     n_groups = min(req.n_auction_groups, bid_counts.height)
     if n_groups < bid_counts.height:
         sampled_bids = bid_counts.sample(n=n_groups, seed=effective_seed)
@@ -2267,11 +2278,11 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
     auction_groups = []
     
     for row in sampled_bids.iter_rows(named=True):
-        bid_auction = row["bid"]
+        bid_auction = row["bid_str"]
         deal_count = row["deal_count"]
         
         # Get all deals for this auction (before sampling)
-        group_all_deals = filtered_df.filter(pl.col("bid") == bid_auction).select(available_deal_cols)
+        group_all_deals = filtered_df.filter(pl.col("bid_str") == bid_auction).select(available_deal_cols)
         
         # Sample deals within group for display
         n_samples = min(req.n_deals_per_group, group_all_deals.height)
@@ -2420,50 +2431,47 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
                 ).alias("Score_IMP")
             )
 
-        # Calculate matchpoint-style scores when duplicate boards exist
+        # Calculate matchpoint-style scores when duplicate boards exist (vectorized, no Python row loops)
         mp_board_count = 0
-        if (
-            has_board_cols
-            and boards_with_dups_sample > 0
-            and "Score" in group_deals.columns
-            and group_deals.height > 0
-        ):
-            mp_values: List[Optional[float]] = [None] * group_deals.height
-            mp_pct_values: List[Optional[float]] = [None] * group_deals.height
-            board_groups: Dict[Tuple[Any, ...], List[Tuple[int, Optional[float]]]] = {}
-            
-            for idx, deal_row in enumerate(group_deals.iter_rows(named=True)):
-                board_key = tuple(deal_row.get(col) for col in board_cols)
-                if any(val is None for val in board_key):
-                    continue
-                raw_score = deal_row.get("Score")
-                try:
-                    score_val = float(raw_score) if raw_score is not None else None
-                except (TypeError, ValueError):
-                    score_val = None
-                board_groups.setdefault(board_key, []).append((idx, score_val))
-            
-            for rows_list in board_groups.values():
-                n = len(rows_list)
-                if n < 2:
-                    continue
-                mp_board_count += 1
-                scores = [val if val is not None else float("-inf") for (_, val) in rows_list]
-                for i, (row_idx, _) in enumerate(rows_list):
-                    score_i = scores[i]
-                    beats = sum(1 for val in scores if val < score_i)
-                    ties = sum(1 for val in scores if val == score_i) - 1
-                    max_mp = 2 * (n - 1)
-                    mp = beats * 2 + max(0, ties)
-                    pct = mp / max_mp if max_mp > 0 else 0.0
-                    mp_values[row_idx] = mp
-                    mp_pct_values[row_idx] = pct
-            
+        if has_board_cols and "Score" in group_deals.columns and group_deals.height > 0:
+            # Boards with duplicates in this sample
+            board_sizes = group_deals.group_by(board_cols).len()
+            mp_board_count = board_sizes.filter(pl.col("len") > 1).height
+
             if mp_board_count > 0:
-                group_deals = group_deals.with_columns([
-                    pl.Series("Score_MP", mp_values, dtype=pl.Float64),
-                    pl.Series("Score_MP_Pct", mp_pct_values, dtype=pl.Float64),
-                ])
+                df_mp = group_deals.with_row_index("__row").with_columns(
+                    pl.col("Score").cast(pl.Float64, strict=False).alias("__Score_f")
+                )
+
+                # Aggregate counts per (board, score)
+                levels = (
+                    df_mp.group_by(board_cols + ["__Score_f"])
+                    .agg(pl.len().alias("__cnt"))
+                    .with_columns(pl.col("__cnt").sum().over(board_cols).alias("__n"))
+                    .sort(board_cols + ["__Score_f"])
+                    .with_columns(pl.col("__cnt").cum_sum().over(board_cols).alias("__cum"))
+                    .with_columns((pl.col("__cum") - pl.col("__cnt")).alias("__beats"))
+                    .with_columns((pl.col("__cnt") - 1).alias("__ties"))
+                    .with_columns((pl.col("__beats") * 2 + pl.col("__ties")).alias("__mp"))
+                    .with_columns((2 * (pl.col("__n") - 1)).alias("__max_mp"))
+                    .with_columns(
+                        pl.when(pl.col("__n") >= 2)
+                        .then(pl.col("__mp") / pl.col("__max_mp"))
+                        .otherwise(None)
+                        .alias("__pct")
+                    )
+                    .select(board_cols + ["__Score_f", "__mp", "__pct"])
+                )
+
+                df_mp = df_mp.join(levels, on=board_cols + ["__Score_f"], how="left").select(
+                    ["__row", pl.col("__mp").alias("Score_MP"), pl.col("__pct").alias("Score_MP_Pct")]
+                )
+
+                group_deals = (
+                    group_deals.with_row_index("__row")
+                    .join(df_mp, on="__row", how="left")
+                    .drop("__row")
+                )
 
         # Compute statistics for this auction group
         stats = {}

@@ -35,6 +35,8 @@ from typing import Any, Dict
 # Add mlBridgeLib to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mlBridgeLib"))
 
+from bbo_bidding_queries_lib import normalize_auction_pattern
+
 
 API_BASE = "http://127.0.0.1:8000"
 
@@ -483,52 +485,6 @@ def filter_deals_by_distribution_duckdb(
         return df, f"-- Error: {e}\n{sql_query}"
 
 
-def normalize_auction_pattern(pattern: str) -> str:
-    """
-    Normalize auction regex pattern by appending implied trailing passes.
-    
-    Bridge auctions end with 3 consecutive passes after any bid/double/redouble.
-    If the pattern doesn't end with '-p-p-p', append it (handling regex anchors).
-    
-    Examples:
-        '1n-p-3n' → '1n-p-3n-p-p-p'
-        '^1N-p-3N$' → '^1N-p-3N-p-p-p$'
-        '1c-p-p-d' → '1c-p-p-d-p-p-p'
-        'p-p-p-p' → 'p-p-p-p' (pass-out, already complete)
-        '1n-p-3n-p-p-p' → '1n-p-3n-p-p-p' (already complete)
-        '.*-3n' → '.*-3n-p-p-p' (wildcards supported)
-    """
-    import re
-    
-    if not pattern or not pattern.strip():
-        return pattern
-    
-    pattern = pattern.strip()
-    
-    # Check for end anchor and temporarily remove it
-    has_end_anchor = pattern.endswith('$')
-    if has_end_anchor:
-        pattern = pattern[:-1]
-    
-    # Check if already ends with -p-p-p (case insensitive)
-    if re.search(r'-[pP]-[pP]-[pP]$', pattern):
-        return pattern + ('$' if has_end_anchor else '')
-    
-    # Check for pass-out pattern (p-p-p-p)
-    if re.search(r'^[\^]?[pP]-[pP]-[pP]-[pP]$', pattern):
-        return pattern + ('$' if has_end_anchor else '')
-    
-    # Don't append if pattern ends with open-ended wildcards that could match passes
-    # e.g., '.*', '.+', '[^-]*' at the end
-    if re.search(r'(\.\*|\.\+|\[[^\]]*\]\*|\[[^\]]*\]\+)$', pattern):
-        return pattern + ('$' if has_end_anchor else '')
-    
-    # Append the trailing passes
-    pattern = pattern + '-p-p-p'
-    
-    return pattern + ('$' if has_end_anchor else '')
-
-
 def api_get(path: str) -> Dict[str, Any]:
     resp = requests.get(f"{API_BASE}{path}")
     resp.raise_for_status()
@@ -537,7 +493,15 @@ def api_get(path: str) -> Dict[str, Any]:
 
 def api_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = requests.post(f"{API_BASE}{path}", json=payload)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        # Surface FastAPI error details in the UI
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise requests.HTTPError(f"{e}\nServer detail: {detail}", response=resp) from e
     return resp.json()
 
 
@@ -608,7 +572,7 @@ def app_info() -> None:
 
 st.set_page_config(layout="wide")
 st.title("BBO GIB Bidding Playground (Proof of Concept)")
-st.caption(app_info())
+app_info()
 
 # ---------------------------------------------------------------------------
 # server initialization / maintenance gate
@@ -870,6 +834,10 @@ def render_deals_by_auction_pattern(pattern: str | None):
         for i, a in enumerate(auctions, start=1):
             st.subheader(f"Auction {i}: {a['auction']}")
             
+            # Show sample count vs total matching deals
+            total_matching = a.get("total_matching_deals", 0)
+            st.caption(f"Showing {n_deal_samples} of {total_matching:,} matching deals")
+            
             # Show criteria debug info (Applied + Missing = all criteria for auction)
             criteria_debug = a.get("criteria_debug", {})
             row_seat = criteria_debug.get("row_seat", "?")
@@ -927,7 +895,7 @@ def render_deals_by_auction_pattern(pattern: str | None):
                 contract_par_pct = (contract_par / total_deals * 100) if total_deals > 0 else 0
                 
                 # Build comparison table
-                st.write(f"**Overalls: AI vs Actual Comparison** ({total_deals} deals)")
+                st.write("**Overalls: AI vs Actual Comparison**")
                 
                 stats_rows = []
                 
@@ -1219,38 +1187,66 @@ def render_analyze_deal():
     
     for deal_idx, deal in enumerate(deals):
         pbn = deal.get("pbn")
-        par_score = deal.get("par_score")
-        par_contracts = deal.get("par_contracts", [])
-        hands = deal.get("hands", {})
-        hand_stats = deal.get("hand_stats", {})
+        par_score = deal.get("Par_Score")
+        par_contracts = deal.get("Par_Contract", "")
+        
+        # Extract hands from flat keys (Hand_N, Hand_E, etc.)
+        hands = {d: deal.get(f"Hand_{d}", "") for d in "NESW"}
         
         with st.expander(f"**Deal {deal_idx + 1}**: {pbn[:50]}..." if len(pbn) > 50 else f"**Deal {deal_idx + 1}**: {pbn}", expanded=(deal_idx == 0)):
             if par_score is not None:
-                par_contracts_str = ", ".join(par_contracts) if par_contracts else "N/A"
-                st.info(f"🎯 **Par Score**: {par_score} ({par_contracts_str}) | Vul: {vul_option}")
+                st.info(f"🎯 **Par Score**: {par_score} ({par_contracts}) | Vul: {vul_option}")
             
             st.write("**Hands:**")
             hands_row = {f"Hand_{d}": hands.get(d, "") for d in "NESW"}
             render_aggrid(pl.DataFrame([hands_row]), key=f"hands_deal_{deal_idx}", height=80)
             
-            if hand_stats:
+            # Extract hand stats from flat keys (HCP_N, SL_S_N, etc.)
+            stats_rows = []
+            for d in "NESW":
+                hcp = deal.get(f"HCP_{d}")
+                if hcp is not None:
+                    row = {
+                        "Dir": d,
+                        "HCP": hcp,
+                        "SL_S": deal.get(f"SL_S_{d}", 0),
+                        "SL_H": deal.get(f"SL_H_{d}", 0),
+                        "SL_D": deal.get(f"SL_D_{d}", 0),
+                        "SL_C": deal.get(f"SL_C_{d}", 0),
+                        "Total_Points": deal.get(f"Total_Points_{d}", hcp),
+                    }
+                    stats_rows.append(row)
+            if stats_rows:
                 st.write("**Hand Statistics:**")
-                stats_rows = []
-                for d in "NESW":
-                    if d in hand_stats:
-                        row = {"Dir": d}
-                        row.update(hand_stats[d])
-                        stats_rows.append(row)
-                if stats_rows:
-                    render_aggrid(pl.DataFrame(stats_rows), key=f"stats_deal_{deal_idx}", height=150)
+                render_aggrid(pl.DataFrame(stats_rows), key=f"stats_deal_{deal_idx}", height=150)
             
             with st.spinner(f"Finding matching auctions for deal {deal_idx + 1}..."):
+                # Map seat (1-4) to direction based on dealer
+                # Seat 1 = Dealer, Seat 2 = LHO, Seat 3 = Partner, Seat 4 = RHO
+                dealer = deal.get("Dealer", "N")
+                direction_order = ["N", "E", "S", "W"]
+                dealer_idx = direction_order.index(dealer) if dealer in direction_order else 0
+                seat_direction = direction_order[(dealer_idx + match_seat - 1) % 4]
+                
+                # Extract hand statistics for the selected seat's direction
+                hcp = deal.get(f"HCP_{seat_direction}", 0)
+                sl_s = deal.get(f"SL_S_{seat_direction}", 0)
+                sl_h = deal.get(f"SL_H_{seat_direction}", 0)
+                sl_d = deal.get(f"SL_D_{seat_direction}", 0)
+                sl_c = deal.get(f"SL_C_{seat_direction}", 0)
+                total_points = deal.get(f"Total_Points_{seat_direction}", hcp)
+                
                 match_payload = {
-                    "pbn": pbn,
+                    "hcp": int(hcp) if hcp else 0,
+                    "sl_s": int(sl_s) if sl_s else 0,
+                    "sl_h": int(sl_h) if sl_h else 0,
+                    "sl_d": int(sl_d) if sl_d else 0,
+                    "sl_c": int(sl_c) if sl_c else 0,
+                    "total_points": int(total_points) if total_points else 0,
                     "seat": match_seat,
                     "max_results": int(max_auctions),
                 }
-                match_data = api_post("/match-auctions", match_payload)
+                match_data = api_post("/find-matching-auctions", match_payload)
             
             matches = match_data.get("matches", [])
             elapsed_ms = match_data.get("elapsed_ms", 0)
@@ -1279,7 +1275,7 @@ def render_pbn_database_lookup():
         try:
             data = api_get("/pbn-sample")
             return data.get("pbn", "")
-        except:
+        except Exception:
             return ""
     
     sample_pbn = get_sample_pbn()
@@ -1300,14 +1296,17 @@ def render_pbn_database_lookup():
         payload = {"pbn": pbn_input.strip()}
         data = api_post("/pbn-lookup", payload)
     
-    found = data.get("found", False)
-    elapsed = data.get("elapsed_ms", 0)
-    total = data.get("total_rows", 0)
+    # Canonical API schema: {matches, count, total_in_df, pbn_searched, elapsed_ms}
+    elapsed = data["elapsed_ms"]
+    total = data["total_in_df"]
+    matches = data["matches"]
+    count = data["count"]
     
-    if found:
+    if count > 0:
         st.success(f"✅ PBN found in database! ({elapsed/1000:.1f}s, searched {total:,} rows)")
         
-        deal_info = data.get("deal_info", {})
+        # Use first returned match as the primary deal info
+        deal_info = matches[0] if matches and isinstance(matches[0], dict) else {}
         if deal_info:
             st.write("**Deal Information:**")
             
@@ -1319,6 +1318,11 @@ def render_pbn_database_lookup():
             with st.expander("Full Deal Data", expanded=False):
                 all_info_df = pl.DataFrame([deal_info])
                 render_aggrid(all_info_df, key="pbn_lookup_full", height=200)
+
+        # If multiple matches exist, show a small sample list for clarity
+        if count > 1:
+            with st.expander(f"All matches ({count:,})", expanded=False):
+                render_aggrid(pl.DataFrame(matches), key="pbn_lookup_matches", height=250)
     else:
         st.warning(f"❌ PBN not found in database ({elapsed/1000:.1f}s, searched {total:,} rows)")
         st.write("**Searched PBN:**")
@@ -1341,34 +1345,38 @@ def render_analyze_actual_auctions():
         st.sidebar.caption(f"→ {auction_regex}")
     
     max_groups = st.sidebar.number_input("Max Auction Groups", value=10, min_value=1, max_value=100)
-    deals_per_group = st.sidebar.number_input("Deals per Group", value=20, min_value=1, max_value=500)
+    deals_per_group = st.sidebar.number_input("Deals per Group", value=100, min_value=1, max_value=1000)
     
     # Random seed at bottom of sidebar
     st.sidebar.divider()
     seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_group"))
 
     payload = {
-        "auction_regex": auction_regex,
-        "max_groups": int(max_groups),
-        "deals_per_group": int(deals_per_group),
+        "auction_pattern": auction_regex,
+        "n_auction_groups": int(max_groups),
+        "n_deals_per_group": int(deals_per_group),
         "seed": seed,
     }
     
     with st.spinner("Grouping deals by bid..."):
         data = api_post("/group-by-bid", payload)
     
-    groups = data.get("groups", [])
-    elapsed_ms = data.get("elapsed_ms", 0)
-    total_auctions = data.get("total_auctions", 0)
+    # Canonical API schema: {pattern, auction_groups, total_matching_deals, unique_auctions, elapsed_ms}
+    groups = data["auction_groups"]
+    elapsed_ms = data["elapsed_ms"]
+    total_auctions = data["unique_auctions"]
+    total_matching_deals = data["total_matching_deals"]
+    effective_pattern = data["pattern"]
     
     if not groups:
-        st.warning(f"No auctions matched pattern: `{auction_regex}` ({elapsed_ms/1000:.1f}s)")
+        st.warning(f"No auctions matched pattern: `{effective_pattern}` ({elapsed_ms/1000:.1f}s)")
         return
     
-    st.success(f"Found {total_auctions:,} matching auctions, showing {len(groups)} groups ({elapsed_ms/1000:.1f}s)")
+    deals_msg = f", {total_matching_deals:,} deals" if isinstance(total_matching_deals, int) and total_matching_deals >= 0 else ""
+    st.success(f"Found {total_auctions:,} matching auctions{deals_msg}, showing {len(groups)} groups ({elapsed_ms/1000:.1f}s)")
     
     for i, group in enumerate(groups):
-        bid_auction = group.get("bid_auction")
+        bid_auction = group.get("auction")
         bt_auction = group.get("bt_auction")
         deal_count = group.get("deal_count", 0)
         sample_count = group.get("sample_count", 0)
@@ -1411,30 +1419,86 @@ def render_analyze_actual_auctions():
                             st.write(f"**Expr:** {expr_str}")
             
             if stats:
-                st.caption("**Statistics:**")
-                stats_cols = st.columns(4)
-                for idx, d in enumerate("NESW"):
-                    with stats_cols[idx]:
-                        hcp_avg = stats.get(f"HCP_{d}_avg")
-                        hcp_min = stats.get(f"HCP_{d}_min")
-                        hcp_max = stats.get(f"HCP_{d}_max")
-                        tp_avg = stats.get(f"TP_{d}_avg")
-                        
-                        st.write(f"**{d}**")
-                        if hcp_avg is not None:
-                            st.write(f"HCP: {hcp_avg:.1f} ({hcp_min}-{hcp_max})")
-                        if tp_avg is not None:
-                            st.write(f"TP: {tp_avg:.1f}")
-                
-                score_stats = []
-                if "Score_Delta_Avg" in stats:
-                    score_stats.append(f"Δ Score: {stats['Score_Delta_Avg']:.1f} ± {stats.get('Score_Delta_StdDev', 0):.1f}")
-                if "Score_MP_Avg" in stats:
-                    score_stats.append(f"MP: {stats['Score_MP_Avg']:.1f}")
-                if "Score_MP_Pct_Avg" in stats:
-                    score_stats.append(f"MP%: {stats['Score_MP_Pct_Avg']:.1f}%")
-                if score_stats:
-                    st.write(" | ".join(score_stats))
+                st.markdown("**Statistics**")
+
+                # Direction summary table (easy to scan across N/E/S/W)
+                dir_rows: list[dict[str, Any]] = []
+                for d in "NESW":
+                    hcp_avg = stats.get(f"HCP_{d}_avg")
+                    hcp_min = stats.get(f"HCP_{d}_min")
+                    hcp_max = stats.get(f"HCP_{d}_max")
+                    total_points_avg = stats.get(f"TP_{d}_avg")
+
+                    if all(v is None for v in [hcp_avg, hcp_min, hcp_max, total_points_avg]):
+                        continue
+
+                    hcp_range = None
+                    if hcp_min is not None and hcp_max is not None:
+                        hcp_range = f"{hcp_min}-{hcp_max}"
+
+                    dir_rows.append(
+                        {
+                            "Dir": d,
+                            "HCP_avg": hcp_avg,
+                            "HCP_range": hcp_range,
+                            "Total_Points_avg": total_points_avg,
+                        }
+                    )
+
+                if dir_rows:
+                    dir_df = pl.DataFrame(dir_rows)
+                    # Stable ordering + nicer formatting
+                    if "Dir" in dir_df.columns:
+                        dir_df = dir_df.with_columns(
+                            pl.col("Dir").cast(pl.Utf8)
+                        )
+                    if "HCP_avg" in dir_df.columns:
+                        dir_df = dir_df.with_columns(pl.col("HCP_avg").cast(pl.Float64).round(1))
+                    if "Total_Points_avg" in dir_df.columns:
+                        dir_df = dir_df.with_columns(pl.col("Total_Points_avg").cast(pl.Float64).round(1))
+                    render_aggrid(dir_df, key=f"group_by_bid_stats_{i}", height=160)
+
+                # Score summary (separate row, avoids mixing with per-direction stats)
+                score_delta_avg = stats.get("Score_Delta_Avg")
+                score_delta_std = stats.get("Score_Delta_StdDev")
+                score_mp_avg = stats.get("Score_MP_Avg")
+                score_mp_pct_avg = stats.get("Score_MP_Pct_Avg")
+
+                score_rows: list[dict[str, Any]] = []
+                if score_delta_avg is not None:
+                    # Server definition: Score_Delta = Score - ParScore
+                    avg = float(score_delta_avg)
+                    sd = float(score_delta_std) if score_delta_std is not None else None
+                    score_rows.append(
+                        {
+                            "Metric": "Score − ParScore (avg ± sd)",
+                            "Avg": avg,
+                            "StdDev": sd,
+                            "Notes": "Computed per deal as Score - ParScore (positive = above par; negative = below par).",
+                        }
+                    )
+                if score_mp_avg is not None:
+                    score_rows.append(
+                        {
+                            "Metric": "MP (avg)",
+                            "Avg": float(score_mp_avg),
+                            "StdDev": None,
+                            "Notes": None,
+                        }
+                    )
+                if score_mp_pct_avg is not None:
+                    score_rows.append(
+                        {
+                            "Metric": "MP% (avg)",
+                            "Avg": float(score_mp_pct_avg),
+                            "StdDev": None,
+                            "Notes": None,
+                        }
+                    )
+
+                if score_rows:
+                    score_df = pl.DataFrame(score_rows)
+                    render_aggrid(score_df, key=f"group_by_bid_score_stats_{i}", height=140)
             
             if deals:
                 st.write(f"**Sample Deals** ({len(deals)} shown):")

@@ -70,6 +70,49 @@ def calculate_imp(score_diff: int) -> int:
 # Auction/Contract Parsing
 # ---------------------------------------------------------------------------
 
+def normalize_auction_pattern(pattern: str) -> str:
+    """
+    Normalize an auction regex pattern by appending implied trailing passes.
+
+    Bridge auctions end with 3 consecutive passes after any bid/double/redouble.
+    If the pattern doesn't end with '-p-p-p', append it (handling regex anchors).
+
+    Examples:
+        '1n-p-3n' → '1n-p-3n-p-p-p'
+        '^1N-p-3N$' → '^1N-p-3N-p-p-p$'
+        '1c-p-p-d' → '1c-p-p-d-p-p-p'
+        'p-p-p-p' → 'p-p-p-p' (pass-out, already complete)
+        '1n-p-3n-p-p-p' → '1n-p-3n-p-p-p' (already complete)
+        '.*-3n' → '.*-3n-p-p-p' (wildcards supported)
+    """
+    if not pattern or not pattern.strip():
+        return pattern
+
+    pattern = pattern.strip()
+
+    # Check for end anchor and temporarily remove it
+    has_end_anchor = pattern.endswith("$")
+    if has_end_anchor:
+        pattern = pattern[:-1]
+
+    # Already ends with -p-p-p (case-insensitive)
+    if re.search(r"-[pP]-[pP]-[pP]$", pattern):
+        return pattern + ("$" if has_end_anchor else "")
+
+    # Pass-out pattern (p-p-p-p)
+    if re.search(r"^[\^]?[pP]-[pP]-[pP]-[pP]$", pattern):
+        return pattern + ("$" if has_end_anchor else "")
+
+    # Don't append if pattern ends with open-ended wildcards that could match passes
+    # e.g., '.*', '.+', '[^-]*' at the end
+    if re.search(r"(\.\*|\.\+|\[[^\]]*\]\*|\[[^\]]*\]\+)$", pattern):
+        return pattern + ("$" if has_end_anchor else "")
+
+    # Append trailing passes
+    pattern = pattern + "-p-p-p"
+    return pattern + ("$" if has_end_anchor else "")
+
+
 def parse_contract_from_auction(auction: str) -> tuple[int, str, int] | None:
     """
     Parse the final contract from an auction string.
@@ -429,7 +472,10 @@ def parse_pbn_deal(pbn_str: str) -> dict | None:
         pbn_str: PBN format like "N:AKQ2.J98.T75.643 ..."
         
     Returns:
-        Dictionary with Hand_N, Hand_E, Hand_S, Hand_W keys, or None if parsing fails
+        Dictionary with Hand_N, Hand_E, Hand_S, Hand_W keys, plus:
+        - Dealer: inferred from the leading "<Dir>:" prefix if present, else "N"
+        - pbn: original input string
+        or None if parsing fails
     """
     try:
         if not pbn_str:
@@ -450,7 +496,8 @@ def parse_pbn_deal(pbn_str: str) -> dict | None:
         dirs = ['N', 'E', 'S', 'W']
         start_idx = dirs.index(start_dir.upper()) if start_dir.upper() in dirs else 0
         
-        result = {}
+        dealer = start_dir.upper() if start_dir.upper() in dirs else "N"
+        result: dict[str, str] = {"Dealer": dealer, "pbn": pbn_str}
         for i, hand in enumerate(hands):
             dir_idx = (start_idx + i) % 4
             result[f'Hand_{dirs[dir_idx]}'] = hand
