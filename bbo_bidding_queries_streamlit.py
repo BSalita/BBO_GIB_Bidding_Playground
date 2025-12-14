@@ -691,6 +691,7 @@ def render_opening_bids_by_deal():
         "seats": seats,
         "directions": directions,
         "opening_directions": opening_directions,
+        "seed": seed,
     }
 
     with st.spinner("Fetching Openings by Deal Index from server. Takes about 20 seconds."):

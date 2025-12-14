@@ -71,21 +71,6 @@ from mlBridgeLib.mlBridgeBiddingLib import (
 )
 
 from bbo_bidding_queries_lib import (
-    calculate_imp,
-    normalize_auction_pattern,
-    parse_contract_from_auction,
-    get_declarer_for_auction,
-    get_ai_contract,
-    get_dd_score_for_auction,
-    get_ev_for_auction,
-    compute_hand_features,
-    compute_par_score,
-    parse_pbn_deal,
-    parse_distribution_pattern,
-    parse_sorted_shape,
-    build_distribution_sql_for_bt,
-    build_distribution_sql_for_deals,
-    add_suit_length_columns,
     evaluate_criterion_for_hand,
 )
 
@@ -94,46 +79,97 @@ from bbo_bidding_queries_lib import (
 # ---------------------------------------------------------------------------
 
 import importlib
-import api_handlers
+import sys
 
-# Track mtime of api_handlers.py for hot-reload
-_HANDLERS_PATH = pathlib.Path(__file__).parent / "api_handlers.py"
-_handlers_mtime: float = 0.0
-_handlers_last_reload_epoch_s: float | None = None
-_handlers_lock = threading.Lock()
+# Track mtime of plugins directory for hot-reload
+_PLUGINS_DIR = pathlib.Path(__file__).parent / "plugins"
+_plugins_mtime: float = 0.0
+_plugins_last_reload_epoch_s: float | None = None
+_plugins_lock = threading.Lock()
 
+# Global registry of loaded plugins
+PLUGINS: Dict[str, Any] = {}
 
-def _maybe_reload_handlers() -> dict[str, object]:
-    """Reload api_handlers module if its file has been modified.
+def _reload_plugins() -> dict[str, object]:
+    """Reload all modules in the plugins directory if any have been modified.
     
-    This allows editing handler code without restarting the server or
-    reloading the expensive data. Call this at the start of any endpoint
-    that should pick up handler code changes.
+    This allows editing handler code without restarting the server.
     """
-    global _handlers_mtime, _handlers_last_reload_epoch_s
+    global _plugins_mtime, _plugins_last_reload_epoch_s
     
-    try:
-        current_mtime = _HANDLERS_PATH.stat().st_mtime
-    except FileNotFoundError:
+    # Check if plugins directory exists
+    if not _PLUGINS_DIR.exists():
         return {"reloaded": False, "mtime": None, "reloaded_at": None}
     
-    with _handlers_lock:
-        if current_mtime > _handlers_mtime:
-            _handlers_last_reload_epoch_s = time.time()
-            print(f"[hot-reload] Reloading api_handlers (mtime {current_mtime})")
-            importlib.reload(api_handlers)
-            _handlers_mtime = current_mtime
+    # Check mtime of the plugins directory itself and all .py files inside
+    # (max mtime of any file or the dir)
+    try:
+        current_mtime = _PLUGINS_DIR.stat().st_mtime
+        for p in _PLUGINS_DIR.glob("*.py"):
+            t = p.stat().st_mtime
+            if t > current_mtime:
+                current_mtime = t
+    except FileNotFoundError:
+        # A file might have been deleted during iteration
+        return {"reloaded": False, "mtime": None, "reloaded_at": None}
+    
+    with _plugins_lock:
+        if current_mtime > _plugins_mtime:
+            _plugins_last_reload_epoch_s = time.time()
+            print(f"[hot-reload] Reloading plugins (mtime {current_mtime})")
+            
+            # Ensure plugins dir is in path or package importable
+            # Since 'plugins' is a package (has __init__.py), we can import 'plugins.module_name'
+            
+            # Reload all .py files in plugins/
+            for p in _PLUGINS_DIR.glob("*.py"):
+                if p.name == "__init__.py":
+                    continue
+                
+                module_name = p.stem
+                full_module_name = f"plugins.{module_name}"
+                
+                try:
+                    if full_module_name in sys.modules:
+                        print(f"  - Reloading {full_module_name}")
+                        module = importlib.reload(sys.modules[full_module_name])
+                    else:
+                        print(f"  - Importing {full_module_name}")
+                        module = importlib.import_module(full_module_name)
+                    
+                    PLUGINS[module_name] = module
+                except Exception as e:
+                    print(f"  ! Error loading {full_module_name}: {e}")
+            
+            _plugins_mtime = current_mtime
             return {
                 "reloaded": True,
                 "mtime": current_mtime,
-                "reloaded_at": _handlers_last_reload_epoch_s,
+                "reloaded_at": _plugins_last_reload_epoch_s,
             }
 
     return {
         "reloaded": False,
-        "mtime": _handlers_mtime if _handlers_mtime else None,
-        "reloaded_at": _handlers_last_reload_epoch_s,
+        "mtime": _plugins_mtime if _plugins_mtime else None,
+        "reloaded_at": _plugins_last_reload_epoch_s,
     }
+
+# Initialize plugins on startup
+_reload_plugins()
+
+# Alias for backward compatibility with existing handler calls
+# This assumes bbo_bidding_queries_api_handlers is present in plugins/
+if "bbo_bidding_queries_api_handlers" in PLUGINS:
+    bbo_bidding_queries_api_handlers = PLUGINS["bbo_bidding_queries_api_handlers"]
+else:
+    print("WARNING: bbo_bidding_queries_api_handlers plugin not found!")
+    # Define a dummy object to prevent startup crash if file missing, 
+    # though it will crash on access
+    class DummyHandler:
+        def __getattr__(self, name):
+            raise ImportError("bbo_bidding_queries_api_handlers plugin not loaded")
+    bbo_bidding_queries_api_handlers = DummyHandler()
+
 
 
 def _attach_hot_reload_info(resp: Dict[str, Any], reload_info: dict[str, object]) -> Dict[str, Any]:
@@ -473,6 +509,7 @@ class OpeningsByDealIndexRequest(BaseModel):
     seats: Optional[List[int]] = None
     directions: Optional[List[str]] = None
     opening_directions: Optional[List[str]] = None
+    seed: Optional[int] = 0
 
 
 class RandomAuctionSequencesRequest(BaseModel):
@@ -697,6 +734,11 @@ def _heavy_init() -> None:
         _update_loading_status(5, "Loading bt_df (bbo_bt_augmented.parquet)...")
         bt_df = load_bt_df(bbo_bidding_table_augmented_file, include_expr_and_sequences=True)
         _log_memory("after load_bt_df")
+        
+        # NOTE: We do NOT filter bt_df to seat 1 only here because bt_criteria and bt_aggregates
+        # were generated with row-positional alignment to the full bt_df.filter(is_completed_auction).
+        # Filtering here would break index alignment with those files.
+        # Seat normalization is applied at query time in the handlers instead.
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
         _update_loading_status(6, "Processing opening bids (may take several minutes)...", "bt_df", bt_df.height)
@@ -762,6 +804,14 @@ def _heavy_init() -> None:
         _update_loading_status(10, "Pre-warming endpoints...")
         try:
             print("[init] Pre-warming openings-by-deal-index endpoint ...")
+            # For pre-warming, we can use the plugin accessor logic or import statically if preferred.
+            # But since endpoints use the plugin logic, we should probably stick to calling the endpoint functions
+            # or rely on the `api_handlers` alias created at startup if valid.
+            
+            # The endpoints access PLUGINS global. 
+            # We must ensure _reload_plugins() has run successfully before pre-warming.
+            # It runs at module level, so PLUGINS should be populated.
+            
             _ = openings_by_deal_index(OpeningsByDealIndexRequest(sample_size=1))
 
             print("[init] Pre-warming random-auction-sequences endpoint ...")
@@ -902,19 +952,25 @@ def _ensure_ready() -> Tuple[pl.DataFrame, pl.DataFrame, Dict[int, Dict[str, pl.
 @app.post("/openings-by-deal-index")
 def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
     """Opening bids by deal index - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()  # Validate state is ready
     
     with _STATE_LOCK:
         state = dict(STATE)  # Shallow copy for handler
     
     try:
-        resp = api_handlers.handle_openings_by_deal_index(
+        # Access plugin dynamically to get fresh version
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+            
+        resp = handler_module.handle_openings_by_deal_index(
             state=state,
             sample_size=req.sample_size,
             seats=req.seats,
             directions=req.directions,
             opening_directions=req.opening_directions,
+            seed=req.seed,
             load_auction_criteria_fn=_load_auction_criteria,
             filter_auctions_by_hand_criteria_fn=_filter_auctions_by_hand_criteria,
         )
@@ -931,14 +987,19 @@ def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
 @app.post("/random-auction-sequences")
 def random_auction_sequences(req: RandomAuctionSequencesRequest) -> Dict[str, Any]:
     """Random auction sequences - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
 
     with _STATE_LOCK:
         state = dict(STATE)
     
     try:
-        resp = api_handlers.handle_random_auction_sequences(
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_random_auction_sequences(
             state=state,
             n_samples=req.n_samples,
             seed=req.seed,
@@ -956,7 +1017,7 @@ def random_auction_sequences(req: RandomAuctionSequencesRequest) -> Dict[str, An
 @app.post("/auction-sequences-matching")
 def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str, Any]:
     """Auction sequences matching pattern - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
 
     with _STATE_LOCK:
@@ -966,7 +1027,12 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
         raise HTTPException(status_code=500, detail="Column 'previous_bid_indices' not found in bt_df")
     
     try:
-        resp = api_handlers.handle_auction_sequences_matching(
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_auction_sequences_matching(
             state=state,
             pattern=req.pattern,
             n_samples=req.n_samples,
@@ -986,12 +1052,17 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
 @app.post("/deals-matching-auction")
 def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
     """Deals matching auction pattern - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
     try:
-        resp = api_handlers.handle_deals_matching_auction(
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_deals_matching_auction(
             state=state,
             pattern=req.pattern,
             n_auction_samples=req.n_auction_samples,
@@ -1015,12 +1086,17 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
 @app.post("/bidding-table-statistics")
 def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, Any]:
     """Bidding table statistics - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
     try:
-        resp = api_handlers.handle_bidding_table_statistics(
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_bidding_table_statistics(
             state=state,
             auction_pattern=req.auction_pattern,
             sample_size=req.sample_size,
@@ -1092,12 +1168,17 @@ def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[s
 @app.post("/process-pbn")
 def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
     """Process PBN or LIN deal(s) - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
     try:
-        resp = api_handlers.handle_process_pbn(
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_process_pbn(
             state=state,
             pbn_input=req.pbn,
             include_par=req.include_par,
@@ -1185,7 +1266,7 @@ def _filter_auctions_by_hand_criteria(
 @app.post("/find-matching-auctions")
 def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
     """Find matching auctions - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
@@ -1194,7 +1275,12 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="bt_criteria not loaded. Run bt_criteria_extractor.py first.")
     
     try:
-        resp = api_handlers.handle_find_matching_auctions(
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_find_matching_auctions(
             state=state,
             hcp=req.hcp, sl_s=req.sl_s, sl_h=req.sl_h, sl_d=req.sl_d, sl_c=req.sl_c,
             total_points=req.total_points, seat=req.seat, max_results=req.max_results,
@@ -1215,12 +1301,17 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
 @app.get("/pbn-sample")
 def get_pbn_sample() -> Dict[str, Any]:
     """Get a sample PBN from the first row of deal_df for testing."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
     try:
-        resp = api_handlers.handle_pbn_sample(state)
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_pbn_sample(state)
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1231,12 +1322,17 @@ def get_pbn_sample() -> Dict[str, Any]:
 @app.get("/pbn-random")
 def get_pbn_random() -> Dict[str, Any]:
     """Get a random PBN from deal_df (YOLO mode)."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
     try:
-        resp = api_handlers.handle_pbn_random(state)
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_pbn_random(state)
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1247,12 +1343,17 @@ def get_pbn_random() -> Dict[str, Any]:
 @app.post("/pbn-lookup")
 def pbn_lookup(req: PBNLookupRequest) -> Dict[str, Any]:
     """Look up a PBN deal in bbo_mldf_augmented.parquet and return matching rows."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
     try:
-        resp = api_handlers.handle_pbn_lookup(state, req.pbn, req.max_results)
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_pbn_lookup(state, req.pbn, req.max_results)
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1269,7 +1370,7 @@ def pbn_lookup(req: PBNLookupRequest) -> Dict[str, Any]:
 @app.post("/group-by-bid")
 def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
     """Group deals by bid - delegated to hot-reloadable handler."""
-    reload_info = _maybe_reload_handlers()
+    reload_info = _reload_plugins()
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
@@ -1278,7 +1379,12 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Column 'bid' not found in deal_df")
     
     try:
-        resp = api_handlers.handle_group_by_bid(
+        # Access plugin dynamically
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_group_by_bid(
             state=state,
             auction_pattern=req.auction_pattern,
             n_auction_groups=req.n_auction_groups,
