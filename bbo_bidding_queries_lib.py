@@ -113,48 +113,23 @@ def normalize_auction_pattern(pattern: str) -> str:
     return pattern + ("$" if has_end_anchor else "")
 
 
-def normalize_auction_to_seat1(auction: str) -> tuple[str, int]:
+def normalize_auction_pattern_to_seat1(pattern: str) -> str:
+    """Normalize auction regex then strip any leading 'p-' prefixes (seat-1 view).
+    
+    This makes matching robust when callers provide seat-relative prefixes:
+      '^p-1N-p-3N$' -> '^1N-p-3N-p-p-p$'
+      'p-p-1C'      -> '1C-p-p-p' (after normalize_auction_pattern)
+    
+    Note: This is ONLY for matching. For display, prefixes can be re-applied
+    based on seat (see API handler display helpers).
     """
-    Normalize an auction pattern to seat 1 format by removing leading passes.
-    
-    Since only seat 1 has complete auction data in bt_df, searches for seats 2-4
-    should be converted to seat 1 format by stripping leading 'p-' prefixes.
-    
-    Args:
-        auction: Auction string or pattern, e.g., "p-1N-p-3N" or "p-p-1C"
-        
-    Returns:
-        Tuple of (normalized_auction, num_passes_removed)
-        - normalized_auction: The auction with leading passes removed
-        - num_passes_removed: Number of leading 'p-' removed (0-3)
-          This indicates the original seat: 0=seat1, 1=seat2, 2=seat3, 3=seat4
-    
-    Examples:
-        "1N-p-3N" → ("1N-p-3N", 0)  # Already seat 1
-        "p-1N-p-3N" → ("1N-p-3N", 1)  # Was seat 2
-        "p-p-1C" → ("1C", 2)  # Was seat 3
-        "p-p-p-1D" → ("1D", 3)  # Was seat 4
-        "^p-1N" → ("^1N", 1)  # Regex with anchor preserved
-    """
-    if not auction:
-        return auction, 0
-    
-    # Handle regex start anchor
-    has_start_anchor = auction.startswith('^')
-    if has_start_anchor:
-        auction = auction[1:]
-    
-    passes_removed = 0
-    # Remove up to 3 leading passes (seats 2-4)
-    while passes_removed < 3 and auction.lower().startswith('p-'):
-        auction = auction[2:]  # Remove 'p-'
-        passes_removed += 1
-    
-    # Restore anchor if present
-    if has_start_anchor:
-        auction = '^' + auction
-    
-    return auction, passes_removed
+    if not pattern or not pattern.strip():
+        return pattern
+    p = normalize_auction_pattern(pattern)
+    # Strip leading p- after optional start anchor.
+    p = re.sub(r"^\^(p-)+", "^", p)
+    p = re.sub(r"^(p-)+", "", p)
+    return p
 
 
 def parse_contract_from_auction(auction: str) -> tuple[int, str, int] | None:

@@ -1,7 +1,7 @@
 """
 FastAPI server for BBO bidding queries.
 
-This service loads bidding data (bt_df and deal_df), exposes HTTP endpoints that Streamlit (or other clients) can call.
+This service loads bidding data (bt_seat1_df and deal_df), exposes HTTP endpoints that Streamlit (or other clients) can call.
 
 Heavy initialization (loading Parquet files, building criteria bitmaps,
 computing opening-bid candidates) is performed once in the background and the
@@ -62,13 +62,14 @@ from endplay.dds import calc_dd_table, par
 
 from mlBridgeLib.mlBridgeBiddingLib import (
     DIRECTIONS,
-    load_bt_df,
     load_deal_df,
     load_execution_plan_data,
     directional_to_directionless,
     build_or_load_directional_criteria_bitmaps,
-    process_opening_bids,
 )
+
+# NOTE: imported as a module so static analysis doesn't get confused about symbol exports.
+import mlBridgeLib.mlBridgeBiddingLib as mlBridgeBiddingLib
 
 from bbo_bidding_queries_lib import (
     evaluate_criterion_for_hand,
@@ -219,10 +220,35 @@ def _parse_deal_rows_arg() -> int | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Optional init knobs (parsed early from sys.argv)
+# ---------------------------------------------------------------------------
+
+def _parse_prewarm_arg() -> bool:
+    """Parse --prewarm / --no-prewarm from sys.argv early.
+    
+    Default: False (off).
+    """
+    import sys
+    prewarm = False
+    for arg in sys.argv:
+        if arg == "--prewarm":
+            prewarm = True
+        elif arg == "--no-prewarm":
+            prewarm = False
+        elif arg.startswith("--prewarm="):
+            v = arg.split("=", 1)[1].strip().lower()
+            prewarm = v in ("1", "true", "yes", "y", "on")
+    return prewarm
+
+
 # Check for --data-dir command line argument
 _cli_data_dir = _parse_data_dir_arg()
 # Check for --deal-rows (limit deal_df rows for faster debugging)
 _cli_deal_rows = _parse_deal_rows_arg()
+_cli_prewarm = _parse_prewarm_arg()
+if _cli_prewarm:
+    print("DEBUG MODE: Pre-warming endpoints is ENABLED (--prewarm)")
 if _cli_deal_rows is not None:
     print(f"DEBUG MODE: Limiting deal_df to {_cli_deal_rows:,} rows")
 
@@ -241,7 +267,7 @@ else:
 
 exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
 bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
-bbo_bidding_table_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")
+bt_seat1_file = dataPath.joinpath("bbo_bt_seat1.parquet")  # Clean seat-1-only table
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 
@@ -384,7 +410,13 @@ def _apply_auction_criteria(
     # For each criterion set, filter out rows that match the partial
     # auction but don't satisfy the criteria
     for partial_auction, criteria in criteria_list:
-        auction_lower = pl.col(auction_col).cast(pl.Utf8).str.to_lowercase()
+        # Criteria matching is defined in "seat-1 view" (no leading p-), so strip for matching.
+        auction_lower = (
+            pl.col(auction_col)
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            .str.replace(r"^(p-)+", "")
+        )
         matches_partial = auction_lower.str.starts_with(partial_auction)
         
         # For each dealer, build the criteria check
@@ -450,18 +482,24 @@ def _apply_auction_criteria(
     return df, rejected_df
 
 
-REQUIRED_FILES = [
-    exec_plan_file,
-    bbo_mldf_augmented_file,
-    bbo_bidding_table_augmented_file,
-    bt_aggregates_file,
-]
-
-
 def _check_required_files() -> list[str]:
-    """Check that all required data files exist. Returns list of missing files."""
-    missing = []
-    for f in REQUIRED_FILES:
+    """Check that required data files exist. Returns list of missing files.
+    
+    NOTE:
+    - `bbo_bt_seat1.parquet` is a REQUIRED pipeline artifact for this API. If it's missing,
+      something is wrong upstream and we hard-fail rather than falling back.
+    - `bbo_bt_aggregate.parquet` is an offline artifact (from `bbo_bt_aggregate.py`) and is NOT required
+      at runtime because `bbo_bt_seat1.parquet` inlines aggregates.
+    - We intentionally do NOT load `bbo_bt_augmented.parquet` at runtime.
+    """
+    required: list[pathlib.Path] = [
+        exec_plan_file,
+        bbo_mldf_augmented_file,
+        bt_seat1_file,
+    ]
+
+    missing: list[str] = []
+    for f in required:
         if not f.exists():
             missing.append(str(f))
     return missing
@@ -522,6 +560,9 @@ class AuctionSequencesMatchingRequest(BaseModel):
     pattern: str
     n_samples: int = 5
     seed: Optional[int] = 0
+    # If True, treat the pattern as applying to all seats (ignore leading initial passes in stored auctions).
+    # If False, treat the pattern as a literal regex against the raw Auction string.
+    allow_initial_passes: bool = True
 
 
 class DealsMatchingAuctionRequest(BaseModel):
@@ -529,6 +570,7 @@ class DealsMatchingAuctionRequest(BaseModel):
     n_auction_samples: int = 2
     n_deal_samples: int = 10
     seed: Optional[int] = 0
+    allow_initial_passes: bool = True
     # Distribution filter for deals
     dist_pattern: Optional[str] = None  # Ordered distribution (S-H-D-C), e.g., "5-4-3-1"
     sorted_shape: Optional[str] = None  # Sorted shape (any suit), e.g., "5431"
@@ -540,6 +582,7 @@ class BiddingTableStatisticsRequest(BaseModel):
     sample_size: int = 100
     min_matches: int = 0  # 0 = no minimum
     seed: Optional[int] = 0
+    allow_initial_passes: bool = True
     # Distribution filter
     dist_pattern: Optional[str] = None  # Ordered distribution (S-H-D-C), e.g., "5-4-3-1"
     sorted_shape: Optional[str] = None  # Sorted shape (any suit), e.g., "5431"
@@ -595,13 +638,14 @@ STATE: Dict[str, Any] = {
     "loading_step": None,  # Current loading step description
     "loaded_files": {},  # File name -> row count (updated as files load)
     "deal_df": None,
-    "bt_df": None,
-    "bt_completed_df": None,  # Cached: bt_df.filter(is_completed_auction)
+    "bt_seat1_df": None,  # Clean seat-1-only table (bbo_bt_seat1.parquet)
+    "bt_openings_df": None,  # Tiny opening-bid lookup table (built from bt_seat1_df)
     "deal_criteria_by_seat_dfs": None,
     "deal_criteria_by_direction_dfs": None,
     "results": None,
-    "bt_criteria": None,  # bt_criteria.parquet
-    "bt_aggregates": None,  # bbo_bt_aggregate.parquet
+    # Legacy artifacts (not loaded at runtime anymore)
+    "bt_criteria": None,
+    "bt_aggregates": None,
 }
 
 # Additional optional data file paths
@@ -639,7 +683,8 @@ def _heavy_init() -> None:
     print("[init] Starting initialization...")
     _log_memory("start")
     
-    TOTAL_STEPS = 10  # Total number of loading steps
+    # Keep this in sync with the _update_loading_status() calls below.
+    TOTAL_STEPS = 7 if _cli_prewarm else 6  # +1 only if prewarm is enabled
     
     def _update_loading_status(step_num: int, step: str, file_name: str | None = None, row_count: int | str | None = None):
         """Update loading progress in STATE (thread-safe)."""
@@ -730,78 +775,61 @@ def _heavy_init() -> None:
         gc.collect()
         _log_memory("after gc.collect (criteria cleanup)")
 
-        # Load bidding table
-        _update_loading_status(5, "Loading bt_df (bbo_bt_augmented.parquet)...")
-        bt_df = load_bt_df(bbo_bidding_table_augmented_file, include_expr_and_sequences=True)
-        _log_memory("after load_bt_df")
-        
-        # NOTE: We do NOT filter bt_df to seat 1 only here because bt_criteria and bt_aggregates
-        # were generated with row-positional alignment to the full bt_df.filter(is_completed_auction).
-        # Filtering here would break index alignment with those files.
-        # Seat normalization is applied at query time in the handlers instead.
+        # Load clean seat-1-only table (used for pattern matching - no p- prefix issues)
+        print(f"[init] Loading bt_seat1_df from {bt_seat1_file}...")
+        bt_seat1_df = pl.read_parquet(bt_seat1_file)
+        # IMPORTANT:
+        # Do NOT strip leading 'p-' prefixes here.
+        # Those prefixes encode seat/turn order and are required for correct declarer/contract logic
+        # (AI/DD/IMP computations). Matching code strips prefixes at query time instead.
+        _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_df.height)
+        print(f"[init] bt_seat1_df: {bt_seat1_df.height:,} rows (clean seat-1 data)")
+        _log_memory("after load bt_seat1_df")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
-        _update_loading_status(6, "Processing opening bids (may take several minutes)...", "bt_df", bt_df.height)
-        results = process_opening_bids(
-            deal_df,
-            bt_df,
-            deal_criteria_by_seat_dfs,
-            bbo_bidding_table_augmented_file,
+        _update_loading_status(6, "Processing opening bids (seat1-only)...", "bt_seat1_df", bt_seat1_df.height)
+        results, bt_openings_df = mlBridgeBiddingLib.process_opening_bids_from_bt_seat1(
+            deal_df=deal_df,
+            bt_seat1_df=bt_seat1_df,
+            deal_criteria_by_seat_dfs=deal_criteria_by_seat_dfs,
         )
-        _update_loading_status(7, "Loading optional files...")
+        _update_loading_status(6, "Preparing to serve..." if not _cli_prewarm else "Preparing to serve (pre-warm next)...")
         _log_memory("after process_opening_bids")
 
-        # Load optional aggregates files (non-blocking if missing)
+        # New architecture: criteria/aggregates are inlined in bt_seat1_df.
+        # We intentionally do NOT load bt_criteria / bt_aggregate at runtime.
         bt_criteria = None
         bt_aggregates = None
-        
-        if bt_criteria_file.exists():
-            _update_loading_status(7, "Loading bt_criteria.parquet...")
-            print(f"[init] Loading bt_criteria from {bt_criteria_file}...")
-            bt_criteria = pl.read_parquet(bt_criteria_file)
-            _update_loading_status(7, "Loading bt_criteria.parquet...", "bt_criteria", bt_criteria.height)
-            _log_memory("after load bt_criteria")
-        else:
-            print(f"[init] bt_criteria not found at {bt_criteria_file} (optional)")
-        
-        if bt_aggregates_file.exists():
-            _update_loading_status(8, "Loading bt_aggregates.parquet...")
-            print(f"[init] Loading bt_aggregates from {bt_aggregates_file}...")
-            bt_aggregates = pl.read_parquet(bt_aggregates_file)
-            _update_loading_status(8, "Loading bt_aggregates.parquet...", "bt_aggregates", bt_aggregates.height)
-            _log_memory("after load bt_aggregates")
-        else:
-            print(f"[init] bt_aggregates not found at {bt_aggregates_file} (optional)")
-
-        # Cache the completed auctions filter (expensive: ~2 min on 541M rows)
-        bt_completed_df = None
-        if "is_completed_auction" in bt_df.columns:
-            _update_loading_status(9, "Filtering completed auctions (bt_completed_df)...")
-            print("[init] Caching bt_completed_df (is_completed_auction filter)...")
-            bt_completed_df = bt_df.filter(pl.col("is_completed_auction"))
-            _update_loading_status(9, "Filtering completed auctions...", "bt_completed_df", bt_completed_df.height)
-            print(f"[init] bt_completed_df: {bt_completed_df.height:,} rows (from {bt_df.height:,})")
-            _log_memory("after bt_completed_df filter")
+        print("[init] bt_seat1_df present: skipping bt_criteria / bt_aggregates load (inlined in bt_seat1_df)")
 
         with _STATE_LOCK:
             STATE["deal_df"] = deal_df
-            STATE["bt_df"] = bt_df
-            STATE["bt_completed_df"] = bt_completed_df
+            STATE["bt_seat1_df"] = bt_seat1_df
+            STATE["bt_openings_df"] = bt_openings_df
             STATE["deal_criteria_by_seat_dfs"] = deal_criteria_by_seat_dfs
             STATE["deal_criteria_by_direction_dfs"] = deal_criteria_by_direction_dfs
             STATE["results"] = results
             STATE["bt_criteria"] = bt_criteria
             STATE["bt_aggregates"] = bt_aggregates
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
-            STATE["warming"] = True  # Still warming - not ready for users yet
+            STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
         _log_memory("after STATE update")
+
+        # If prewarm is disabled, we are ready immediately.
+        if not _cli_prewarm:
+            with _STATE_LOCK:
+                STATE["warming"] = False
+                STATE["initializing"] = False
+            elapsed = time.time() - t0
+            print(f"[init] Completed heavy initialization (pre-warm disabled) in {elapsed:.1f}s")
+            return
 
         # ------------------------------------------------------------------
         # Pre-warm selected query paths so the first user request is faster.
         # This does a tiny sample query on each endpoint's core logic.
         # ------------------------------------------------------------------
-        _update_loading_status(10, "Pre-warming endpoints...")
+        _update_loading_status(7, "Pre-warming endpoints...")
         try:
             print("[init] Pre-warming openings-by-deal-index endpoint ...")
             # For pre-warming, we can use the plugin accessor logic or import statically if preferred.
@@ -896,8 +924,8 @@ def get_status() -> StatusResponse:
         bt_df_rows = None
         deal_df_rows = None
         if STATE["initialized"]:
-            if STATE["bt_df"] is not None:
-                bt_df_rows = STATE["bt_df"].height
+            if STATE["bt_seat1_df"] is not None:
+                bt_df_rows = STATE["bt_seat1_df"].height
             if STATE["deal_df"] is not None:
                 deal_df_rows = STATE["deal_df"].height
         return StatusResponse(
@@ -928,20 +956,28 @@ def start_init(background_tasks: BackgroundTasks) -> InitResponse:
     return InitResponse(status="started")
 
 
-def _ensure_ready() -> Tuple[pl.DataFrame, pl.DataFrame, Dict[int, Dict[str, pl.DataFrame]], Dict[Tuple[str, int], Dict[str, Any]]]:
+def _ensure_ready() -> Tuple[
+    pl.DataFrame,
+    pl.DataFrame,
+    pl.DataFrame,
+    Dict[int, Dict[str, pl.DataFrame]],
+    Dict[Tuple[str, int], Dict[str, Any]],
+]:
     with _STATE_LOCK:
         if not STATE["initialized"]:
             if STATE["initializing"]:
                 raise HTTPException(status_code=503, detail="Initialization in progress")
             raise HTTPException(status_code=503, detail="Service not initialized")
         deal_df = STATE["deal_df"]
-        bt_df = STATE["bt_df"]
+        bt_seat1_df = STATE["bt_seat1_df"]
+        bt_openings_df = STATE["bt_openings_df"]
         deal_criteria_by_seat_dfs = STATE["deal_criteria_by_seat_dfs"]
         results = STATE["results"]
 
     assert isinstance(deal_df, pl.DataFrame)
-    assert isinstance(bt_df, pl.DataFrame)
-    return deal_df, bt_df, deal_criteria_by_seat_dfs, results
+    assert isinstance(bt_seat1_df, pl.DataFrame)
+    assert isinstance(bt_openings_df, pl.DataFrame)
+    return deal_df, bt_seat1_df, bt_openings_df, deal_criteria_by_seat_dfs, results
 
 
 # ---------------------------------------------------------------------------
@@ -1023,8 +1059,8 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
     with _STATE_LOCK:
         state = dict(STATE)
     
-    if "previous_bid_indices" not in state["bt_df"].columns:
-        raise HTTPException(status_code=500, detail="Column 'previous_bid_indices' not found in bt_df")
+    if state.get("bt_seat1_df") is None or "previous_bid_indices" not in state["bt_seat1_df"].columns:
+        raise HTTPException(status_code=500, detail="Column 'previous_bid_indices' not found in bt_seat1_df")
     
     try:
         # Access plugin dynamically
@@ -1035,6 +1071,7 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
         resp = handler_module.handle_auction_sequences_matching(
             state=state,
             pattern=req.pattern,
+            allow_initial_passes=req.allow_initial_passes,
             n_samples=req.n_samples,
             seed=req.seed,
             apply_auction_criteria_fn=_apply_auction_criteria,
@@ -1065,6 +1102,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
         resp = handler_module.handle_deals_matching_auction(
             state=state,
             pattern=req.pattern,
+            allow_initial_passes=req.allow_initial_passes,
             n_auction_samples=req.n_auction_samples,
             n_deal_samples=req.n_deal_samples,
             seed=req.seed,
@@ -1099,6 +1137,7 @@ def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, An
         resp = handler_module.handle_bidding_table_statistics(
             state=state,
             auction_pattern=req.auction_pattern,
+            allow_initial_passes=req.allow_initial_passes,
             sample_size=req.sample_size,
             min_matches=req.min_matches,
             seed=req.seed,
@@ -1271,8 +1310,9 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
     with _STATE_LOCK:
         state = dict(STATE)
     
-    if state.get("bt_criteria") is None:
-        raise HTTPException(status_code=503, detail="bt_criteria not loaded. Run bt_criteria_extractor.py first.")
+    if state.get("bt_seat1_df") is None:
+        # This should never happen: bt_seat1 is a required file and init hard-fails if missing.
+        raise HTTPException(status_code=503, detail="bt_seat1_df not loaded (pipeline error).")
     
     try:
         # Access plugin dynamically
