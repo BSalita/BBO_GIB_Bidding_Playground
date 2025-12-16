@@ -1850,7 +1850,7 @@ def render_bt_seat_stats_tool():
     st.caption(
         "Compute HCP / suit-length / total-points ranges per seat directly from deals, "
         "using the bidding table's criteria bitmaps. "
-        "Enter a `bt_index` from bt_seat1 (shown in the Bidding Table Explorer)."
+        "Enter a `bt_index` from bt_seat1 (shown in the Bidding Table Explorer), or view a sample row."
     )
 
     bt_index = st.sidebar.number_input(
@@ -1874,80 +1874,124 @@ def render_bt_seat_stats_tool():
         help="Optional cap on the number of deals to aggregate (currently exact stats; cap reserved for future use).",
     )
 
-    if st.sidebar.button("Compute Stats", type="primary"):
-        if bt_index < 0:
-            st.error("bt_index must be non-negative.")
-            return
+    # Always show basic instructions.
+    st.info(
+        "Use the sidebar to choose a `bt_index` (from the Bidding Table Explorer) and seat(s). "
+        "Seat 1=Dealer, Seat 2=LHO, Seat 3=Partner, Seat 4=RHO. "
+        "If `bt_index` is 0, a sample bt row will be used."
+    )
 
-        seat = 0 if seat_option.startswith("All") else int(seat_option)
-        payload = {
-            "bt_index": int(bt_index),
-            "seat": int(seat),
-            "max_deals": int(max_deals),
-        }
+    if bt_index < 0:
+        st.error("bt_index must be non-negative.")
+        return
 
-        with st.spinner("Computing on-the-fly stats from deals..."):
+    seat = 0 if seat_option.startswith("All") else int(seat_option)
+
+    # If bt_index is 0, fetch a sample bt_index once from the API and cache it.
+    if bt_index == 0:
+        sample_key = "bt_seat_stats_sample_bt_index"
+        sample_bt_index = st.session_state.get(sample_key)
+        if sample_bt_index is None:
             try:
-                data = api_post("/bt-seat-stats", payload)
-            except Exception as e:
-                st.error(f"Failed to compute stats: {e}")
-                return
+                # Use bidding-table-statistics to grab a single completed auction row.
+                with st.spinner("Loading sample bt_index from bidding table..."):
+                    sample_payload = {
+                        "auction_pattern": ".*",
+                        "allow_initial_passes": False,
+                        "sample_size": 1,
+                        "min_matches": 0,
+                        "seed": 42,
+                        "dist_pattern": None,
+                        "sorted_shape": None,
+                        "dist_seat": 1,
+                    }
+                    sample_data = api_post("/bidding-table-statistics", sample_payload)
+                    rows = sample_data.get("rows", [])
+                    if rows:
+                        row0 = rows[0]
+                        # Prefer explicit bt_index if present; fall back to original_idx.
+                        sample_bt_index = int(row0.get("bt_index", row0.get("original_idx", 0)))
+                        st.session_state[sample_key] = sample_bt_index
+            except Exception:
+                sample_bt_index = None
 
-        seats = data.get("seats", {})
-        if not seats:
-            st.info("No matching deals found for this bt_index / seat combination.")
+        if not sample_bt_index:
+            st.warning(
+                "Could not find a sample bt_index automatically. "
+                "Please enter a bt_index from the Bidding Table Explorer in the sidebar."
+            )
+            return
+        effective_bt_index = int(sample_bt_index)
+    else:
+        effective_bt_index = int(bt_index)
+    payload = {
+        "bt_index": effective_bt_index,
+        "seat": int(seat),
+        "max_deals": int(max_deals),
+    }
+
+    with st.spinner("Computing on-the-fly stats from deals..."):
+        try:
+            data = api_post("/bt-seat-stats", payload)
+        except Exception as e:
+            st.error(f"Failed to compute stats: {e}")
             return
 
-        rows = []
-        for seat_key, seat_res in seats.items():
-            seat_num = int(seat_key)
-            mcount = int(seat_res.get("matching_deal_count", 0))
-            stats = seat_res.get("stats") or {}
-            if not stats:
-                rows.append(
-                    {
-                        "Seat": seat_num,
-                        "Metric": "(none)",
-                        "Deals": mcount,
-                        "Min": None,
-                        "Max": None,
-                        "Mean": None,
-                        "Std": None,
-                    }
-                )
-                continue
+    seats = data.get("seats", {})
+    if not seats:
+        st.info("No matching deals found for this bt_index / seat combination.")
+        return
 
-            for metric_name, metric_vals in stats.items():
-                rows.append(
-                    {
-                        "Seat": seat_num,
-                        "Metric": metric_name,
-                        "Deals": mcount,
-                        "Min": metric_vals.get("min"),
-                        "Max": metric_vals.get("max"),
-                        "Mean": metric_vals.get("mean"),
-                        "Std": metric_vals.get("std"),
-                    }
-                )
+    rows = []
+    for seat_key, seat_res in seats.items():
+        seat_num = int(seat_key)
+        mcount = int(seat_res.get("matching_deal_count", 0))
+        stats = seat_res.get("stats") or {}
+        if not stats:
+            rows.append(
+                {
+                    "Seat": seat_num,
+                    "Metric": "(none)",
+                    "Deals": mcount,
+                    "Min": None,
+                    "Max": None,
+                    "Mean": None,
+                    "Std": None,
+                }
+            )
+            continue
 
-        if not rows:
-            st.info("No metrics available for the selected bt_index / seat.")
-            return
+        for metric_name, metric_vals in stats.items():
+            rows.append(
+                {
+                    "Seat": seat_num,
+                    "Metric": metric_name,
+                    "Deals": mcount,
+                    "Min": metric_vals.get("min"),
+                    "Max": metric_vals.get("max"),
+                    "Mean": metric_vals.get("mean"),
+                    "Std": metric_vals.get("std"),
+                }
+            )
 
-        df_stats = pl.DataFrame(rows)
-        df_stats = order_columns(
-            df_stats,
-            priority_cols=["Seat", "Metric", "Deals", "Min", "Max", "Mean", "Std"],
-        )
+    if not rows:
+        st.info("No metrics available for the selected bt_index / seat.")
+        return
 
-        st.subheader("Seat Stats")
-        render_aggrid(
-            df_stats,
-            key="bt_seat_stats_grid",
-            height=calc_grid_height(len(df_stats)),
-            table_name="bt_seat_stats",
-        )
-        st.caption(f"Auction: {data.get('auction')} (bt_index={data.get('bt_index')})")
+    df_stats = pl.DataFrame(rows)
+    df_stats = order_columns(
+        df_stats,
+        priority_cols=["Seat", "Metric", "Deals", "Min", "Max", "Mean", "Std"],
+    )
+
+    st.subheader("Seat Stats")
+    render_aggrid(
+        df_stats,
+        key="bt_seat_stats_grid",
+        height=calc_grid_height(len(df_stats)),
+        table_name="bt_seat_stats",
+    )
+    st.caption(f"Auction: {data.get('auction')} (bt_index={data.get('bt_index')})")
 
 
 # ---------------------------------------------------------------------------

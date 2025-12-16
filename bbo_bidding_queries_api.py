@@ -227,10 +227,10 @@ def _parse_deal_rows_arg() -> int | None:
 def _parse_prewarm_arg() -> bool:
     """Parse --prewarm / --no-prewarm from sys.argv early.
     
-    Default: False (off).
+    Default: True (on) so endpoints are pre-warmed unless explicitly disabled.
     """
     import sys
-    prewarm = False
+    prewarm = True
     for arg in sys.argv:
         if arg == "--prewarm":
             prewarm = True
@@ -248,7 +248,9 @@ _cli_data_dir = _parse_data_dir_arg()
 _cli_deal_rows = _parse_deal_rows_arg()
 _cli_prewarm = _parse_prewarm_arg()
 if _cli_prewarm:
-    print("DEBUG MODE: Pre-warming endpoints is ENABLED (--prewarm)")
+    print("DEBUG MODE: Pre-warming endpoints is ENABLED (use --no-prewarm to disable)")
+else:
+    print("DEBUG MODE: Pre-warming endpoints is DISABLED (--no-prewarm)")
 if _cli_deal_rows is not None:
     print(f"DEBUG MODE: Limiting deal_df to {_cli_deal_rows:,} rows")
 
@@ -874,21 +876,15 @@ def _heavy_init() -> None:
         _update_loading_status(7, "Pre-warming endpoints...")
         try:
             print("[init] Pre-warming openings-by-deal-index endpoint ...")
-            # For pre-warming, we can use the plugin accessor logic or import statically if preferred.
-            # But since endpoints use the plugin logic, we should probably stick to calling the endpoint functions
-            # or rely on the `api_handlers` alias created at startup if valid.
-            
-            # The endpoints access PLUGINS global. 
-            # We must ensure _reload_plugins() has run successfully before pre-warming.
-            # It runs at module level, so PLUGINS should be populated.
-            
             _ = openings_by_deal_index(OpeningsByDealIndexRequest(sample_size=1))
 
             print("[init] Pre-warming random-auction-sequences endpoint ...")
             _ = random_auction_sequences(RandomAuctionSequencesRequest(n_samples=1, seed=42))
 
             print("[init] Pre-warming auction-sequences-matching endpoint ...")
-            _ = auction_sequences_matching(AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))
+            _ = auction_sequences_matching(
+                AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0)
+            )
 
             print("[init] Pre-warming deals-matching-auction endpoint ...")
             _ = deals_matching_auction(
@@ -921,8 +917,14 @@ def _heavy_init() -> None:
             print("[init] Pre-warming find-matching-auctions endpoint ...")
             _ = find_matching_auctions(
                 FindMatchingAuctionsRequest(
-                    hcp=15, sl_s=4, sl_h=3, sl_d=3, sl_c=3,
-                    total_points=17, seat=1, max_results=1,
+                    hcp=15,
+                    sl_s=4,
+                    sl_h=3,
+                    sl_d=3,
+                    sl_c=3,
+                    total_points=17,
+                    seat=1,
+                    max_results=1,
                 )
             )
 
@@ -935,6 +937,33 @@ def _heavy_init() -> None:
                     seed=42,
                 )
             )
+
+            # Pre-warm PBN sample / random / lookup endpoints
+            print("[init] Pre-warming pbn-sample endpoint ...")
+            sample_resp = get_pbn_sample()
+
+            print("[init] Pre-warming pbn-random endpoint ...")
+            _ = get_pbn_random()
+
+            print("[init] Pre-warming pbn-lookup endpoint ...")
+            sample_pbn = getattr(sample_resp, "pbn", None) or sample_resp.get("pbn", "")
+            if sample_pbn:
+                _ = pbn_lookup(PBNLookupRequest(pbn=sample_pbn, max_results=1))
+
+            # Pre-warm execute-sql endpoint with a trivial query
+            print("[init] Pre-warming execute-sql endpoint ...")
+            _ = execute_sql(ExecuteSQLRequest(sql="SELECT 1 AS x", max_rows=1))
+
+            # Pre-warm bt-seat-stats endpoint (on-the-fly stats)
+            print("[init] Pre-warming bt-seat-stats endpoint ...")
+            first_bt_index = None
+            if bt_seat1_df.height > 0 and "bt_index" in bt_seat1_df.columns:
+                try:
+                    first_bt_index = int(bt_seat1_df["bt_index"][0])
+                except Exception:
+                    first_bt_index = None
+            if first_bt_index is not None:
+                _ = bt_seat_stats(BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))
         except Exception as warm_exc:  # pragma: no cover - best-effort prewarm
             print("[init] WARNING: pre-warm step failed:", warm_exc)
 
