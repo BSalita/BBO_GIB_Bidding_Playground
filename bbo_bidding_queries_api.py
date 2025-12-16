@@ -270,6 +270,7 @@ else:
 exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
 bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
 bt_seat1_file = dataPath.joinpath("bbo_bt_seat1.parquet")  # Clean seat-1-only table
+bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 
@@ -490,9 +491,11 @@ def _check_required_files() -> list[str]:
     NOTE:
     - `bbo_bt_seat1.parquet` is a REQUIRED pipeline artifact for this API. If it's missing,
       something is wrong upstream and we hard-fail rather than falling back.
-    - `bbo_bt_aggregate.parquet` is an offline artifact (from `bbo_bt_aggregate.py`) and is NOT required
-      at runtime because `bbo_bt_seat1.parquet` inlines aggregates.
-    - We intentionally do NOT load `bbo_bt_augmented.parquet` at runtime.
+    - `bbo_bt_criteria.parquet` and `bbo_bt_aggregate.parquet` are used to build an in-memory
+      `bt_stats_df` (completed-auction criteria/aggregates). They are optional but recommended;
+      if missing, any endpoints that rely on criteria/aggregates will report them as unavailable.
+    - We intentionally do NOT load the full `bbo_bt_augmented.parquet` into memory; it is only
+      scanned lazily to build the bt_row_idx → bt_index mapping for `bt_stats_df`.
     """
     required: list[pathlib.Path] = [
         exec_plan_file,
@@ -660,13 +663,16 @@ STATE: Dict[str, Any] = {
     "deal_criteria_by_seat_dfs": None,
     "deal_criteria_by_direction_dfs": None,
     "results": None,
-    # Legacy artifacts (not loaded at runtime anymore)
-    "bt_criteria": None,
-    "bt_aggregates": None,
+    # Criteria / aggregate statistics for completed auctions (seat-1 view).
+    # Built from bbo_bt_criteria.parquet + bbo_bt_aggregate.parquet and keyed by bt_index.
+    "bt_stats_df": None,
 }
 
 # Additional optional data file paths
 bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
+bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
+# Pre-joined completed-auction criteria/aggregate table (preferred at runtime).
+bt_criteria_seat1_file = dataPath.joinpath("bbo_bt_criteria_seat1_df.parquet")
 
 _STATE_LOCK = threading.Lock()
 
@@ -679,16 +685,33 @@ DUCKDB_CONN: Optional[duckdb.DuckDBPyConnection] = None
 _DUCKDB_LOCK = threading.Lock()
 
 
-def _register_duckdb_tables(deal_df: pl.DataFrame, bt_seat1_df: pl.DataFrame) -> None:
+def _register_duckdb_tables(
+    deal_df: pl.DataFrame,
+    bt_seat1_df: pl.DataFrame,
+    bt_stats_df: Optional[pl.DataFrame] = None,
+) -> None:
     """Register DataFrames with DuckDB for SQL queries."""
     global DUCKDB_CONN
     with _DUCKDB_LOCK:
         if DUCKDB_CONN is None:
             DUCKDB_CONN = duckdb.connect()
         # Register DataFrames as queryable tables
-        DUCKDB_CONN.register('deals', deal_df.to_arrow())
-        DUCKDB_CONN.register('auctions', bt_seat1_df.to_arrow())
-        print(f"[duckdb] Registered tables: deals ({deal_df.height:,} rows), auctions ({bt_seat1_df.height:,} rows)")
+        DUCKDB_CONN.register("deals", deal_df.to_arrow())
+        DUCKDB_CONN.register("auctions", bt_seat1_df.to_arrow())
+        if bt_stats_df is not None:
+            DUCKDB_CONN.register("auction_stats", bt_stats_df.to_arrow())
+            print(
+                "[duckdb] Registered tables: "
+                f"deals ({deal_df.height:,} rows), "
+                f"auctions ({bt_seat1_df.height:,} rows), "
+                f"auction_stats ({bt_stats_df.height:,} rows)"
+            )
+        else:
+            print(
+                "[duckdb] Registered tables: "
+                f"deals ({deal_df.height:,} rows), "
+                f"auctions ({bt_seat1_df.height:,} rows)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -816,8 +839,37 @@ def _heavy_init() -> None:
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load clean seat-1-only table (used for pattern matching - no p- prefix issues)
-        print(f"[init] Loading bt_seat1_df from {bt_seat1_file}...")
-        bt_seat1_df = pl.read_parquet(bt_seat1_file)
+        # NOTE: bbo_bt_seat1.parquet is wide on disk (includes criteria/aggregates for all seats),
+        # but we only need the core bidding columns in memory. Use a lazy scan + select to keep
+        # the in-memory DataFrame narrow.
+        print(f"[init] Loading bt_seat1_df from {bt_seat1_file} (core columns only)...")
+        bt_seat1_core_cols = [
+            "bt_index" if "bt_index" in pl.scan_parquet(bt_seat1_file).collect_schema().names() else "index",
+            "Auction",
+            "is_opening_bid",
+            "is_completed_auction",
+            "Expr",
+            "Agg_Expr_Seat_1",
+            "Agg_Expr_Seat_2",
+            "Agg_Expr_Seat_3",
+            "Agg_Expr_Seat_4",
+            "previous_bid_indices",
+            "next_bid_indices",
+            "missing_next_bid",
+        ]
+        bt_seat1_scan = pl.scan_parquet(bt_seat1_file)
+        # Normalise primary key name to bt_index for downstream consumers.
+        if "bt_index" in bt_seat1_scan.collect_schema().names():
+            bt_seat1_df = (
+                bt_seat1_scan.select(bt_seat1_core_cols).collect()
+            )
+        else:
+            bt_seat1_df = (
+                bt_seat1_scan
+                .select(bt_seat1_core_cols)
+                .rename({"index": "bt_index"})
+                .collect()
+            )
         # IMPORTANT:
         # Do NOT strip leading 'p-' prefixes here.
         # Those prefixes encode seat/turn order and are required for correct declarer/contract logic
@@ -825,6 +877,25 @@ def _heavy_init() -> None:
         _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_df.height)
         print(f"[init] bt_seat1_df: {bt_seat1_df.height:,} rows (clean seat-1 data)")
         _log_memory("after load bt_seat1_df")
+
+        # Load completed-auction stats table (criteria + aggregates) keyed by bt_index.
+        # Prefer the pre-joined bbo_bt_criteria_seat1_df.parquet produced by bbo_bt_build_seat1.py v2,
+        # so we do not need to scan the full bbo_bt_augmented.parquet at startup.
+        print(f"[init] Loading bt_stats_df from {bt_criteria_seat1_file}...")
+        if bt_criteria_seat1_file.exists():
+            try:
+                bt_stats_df = pl.read_parquet(bt_criteria_seat1_file)
+                print(f"[init] bt_stats_df: {bt_stats_df.height:,} rows (completed auctions with criteria/aggregates)")
+            except Exception as e:
+                print(f"[init] WARNING: Failed to load bt_stats_df from {bt_criteria_seat1_file} ({e}); criteria/aggregates will be unavailable.")
+                bt_stats_df = None
+        else:
+            print(
+                f"[init] WARNING: {bt_criteria_seat1_file} not found. "
+                "Run bbo_bt_build_seat1.py (v2) to generate it if you need precomputed criteria/aggregates."
+            )
+            bt_stats_df = None
+        _log_memory("after load bt_stats_df")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
         _update_loading_status(6, "Processing opening bids (seat1-only)...", "bt_seat1_df", bt_seat1_df.height)
@@ -836,12 +907,6 @@ def _heavy_init() -> None:
         _update_loading_status(6, "Preparing to serve..." if not _cli_prewarm else "Preparing to serve (pre-warm next)...")
         _log_memory("after process_opening_bids")
 
-        # New architecture: criteria/aggregates are inlined in bt_seat1_df.
-        # We intentionally do NOT load bt_criteria / bt_aggregate at runtime.
-        bt_criteria = None
-        bt_aggregates = None
-        print("[init] bt_seat1_df present: skipping bt_criteria / bt_aggregates load (inlined in bt_seat1_df)")
-
         with _STATE_LOCK:
             STATE["deal_df"] = deal_df
             STATE["bt_seat1_df"] = bt_seat1_df
@@ -849,15 +914,14 @@ def _heavy_init() -> None:
             STATE["deal_criteria_by_seat_dfs"] = deal_criteria_by_seat_dfs
             STATE["deal_criteria_by_direction_dfs"] = deal_criteria_by_direction_dfs
             STATE["results"] = results
-            STATE["bt_criteria"] = bt_criteria
-            STATE["bt_aggregates"] = bt_aggregates
+            STATE["bt_stats_df"] = bt_stats_df
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
         _log_memory("after STATE update")
 
         # Register DataFrames with DuckDB for SQL queries
-        _register_duckdb_tables(deal_df, bt_seat1_df)
+        _register_duckdb_tables(deal_df, bt_seat1_df, bt_stats_df)
         _log_memory("after DuckDB registration")
 
         # If prewarm is disabled, we are ready immediately.
