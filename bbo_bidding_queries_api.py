@@ -491,16 +491,18 @@ def _check_required_files() -> list[str]:
     NOTE:
     - `bbo_bt_seat1.parquet` is a REQUIRED pipeline artifact for this API. If it's missing,
       something is wrong upstream and we hard-fail rather than falling back.
-    - `bbo_bt_criteria.parquet` and `bbo_bt_aggregate.parquet` are used to build an in-memory
-      `bt_stats_df` (completed-auction criteria/aggregates). They are optional but recommended;
-      if missing, any endpoints that rely on criteria/aggregates will report them as unavailable.
-    - We intentionally do NOT load the full `bbo_bt_augmented.parquet` into memory; it is only
-      scanned lazily to build the bt_row_idx → bt_index mapping for `bt_stats_df`.
+    - `bbo_bt_criteria_seat1_df.parquet` is now also REQUIRED at runtime; it provides the
+      completed-auction criteria/aggregate stats (`bt_stats_df`) used by several endpoints
+      (Bidding Table Explorer, Find Matching Auctions, etc.). If it's missing, we fail fast
+      instead of running with partially functional endpoints.
+    - We intentionally do NOT load the full `bbo_bt_augmented.parquet` into memory; all heavy
+      preprocessing should be done offline by `bbo_bt_build_seat1.py` and friends.
     """
     required: list[pathlib.Path] = [
         exec_plan_file,
         bbo_mldf_augmented_file,
         bt_seat1_file,
+        bt_criteria_seat1_file,
     ]
 
     missing: list[str] = []
@@ -886,6 +888,8 @@ def _heavy_init() -> None:
             try:
                 bt_stats_df = pl.read_parquet(bt_criteria_seat1_file)
                 print(f"[init] bt_stats_df: {bt_stats_df.height:,} rows (completed auctions with criteria/aggregates)")
+                # Track in loaded_files so the UI "Files loaded" list includes stats.
+                _update_loading_status(5, "Loading bt_seat1_df and bt_stats_df...", "bt_stats_df", bt_stats_df.height)
             except Exception as e:
                 print(f"[init] WARNING: Failed to load bt_stats_df from {bt_criteria_seat1_file} ({e}); criteria/aggregates will be unavailable.")
                 bt_stats_df = None

@@ -1948,10 +1948,13 @@ def render_bt_seat_stats_tool():
         mcount = int(seat_res.get("matching_deal_count", 0))
         stats = seat_res.get("stats") or {}
         if not stats:
+            # Make it explicit that this seat had no matching deals, rather than a
+            # generic "(none)" metric label with all values None.
+            metric_label = "(no deals)" if mcount == 0 else "(none)"
             rows.append(
                 {
                     "Seat": seat_num,
-                    "Metric": "(none)",
+                    "Metric": metric_label,
                     "Deals": mcount,
                     "Min": None,
                     "Max": None,
