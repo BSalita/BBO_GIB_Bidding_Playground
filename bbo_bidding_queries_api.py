@@ -668,6 +668,7 @@ STATE: Dict[str, Any] = {
     # Criteria / aggregate statistics for completed auctions (seat-1 view).
     # Built from bbo_bt_criteria.parquet + bbo_bt_aggregate.parquet and keyed by bt_index.
     "bt_stats_df": None,
+    "duckdb_conn": None,
 }
 
 # Additional optional data file paths
@@ -926,6 +927,8 @@ def _heavy_init() -> None:
 
         # Register DataFrames with DuckDB for SQL queries
         _register_duckdb_tables(deal_df, bt_seat1_df, bt_stats_df)
+        with _STATE_LOCK:
+            STATE["duckdb_conn"] = DUCKDB_CONN
         _log_memory("after DuckDB registration")
 
         # If prewarm is disabled, we are ready immediately.
