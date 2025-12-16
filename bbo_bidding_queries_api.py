@@ -620,6 +620,21 @@ class GroupByBidRequest(BaseModel):
     min_deals: int = 1  # Minimum deals required per auction group
 
 
+class BTSeatStatsRequest(BaseModel):
+    """Request for on-the-fly seat stats for a single bt_seat1 row."""
+    bt_index: int  # bt_seat1.bt_index
+    # seat: 1-4 for specific seat, 0 for all seats
+    seat: int = 0
+    # Optional cap on number of deals to aggregate (0 = all); currently unused.
+    max_deals: Optional[int] = 0
+
+
+class ExecuteSQLRequest(BaseModel):
+    """Request for executing user SQL queries."""
+    sql: str
+    max_rows: int = 10000
+
+
 # ---------------------------------------------------------------------------
 # In-process state
 # ---------------------------------------------------------------------------
@@ -652,6 +667,26 @@ STATE: Dict[str, Any] = {
 bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
 
 _STATE_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# DuckDB Connection for SQL queries
+# ---------------------------------------------------------------------------
+
+# Global DuckDB connection - will be initialized after DataFrames are loaded
+DUCKDB_CONN: Optional[duckdb.DuckDBPyConnection] = None
+_DUCKDB_LOCK = threading.Lock()
+
+
+def _register_duckdb_tables(deal_df: pl.DataFrame, bt_seat1_df: pl.DataFrame) -> None:
+    """Register DataFrames with DuckDB for SQL queries."""
+    global DUCKDB_CONN
+    with _DUCKDB_LOCK:
+        if DUCKDB_CONN is None:
+            DUCKDB_CONN = duckdb.connect()
+        # Register DataFrames as queryable tables
+        DUCKDB_CONN.register('deals', deal_df.to_arrow())
+        DUCKDB_CONN.register('auctions', bt_seat1_df.to_arrow())
+        print(f"[duckdb] Registered tables: deals ({deal_df.height:,} rows), auctions ({bt_seat1_df.height:,} rows)")
 
 
 # ---------------------------------------------------------------------------
@@ -757,10 +792,13 @@ def _heavy_init() -> None:
             deal_df = deal_df.with_columns(pl.col('bid').list.join('-'))
         
         # Build criteria bitmaps and derive per-seat/per-dealer views
+        # Pass file paths for caching - bitmaps will be saved/loaded based on staleness
         criteria_deal_dfs_directional = build_or_load_directional_criteria_bitmaps(
             deal_df,
             pythonized_exprs_by_direction,
             expr_map_by_direction,
+            deal_file=bbo_mldf_augmented_file,
+            exec_plan_file=exec_plan_file,
         )
         _log_memory("after build_or_load_directional_criteria_bitmaps")
 
@@ -815,6 +853,10 @@ def _heavy_init() -> None:
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
         _log_memory("after STATE update")
+
+        # Register DataFrames with DuckDB for SQL queries
+        _register_duckdb_tables(deal_df, bt_seat1_df)
+        _log_memory("after DuckDB registration")
 
         # If prewarm is disabled, we are ready immediately.
         if not _cli_prewarm:
@@ -1437,6 +1479,96 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         _log_and_raise("group-by-bid", e)
+
+
+# ---------------------------------------------------------------------------
+# API: On-the-fly bt seat stats
+# ---------------------------------------------------------------------------
+
+
+@app.post("/bt-seat-stats")
+def bt_seat_stats(req: BTSeatStatsRequest) -> Dict[str, Any]:
+    """Compute on-the-fly hand stats for a single bt_seat1 row and seat (or all seats)."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+
+    with _STATE_LOCK:
+        state = dict(STATE)
+        bt_seat1_df = STATE.get("bt_seat1_df")
+
+    if bt_seat1_df is None:
+        raise HTTPException(status_code=503, detail="bt_seat1_df not loaded (pipeline error).")
+
+    try:
+        row_df = bt_seat1_df.filter(pl.col("bt_index") == req.bt_index)
+        if row_df.height == 0:
+            raise HTTPException(status_code=404, detail=f"bt_index {req.bt_index} not found in bt_seat1_df")
+        bt_row = row_df.row(0, named=True)
+
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_bt_seat_stats(
+            state=state,
+            bt_row=bt_row,
+            seat=req.seat,
+            max_deals=req.max_deals or None,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log_and_raise("bt-seat-stats", e)
+
+
+# ---------------------------------------------------------------------------
+# API: Execute SQL
+# ---------------------------------------------------------------------------
+
+
+@app.post("/execute-sql")
+def execute_sql(req: ExecuteSQLRequest) -> Dict[str, Any]:
+    """Execute user-provided SQL against registered tables (deals, auctions)."""
+    _ensure_ready()
+    
+    if DUCKDB_CONN is None:
+        raise HTTPException(status_code=503, detail="DuckDB not initialized")
+    
+    t0 = time.time()
+    sql = req.sql.strip()
+    
+    # Remove trailing semicolons (they break subquery wrapping)
+    sql = sql.rstrip(';').strip()
+    
+    # Security: only allow SELECT queries
+    sql_lower = sql.lower()
+    if any(kw in sql_lower for kw in ['drop', 'delete', 'update', 'insert', 'alter', 'create', 'truncate']):
+        raise HTTPException(status_code=400, detail="Only SELECT queries allowed")
+    
+    try:
+        with _DUCKDB_LOCK:
+            # Execute with row limit for safety
+            if req.max_rows > 0:
+                limited_sql = f"SELECT * FROM ({sql}) AS _subq LIMIT {req.max_rows}"
+            else:
+                limited_sql = sql
+            result = DUCKDB_CONN.execute(limited_sql).pl()
+        
+        elapsed_ms = (time.time() - t0) * 1000
+        print(f"[execute-sql] {result.height} rows in {elapsed_ms:.1f}ms")
+        
+        return {
+            "rows": result.to_dicts(),
+            "columns": result.columns,
+            "row_count": result.height,
+            "sql": sql,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"SQL Error: {e}")
 
 
 if __name__ == "__main__":  # pragma: no cover
