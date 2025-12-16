@@ -1356,7 +1356,8 @@ def render_bidding_table_explorer():
                 "HCP_min_S1", "HCP_max_S1", "HCP_min_S2", "HCP_max_S2",
                 "HCP_min_S3", "HCP_max_S3", "HCP_min_S4", "HCP_max_S4",
             ])
-            render_aggrid(display_df, key="bt_stats_grid", height=500, table_name="bidding_table_stats")
+            # Let render_aggrid pick a dynamic height based on row count instead of forcing 500px.
+            render_aggrid(display_df, key="bt_stats_grid", table_name="bidding_table_stats")
             
             with st.expander("Column Descriptions"):
                 st.markdown("""
@@ -1634,7 +1635,8 @@ def render_pbn_database_lookup():
                 "bid", "Contract", "Result", "Tricks", "Score", "ParScore",
                 "HCP_N", "HCP_S", "HCP_E", "HCP_W",
             ])
-            render_aggrid(all_info_df, key="pbn_lookup_full", height=200, table_name="deal_full_info")
+            # Let AgGrid choose a dynamic height for the full-deal info instead of forcing 200px.
+            render_aggrid(all_info_df, key="pbn_lookup_full", table_name="deal_full_info")
 
         # If multiple matches exist, show a small sample list for clarity
         if count > 1:
@@ -1850,7 +1852,7 @@ def render_bt_seat_stats_tool():
     st.caption(
         "Compute HCP / suit-length / total-points ranges per seat directly from deals, "
         "using the bidding table's criteria bitmaps. "
-        "Enter a `bt_index` from bt_seat1 (shown in the Bidding Table Explorer), or view a sample row."
+        "Enter a `bt_index` from bt_seat1 (shown in the Bidding Table Explorer), or use a random sample row."
     )
 
     bt_index = st.sidebar.number_input(
@@ -1874,11 +1876,21 @@ def render_bt_seat_stats_tool():
         help="Optional cap on the number of deals to aggregate (currently exact stats; cap reserved for future use).",
     )
 
+    # Random seed (used when bt_index == 0 to pick a random bt row).
+    seed_bt_stats = int(
+        st.sidebar.number_input(
+            "Random Seed (0=random)",
+            value=0,
+            min_value=0,
+            key="bt_seat_stats_seed",
+        )
+    )
+
     # Always show basic instructions.
     st.info(
         "Use the sidebar to choose a `bt_index` (from the Bidding Table Explorer) and seat(s). "
         "Seat 1=Dealer, Seat 2=LHO, Seat 3=Partner, Seat 4=RHO. "
-        "If `bt_index` is 0, a sample bt row will be used."
+        "If `bt_index` is 0, a random completed auction row will be sampled (seed-controlled)."
     )
 
     if bt_index < 0:
@@ -1887,41 +1899,34 @@ def render_bt_seat_stats_tool():
 
     seat = 0 if seat_option.startswith("All") else int(seat_option)
 
-    # If bt_index is 0, fetch a sample bt_index once from the API and cache it.
+    # If bt_index is 0, fetch a random completed-auction bt_index from the API.
     if bt_index == 0:
-        sample_key = "bt_seat_stats_sample_bt_index"
-        sample_bt_index = st.session_state.get(sample_key)
-        if sample_bt_index is None:
-            try:
-                # Use bidding-table-statistics to grab a single completed auction row.
-                with st.spinner("Loading sample bt_index from bidding table..."):
-                    sample_payload = {
-                        "auction_pattern": ".*",
-                        "allow_initial_passes": False,
-                        "sample_size": 1,
-                        "min_matches": 0,
-                        "seed": 42,
-                        "dist_pattern": None,
-                        "sorted_shape": None,
-                        "dist_seat": 1,
-                    }
-                    sample_data = api_post("/bidding-table-statistics", sample_payload)
-                    rows = sample_data.get("rows", [])
-                    if rows:
-                        row0 = rows[0]
-                        # Prefer explicit bt_index if present; fall back to original_idx.
-                        sample_bt_index = int(row0.get("bt_index", row0.get("original_idx", 0)))
-                        st.session_state[sample_key] = sample_bt_index
-            except Exception:
-                sample_bt_index = None
-
-        if not sample_bt_index:
-            st.warning(
-                "Could not find a sample bt_index automatically. "
-                "Please enter a bt_index from the Bidding Table Explorer in the sidebar."
-            )
+        try:
+            with st.spinner("Sampling a random bt_index from the bidding table..."):
+                sample_payload = {
+                    "auction_pattern": ".*",
+                    "allow_initial_passes": False,
+                    "sample_size": 1,
+                    "min_matches": 0,
+                    "seed": seed_bt_stats,  # 0 => non-deterministic each call
+                    "dist_pattern": None,
+                    "sorted_shape": None,
+                    "dist_seat": 1,
+                }
+                sample_data = api_post("/bidding-table-statistics", sample_payload)
+                rows = sample_data.get("rows", [])
+                if not rows:
+                    st.warning(
+                        "Could not find a sample bt_index automatically. "
+                        "Please enter a bt_index from the Bidding Table Explorer in the sidebar."
+                    )
+                    return
+                row0 = rows[0]
+                # Prefer explicit bt_index if present; fall back to original_idx.
+                effective_bt_index = int(row0.get("bt_index", row0.get("original_idx", 0)))
+        except Exception as e:
+            st.error(f"Failed to sample a bt_index from bidding table: {e}")
             return
-        effective_bt_index = int(sample_bt_index)
     else:
         effective_bt_index = int(bt_index)
     payload = {
@@ -1942,50 +1947,53 @@ def render_bt_seat_stats_tool():
         st.info("No matching deals found for this bt_index / seat combination.")
         return
 
-    rows = []
+    # Pivot: one row per seat, with metrics expanded into columns such as
+    # HCP_min, HCP_max, HCP_mean, HCP_std, SL_S_min, ..., Total_Points_std.
+    pivot_rows: list[dict[str, object]] = []
     for seat_key, seat_res in seats.items():
         seat_num = int(seat_key)
         mcount = int(seat_res.get("matching_deal_count", 0))
         stats = seat_res.get("stats") or {}
-        if not stats:
-            # Make it explicit that this seat had no matching deals, rather than a
-            # generic "(none)" metric label with all values None.
-            metric_label = "(no deals)" if mcount == 0 else "(none)"
-            rows.append(
-                {
-                    "Seat": seat_num,
-                    "Metric": metric_label,
-                    "Deals": mcount,
-                    "Min": None,
-                    "Max": None,
-                    "Mean": None,
-                    "Std": None,
-                }
-            )
-            continue
+        expr_list = seat_res.get("expr") or []
+        if expr_list:
+            expr_str = ", ".join(str(e) for e in expr_list)
+        else:
+            expr_str = "(empty criteria list)"
 
+        row: dict[str, object] = {
+            "Auction": data.get("auction"),
+            "Seat": seat_num,
+            "Expr": expr_str,
+            "Deals": mcount,
+        }
+
+        # Flatten each metric's stats into columns.
         for metric_name, metric_vals in stats.items():
-            rows.append(
-                {
-                    "Seat": seat_num,
-                    "Metric": metric_name,
-                    "Deals": mcount,
-                    "Min": metric_vals.get("min"),
-                    "Max": metric_vals.get("max"),
-                    "Mean": metric_vals.get("mean"),
-                    "Std": metric_vals.get("std"),
-                }
-            )
+            prefix = str(metric_name)
+            row[f"{prefix}_min"] = metric_vals.get("min")
+            row[f"{prefix}_max"] = metric_vals.get("max")
+            row[f"{prefix}_mean"] = metric_vals.get("mean")
+            row[f"{prefix}_std"] = metric_vals.get("std")
 
-    if not rows:
+        pivot_rows.append(row)
+
+    if not pivot_rows:
         st.info("No metrics available for the selected bt_index / seat.")
         return
 
-    df_stats = pl.DataFrame(rows)
+    df_stats = pl.DataFrame(pivot_rows)
     df_stats = order_columns(
         df_stats,
-        priority_cols=["Seat", "Metric", "Deals", "Min", "Max", "Mean", "Std"],
+        priority_cols=["Auction", "Seat", "Expr", "Deals"],
     )
+
+    # Show the auction context above the stats table (slightly emphasized).
+    auction_str = data.get("auction") or "(unknown auction)"
+    bt_idx_val = data.get("bt_index")
+    if bt_idx_val is not None:
+        st.markdown(f"**Auction: {auction_str} (bt_index={bt_idx_val})**")
+    else:
+        st.markdown(f"**Auction: {auction_str}**")
 
     st.subheader("Seat Stats")
     render_aggrid(
@@ -1994,7 +2002,6 @@ def render_bt_seat_stats_tool():
         height=calc_grid_height(len(df_stats)),
         table_name="bt_seat_stats",
     )
-    st.caption(f"Auction: {data.get('auction')} (bt_index={data.get('bt_index')})")
 
 
 # ---------------------------------------------------------------------------
