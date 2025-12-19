@@ -807,7 +807,7 @@ def render_opening_bids_by_deal():
             opening_bids_df = d.get("opening_bids_df", [])
             
             # Extract invariant columns (same for all rows) to show in Deal Info instead
-            invariant_cols = ["Dealer", "bid", "Actual_Contract", "ParScore", "ParContract", "EV_ParContracts"]
+            invariant_cols = ["Dealer", "Actual_Auction", "Actual_Contract", "ParScore", "ParContract", "EV_ParContracts"]
             invariant_values: dict = {}
             
             if opening_bids_df:
@@ -859,8 +859,8 @@ def render_opening_bids_by_deal():
                 deal_info.update(invariant_values)
                 df_deal_info = pl.DataFrame([deal_info])
                 df_deal_info = order_columns(df_deal_info, priority_cols=[
-                    "Hand_N", "Hand_S", "Hand_E", "Hand_W",
-                    "Dealer", "bid", "Actual_Contract", "ParScore", "ParContract", "EV_ParContracts",
+                    "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                    "Dealer", "Actual_Auction", "Actual_Contract", "ParScore", "ParContract", "EV_ParContracts",
                 ])
                 render_aggrid(df_deal_info, key=f"deal_info_{d['dealer']}_{d['index']}", table_name="deal_info")
             st.divider()
@@ -1189,9 +1189,9 @@ def render_deals_by_auction_pattern(pattern: str | None):
             if deals:
                 deals_df = pl.DataFrame(deals)
                 deals_df = order_columns(deals_df, priority_cols=[
-                    "index", "Dealer", "Vul", "Hand_N", "Hand_S", "Hand_E", "Hand_W",
+                    "index", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
                     "Contract", "Result", "Tricks", "Score", "ParScore", "DD_Score_Declarer",
-                    "HCP_N", "HCP_S", "HCP_E", "HCP_W",
+                    "HCP_N", "HCP_E", "HCP_S", "HCP_W",
                 ])
                 st.write(f"**Matching Deals:** (showing {len(deals_df)})")
                 render_aggrid(deals_df, key=f"deals_{i}", table_name="deals")
@@ -1623,7 +1623,7 @@ def render_pbn_database_lookup():
         if deal_info:
             st.write("**Deal Information:**")
             
-            key_cols = ["PBN", "Vul", "Dealer", "bid", "Contract", "Result", "Tricks", "Score", "ParScore", "DD_Score_Declarer"]
+            key_cols = ["PBN", "Vul", "Dealer", "Actual_Auction", "Contract", "Result", "Tricks", "Score", "ParScore", "DD_Score_Declarer"]
             key_info = {k: v for k, v in deal_info.items() if k in key_cols and v is not None}
             if key_info:
                 render_aggrid(pl.DataFrame([key_info]), key="pbn_lookup_key", height=80, table_name="deal_key_info")
@@ -1631,9 +1631,9 @@ def render_pbn_database_lookup():
             st.markdown("**Full Deal Data:**")
             all_info_df = pl.DataFrame([deal_info])
             all_info_df = order_columns(all_info_df, priority_cols=[
-                "PBN", "Dealer", "Vul", "Hand_N", "Hand_S", "Hand_E", "Hand_W",
-                "bid", "Contract", "Result", "Tricks", "Score", "ParScore",
-                "HCP_N", "HCP_S", "HCP_E", "HCP_W",
+                "PBN", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                "Actual_Auction", "Contract", "Result", "Tricks", "Score", "ParScore",
+                "HCP_N", "HCP_E", "HCP_S", "HCP_W",
             ])
             # Let AgGrid choose a dynamic height for the full-deal info instead of forcing 200px.
             render_aggrid(all_info_df, key="pbn_lookup_full", table_name="deal_full_info")
@@ -1835,11 +1835,11 @@ def render_analyze_actual_auctions():
             deals_df = pl.DataFrame(deals)
             deals_df = order_columns(deals_df, priority_cols=[
                 "PBN",
-                "index", "Dealer", "Vul", "Hand_N", "Hand_S", "Hand_E", "Hand_W",
+                "index", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
                 "Contract", "Result", "Score", "Score_MP", "Score_MP_Pct",
                 "ParScore", "DD_Score_Declarer",
-                "HCP_N", "HCP_S", "HCP_E", "HCP_W",
-                "Total_Points_N", "Total_Points_S", "Total_Points_E", "Total_Points_W",
+                "HCP_N", "HCP_E", "HCP_S", "HCP_W",
+                "Total_Points_N", "Total_Points_E", "Total_Points_S", "Total_Points_W",
             ], drop_cols=["Auction", "Board_ID"])
             render_aggrid(deals_df, key=f"group_by_bid_deals_{i}", height=calc_grid_height(len(deals)), table_name="bid_group_deals")
         
@@ -2015,7 +2015,7 @@ def render_bidding_arena():
     
     # Get available models
     try:
-        models_response = requests.get(f"{API_URL}/bidding-models", timeout=30)
+        models_response = requests.get(f"{API_BASE}/bidding-models", timeout=30)
         models_response.raise_for_status()
         models_data = models_response.json()
         model_names = [m["name"] for m in models_data.get("models", [])]
@@ -2023,12 +2023,13 @@ def render_bidding_arena():
         st.error(f"Failed to get models: {e}")
         model_names = ["Rules", "Actual"]
     
-    # Model selection
+    # Model selection - default to Actual vs Rules
     col1, col2 = st.columns(2)
     with col1:
-        model_a = st.selectbox("Model A", model_names, index=0 if "Rules" in model_names else 0)
+        default_a = model_names.index("Actual") if "Actual" in model_names else 0
+        model_a = st.selectbox("Model A", model_names, index=default_a)
     with col2:
-        default_b = model_names.index("Actual") if "Actual" in model_names else 1
+        default_b = model_names.index("Rules") if "Rules" in model_names else (1 if len(model_names) > 1 else 0)
         model_b = st.selectbox("Model B", model_names, index=min(default_b, len(model_names) - 1))
     
     # Options
@@ -2056,7 +2057,7 @@ def render_bidding_arena():
                     "auction_pattern": auction_pattern if auction_pattern else None,
                     "deals_uri": deals_uri if deals_uri else None,
                 }
-                response = requests.post(f"{API_URL}/bidding-arena", json=payload, timeout=120)
+                response = requests.post(f"{API_BASE}/bidding-arena", json=payload, timeout=120)
                 response.raise_for_status()
                 data = response.json()
                 
@@ -2138,7 +2139,7 @@ def render_wrong_bid_analysis():
         if st.button("Load Wrong Bid Stats", key="load_wrong_bid_stats"):
             with st.spinner("Loading statistics..."):
                 try:
-                    response = requests.post(f"{API_URL}/wrong-bid-stats", json={}, timeout=60)
+                    response = requests.post(f"{API_BASE}/wrong-bid-stats", json={}, timeout=60)
                     response.raise_for_status()
                     data = response.json()
                     
@@ -2176,7 +2177,7 @@ def render_wrong_bid_analysis():
         if st.button("Load Failed Criteria", key="load_failed_criteria"):
             with st.spinner("Analyzing failed criteria..."):
                 try:
-                    response = requests.post(f"{API_URL}/failed-criteria-summary", 
+                    response = requests.post(f"{API_BASE}/failed-criteria-summary", 
                                            json={"top_n": top_n}, timeout=60)
                     response.raise_for_status()
                     data = response.json()
@@ -2213,7 +2214,7 @@ def render_wrong_bid_analysis():
         if st.button("Load Leaderboard", key="load_leaderboard"):
             with st.spinner("Loading leaderboard..."):
                 try:
-                    response = requests.post(f"{API_URL}/wrong-bid-leaderboard",
+                    response = requests.post(f"{API_BASE}/wrong-bid-leaderboard",
                                            json={"top_n": top_n_lb, "min_deals": min_deals}, timeout=60)
                     response.raise_for_status()
                     data = response.json()

@@ -445,8 +445,8 @@ def handle_openings_by_deal_index(
                 # IMPORTANT: contract/dd/ev computations require seat-relative prefixes.
                 r["Rules_Contract"] = get_ai_contract(str(auction_disp), dealer) if auction_disp is not None else None
                 r["Actual_Contract"] = actual_contract
-                # 'bid' should come from deal_df['bid'] (stringized if it's a list)
-                r["bid"] = bid_str
+                # 'Actual_Auction' is the stringized deal_df['bid'] column
+                r["Actual_Auction"] = bid_str
                 r["DD_Score_Declarer"] = (
                     get_dd_score_for_auction(str(auction_disp), dealer, current_row) if auction_disp is not None else None
                 )
@@ -986,8 +986,14 @@ def handle_pbn_lookup(
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"[pbn-lookup] Found {matching.height} matches in {elapsed_ms:.1f}ms")
     
+    # Rename 'bid' to 'Actual_Auction' in output
+    matches_list = matching.to_dicts()
+    for m in matches_list:
+        if "bid" in m:
+            m["Actual_Auction"] = _bid_value_to_str(m.pop("bid"))
+    
     return {
-        "matches": matching.to_dicts(),
+        "matches": matches_list,
         "count": matching.height,
         "total_in_df": deal_df.height,
         "pbn_searched": pbn_input,
@@ -1063,7 +1069,7 @@ def handle_deals_matching_auction(
     sampled_auctions = filtered_df.sample(n=sample_n, seed=effective_seed)
 
     deal_display_cols = [
-        "index", "Dealer", "Vul", "bid", "Contract", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+        "index", "Dealer", "Vul", "Actual_Auction", "Contract", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
         "Declarer", "Result", "Tricks", "Score", "DD_Score_Declarer", "EV_Score_Declarer",
         "EV_Declarer", "ParScore", "ParContracts", "EV_ParContracts",
     ]
@@ -1217,6 +1223,10 @@ def handle_deals_matching_auction(
         deals_list = combined_df.to_dicts()
         wrong_bid_count = 0
         for deal_row in deals_list:
+            # Rename 'bid' column to 'Actual_Auction'
+            if "bid" in deal_row:
+                deal_row["Actual_Auction"] = _bid_value_to_str(deal_row.pop("bid"))
+            
             dealer = deal_row.get("Dealer", "N")
             deal_row["Rules_Contract"] = get_ai_contract(auction, dealer)
             dd_score_rules = get_dd_score_for_auction(auction, dealer, deal_row)
@@ -1264,10 +1274,6 @@ def handle_deals_matching_auction(
             # Normalize ParContracts display and ensure it matches EV_ParContracts de-duped ordering
             par_contracts_raw = deal_row.get("ParContracts")
             deal_row["ParContracts"] = _format_par_contracts(par_contracts_raw)
-        
-            # Add Rules_Bid and Actual_Bid for easy comparison
-            deal_row["Rules_Bid"] = auction  # The expected auction from bt_seat1_df
-            deal_row["Actual_Bid"] = _bid_value_to_str(deal_row.get("bid"))  # The actual bid from the deal
         
         # Add wrong_bid_count to auction_info
         auction_info["wrong_bid_count"] = wrong_bid_count
@@ -1975,6 +1981,7 @@ LIMIT {n_auction_groups}"""
                  "SL_S_N", "SL_H_N", "SL_D_N", "SL_C_N", "SL_S_E", "SL_H_E", "SL_D_E", "SL_C_E",
                  "SL_S_S", "SL_H_S", "SL_D_S", "SL_C_S", "SL_S_W", "SL_H_W", "SL_D_W", "SL_C_W",
                  "Total_Points_N", "Total_Points_E", "Total_Points_S", "Total_Points_W"]
+    # Note: "bid" column will be renamed to "Actual_Auction" in the output
     available_deal_cols = [c for c in deal_cols if c in filtered_df.columns]
     
     bt_cols = ["Auction", "Expr", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"]
@@ -2048,6 +2055,10 @@ LIMIT {n_auction_groups}"""
         deals_list = group_deals.to_dicts()
         wrong_bid_count = 0
         for deal_row in deals_list:
+            # Rename 'bid' column to 'Actual_Auction'
+            if "bid" in deal_row:
+                deal_row["Actual_Auction"] = _bid_value_to_str(deal_row.pop("bid"))
+            
             dealer = deal_row.get("Dealer", "N")
             deal_idx = deal_row.get("_row_idx")
             if deal_idx is not None and bt_info:
@@ -2070,11 +2081,7 @@ LIMIT {n_auction_groups}"""
                 deal_row["first_wrong_seat"] = None
             # Remove internal row index from output
             deal_row.pop("_row_idx", None)
-            
-            # Add Rules_Bid and Actual_Bid for easy comparison
-            deal_row["Rules_Bid"] = bt_auction  # The expected auction from bt_seat1_df
-            deal_row["Actual_Bid"] = _bid_value_to_str(deal_row.get("bid"))  # The actual bid from the deal
-        
+
         auction_groups.append({
             "auction": bid_auction, "bt_auction": bt_auction, "deal_count": deal_count,
             "sample_count": group_deals.height, "bt_info": bt_info, "stats": stats,
@@ -2162,16 +2169,16 @@ def handle_wrong_bid_stats(
     result_df = batch_check_wrong_bids(joined_df, deal_criteria_by_seat_dfs, seat)
     
     # Aggregate statistics from result_df
-    deals_with_wrong_bid = result_df.filter(pl.col("first_wrong_seat").is_not_null()).height
+    wrong_rows = result_df.filter(pl.col("first_wrong_seat").is_not_null())
+    deals_with_wrong_bid = wrong_rows.height
     
     # By seat
-    wrong_bids_by_seat = {s: 0 for s in range(1, 5)}
+    wrong_bids_by_seat: Dict[int, int] = {s: 0 for s in range(1, 5)}
     for s in range(1, 5):
         wrong_bids_by_seat[s] = result_df.filter(pl.col(f"Wrong_Bid_S{s}")).height
     
     # By dealer
     wrong_bids_by_dealer = {"N": 0, "E": 0, "S": 0, "W": 0}
-    wrong_rows = result_df.filter(pl.col("first_wrong_seat").is_not_null())
     if wrong_rows.height > 0 and "Dealer" in wrong_rows.columns:
         dealer_counts = wrong_rows.group_by("Dealer").agg(pl.len().alias("count")).to_dicts()
         for row in dealer_counts:
@@ -2187,35 +2194,60 @@ def handle_wrong_bid_stats(
             v = row.get("Vul")
             if v in wrong_bids_by_vul:
                 wrong_bids_by_vul[v] = row.get("count", 0)
+
+    # Unique auctions with wrong bids (for overall stats)
+    unique_auctions_with_wrong_bids = 0
+    if wrong_rows.height > 0:
+        if "_auction_key" in wrong_rows.columns:
+            unique_auctions_with_wrong_bids = wrong_rows.select(pl.col("_auction_key").n_unique()).item()
+        elif "_bid_str" in wrong_rows.columns:
+            unique_auctions_with_wrong_bids = wrong_rows.select(pl.col("_bid_str").n_unique()).item()
     
     # Calculate rates
-    wrong_bid_rate = deals_with_wrong_bid / analyzed_deals if analyzed_deals > 0 else 0
+    wrong_bid_rate = deals_with_wrong_bid / analyzed_deals if analyzed_deals > 0 else 0.0
     
-    seat_rates = {}
+    seat_rates: Dict[str, Dict[str, float]] = {}
+    per_seat: Dict[str, float] = {}
     for s in range(1, 5):
+        count_s = wrong_bids_by_seat[s]
+        rate_s = count_s / analyzed_deals if analyzed_deals > 0 else 0.0
         seat_rates[f"seat_{s}"] = {
-            "count": wrong_bids_by_seat[s],
-            "rate": wrong_bids_by_seat[s] / analyzed_deals if analyzed_deals > 0 else 0,
+            "count": count_s,
+            "rate": rate_s,
         }
+        # Structure expected by Streamlit UI (seat_{i}_wrong_bids / seat_{i}_rate)
+        per_seat[f"seat_{s}_wrong_bids"] = count_s
+        per_seat[f"seat_{s}_rate"] = rate_s
     
-    dealer_rates = {}
+    dealer_rates: Dict[str, Dict[str, float]] = {}
     for d in ["N", "E", "S", "W"]:
+        count_d = wrong_bids_by_dealer[d]
         dealer_rates[d] = {
-            "count": wrong_bids_by_dealer[d],
-            "rate": wrong_bids_by_dealer[d] / analyzed_deals if analyzed_deals > 0 else 0,
+            "count": count_d,
+            "rate": count_d / analyzed_deals if analyzed_deals > 0 else 0.0,
         }
     
-    vul_rates = {}
+    vul_rates: Dict[str, Dict[str, float]] = {}
     for v in ["None", "NS", "EW", "Both"]:
+        count_v = wrong_bids_by_vul[v]
         vul_rates[v] = {
-            "count": wrong_bids_by_vul[v],
-            "rate": wrong_bids_by_vul[v] / analyzed_deals if analyzed_deals > 0 else 0,
+            "count": count_v,
+            "rate": count_v / analyzed_deals if analyzed_deals > 0 else 0.0,
         }
     
+    # Overall summary block expected by Streamlit
+    overall_stats = {
+        "total_deals": total_deals,
+        "deals_with_wrong_bids": deals_with_wrong_bid,
+        "wrong_bid_rate": round(wrong_bid_rate, 4),
+        "unique_auctions_with_wrong_bids": unique_auctions_with_wrong_bids,
+    }
+
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"[wrong-bid-stats] {elapsed_ms:.1f}ms ({analyzed_deals} analyzed, {deals_with_wrong_bid} wrong)")
     
     return {
+        # Legacy flat fields
         "total_deals": total_deals,
         "analyzed_deals": analyzed_deals,
         "deals_with_wrong_bid": deals_with_wrong_bid,
@@ -2226,6 +2258,9 @@ def handle_wrong_bid_stats(
         "auction_pattern": auction_pattern,
         "seat_filter": seat,
         "elapsed_ms": round(elapsed_ms, 1),
+        # New structured fields for Wrong Bid Analysis UI
+        "overall_stats": overall_stats,
+        "per_seat": per_seat,
     }
 
 
@@ -2326,11 +2361,14 @@ def handle_failed_criteria_summary(
     criteria_results = []
     for criterion, fail_count in sorted(criteria_fail_counts.items(), key=lambda x: -x[1]):
         check_count = criteria_check_counts.get(criterion, 0)
-        fail_rate = fail_count / check_count if check_count > 0 else 0
+        fail_rate = fail_count / check_count if check_count > 0 else 0.0
         criteria_results.append({
             "criterion": criterion,
+            # Aliases for Streamlit visualization
             "fail_count": fail_count,
+            "failure_count": fail_count,
             "check_count": check_count,
+            "affected_auctions": check_count,
             "fail_rate": round(fail_rate, 4),
         })
     
@@ -2355,6 +2393,8 @@ def handle_failed_criteria_summary(
         "auction_pattern": auction_pattern,
         "seat_filter": seat,
         "elapsed_ms": round(elapsed_ms, 1),
+        # Field expected by Streamlit Wrong Bid Analysis UI
+        "criteria": top_criteria,
     }
 
 
@@ -2779,6 +2819,9 @@ def handle_bidding_arena(
     total_imp_a = 0
     total_imp_b = 0
     imp_diffs: List[int] = []
+    sum_dd_a = 0
+    sum_dd_b = 0
+    sample_deals: List[Dict[str, Any]] = []
     
     # Contract agreement
     same_contract = 0
@@ -2848,12 +2891,12 @@ def handle_bidding_arena(
             if bt_auction:
                 contract_a = get_ai_contract(bt_auction, dealer)
                 auction_a = bt_auction
+                # Compute DD score for Rules contract on-the-fly
+                dd_score_a = get_dd_score_for_auction(bt_auction, dealer, row)
             else:
                 contract_a = None
                 auction_a = None
-            
-            # Get DD score for Rules contract
-            dd_score_a = row.get("DD_Score_Rules") if "DD_Score_Rules" in row else None
+                dd_score_a = None
         
         # Model B
         if model_b == "Actual":
@@ -2865,11 +2908,12 @@ def handle_bidding_arena(
             if bt_auction:
                 contract_b = get_ai_contract(bt_auction, dealer)
                 auction_b = bt_auction
+                # Compute DD score for Rules contract on-the-fly
+                dd_score_b = get_dd_score_for_auction(bt_auction, dealer, row)
             else:
                 contract_b = None
                 auction_b = None
-            
-            dd_score_b = row.get("DD_Score_Rules") if "DD_Score_Rules" in row else None
+                dd_score_b = None
         
         # Skip if we don't have scores for both models
         if dd_score_a is None or dd_score_b is None:
@@ -2878,19 +2922,41 @@ def handle_bidding_arena(
         contracts_compared += 1
         
         # Head-to-head comparison (from A's perspective)
-        score_diff = int(dd_score_a) - int(dd_score_b)
-        imp_diff = calculate_imp(abs(score_diff))
+        score_a = int(dd_score_a)
+        score_b = int(dd_score_b)
+        score_diff = score_a - score_b
+        imp_diff_mag = calculate_imp(abs(score_diff))
         if score_diff > 0:
             model_a_wins += 1
-            total_imp_a += imp_diff
-            imp_diffs.append(imp_diff)
+            total_imp_a += imp_diff_mag
+            imp_signed = imp_diff_mag
         elif score_diff < 0:
             model_b_wins += 1
-            total_imp_b += imp_diff
-            imp_diffs.append(-imp_diff)
+            total_imp_b += imp_diff_mag
+            imp_signed = -imp_diff_mag
         else:
             ties += 1
-            imp_diffs.append(0)
+            imp_signed = 0
+        imp_diffs.append(imp_signed)
+
+        # Sum DD scores for averages
+        sum_dd_a += score_a
+        sum_dd_b += score_b
+
+        # Collect a small sample of deal-level comparisons for UI
+        if len(sample_deals) < 50:
+            sample_deals.append(
+                {
+                    "PBN": row.get("PBN"),
+                    "Dealer": dealer,
+                    "Vul": vul,
+                    f"Auction_{model_a}": auction_a,
+                    f"Auction_{model_b}": auction_b,
+                    f"DD_Score_{model_a}": score_a,
+                    f"DD_Score_{model_b}": score_b,
+                    "IMP_Diff": imp_signed,
+                }
+            )
         
         # Segmentation updates
         if vul in by_vulnerability:
@@ -3028,9 +3094,102 @@ def handle_bidding_arena(
     swings_for_a = sum(1 for d in imp_diffs if d >= swing_threshold)
     swings_for_b = sum(1 for d in imp_diffs if d <= -swing_threshold)
     
-    # Build response
+    # Build response-level aggregates
     avg_imp_diff = sum(imp_diffs) / len(imp_diffs) if imp_diffs else 0.0
-    
+    avg_dd_a = sum_dd_a / contracts_compared if contracts_compared > 0 else 0.0
+    avg_dd_b = sum_dd_b / contracts_compared if contracts_compared > 0 else 0.0
+
+    # Summary block expected by Streamlit UI
+    summary: Dict[str, Any] = {
+        "total_deals": contracts_compared,
+        f"avg_dd_score_{model_a.lower()}": avg_dd_a,
+        f"avg_dd_score_{model_b.lower()}": avg_dd_b,
+        f"avg_imp_{model_a.lower()}_vs_{model_b.lower()}": avg_imp_diff,
+    }
+
+    # Head-to-head block with dynamic keys per model
+    head_to_head: Dict[str, Any] = {
+        f"{model_a.lower()}_wins": model_a_wins,
+        f"{model_b.lower()}_wins": model_b_wins,
+        "ties": ties,
+        "model_a_wins": model_a_wins,
+        "model_b_wins": model_b_wins,
+        "model_a_win_rate": round(model_a_wins / contracts_compared, 4) if contracts_compared > 0 else 0.0,
+        "model_b_win_rate": round(model_b_wins / contracts_compared, 4) if contracts_compared > 0 else 0.0,
+        "avg_imp_diff": round(avg_imp_diff, 2),  # Positive favors A
+        "total_imp_a": total_imp_a,
+        "total_imp_b": total_imp_b,
+        "net_imp_for_a": total_imp_a - total_imp_b,
+        "swings_for_a": swings_for_a,
+        "swings_for_b": swings_for_b,
+        "swing_threshold": swing_threshold,
+    }
+
+    # Contract quality block expected by UI
+    contract_quality: Dict[str, Dict[str, Any]] = {
+        "Make Rate": {
+            model_a.lower(): quality_a_rates.get("make_rate", 0.0),
+            model_b.lower(): quality_b_rates.get("make_rate", 0.0),
+        },
+        "Par Rate": {
+            model_a.lower(): quality_a_rates.get("par_rate", 0.0),
+            model_b.lower(): quality_b_rates.get("par_rate", 0.0),
+        },
+        "Slam Accuracy": {
+            model_a.lower(): quality_a_rates.get("slam_accuracy"),
+            model_b.lower(): quality_b_rates.get("slam_accuracy"),
+        },
+        "Game Accuracy": {
+            model_a.lower(): quality_a_rates.get("game_accuracy"),
+            model_b.lower(): quality_b_rates.get("game_accuracy"),
+        },
+        "Partscore Accuracy": {
+            model_a.lower(): quality_a_rates.get("partscore_accuracy"),
+            model_b.lower(): quality_b_rates.get("partscore_accuracy"),
+        },
+    }
+
+    # Segmentation block expected by UI
+    segmentation: Dict[str, Any] = {
+        "by_vulnerability": [
+            {
+                "Vul": vul,
+                **{
+                    "count": data["count"],
+                    "a_win_rate": round(data["a_wins"] / data["count"], 4) if data["count"] > 0 else 0.0,
+                    "b_win_rate": round(data["b_wins"] / data["count"], 4) if data["count"] > 0 else 0.0,
+                    "tie_rate": round(data["ties"] / data["count"], 4) if data["count"] > 0 else 0.0,
+                },
+            }
+            for vul, data in by_vulnerability.items()
+            if data["count"] > 0
+        ],
+        "by_dealer": [
+            {
+                "Dealer": dealer,
+                **{
+                    "count": data["count"],
+                    "a_win_rate": round(data["a_wins"] / data["count"], 4) if data["count"] > 0 else 0.0,
+                    "b_win_rate": round(data["b_wins"] / data["count"], 4) if data["count"] > 0 else 0.0,
+                },
+            }
+            for dealer, data in by_dealer.items()
+            if data["count"] > 0
+        ],
+        "by_hcp_range": [
+            {
+                "HCP_Range": hcp,
+                **{
+                    "count": data["count"],
+                    "a_win_rate": round(data["a_wins"] / data["count"], 4) if data["count"] > 0 else 0.0,
+                    "b_win_rate": round(data["b_wins"] / data["count"], 4) if data["count"] > 0 else 0.0,
+                },
+            }
+            for hcp, data in sorted(by_hcp_range.items())
+            if data["count"] > 0
+        ],
+    }
+
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"[bidding-arena] {elapsed_ms:.1f}ms ({contracts_compared} compared)")
     
@@ -3042,22 +3201,8 @@ def handle_bidding_arena(
         "analyzed_deals": analyzed_deals,
         "deals_compared": contracts_compared,
         "auction_pattern": auction_pattern,
-        
-        "head_to_head": {
-            "model_a_wins": model_a_wins,
-            "model_b_wins": model_b_wins,
-            "ties": ties,
-            "model_a_win_rate": round(model_a_wins / contracts_compared, 4) if contracts_compared > 0 else 0.0,
-            "model_b_win_rate": round(model_b_wins / contracts_compared, 4) if contracts_compared > 0 else 0.0,
-            "avg_imp_diff": round(avg_imp_diff, 2),  # Positive favors A
-            "total_imp_a": total_imp_a,
-            "total_imp_b": total_imp_b,
-            "net_imp_for_a": total_imp_a - total_imp_b,
-            "swings_for_a": swings_for_a,
-            "swings_for_b": swings_for_b,
-            "swing_threshold": swing_threshold,
-        },
-        
+        "summary": summary,
+        "head_to_head": head_to_head,
         "contract_agreement": {
             "same_contract": same_contract,
             "same_contract_rate": round(same_contract / contracts_compared, 4) if contracts_compared > 0 else 0.0,
@@ -3068,12 +3213,11 @@ def handle_bidding_arena(
             "same_declarer": same_declarer,
             "same_declarer_rate": round(same_declarer / contracts_compared, 4) if contracts_compared > 0 else 0.0,
         },
-        
         "quality_by_model": {
             model_a: quality_a_rates,
             model_b: quality_b_rates,
         },
-        
+        "contract_quality": contract_quality,
         "by_vulnerability": {
             vul: {
                 "count": data["count"],
@@ -3083,7 +3227,6 @@ def handle_bidding_arena(
             }
             for vul, data in by_vulnerability.items() if data["count"] > 0
         },
-        
         "by_dealer": {
             dealer: {
                 "count": data["count"],
@@ -3092,7 +3235,6 @@ def handle_bidding_arena(
             }
             for dealer, data in by_dealer.items() if data["count"] > 0
         },
-        
         "by_hcp_range": {
             hcp: {
                 "count": data["count"],
@@ -3101,7 +3243,8 @@ def handle_bidding_arena(
             }
             for hcp, data in sorted(by_hcp_range.items()) if data["count"] > 0
         },
-        
+        "segmentation": segmentation,
+        "sample_deals": sample_deals,
         "elapsed_ms": round(elapsed_ms, 1),
     }
 
