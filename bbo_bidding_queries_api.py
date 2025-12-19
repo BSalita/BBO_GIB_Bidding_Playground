@@ -207,17 +207,19 @@ def _parse_data_dir_arg() -> pathlib.Path | None:
 
 
 def _parse_deal_rows_arg() -> int | None:
-    """Parse --deal-rows from sys.argv early (before full argparse).
+    """Parse --deal-rows from sys.argv early.
     
-    Use this to limit deal_df rows for faster debugging startup.
+    0 or None means 'all rows'.
     """
     import sys
     for i, arg in enumerate(sys.argv):
         if arg == "--deal-rows" and i + 1 < len(sys.argv):
-            return int(sys.argv[i + 1])
+            val = int(sys.argv[i + 1])
+            return None if val <= 0 else val
         if arg.startswith("--deal-rows="):
-            return int(arg.split("=", 1)[1])
-    return None
+            val = int(arg.split("=", 1)[1])
+            return None if val <= 0 else val
+    return None # Default to all rows if not specified
 
 
 # ---------------------------------------------------------------------------
@@ -698,20 +700,24 @@ def _register_duckdb_tables(
     with _DUCKDB_LOCK:
         if DUCKDB_CONN is None:
             DUCKDB_CONN = duckdb.connect()
-        # Register DataFrames as queryable tables
-        DUCKDB_CONN.register("deals", deal_df.to_arrow())
-        DUCKDB_CONN.register("auctions", bt_seat1_df.to_arrow())
+        
+        # Register Polars DataFrames directly with DuckDB (Zero-copy)
+        # DuckDB can see Polars objects in the local scope if we use the same name,
+        # or we can use the register() method.
+        DUCKDB_CONN.register("deals", deal_df)
+        DUCKDB_CONN.register("auctions", bt_seat1_df)
+        
         if bt_stats_df is not None:
-            DUCKDB_CONN.register("auction_stats", bt_stats_df.to_arrow())
+            DUCKDB_CONN.register("auction_stats", bt_stats_df)
             print(
-                "[duckdb] Registered tables: "
+                "[duckdb] Registered Polars DataFrames (Zero-copy): "
                 f"deals ({deal_df.height:,} rows), "
                 f"auctions ({bt_seat1_df.height:,} rows), "
                 f"auction_stats ({bt_stats_df.height:,} rows)"
             )
         else:
             print(
-                "[duckdb] Registered tables: "
+                "[duckdb] Registered Polars DataFrames (Zero-copy): "
                 f"deals ({deal_df.height:,} rows), "
                 f"auctions ({bt_seat1_df.height:,} rows)"
             )
@@ -842,64 +848,58 @@ def _heavy_init() -> None:
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load clean seat-1-only table (used for pattern matching - no p- prefix issues)
-        # NOTE: bbo_bt_seat1.parquet is wide on disk (includes criteria/aggregates for all seats),
-        # but we only need the core bidding columns in memory. Use a lazy scan + select to keep
-        # the in-memory DataFrame narrow.
-        print(f"[init] Loading bt_seat1_df from {bt_seat1_file} (core columns only)...")
-        bt_seat1_core_cols = [
-            "bt_index" if "bt_index" in pl.scan_parquet(bt_seat1_file).collect_schema().names() else "index",
-            "Auction",
-            "is_opening_bid",
-            "is_completed_auction",
-            "Expr",
-            "Agg_Expr_Seat_1",
-            "Agg_Expr_Seat_2",
-            "Agg_Expr_Seat_3",
-            "Agg_Expr_Seat_4",
-            "previous_bid_indices",
-            "next_bid_indices",
-            "missing_next_bid",
-        ]
+        # NOTE: We load only the columns needed at runtime to minimize memory usage.
+        # The full file has 122 columns including many List(String) types that explode in RAM.
+        print(f"[init] Loading bt_seat1_df from {bt_seat1_file} (selective columns)...")
         bt_seat1_scan = pl.scan_parquet(bt_seat1_file)
-        # Normalise primary key name to bt_index for downstream consumers.
-        if "bt_index" in bt_seat1_scan.collect_schema().names():
-            bt_seat1_df = (
-                bt_seat1_scan.select(bt_seat1_core_cols).collect()
-            )
-        else:
-            bt_seat1_df = (
-                bt_seat1_scan
-                .select(bt_seat1_core_cols)
-                .rename({"index": "bt_index"})
-                .collect()
-            )
+        available_cols = bt_seat1_scan.collect_schema().names()
+        
+        # Hard fail if 'bt_index' is missing
+        if "bt_index" not in available_cols:
+            raise ValueError(f"REQUIRED column 'bt_index' missing from {bt_seat1_file}. Pipeline error.")
+        
+        # Columns required for API operations:
+        # - bt_index: primary key
+        # - Auction: pattern matching
+        # - is_opening_bid, is_completed_auction: filtering
+        # - seat: seat identification
+        # - Agg_Expr_Seat_1-4: opening bid criteria matching
+        # - previous_bid_indices: auction sequence queries
+        # Exclude: Expr, Agg_Expr, *_right columns, next_bid_indices (not used at runtime)
+        required_cols = [
+            "bt_index", "Auction", "is_opening_bid", "is_completed_auction", 
+            "seat", "candidate_bid", "npasses", "auction_len",
+            "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
+            "previous_bid_indices",
+        ]
+        # Only select columns that exist in the file
+        cols_to_load = [c for c in required_cols if c in available_cols]
+        print(f"[init] Loading {len(cols_to_load)} of {len(available_cols)} columns...")
+        
+        bt_seat1_df = bt_seat1_scan.select(cols_to_load).collect()
+        
         # IMPORTANT:
         # Do NOT strip leading 'p-' prefixes here.
         # Those prefixes encode seat/turn order and are required for correct declarer/contract logic
         # (AI/DD/IMP computations). Matching code strips prefixes at query time instead.
         _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_df.height)
-        print(f"[init] bt_seat1_df: {bt_seat1_df.height:,} rows (clean seat-1 data)")
+        print(f"[init] bt_seat1_df: {bt_seat1_df.height:,} rows (clean seat-1 data with all stats)")
         _log_memory("after load bt_seat1_df")
 
         # Load completed-auction stats table (criteria + aggregates) keyed by bt_index.
-        # Prefer the pre-joined bbo_bt_criteria_seat1_df.parquet produced by bbo_bt_build_seat1.py v2,
-        # so we do not need to scan the full bbo_bt_augmented.parquet at startup.
+        # This file is REQUIRED for the Bidding Table Explorer and other tools.
         print(f"[init] Loading bt_stats_df from {bt_criteria_seat1_file}...")
-        if bt_criteria_seat1_file.exists():
-            try:
-                bt_stats_df = pl.read_parquet(bt_criteria_seat1_file)
-                print(f"[init] bt_stats_df: {bt_stats_df.height:,} rows (completed auctions with criteria/aggregates)")
-                # Track in loaded_files so the UI "Files loaded" list includes stats.
-                _update_loading_status(5, "Loading bt_seat1_df and bt_stats_df...", "bt_stats_df", bt_stats_df.height)
-            except Exception as e:
-                print(f"[init] WARNING: Failed to load bt_stats_df from {bt_criteria_seat1_file} ({e}); criteria/aggregates will be unavailable.")
-                bt_stats_df = None
-        else:
-            print(
-                f"[init] WARNING: {bt_criteria_seat1_file} not found. "
-                "Run bbo_bt_build_seat1.py (v2) to generate it if you need precomputed criteria/aggregates."
-            )
-            bt_stats_df = None
+        if not bt_criteria_seat1_file.exists():
+            raise FileNotFoundError(f"REQUIRED stats file missing: {bt_criteria_seat1_file}. Pipeline error.")
+        
+        try:
+            bt_stats_df = pl.read_parquet(bt_criteria_seat1_file)
+            print(f"[init] bt_stats_df: {bt_stats_df.height:,} rows (completed auctions with criteria/aggregates)")
+            # Track in loaded_files so the UI "Files loaded" list includes stats.
+            _update_loading_status(5, "Loading bt_seat1_df and bt_stats_df...", "bt_stats_df", bt_stats_df.height)
+        except Exception as e:
+            print(f"[init] ERROR: Failed to load bt_stats_df from {bt_criteria_seat1_file}: {e}")
+            raise
         _log_memory("after load bt_stats_df")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
@@ -1028,7 +1028,7 @@ def _heavy_init() -> None:
             # Pre-warm bt-seat-stats endpoint (on-the-fly stats)
             print("[init] Pre-warming bt-seat-stats endpoint ...")
             first_bt_index = None
-            if bt_seat1_df.height > 0 and "bt_index" in bt_seat1_df.columns:
+            if bt_seat1_df.height > 0:
                 try:
                     first_bt_index = int(bt_seat1_df["bt_index"][0])
                 except Exception:
@@ -1697,8 +1697,8 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument(
         "--deal-rows",
         type=int,
-        default=1000,
-        help="Limit deal_df rows for faster startup (default: 1000) or None for all rows",
+        default=0,
+        help="Limit deal_df rows for faster startup (default: 0, which means all rows)",
     )
     args = parser.parse_args()
 

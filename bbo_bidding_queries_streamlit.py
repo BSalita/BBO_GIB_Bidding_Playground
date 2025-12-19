@@ -1922,8 +1922,8 @@ def render_bt_seat_stats_tool():
                     )
                     return
                 row0 = rows[0]
-                # Prefer explicit bt_index if present; fall back to original_idx.
-                effective_bt_index = int(row0.get("bt_index", row0.get("original_idx", 0)))
+                # Use bt_index column (REQUIRED)
+                effective_bt_index = int(row0["bt_index"])
         except Exception as e:
             st.error(f"Failed to sample a bt_index from bidding table: {e}")
             return
