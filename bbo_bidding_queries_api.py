@@ -678,7 +678,7 @@ class BiddingArenaRequest(BaseModel):
 
 
 # Import model registry for Bidding Arena
-from bidding_models import MODEL_REGISTRY
+from bbo_bidding_models import MODEL_REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1072,27 @@ def _heavy_init() -> None:
                     first_bt_index = None
             if first_bt_index is not None:
                 _ = bt_seat_stats(BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))
+
+            # Pre-warm wrong-bid-stats endpoint
+            print("[init] Pre-warming wrong-bid-stats endpoint ...")
+            _ = wrong_bid_stats(WrongBidStatsRequest(auction_pattern=None, seat=None))
+
+            # Pre-warm failed-criteria-summary endpoint
+            print("[init] Pre-warming failed-criteria-summary endpoint ...")
+            _ = failed_criteria_summary(FailedCriteriaSummaryRequest(auction_pattern=None, top_n=5, seat=None))
+
+            # Pre-warm wrong-bid-leaderboard endpoint
+            print("[init] Pre-warming wrong-bid-leaderboard endpoint ...")
+            _ = wrong_bid_leaderboard(WrongBidLeaderboardRequest(top_n=5, seat=None))
+
+            # Pre-warm bidding-models endpoint
+            print("[init] Pre-warming bidding-models endpoint ...")
+            _ = list_bidding_models()
+
+            # Pre-warm bidding-arena endpoint
+            print("[init] Pre-warming bidding-arena endpoint ...")
+            _ = bidding_arena(BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
+
         except Exception as warm_exc:  # pragma: no cover - best-effort prewarm
             print("[init] WARNING: pre-warm step failed:", warm_exc)
 

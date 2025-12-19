@@ -1,0 +1,508 @@
+"""
+Common utilities, constants, and types for API handlers.
+
+This module contains shared helper functions, constants, and the HandlerState
+dataclass to eliminate primitive obsession and magic numbers/strings.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import polars as pl
+
+from bbo_bidding_queries_lib import normalize_auction_pattern
+from mlBridgeLib.mlBridgeBiddingLib import DIRECTIONS
+
+# ===========================================================================
+# Constants (eliminates magic numbers/strings)
+# ===========================================================================
+
+SEAT_RANGE = range(1, 5)  # Seats 1-4
+MAX_SAMPLE_SIZE = 10_000  # Default sample limit for performance
+DEFAULT_SEED = 42
+
+
+def agg_expr_col(seat: int) -> str:
+    """Get the Agg_Expr column name for a seat."""
+    return f"Agg_Expr_Seat_{seat}"
+
+
+def wrong_bid_col(seat: int) -> str:
+    """Get the Wrong_Bid column name for a seat."""
+    return f"Wrong_Bid_S{seat}"
+
+
+def invalid_criteria_col(seat: int) -> str:
+    """Get the Invalid_Criteria column name for a seat."""
+    return f"Invalid_Criteria_S{seat}"
+
+
+# ===========================================================================
+# Typed State (eliminates primitive obsession)
+# ===========================================================================
+
+@dataclass
+class HandlerState:
+    """Typed container for handler state, replacing Dict[str, Any].
+    
+    This provides type safety and IDE autocompletion for the state object
+    passed to all handlers.
+    """
+    deal_df: pl.DataFrame
+    bt_seat1_df: pl.DataFrame
+    bt_stats_df: Optional[pl.DataFrame] = None
+    deal_criteria_by_seat_dfs: Dict[int, Dict[str, pl.DataFrame]] = field(default_factory=dict)
+    duckdb_conn: Any = None  # DuckDB connection
+    
+    @classmethod
+    def from_dict(cls, state: Dict[str, Any]) -> "HandlerState":
+        """Create HandlerState from a legacy dict."""
+        return cls(
+            deal_df=state["deal_df"],
+            bt_seat1_df=state.get("bt_seat1_df"),
+            bt_stats_df=state.get("bt_stats_df"),
+            deal_criteria_by_seat_dfs=state.get("deal_criteria_by_seat_dfs", {}),
+            duckdb_conn=state.get("duckdb_conn"),
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert back to dict for backward compatibility."""
+        return {
+            "deal_df": self.deal_df,
+            "bt_seat1_df": self.bt_seat1_df,
+            "bt_stats_df": self.bt_stats_df,
+            "deal_criteria_by_seat_dfs": self.deal_criteria_by_seat_dfs,
+            "duckdb_conn": self.duckdb_conn,
+        }
+
+
+# ===========================================================================
+# Auction Helpers
+# ===========================================================================
+
+def display_auction_with_seat_prefix(auction: Any, seat: Any) -> Any:
+    """Display helper: prepend leading passes for the requested seat.
+    
+    We keep auctions canonicalized (no leading p-) for matching, but for UI display
+    we want seat-relative prefixes:
+      seat=1 -> ""
+      seat=2 -> "p-"
+      seat=3 -> "p-p-"
+      seat=4 -> "p-p-p-"
+    """
+    if auction is None:
+        return None
+    try:
+        s = str(auction)
+    except Exception:
+        return auction
+    try:
+        seat_i = int(seat)
+    except Exception:
+        seat_i = 1
+    seat_i = max(1, min(4, seat_i))
+    base = re.sub(r"^(p-)+", "", s)
+    prefix = "p-" * (seat_i - 1)
+    return prefix + base
+
+
+def normalize_to_seat1(pattern: str) -> str:
+    """Normalize auction regex then strip any leading 'p-' prefixes (seat-1 view)."""
+    if not pattern or not pattern.strip():
+        return pattern
+    p = normalize_auction_pattern(pattern)
+    # Strip leading p- (case-insensitive) after optional start anchor
+    p = re.sub(r"(?i)^\^(p-)+", "^", p)
+    p = re.sub(r"(?i)^(p-)+", "", p)
+    return p
+
+
+def expand_row_to_all_seats(row: Dict[str, Any], allow_initial_passes: bool) -> List[Dict[str, Any]]:
+    """Expand a single bt_seat1 row to 4 seat variants (or 1 if allow_initial_passes=False).
+    
+    When allow_initial_passes is True, each matched auction is expanded to 4 rows
+    representing the 4 possible dealer positions. The Agg_Expr_Seat_X columns are
+    rotated to maintain correct seat semantics.
+    """
+    if not allow_initial_passes:
+        return [row]
+    
+    auction = row.get("Auction", "")
+    if not auction:
+        return [row]
+    
+    # Strip any existing leading passes to get the base auction
+    base_auction = re.sub(r"(?i)^(p-)+", "", str(auction))
+    
+    # Identify all seat-indexed column groups to rotate
+    agg_expr_pattern = re.compile(r"^Agg_Expr_Seat_([1-4])$")
+    suffix_s_pattern = re.compile(r"^(.+)_S([1-4])$")
+    
+    expanded_rows = []
+    for num_passes in range(4):
+        new_row = {}
+        
+        # Copy non-seat-specific columns
+        for col_name, value in row.items():
+            if agg_expr_pattern.match(col_name) or suffix_s_pattern.match(col_name):
+                continue
+            new_row[col_name] = value
+        
+        # Build the auction with appropriate prefix
+        prefix = "p-" * num_passes
+        new_row["Auction"] = prefix + base_auction
+        new_row["_opener_seat"] = num_passes + 1
+        
+        # Rotate seat-indexed columns
+        for display_seat in SEAT_RANGE:
+            original_seat = ((display_seat - 1 - num_passes) % 4) + 1
+            
+            orig_agg = agg_expr_col(original_seat)
+            display_agg = agg_expr_col(display_seat)
+            if orig_agg in row:
+                new_row[display_agg] = row[orig_agg]
+            
+            for col_name in row.keys():
+                match = suffix_s_pattern.match(col_name)
+                if match:
+                    base_name = match.group(1)
+                    col_seat = int(match.group(2))
+                    if col_seat == original_seat:
+                        display_col = f"{base_name}_S{display_seat}"
+                        new_row[display_col] = row[col_name]
+        
+        expanded_rows.append(new_row)
+    
+    return expanded_rows
+
+
+# ===========================================================================
+# DataFrame Helpers
+# ===========================================================================
+
+def take_rows_by_index(df: pl.DataFrame, row_indices: List[int]) -> pl.DataFrame:
+    """Version-tolerant row selection by integer indices (preserves order).
+    
+    Polars versions differ on whether `DataFrame.take()` exists. This helper works
+    without it by joining on a generated row index.
+    """
+    if not row_indices:
+        return df.head(0)
+    idx_df = pl.DataFrame(
+        {"_row": [int(i) for i in row_indices], "_pos": list(range(len(row_indices)))}
+    )
+    return (
+        df.with_row_index("_row")
+        .join(idx_df, on="_row", how="inner")
+        .sort("_pos")
+        .drop(["_row", "_pos"])
+    )
+
+
+def effective_seed(seed: int | None) -> int | None:
+    """Convert seed=0 to None (non-reproducible) for Polars .sample()."""
+    if seed is None:
+        return None
+    return None if seed == 0 else seed
+
+
+def safe_float(x: Any) -> float | None:
+    """Convert a value to float if possible; otherwise return None."""
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+# ===========================================================================
+# Bid/Contract Helpers
+# ===========================================================================
+
+def bid_value_to_str(bid_val: Any) -> str:
+    """Stringize deal_df['bid'] consistently across endpoints.
+
+    - If it's a list of bids, join with '-' (e.g., ['1N','p','3N'] -> '1N-p-3N')
+    - If it's already a string, return as-is
+    - Else, best-effort str(...)
+    """
+    if bid_val is None:
+        return ""
+    if isinstance(bid_val, list):
+        try:
+            return "-".join(map(str, bid_val))
+        except Exception:
+            return "-".join([str(x) for x in bid_val])
+    if isinstance(bid_val, str):
+        return bid_val
+    return str(bid_val)
+
+
+def extract_bid_at_seat(auction: str, seat: int) -> str | None:
+    """Extract the bid at a specific seat position from an auction string.
+    
+    Args:
+        auction: Auction string like "1N-p-3N-p-p-p"
+        seat: 1-based seat position (1-4)
+    
+    Returns:
+        The bid at that seat, or None if not found
+    """
+    if not auction:
+        return None
+    bids = auction.split("-")
+    seat_idx = seat - 1
+    if seat_idx < 0 or seat_idx >= len(bids):
+        return None
+    return bids[seat_idx]
+
+
+def seat_direction_map(seat: int) -> Dict[str, str]:
+    """Map dealer -> actual hand direction for a given seat (1–4).
+    
+    Seat 1 is the dealer; seat 2 is LHO; seat 3 is partner; seat 4 is RHO.
+    """
+    seat_i = max(1, min(4, int(seat)))
+    mapping: Dict[str, str] = {}
+    for dealer in DIRECTIONS:
+        dealer_idx = DIRECTIONS.index(dealer)
+        direction = DIRECTIONS[(dealer_idx + seat_i - 1) % 4]
+        mapping[dealer] = direction
+    return mapping
+
+
+# ===========================================================================
+# Par Contract Helpers
+# ===========================================================================
+
+def par_contract_signature(c: dict) -> str:
+    """Stable signature for a par-contract dict (used for de-duping)."""
+    level = c.get("Level", "")
+    strain = c.get("Strain", "")
+    dbl = c.get("Doubled", "")
+    if dbl == "":
+        dbl = c.get("Double", "")
+    pair_dir = c.get("Pair_Direction", "")
+    result = c.get("Result", "")
+    return f"{level}|{strain}|{dbl}|{pair_dir}|{result}"
+
+
+def dedup_par_contracts(par_contracts: Any) -> List[dict]:
+    """Return de-duplicated par contracts (preserving first-seen order)."""
+    if not isinstance(par_contracts, list):
+        return []
+    seen: set[str] = set()
+    out: List[dict] = []
+    for c in par_contracts:
+        if not isinstance(c, dict):
+            continue
+        sig = par_contract_signature(c)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(c)
+    return out
+
+
+def format_par_contracts(par_contracts: Any) -> str | None:
+    """Format ParContracts into a readable string, de-duped and with correct 'Doubled' key."""
+    if par_contracts is None:
+        return None
+    if not isinstance(par_contracts, list):
+        return str(par_contracts)
+    formatted: List[str] = []
+    for c in dedup_par_contracts(par_contracts):
+        level = c.get("Level", "")
+        strain = c.get("Strain", "")
+        dbl = c.get("Doubled", "")
+        if dbl == "":
+            dbl = c.get("Double", "")
+        pair_dir = c.get("Pair_Direction", "")
+        result = c.get("Result", "")
+        contract_str = f"{level}{strain}{dbl}"
+        if pair_dir:
+            contract_str += f" {pair_dir}"
+        if result is not None and result != "":
+            if isinstance(result, int):
+                if result == 0:
+                    contract_str += " ="
+                elif result > 0:
+                    contract_str += f" +{result}"
+                else:
+                    contract_str += f" {result}"
+            else:
+                contract_str += f" {result}"
+        formatted.append(contract_str.strip())
+    return ", ".join(formatted)
+
+
+def ev_list_for_par_contracts(deal_row: dict) -> List[float | None]:
+    """EV values aligned to the de-duplicated ParContracts order."""
+    par_contracts = dedup_par_contracts(deal_row.get("ParContracts"))
+    if not par_contracts:
+        return []
+
+    def _vul_flag(vul_raw: Any, pair: str) -> str:
+        vul_raw_s = "None" if vul_raw is None else str(vul_raw).strip()
+        if vul_raw_s in ["Both", "All", "b", "B"]:
+            return "V"
+        if vul_raw_s == pair or (vul_raw_s == "NS" and pair == "NS") or (vul_raw_s == "EW" and pair == "EW"):
+            return "V"
+        if vul_raw_s in ["None", "O", "o", "-", ""]:
+            return "NV"
+        return "NV"
+
+    out: List[float | None] = []
+    for c in par_contracts:
+        level_raw = c.get("Level")
+        strain_raw = c.get("Strain")
+        pair = c.get("Pair_Direction")
+        if not level_raw or not strain_raw or pair not in ("NS", "EW"):
+            out.append(None)
+            continue
+        try:
+            level = int(level_raw)
+        except Exception:
+            out.append(None)
+            continue
+        strain = str(strain_raw).strip().upper()
+        if strain not in ["C", "D", "H", "S", "N"]:
+            out.append(None)
+            continue
+        vul = _vul_flag(deal_row.get("Vul", "None"), str(pair))
+        decls = ["N", "S"] if pair == "NS" else ["E", "W"]
+        best_for_contract: float | None = None
+        for declarer in decls:
+            col = f"EV_{pair}_{declarer}_{strain}_{level}_{vul}"
+            ev_f = safe_float(deal_row.get(col))
+            if ev_f is None:
+                continue
+            if best_for_contract is None or ev_f > best_for_contract:
+                best_for_contract = ev_f
+        out.append(best_for_contract)
+    return out
+
+
+# ===========================================================================
+# BT Lookup Helper (extracted from duplicated code pattern)
+# ===========================================================================
+
+def lookup_bt_row(
+    bt_lookup_df: pl.DataFrame,
+    bid_str: str,
+) -> Tuple[pl.DataFrame, str]:
+    """Look up bidding table row with pass-suffix fallback.
+    
+    This extracts the duplicated pattern that appeared 6 times in the codebase.
+    
+    Args:
+        bt_lookup_df: Bidding table DataFrame (filtered to completed auctions)
+        bid_str: Auction string to look up
+    
+    Returns:
+        Tuple of (matched_df, normalized_auction_string)
+    """
+    # Normalize: strip leading passes
+    auction_for_search = re.sub(r"^(p-)+", "", bid_str.lower()) if bid_str else ""
+    
+    # Try exact match
+    bt_match = bt_lookup_df.filter(
+        pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search
+    )
+    
+    # Fallback: try with trailing passes
+    if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
+        bt_match = bt_lookup_df.filter(
+            pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search + "-p-p-p"
+        )
+    
+    return bt_match, auction_for_search
+
+
+def get_bt_info_from_match(bt_match: pl.DataFrame) -> Dict[str, Any] | None:
+    """Extract bt_info dict from a bt_match DataFrame.
+    
+    Returns None if no match found.
+    """
+    if bt_match.height == 0:
+        return None
+    
+    bt_row = bt_match.row(0, named=True)
+    return {
+        agg_expr_col(seat): bt_row.get(agg_expr_col(seat))
+        for seat in SEAT_RANGE
+    }
+
+
+# ===========================================================================
+# Wrong Bid Conformance Checking
+# ===========================================================================
+
+def check_deal_criteria_conformance_bitmap(
+    deal_idx: int,
+    bt_info: Dict[str, Any] | None,
+    dealer: str,
+    deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
+    auction: str | None = None,
+) -> Dict[str, Any]:
+    """Check if a deal conforms to the criteria for each seat using bitmap lookups.
+    
+    Args:
+        deal_idx: Row index in deal_df
+        bt_info: Dict with Agg_Expr_Seat_1..4 keys
+        dealer: Dealer direction (N/E/S/W)
+        deal_criteria_by_seat_dfs: Pre-computed criteria bitmap DataFrames
+        auction: Optional auction string for including bid in failed criteria
+    
+    Returns:
+        Dict with Wrong_Bid_S1-S4, Invalid_Criteria_S1-S4, and first_wrong_seat
+    """
+    import json
+    
+    result: Dict[str, Any] = {
+        wrong_bid_col(s): False for s in SEAT_RANGE
+    }
+    result.update({
+        invalid_criteria_col(s): None for s in SEAT_RANGE
+    })
+    result["first_wrong_seat"] = None
+    
+    if bt_info is None:
+        return result
+    
+    for seat in SEAT_RANGE:
+        criteria_list = bt_info.get(agg_expr_col(seat))
+        if not criteria_list:
+            continue
+        
+        seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
+        criteria_df = seat_dfs.get(dealer)
+        if criteria_df is None or criteria_df.is_empty():
+            continue
+        
+        failed_criteria: List[str] = []
+        for criterion in criteria_list:
+            if criterion not in criteria_df.columns:
+                continue
+            try:
+                bitmap_value = criteria_df[criterion][deal_idx]
+                if not bitmap_value:
+                    failed_criteria.append(criterion)
+            except (IndexError, KeyError):
+                continue
+        
+        if failed_criteria:
+            result[wrong_bid_col(seat)] = True
+            bid_at_seat = extract_bid_at_seat(auction, seat) if auction else None
+            if bid_at_seat:
+                result[invalid_criteria_col(seat)] = json.dumps([bid_at_seat, failed_criteria])
+            else:
+                result[invalid_criteria_col(seat)] = json.dumps(failed_criteria)
+            
+            if result["first_wrong_seat"] is None:
+                result["first_wrong_seat"] = seat
+    
+    return result
+

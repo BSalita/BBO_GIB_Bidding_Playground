@@ -8,10 +8,13 @@ the server or reloading data.
 
 Handler functions receive a `state` dict containing loaded DataFrames
 and precomputed structures.
+
+Refactored: Common helpers and constants are in handlers_common.py
 """
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import time
@@ -40,297 +43,50 @@ from bbo_bidding_queries_lib import (
 
 from mlBridgeLib.mlBridgeBiddingLib import DIRECTIONS
 
-
-def _display_auction_with_seat_prefix(auction: Any, seat: Any) -> Any:
-    """Display helper: prepend leading passes for the requested seat.
-    
-    We keep auctions canonicalized (no leading p-) for matching, but for UI display
-    we want seat-relative prefixes:
-      seat=1 -> ""
-      seat=2 -> "p-"
-      seat=3 -> "p-p-"
-      seat=4 -> "p-p-p-"
-    """
-    if auction is None:
-        return None
-    try:
-        s = str(auction)
-    except Exception:
-        return auction
-    try:
-        seat_i = int(seat)
-    except Exception:
-        seat_i = 1
-    seat_i = max(1, min(4, seat_i))
-    base = re.sub(r"^(p-)+", "", s)
-    prefix = "p-" * (seat_i - 1)
-    return prefix + base
-
-
-def _expand_row_to_all_seats(row: Dict[str, Any], allow_initial_passes: bool) -> List[Dict[str, Any]]:
-    """Expand a single bt_seat1 row to 4 seat variants (or 1 if allow_initial_passes=False).
-    
-    When allow_initial_passes is True, each matched auction is expanded to 4 rows
-    representing the 4 possible dealer positions. The Agg_Expr_Seat_X columns are
-    rotated to maintain correct seat semantics.
-    
-    For k leading passes (opener is seat k+1), the seat column rotation is:
-      Display Seat D gets value from Original Seat ((D - 1 - k) % 4) + 1
-    
-    Example for `1N-p-3N-p-p-p` (opener at seat 1):
-      - k=0: no prefix, columns unchanged
-      - k=1: `p-` prefix, opener moves to seat 2
-        - Display Seat 1 <- Original Seat 4 (dealer passed)
-        - Display Seat 2 <- Original Seat 1 (opener)
-        - Display Seat 3 <- Original Seat 2
-        - Display Seat 4 <- Original Seat 3
-    """
-    if not allow_initial_passes:
-        return [row]
-    
-    auction = row.get("Auction", "")
-    if not auction:
-        return [row]
-    
-    # Strip any existing leading passes to get the base auction
-    base_auction = re.sub(r"(?i)^(p-)+", "", str(auction))
-    
-    # Identify all seat-indexed column groups to rotate
-    # Patterns: Agg_Expr_Seat_N, *_SN (e.g., HCP_min_S1)
-    agg_expr_pattern = re.compile(r"^Agg_Expr_Seat_([1-4])$")
-    suffix_s_pattern = re.compile(r"^(.+)_S([1-4])$")
-    
-    expanded_rows = []
-    for num_passes in range(4):  # 0, 1, 2, 3 leading passes
-        # Start fresh - don't copy seat-specific columns yet
-        new_row = {}
-        
-        # Copy non-seat-specific columns
-        for col_name, value in row.items():
-            if agg_expr_pattern.match(col_name) or suffix_s_pattern.match(col_name):
-                continue  # Will handle rotation below
-            new_row[col_name] = value
-        
-        # Build the auction with appropriate prefix
-        prefix = "p-" * num_passes
-        new_row["Auction"] = prefix + base_auction
-        new_row["_opener_seat"] = num_passes + 1  # Which seat opens (1-4)
-        
-        # Rotate seat-indexed columns using inverse mapping:
-        # Display Seat D <- Original Seat ((D - 1 - num_passes) % 4) + 1
-        for display_seat in range(1, 5):
-            original_seat = ((display_seat - 1 - num_passes) % 4) + 1
-            
-            # Agg_Expr_Seat_N columns
-            orig_agg = f"Agg_Expr_Seat_{original_seat}"
-            display_agg = f"Agg_Expr_Seat_{display_seat}"
-            if orig_agg in row:
-                new_row[display_agg] = row[orig_agg]
-            
-            # *_SN columns (e.g., HCP_min_S1 -> HCP_min_S2)
-            for col_name in row.keys():
-                match = suffix_s_pattern.match(col_name)
-                if match:
-                    base_name = match.group(1)
-                    col_seat = int(match.group(2))
-                    if col_seat == original_seat:
-                        display_col = f"{base_name}_S{display_seat}"
-                        new_row[display_col] = row[col_name]
-        
-        expanded_rows.append(new_row)
-    
-    return expanded_rows
+# Import from common module (eliminates code duplication)
+from plugins.bbo_handlers_common import (
+    # Constants
+    SEAT_RANGE,
+    MAX_SAMPLE_SIZE,
+    DEFAULT_SEED,
+    agg_expr_col,
+    wrong_bid_col,
+    invalid_criteria_col,
+    # Typed state
+    HandlerState,
+    # Auction helpers
+    display_auction_with_seat_prefix as _display_auction_with_seat_prefix,
+    normalize_to_seat1 as _normalize_to_seat1,
+    expand_row_to_all_seats as _expand_row_to_all_seats,
+    # DataFrame helpers
+    take_rows_by_index as _take_rows_by_index,
+    effective_seed as _effective_seed,
+    safe_float as _safe_float,
+    # Bid/Contract helpers
+    bid_value_to_str as _bid_value_to_str,
+    extract_bid_at_seat as _extract_bid_at_seat,
+    seat_direction_map as _seat_direction_map,
+    # Par contract helpers
+    par_contract_signature as _par_contract_signature,
+    dedup_par_contracts as _dedup_par_contracts,
+    format_par_contracts as _format_par_contracts,
+    ev_list_for_par_contracts as _ev_list_for_par_contracts,
+    # BT Lookup (extracted from duplicate pattern)
+    lookup_bt_row as _lookup_bt_row,
+    get_bt_info_from_match as _get_bt_info_from_match,
+    # Wrong bid checking
+    check_deal_criteria_conformance_bitmap as _check_deal_criteria_conformance_bitmap,
+)
 
 
-def _normalize_to_seat1(pattern: str) -> str:
-    """Normalize auction regex then strip any leading 'p-' prefixes (seat-1 view)."""
-    if not pattern or not pattern.strip():
-        return pattern
-    p = normalize_auction_pattern(pattern)
-    # Strip leading p- (case-insensitive) after optional start anchor
-    p = re.sub(r"(?i)^\^(p-)+", "^", p)
-    p = re.sub(r"(?i)^(p-)+", "", p)
-    return p
-
-
-def _take_rows_by_index(df: pl.DataFrame, row_indices: List[int]) -> pl.DataFrame:
-    """Version-tolerant row selection by integer indices (preserves order).
-    
-    Polars versions differ on whether `DataFrame.take()` exists. This helper works
-    without it by joining on a generated row index.
-    """
-    if not row_indices:
-        return df.head(0)
-    idx_df = pl.DataFrame(
-        {"_row": [int(i) for i in row_indices], "_pos": list(range(len(row_indices)))}
-    )
-    return (
-        df.with_row_index("_row")
-        .join(idx_df, on="_row", how="inner")
-        .sort("_pos")
-        .drop(["_row", "_pos"])
-    )
-
-
-def _safe_float(x: Any) -> float | None:
-    """Convert a value to float if possible; otherwise return None.
-
-    This keeps runtime behavior robust and also satisfies static type checking
-    (Polars aggregations can have imprecise return types).
-    """
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
-def _bid_value_to_str(bid_val: Any) -> str:
-    """Stringize deal_df['bid'] consistently across endpoints.
-
-    - If it's a list of bids, join with '-' (e.g., ['1N','p','3N'] -> '1N-p-3N')
-    - If it's already a string, return as-is
-    - Else, best-effort str(...)
-    """
-    if bid_val is None:
-        return ""
-    if isinstance(bid_val, list):
-        try:
-            return "-".join(map(str, bid_val))
-        except Exception:
-            return "-".join([str(x) for x in bid_val])
-    if isinstance(bid_val, str):
-        return bid_val
-    return str(bid_val)
-
-
-def _par_contract_signature(c: dict) -> str:
-    """Stable signature for a par-contract dict (used for de-duping)."""
-    level = c.get("Level", "")
-    strain = c.get("Strain", "")
-    # Dataset uses 'Doubled' but some older code used 'Double'
-    dbl = c.get("Doubled", "")
-    if dbl == "":
-        dbl = c.get("Double", "")
-    pair_dir = c.get("Pair_Direction", "")
-    result = c.get("Result", "")
-    return f"{level}|{strain}|{dbl}|{pair_dir}|{result}"
-
-
-def _dedup_par_contracts(par_contracts: Any) -> list[dict]:
-    """Return de-duplicated par contracts (preserving first-seen order)."""
-    if not isinstance(par_contracts, list):
-        return []
-    seen: set[str] = set()
-    out: list[dict] = []
-    for c in par_contracts:
-        if not isinstance(c, dict):
-            continue
-        sig = _par_contract_signature(c)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append(c)
-    return out
-
-
-def _format_par_contracts(par_contracts: Any) -> str | None:
-    """Format ParContracts into a readable string, de-duped and with correct 'Doubled' key."""
-    if par_contracts is None:
-        return None
-    if not isinstance(par_contracts, list):
-        return str(par_contracts)
-    formatted: list[str] = []
-    for c in _dedup_par_contracts(par_contracts):
-        level = c.get("Level", "")
-        strain = c.get("Strain", "")
-        dbl = c.get("Doubled", "")
-        if dbl == "":
-            dbl = c.get("Double", "")
-        pair_dir = c.get("Pair_Direction", "")
-        result = c.get("Result", "")
-        contract_str = f"{level}{strain}{dbl}"
-        if pair_dir:
-            contract_str += f" {pair_dir}"
-        if result is not None and result != "":
-            if isinstance(result, int):
-                if result == 0:
-                    contract_str += " ="
-                elif result > 0:
-                    contract_str += f" +{result}"
-                else:
-                    contract_str += f" {result}"
-            else:
-                contract_str += f" {result}"
-        formatted.append(contract_str.strip())
-    return ", ".join(formatted)
-
-
-def _ev_list_for_par_contracts(deal_row: dict) -> list[float | None]:
-    """EV values aligned to the de-duplicated ParContracts order (best EV over possible declarers in that pair)."""
-    par_contracts = _dedup_par_contracts(deal_row.get("ParContracts"))
-    if not par_contracts:
-        return []
-
-    def _vul_flag(vul_raw: Any, pair: str) -> str:
-        vul_raw_s = "None" if vul_raw is None else str(vul_raw).strip()
-        if vul_raw_s in ["Both", "All", "b", "B"]:
-            return "V"
-        if vul_raw_s == pair or (vul_raw_s == "NS" and pair == "NS") or (vul_raw_s == "EW" and pair == "EW"):
-            return "V"
-        if vul_raw_s in ["None", "O", "o", "-", ""]:
-            return "NV"
-        return "NV"
-
-    out: list[float | None] = []
-    for c in par_contracts:
-        level_raw = c.get("Level")
-        strain_raw = c.get("Strain")
-        pair = c.get("Pair_Direction")
-        if not level_raw or not strain_raw or pair not in ("NS", "EW"):
-            out.append(None)
-            continue
-        try:
-            level = int(level_raw)
-        except Exception:
-            out.append(None)
-            continue
-        strain = str(strain_raw).strip().upper()
-        if strain not in ["C", "D", "H", "S", "N"]:
-            out.append(None)
-            continue
-        vul = _vul_flag(deal_row.get("Vul", "None"), str(pair))
-        decls = ["N", "S"] if pair == "NS" else ["E", "W"]
-        best_for_contract: float | None = None
-        for declarer in decls:
-            col = f"EV_{pair}_{declarer}_{strain}_{level}_{vul}"
-            ev_f = _safe_float(deal_row.get(col))
-            if ev_f is None:
-                continue
-            if best_for_contract is None or ev_f > best_for_contract:
-                best_for_contract = ev_f
-        out.append(best_for_contract)
-    return out
-
-
-def _effective_seed(seed: int | None) -> int | None:
-    """Convert seed=0 to None (non-reproducible) for Polars .sample()."""
-    if seed is None:
-        return None
-    return None if seed == 0 else seed
-
-
-def _seat_direction_map(seat: int) -> dict[str, str]:
-    """Map dealer -> actual hand direction for a given seat (1–4).
-    
-    Seat 1 is the dealer; seat 2 is LHO; seat 3 is partner; seat 4 is RHO.
-    """
-    seat_i = max(1, min(4, int(seat)))
-    mapping: dict[str, str] = {}
-    for dealer in DIRECTIONS:
-        dealer_idx = DIRECTIONS.index(dealer)
-        direction = DIRECTIONS[(dealer_idx + seat_i - 1) % 4]
-        mapping[dealer] = direction
-    return mapping
+# ===========================================================================
+# Note: Common helpers (_display_auction_with_seat_prefix, _expand_row_to_all_seats,
+# _normalize_to_seat1, _take_rows_by_index, _safe_float, _bid_value_to_str,
+# _par_contract_signature, _dedup_par_contracts, _format_par_contracts,
+# _ev_list_for_par_contracts, _effective_seed, _seat_direction_map,
+# _extract_bid_at_seat, _check_deal_criteria_conformance_bitmap, _lookup_bt_row)
+# are imported from handlers_common.py to eliminate code duplication.
+# ===========================================================================
 
 
 def _compute_seat_stats_for_bt_row(
@@ -2130,103 +1886,6 @@ def handle_process_pbn(
     print(f"[process-pbn] {elapsed_ms:.1f}ms ({len(results)} deals, type={input_type})")
     
     return {"deals": results, "count": len(results), "input_type": input_type, "input_source": input_source, "elapsed_ms": round(elapsed_ms, 1)}
-
-
-def _extract_bid_at_seat(auction: str, seat: int) -> str | None:
-    """Extract the bid made at a specific seat position in an auction.
-    
-    Args:
-        auction: Auction string like "1N-p-3N-p-p-p"
-        seat: Seat number (1-4)
-        
-    Returns:
-        The bid at that position (e.g., "1N", "p", "3N") or None if not found.
-    """
-    if not auction:
-        return None
-    parts = auction.split("-")
-    if seat <= 0 or seat > len(parts):
-        return None
-    return parts[seat - 1]
-
-
-def _check_deal_criteria_conformance_bitmap(
-    deal_idx: int,
-    bt_info: Dict[str, Any] | None,
-    dealer: str,
-    deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
-    auction: str | None = None,
-) -> Dict[str, Any]:
-    """Check if a deal's bitmap values conform to the auction's criteria for each seat.
-    
-    Uses pre-computed bitmap columns (True/False) from deal_criteria_by_seat_dfs.
-    If a bitmap value is False for a criterion but the deal has this auction in 
-    its 'bid' column, it's a "wrong bid" - the actual bid doesn't match the expected criteria.
-    
-    Stops at the first seat with a wrong bid (subsequent bids are tainted anyway).
-    
-    Args:
-        deal_idx: Row index in deal_df (for bitmap lookup)
-        bt_info: Auction info with Agg_Expr_Seat_1, Agg_Expr_Seat_2, etc.
-        dealer: Dealer direction (N/E/S/W) for seat-to-direction mapping
-        deal_criteria_by_seat_dfs: Pre-computed bitmap DataFrames keyed by [seat][dealer]
-        auction: Auction string to extract per-seat bids (e.g., "1N-p-3N-p-p-p")
-        
-    Returns:
-        Dict with per-seat columns:
-            - "Wrong_Bid_S{1-4}": Boolean - True if that seat's bid failed criteria
-            - "Invalid_Criteria_S{1-4}": [bid, [failed_criteria...]] or None
-            - "first_wrong_seat": seat number of first wrong bid (None if all OK)
-    """
-    result: Dict[str, Any] = {
-        "Wrong_Bid_S1": False, "Wrong_Bid_S2": False, "Wrong_Bid_S3": False, "Wrong_Bid_S4": False,
-        "Invalid_Criteria_S1": None, "Invalid_Criteria_S2": None, "Invalid_Criteria_S3": None, "Invalid_Criteria_S4": None,
-        "first_wrong_seat": None,
-    }
-    
-    if not bt_info or not deal_criteria_by_seat_dfs:
-        return result
-    
-    # For each seat, check the criteria bitmaps - stop at first wrong bid
-    for seat in range(1, 5):
-        agg_col = f"Agg_Expr_Seat_{seat}"
-        criteria_list = bt_info.get(agg_col)
-        if not criteria_list:
-            continue
-        
-        # Get the bitmap DataFrame for this seat and dealer
-        seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
-        criteria_df = seat_dfs.get(dealer)
-        if criteria_df is None or criteria_df.is_empty():
-            continue
-        
-        # Check each criterion's bitmap value for this deal
-        seat_failed: List[str] = []
-        for criterion in criteria_list:
-            if criterion not in criteria_df.columns:
-                # Criterion not in bitmaps - can't check, skip
-                continue
-            
-            # Get the bitmap value for this deal
-            try:
-                bitmap_value = criteria_df[criterion][deal_idx]
-                if not bitmap_value:  # False = criterion not met
-                    seat_failed.append(criterion)
-            except (IndexError, KeyError):
-                # Index out of range or column missing - skip
-                continue
-        
-        if seat_failed:
-            # Extract the bid made at this seat
-            bid_at_seat = _extract_bid_at_seat(auction, seat) if auction else None
-            
-            result[f"Wrong_Bid_S{seat}"] = True
-            result[f"Invalid_Criteria_S{seat}"] = [bid_at_seat, seat_failed]
-            result["first_wrong_seat"] = seat
-            # Stop at first wrong bid - subsequent bids are tainted
-            break
-    
-    return result
 
 
 # ---------------------------------------------------------------------------
