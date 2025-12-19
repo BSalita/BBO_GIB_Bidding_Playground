@@ -982,48 +982,59 @@ def _heavy_init() -> None:
         # This does a tiny sample query on each endpoint's core logic.
         # ------------------------------------------------------------------
         _update_loading_status(7, "Pre-warming endpoints...")
+        
+        def _prewarm_endpoint(name: str, fn, *args, **kwargs):
+            """Run a prewarm call and log its duration."""
+            t0 = time.perf_counter()
+            try:
+                result = fn(*args, **kwargs)
+                elapsed_s = time.perf_counter() - t0
+                print(f"[init] Pre-warmed {name}: {elapsed_s:.2f}s")
+                return result
+            except Exception as e:
+                elapsed_s = time.perf_counter() - t0
+                print(f"[init] Pre-warm {name} FAILED ({elapsed_s:.2f}s): {e}")
+                return None
+        
+        prewarm_t0 = time.perf_counter()
         try:
-            print("[init] Pre-warming openings-by-deal-index endpoint ...")
-            _ = openings_by_deal_index(OpeningsByDealIndexRequest(sample_size=1))
+            _prewarm_endpoint("openings-by-deal-index",
+                openings_by_deal_index, OpeningsByDealIndexRequest(sample_size=1))
 
-            print("[init] Pre-warming random-auction-sequences endpoint ...")
-            _ = random_auction_sequences(RandomAuctionSequencesRequest(n_samples=1, seed=42))
+            _prewarm_endpoint("random-auction-sequences",
+                random_auction_sequences, RandomAuctionSequencesRequest(n_samples=1, seed=42))
 
-            print("[init] Pre-warming auction-sequences-matching endpoint ...")
-            _ = auction_sequences_matching(
-                AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0)
-            )
+            _prewarm_endpoint("auction-sequences-matching",
+                auction_sequences_matching,
+                AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))
 
-            print("[init] Pre-warming deals-matching-auction endpoint ...")
-            _ = deals_matching_auction(
+            _prewarm_endpoint("deals-matching-auction",
+                deals_matching_auction,
                 DealsMatchingAuctionRequest(
                     pattern="^1N-p-3N$",
                     n_auction_samples=1,
                     n_deal_samples=3,
                     seed=0,
-                )
-            )
+                ))
 
-            print("[init] Pre-warming bidding-table-statistics endpoint ...")
-            _ = bidding_table_statistics(
+            _prewarm_endpoint("bidding-table-statistics",
+                bidding_table_statistics,
                 BiddingTableStatisticsRequest(
                     auction_pattern="^1N-p-3N$",
                     sample_size=1,
                     seed=42,
-                )
-            )
+                ))
 
-            print("[init] Pre-warming process-pbn endpoint ...")
-            _ = process_pbn(
+            _prewarm_endpoint("process-pbn",
+                process_pbn,
                 ProcessPBNRequest(
                     pbn="N:AKQ2.KQ2.AK2.AK2 T987.987.987.987 J654.654.654.654 3.JT53.QJT53.QJT5",
                     include_par=True,
                     vul="None",
-                )
-            )
+                ))
 
-            print("[init] Pre-warming find-matching-auctions endpoint ...")
-            _ = find_matching_auctions(
+            _prewarm_endpoint("find-matching-auctions",
+                find_matching_auctions,
                 FindMatchingAuctionsRequest(
                     hcp=15,
                     sl_s=4,
@@ -1033,37 +1044,31 @@ def _heavy_init() -> None:
                     total_points=17,
                     seat=1,
                     max_results=1,
-                )
-            )
+                ))
 
-            print("[init] Pre-warming group-by-bid endpoint ...")
-            _ = group_by_bid(
+            _prewarm_endpoint("group-by-bid",
+                group_by_bid,
                 GroupByBidRequest(
                     auction_pattern="^1N-p-3N$",
                     n_auction_groups=1,
                     n_deals_per_group=1,
                     seed=42,
-                )
-            )
+                ))
 
             # Pre-warm PBN sample / random / lookup endpoints
-            print("[init] Pre-warming pbn-sample endpoint ...")
-            sample_resp = get_pbn_sample()
+            sample_resp = _prewarm_endpoint("pbn-sample", get_pbn_sample)
 
-            print("[init] Pre-warming pbn-random endpoint ...")
-            _ = get_pbn_random()
+            _prewarm_endpoint("pbn-random", get_pbn_random)
 
-            print("[init] Pre-warming pbn-lookup endpoint ...")
-            sample_pbn = getattr(sample_resp, "pbn", None) or sample_resp.get("pbn", "")
+            sample_pbn = getattr(sample_resp, "pbn", None) or (sample_resp.get("pbn", "") if sample_resp else "")
             if sample_pbn:
-                _ = pbn_lookup(PBNLookupRequest(pbn=sample_pbn, max_results=1))
+                _prewarm_endpoint("pbn-lookup",
+                    pbn_lookup, PBNLookupRequest(pbn=sample_pbn, max_results=1))
 
-            # Pre-warm execute-sql endpoint with a trivial query
-            print("[init] Pre-warming execute-sql endpoint ...")
-            _ = execute_sql(ExecuteSQLRequest(sql="SELECT 1 AS x", max_rows=1))
+            _prewarm_endpoint("execute-sql",
+                execute_sql, ExecuteSQLRequest(sql="SELECT 1 AS x", max_rows=1))
 
             # Pre-warm bt-seat-stats endpoint (on-the-fly stats)
-            print("[init] Pre-warming bt-seat-stats endpoint ...")
             first_bt_index = None
             if bt_seat1_df.height > 0:
                 try:
@@ -1071,27 +1076,25 @@ def _heavy_init() -> None:
                 except Exception:
                     first_bt_index = None
             if first_bt_index is not None:
-                _ = bt_seat_stats(BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))
+                _prewarm_endpoint("bt-seat-stats",
+                    bt_seat_stats, BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))
 
-            # Pre-warm wrong-bid-stats endpoint
-            print("[init] Pre-warming wrong-bid-stats endpoint ...")
-            _ = wrong_bid_stats(WrongBidStatsRequest(auction_pattern=None, seat=None))
+            _prewarm_endpoint("wrong-bid-stats",
+                wrong_bid_stats, WrongBidStatsRequest(auction_pattern=None, seat=None))
 
-            # Pre-warm failed-criteria-summary endpoint
-            print("[init] Pre-warming failed-criteria-summary endpoint ...")
-            _ = failed_criteria_summary(FailedCriteriaSummaryRequest(auction_pattern=None, top_n=5, seat=None))
+            _prewarm_endpoint("failed-criteria-summary",
+                failed_criteria_summary, FailedCriteriaSummaryRequest(auction_pattern=None, top_n=5, seat=None))
 
-            # Pre-warm wrong-bid-leaderboard endpoint
-            print("[init] Pre-warming wrong-bid-leaderboard endpoint ...")
-            _ = wrong_bid_leaderboard(WrongBidLeaderboardRequest(top_n=5, seat=None))
+            _prewarm_endpoint("wrong-bid-leaderboard",
+                wrong_bid_leaderboard, WrongBidLeaderboardRequest(top_n=5, seat=None))
 
-            # Pre-warm bidding-models endpoint
-            print("[init] Pre-warming bidding-models endpoint ...")
-            _ = list_bidding_models()
+            _prewarm_endpoint("bidding-models", list_bidding_models)
 
-            # Pre-warm bidding-arena endpoint
-            print("[init] Pre-warming bidding-arena endpoint ...")
-            _ = bidding_arena(BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
+            _prewarm_endpoint("bidding-arena",
+                bidding_arena, BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
+
+            total_prewarm_s = time.perf_counter() - prewarm_t0
+            print(f"[init] All endpoints pre-warmed in {total_prewarm_s:.2f}s")
 
         except Exception as warm_exc:  # pragma: no cover - best-effort prewarm
             print("[init] WARNING: pre-warm step failed:", warm_exc)
