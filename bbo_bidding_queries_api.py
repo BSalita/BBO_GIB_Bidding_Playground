@@ -584,6 +584,8 @@ class DealsMatchingAuctionRequest(BaseModel):
     dist_pattern: Optional[str] = None  # Ordered distribution (S-H-D-C), e.g., "5-4-3-1"
     sorted_shape: Optional[str] = None  # Sorted shape (any suit), e.g., "5431"
     dist_direction: str = "N"  # Which hand to filter (N/E/S/W)
+    # Wrong bid filter: "all" (default), "no_wrong" (only conforming bids), "only_wrong" (only non-conforming)
+    wrong_bid_filter: str = "all"
 
 
 class BiddingTableStatisticsRequest(BaseModel):
@@ -642,6 +644,38 @@ class ExecuteSQLRequest(BaseModel):
     """Request for executing user SQL queries."""
     sql: str
     max_rows: int = 10000
+
+
+class WrongBidStatsRequest(BaseModel):
+    """Request for aggregate wrong bid statistics."""
+    auction_pattern: Optional[str] = None  # Optional filter pattern
+    seat: Optional[int] = None  # Filter by specific seat (1-4), None = all seats
+
+
+class FailedCriteriaSummaryRequest(BaseModel):
+    """Request for criterion failure analysis."""
+    auction_pattern: Optional[str] = None  # Optional filter pattern
+    top_n: int = 20  # Number of top failing criteria to return
+    seat: Optional[int] = None  # Filter by specific seat (1-4), None = all seats
+
+
+class WrongBidLeaderboardRequest(BaseModel):
+    """Request for wrong bid leaderboard."""
+    top_n: int = 20  # Number of bids to return
+    seat: Optional[int] = None  # Filter by specific seat (1-4), None = all seats
+
+
+class BiddingArenaRequest(BaseModel):
+    """Request for Bidding Arena: head-to-head model comparison."""
+    model_a: str = "Rules"  # First model to compare
+    model_b: str = "Actual"  # Second model to compare
+    auction_pattern: Optional[str] = None  # Optional filter pattern
+    sample_size: int = 1000  # Number of deals to compare
+    seed: Optional[int] = 0  # Random seed for sampling
+
+
+# Import model registry for Bidding Arena
+from bidding_models import MODEL_REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -1251,6 +1285,7 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
             dist_pattern=req.dist_pattern,
             sorted_shape=req.sorted_shape,
             dist_direction=req.dist_direction,
+            wrong_bid_filter=req.wrong_bid_filter,
             apply_auction_criteria_fn=_apply_auction_criteria,
         )
         return _attach_hot_reload_info(resp, reload_info)
@@ -1669,6 +1704,159 @@ def execute_sql(req: ExecuteSQLRequest) -> Dict[str, Any]:
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"SQL Error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# API: Wrong Bid Statistics
+# ---------------------------------------------------------------------------
+
+
+@app.post("/wrong-bid-stats")
+def wrong_bid_stats(req: WrongBidStatsRequest) -> Dict[str, Any]:
+    """Aggregate statistics about wrong bids across the dataset."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_wrong_bid_stats(
+            state=state,
+            auction_pattern=req.auction_pattern,
+            seat=req.seat,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("wrong-bid-stats", e)
+
+
+@app.post("/failed-criteria-summary")
+def failed_criteria_summary(req: FailedCriteriaSummaryRequest) -> Dict[str, Any]:
+    """Analysis of which criteria fail most often."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_failed_criteria_summary(
+            state=state,
+            auction_pattern=req.auction_pattern,
+            top_n=req.top_n,
+            seat=req.seat,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("failed-criteria-summary", e)
+
+
+@app.post("/wrong-bid-leaderboard")
+def wrong_bid_leaderboard(req: WrongBidLeaderboardRequest) -> Dict[str, Any]:
+    """Leaderboard of bids with highest error rates."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_wrong_bid_leaderboard(
+            state=state,
+            top_n=req.top_n,
+            seat=req.seat,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("wrong-bid-leaderboard", e)
+
+
+# ---------------------------------------------------------------------------
+# API: Bidding Models Registry
+# ---------------------------------------------------------------------------
+
+
+@app.get("/bidding-models")
+def list_bidding_models() -> Dict[str, Any]:
+    """List all available bidding models for the Bidding Arena."""
+    models = MODEL_REGISTRY.list_models()
+    return {
+        "models": models,
+        "count": len(models),
+        "help": "Use these model names in /bidding-arena requests",
+    }
+
+
+# ---------------------------------------------------------------------------
+# API: Bidding Arena (Model Comparison)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/bidding-arena")
+def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
+    """Bidding Arena: Head-to-head comparison between two bidding models."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    
+    # Validate model names against registry
+    if not MODEL_REGISTRY.is_valid_model(req.model_a):
+        available = [m["name"] for m in MODEL_REGISTRY.list_models()]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model_a: '{req.model_a}'. Available models: {available}"
+        )
+    if not MODEL_REGISTRY.is_valid_model(req.model_b):
+        available = [m["name"] for m in MODEL_REGISTRY.list_models()]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model_b: '{req.model_b}'. Available models: {available}"
+        )
+    if req.model_a == req.model_b:
+        raise HTTPException(
+            status_code=400,
+            detail="model_a and model_b must be different"
+        )
+    
+    with _STATE_LOCK:
+        state = dict(STATE)
+    
+    # Check model availability
+    model_a = MODEL_REGISTRY.get(req.model_a)
+    model_b = MODEL_REGISTRY.get(req.model_b)
+    if model_a and not model_a.is_available(state):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model '{req.model_a}' is not available (required data not loaded)"
+        )
+    if model_b and not model_b.is_available(state):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model '{req.model_b}' is not available (required data not loaded)"
+        )
+    
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_bidding_arena(
+            state=state,
+            model_a=req.model_a,
+            model_b=req.model_b,
+            auction_pattern=req.auction_pattern,
+            sample_size=req.sample_size,
+            seed=req.seed,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("bidding-arena", e)
 
 
 if __name__ == "__main__":  # pragma: no cover

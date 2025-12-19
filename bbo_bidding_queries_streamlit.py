@@ -835,7 +835,7 @@ def render_opening_bids_by_deal():
                         
                         bids_df = order_columns(bids_df, priority_cols=[
                             "Best_Bid", "index", "Auction", "seat",
-                            "AI_Contract", "DD_Score_Declarer", "EV_Score_Declarer", "Expr",
+                            "Rules_Contract", "DD_Score_Declarer", "EV_Score_Declarer", "Expr",
                         ], drop_cols=invariant_cols)
                     
                     render_aggrid(bids_df, key=f"bids_{d['dealer']}_{d['index']}", table_name="opening_bids")
@@ -1180,8 +1180,8 @@ def render_deals_by_auction_pattern(pattern: str | None):
                 st.write("**Contract Summary:**")
                 summary_df = pl.DataFrame(contract_summary)
                 summary_df = order_columns(summary_df, priority_cols=[
-                    "Contract", "Count", "Avg_IMP_AI", "Contract_Made%", "AI_Made%",
-                    "Contract_Par%", "AI_Par%",
+                    "Contract", "Count", "Avg_IMP_Rules", "Contract_Made%", "Rules_Made%",
+                    "Contract_Par%", "Rules_Par%",
                 ])
                 render_aggrid(summary_df, key=f"contract_summary_{i}", height=200, table_name="contract_summary")
             
@@ -1537,7 +1537,7 @@ def render_analyze_deal():
             st.success(f"Found {len(matches)} matching auction(s) for seat {match_seat} in {elapsed_ms/1000:.1f}s")
             matches_df = pl.DataFrame(matches)
             matches_df = order_columns(matches_df, priority_cols=[
-                "Auction", "AI_Auction", "Expr",
+                "Auction", "Rules_Auction", "Expr",
                 "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
             ])
             render_aggrid(matches_df, key=f"matches_deal_{deal_idx}", height=calc_grid_height(len(matches)), table_name="auction_matches")
