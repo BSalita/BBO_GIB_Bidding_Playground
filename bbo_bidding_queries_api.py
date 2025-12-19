@@ -672,6 +672,9 @@ class BiddingArenaRequest(BaseModel):
     auction_pattern: Optional[str] = None  # Optional filter pattern
     sample_size: int = 1000  # Number of deals to compare
     seed: Optional[int] = 0  # Random seed for sampling
+    # Custom deals source: file path or URL to parquet/csv file
+    # If None, uses the default deal_df loaded at startup
+    deals_uri: Optional[str] = None
 
 
 # Import model registry for Bidding Arena
@@ -1853,6 +1856,7 @@ def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
             auction_pattern=req.auction_pattern,
             sample_size=req.sample_size,
             seed=req.seed,
+            deals_uri=req.deals_uri,
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
