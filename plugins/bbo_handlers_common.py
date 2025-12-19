@@ -437,6 +437,160 @@ def get_bt_info_from_match(bt_match: pl.DataFrame) -> Dict[str, Any] | None:
 
 
 # ===========================================================================
+# Vectorized Deal-to-BT Join Helpers (performance optimization)
+# ===========================================================================
+
+def prepare_deals_with_bid_str(deal_df: pl.DataFrame) -> pl.DataFrame:
+    """Add _bid_str and _auction_key columns to deal DataFrame for joining.
+    
+    _auction_key is normalized: lowercase, leading passes stripped, trailing -p-p-p removed.
+    """
+    bid_dtype = deal_df.schema.get("bid")
+    
+    # Add bid_str column
+    if bid_dtype == pl.List(pl.Utf8):
+        df = deal_df.with_columns(pl.col("bid").list.join("-").alias("_bid_str"))
+    elif bid_dtype == pl.Utf8:
+        df = deal_df.with_columns(pl.col("bid").fill_null("").alias("_bid_str"))
+    else:
+        df = deal_df.with_columns(
+            pl.col("bid").map_elements(
+                lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
+                return_dtype=pl.Utf8,
+            ).alias("_bid_str")
+        )
+    
+    # Add normalized auction key for joining
+    df = df.with_columns(
+        pl.col("_bid_str")
+        .str.to_lowercase()
+        .str.replace(r"^(p-)+", "")  # Strip leading passes
+        .str.replace(r"-p-p-p$", "")  # Strip trailing passes for matching
+        .alias("_auction_key")
+    )
+    
+    return df
+
+
+def prepare_bt_for_join(bt_df: pl.DataFrame) -> pl.DataFrame:
+    """Add _auction_key column to BT DataFrame for joining.
+    
+    Filters to completed auctions only and normalizes the auction key.
+    """
+    if "is_completed_auction" in bt_df.columns:
+        bt_df = bt_df.filter(pl.col("is_completed_auction"))
+    
+    # Add normalized key (BT auctions are already seat-1 normalized, just need lowercase + strip trailing passes)
+    return bt_df.with_columns(
+        pl.col("Auction")
+        .cast(pl.Utf8)
+        .str.to_lowercase()
+        .str.replace(r"-p-p-p$", "")  # Strip trailing passes for matching
+        .alias("_auction_key")
+    )
+
+
+def join_deals_with_bt(
+    deals_df: pl.DataFrame,
+    bt_df: pl.DataFrame,
+    bt_cols: List[str] | None = None,
+) -> pl.DataFrame:
+    """Join deals with BT data using pre-computed auction keys.
+    
+    Both DataFrames must have _auction_key column (use prepare_* functions).
+    
+    Args:
+        deals_df: Deal DataFrame with _auction_key column
+        bt_df: BT DataFrame with _auction_key column  
+        bt_cols: Columns to select from BT (defaults to Agg_Expr_Seat_1-4)
+    
+    Returns:
+        Joined DataFrame with BT columns added
+    """
+    if bt_cols is None:
+        bt_cols = [agg_expr_col(s) for s in SEAT_RANGE]
+    
+    # Select only needed columns from BT to avoid column conflicts
+    bt_select = ["_auction_key"] + [c for c in bt_cols if c in bt_df.columns]
+    bt_slim = bt_df.select(bt_select).unique(subset=["_auction_key"])
+    
+    return deals_df.join(bt_slim, on="_auction_key", how="left")
+
+
+def batch_check_wrong_bids(
+    joined_df: pl.DataFrame,
+    deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
+    seat_filter: int | None = None,
+) -> pl.DataFrame:
+    """Batch-check wrong bids for a joined deals+BT DataFrame.
+    
+    This is more efficient than row-by-row checking when processing many deals.
+    Still uses row iteration for bitmap checks (criteria vary per auction),
+    but eliminates the expensive per-row BT lookups.
+    
+    Args:
+        joined_df: DataFrame with _row_idx, Dealer, _bid_str, and Agg_Expr_Seat_1-4 columns
+        deal_criteria_by_seat_dfs: Pre-computed criteria bitmap DataFrames
+        seat_filter: Optional seat to check (None = all seats)
+    
+    Returns:
+        DataFrame with Wrong_Bid_S1-4, first_wrong_seat columns added
+    """
+    # Prepare result columns
+    wrong_cols = {wrong_bid_col(s): [] for s in SEAT_RANGE}
+    first_wrong_list: List[int | None] = []
+    
+    seats_to_check = [seat_filter] if seat_filter else list(SEAT_RANGE)
+    
+    # Process rows - still a loop but without per-row DataFrame filters
+    for row in joined_df.iter_rows(named=True):
+        deal_idx = row.get("_row_idx", 0)
+        dealer = row.get("Dealer", "N")
+        
+        first_wrong_seat: int | None = None
+        row_wrong = {s: False for s in SEAT_RANGE}
+        
+        for seat in seats_to_check:
+            if seat is None:
+                continue
+            criteria_list = row.get(agg_expr_col(seat))
+            if not criteria_list:
+                continue
+            
+            seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
+            criteria_df = seat_dfs.get(dealer)
+            if criteria_df is None or criteria_df.is_empty():
+                continue
+            
+            for criterion in criteria_list:
+                if criterion not in criteria_df.columns:
+                    continue
+                try:
+                    bitmap_value = criteria_df[criterion][deal_idx]
+                    if not bitmap_value:
+                        row_wrong[seat] = True
+                        if first_wrong_seat is None:
+                            first_wrong_seat = seat
+                        break  # One failed criterion is enough
+                except (IndexError, KeyError):
+                    continue
+        
+        for s in SEAT_RANGE:
+            wrong_cols[wrong_bid_col(s)].append(row_wrong[s])
+        first_wrong_list.append(first_wrong_seat)
+    
+    # Add columns to DataFrame
+    result = joined_df.with_columns([
+        pl.Series(name=wrong_bid_col(s), values=wrong_cols[wrong_bid_col(s)])
+        for s in SEAT_RANGE
+    ] + [
+        pl.Series(name="first_wrong_seat", values=first_wrong_list)
+    ])
+    
+    return result
+
+
+# ===========================================================================
 # Wrong Bid Conformance Checking
 # ===========================================================================
 

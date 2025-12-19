@@ -76,6 +76,11 @@ from plugins.bbo_handlers_common import (
     get_bt_info_from_match as _get_bt_info_from_match,
     # Wrong bid checking
     check_deal_criteria_conformance_bitmap as _check_deal_criteria_conformance_bitmap,
+    # Vectorized join helpers (performance optimization)
+    prepare_deals_with_bid_str,
+    prepare_bt_for_join,
+    join_deals_with_bt,
+    batch_check_wrong_bids,
 )
 
 
@@ -668,7 +673,7 @@ LIMIT {sample_n}"""
                         wrong_bid_count += 1
                 
                 wrong_bid_rate = wrong_bid_count / sample_n if sample_n > 0 else 0.0
-        
+
         out_samples.append({
             "auction": matched_auction, 
             "sequence": seq_df.to_dicts(),
@@ -1259,7 +1264,7 @@ def handle_deals_matching_auction(
             # Normalize ParContracts display and ensure it matches EV_ParContracts de-duped ordering
             par_contracts_raw = deal_row.get("ParContracts")
             deal_row["ParContracts"] = _format_par_contracts(par_contracts_raw)
-            
+        
             # Add Rules_Bid and Actual_Bid for easy comparison
             deal_row["Rules_Bid"] = auction  # The expected auction from bt_seat1_df
             deal_row["Actual_Bid"] = _bid_value_to_str(deal_row.get("bid"))  # The actual bid from the deal
@@ -2113,6 +2118,7 @@ def handle_wrong_bid_stats(
     """Handle /wrong-bid-stats endpoint.
     
     Provides aggregate statistics about wrong bids across the dataset.
+    Uses vectorized join instead of per-row BT lookups for performance.
     """
     t0 = time.perf_counter()
     
@@ -2123,110 +2129,64 @@ def handle_wrong_bid_stats(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
     
+    # Add row index for bitmap lookups
+    deal_df = deal_df.with_row_index("_row_idx")
+    
+    # Prepare for join: add _bid_str and _auction_key
+    deals_prepared = prepare_deals_with_bid_str(deal_df)
+    
     # Filter deals by auction pattern if provided
     if auction_pattern:
         try:
-            bid_dtype = deal_df.schema.get("bid")
-            if bid_dtype == pl.List(pl.Utf8):
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").list.join("-").alias("bid_str"))
-            elif bid_dtype == pl.Utf8:
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").fill_null("").alias("bid_str"))
-            else:
-                deal_df_with_str = deal_df.with_columns(
-                    pl.col("bid").map_elements(
-                        lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                        return_dtype=pl.Utf8,
-                    ).alias("bid_str")
-                )
             regex_pattern = f"(?i){normalize_auction_pattern(auction_pattern)}"
-            filtered_df = deal_df_with_str.filter(pl.col("bid_str").str.contains(regex_pattern))
+            deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
-    else:
-        filtered_df = deal_df.with_row_index("_row_idx")
     
-    # Add row index for bitmap lookups
-    if "_row_idx" not in filtered_df.columns:
-        filtered_df = filtered_df.with_row_index("_row_idx")
-    
-    total_deals = filtered_df.height
-    
-    # Build a lookup from auction string -> bt_info
-    bt_lookup_df = bt_seat1_df
-    if "is_completed_auction" in bt_lookup_df.columns:
-        bt_lookup_df = bt_lookup_df.filter(pl.col("is_completed_auction"))
-    
-    # Stats containers
-    deals_with_wrong_bid = 0
-    wrong_bids_by_seat = {1: 0, 2: 0, 3: 0, 4: 0}
-    wrong_bids_by_dealer = {"N": 0, "E": 0, "S": 0, "W": 0}
-    wrong_bids_by_vul = {"None": 0, "NS": 0, "EW": 0, "Both": 0}
+    total_deals = deals_prepared.height
     
     # Sample deals to analyze (for performance, limit to 10000)
     sample_size = min(10000, total_deals)
     if sample_size < total_deals:
-        sample_df = filtered_df.sample(n=sample_size, seed=42)
+        sample_df = deals_prepared.sample(n=sample_size, seed=42)
     else:
-        sample_df = filtered_df
+        sample_df = deals_prepared
     
     analyzed_deals = sample_df.height
     
-    # Get bid column as string for auction matching
-    bid_dtype = sample_df.schema.get("bid")
-    if bid_dtype == pl.List(pl.Utf8):
-        sample_df = sample_df.with_columns(pl.col("bid").list.join("-").alias("_bid_str"))
-    elif bid_dtype == pl.Utf8:
-        sample_df = sample_df.with_columns(pl.col("bid").fill_null("").alias("_bid_str"))
-    else:
-        sample_df = sample_df.with_columns(
-            pl.col("bid").map_elements(
-                lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                return_dtype=pl.Utf8,
-            ).alias("_bid_str")
-        )
+    # Prepare BT for join and join once (instead of per-row lookups)
+    bt_prepared = prepare_bt_for_join(bt_seat1_df)
+    joined_df = join_deals_with_bt(sample_df, bt_prepared)
     
-    # Process each deal
-    for row in sample_df.iter_rows(named=True):
-        deal_idx = row.get("_row_idx", 0)
-        dealer = row.get("Dealer", "N")
-        vul = row.get("Vul", "None")
-        bid_str = row.get("_bid_str", "")
-        
-        # Look up bt_info for this auction
-        auction_for_search = re.sub(r"^(p-)+", "", bid_str.lower()) if bid_str else ""
-        bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search)
-        if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
-            bt_match = bt_lookup_df.filter(
-                pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search + "-p-p-p"
-            )
-        
-        if bt_match.height == 0:
-            continue
-        
-        bt_row = bt_match.row(0, named=True)
-        bt_info = {
-            "Agg_Expr_Seat_1": bt_row.get("Agg_Expr_Seat_1"),
-            "Agg_Expr_Seat_2": bt_row.get("Agg_Expr_Seat_2"),
-            "Agg_Expr_Seat_3": bt_row.get("Agg_Expr_Seat_3"),
-            "Agg_Expr_Seat_4": bt_row.get("Agg_Expr_Seat_4"),
-        }
-        
-        # Check conformance
-        conformance = _check_deal_criteria_conformance_bitmap(
-            int(deal_idx), bt_info, dealer, deal_criteria_by_seat_dfs, auction=bid_str
-        )
-        
-        first_wrong = conformance["first_wrong_seat"]
-        if first_wrong is not None:
-            # Apply seat filter if specified
-            if seat is not None and first_wrong != seat:
-                continue
-            
-            deals_with_wrong_bid += 1
-            wrong_bids_by_seat[first_wrong] = wrong_bids_by_seat.get(first_wrong, 0) + 1
-            wrong_bids_by_dealer[dealer] = wrong_bids_by_dealer.get(dealer, 0) + 1
-            if vul in wrong_bids_by_vul:
-                wrong_bids_by_vul[vul] += 1
+    # Batch check wrong bids (still loops but no per-row filter operations)
+    result_df = batch_check_wrong_bids(joined_df, deal_criteria_by_seat_dfs, seat)
+    
+    # Aggregate statistics from result_df
+    deals_with_wrong_bid = result_df.filter(pl.col("first_wrong_seat").is_not_null()).height
+    
+    # By seat
+    wrong_bids_by_seat = {s: 0 for s in range(1, 5)}
+    for s in range(1, 5):
+        wrong_bids_by_seat[s] = result_df.filter(pl.col(f"Wrong_Bid_S{s}")).height
+    
+    # By dealer
+    wrong_bids_by_dealer = {"N": 0, "E": 0, "S": 0, "W": 0}
+    wrong_rows = result_df.filter(pl.col("first_wrong_seat").is_not_null())
+    if wrong_rows.height > 0 and "Dealer" in wrong_rows.columns:
+        dealer_counts = wrong_rows.group_by("Dealer").agg(pl.len().alias("count")).to_dicts()
+        for row in dealer_counts:
+            d = row.get("Dealer")
+            if d in wrong_bids_by_dealer:
+                wrong_bids_by_dealer[d] = row.get("count", 0)
+    
+    # By vulnerability
+    wrong_bids_by_vul = {"None": 0, "NS": 0, "EW": 0, "Both": 0}
+    if wrong_rows.height > 0 and "Vul" in wrong_rows.columns:
+        vul_counts = wrong_rows.group_by("Vul").agg(pl.len().alias("count")).to_dicts()
+        for row in vul_counts:
+            v = row.get("Vul")
+            if v in wrong_bids_by_vul:
+                wrong_bids_by_vul[v] = row.get("count", 0)
     
     # Calculate rates
     wrong_bid_rate = deals_with_wrong_bid / analyzed_deals if analyzed_deals > 0 else 0
@@ -2283,6 +2243,7 @@ def handle_failed_criteria_summary(
     """Handle /failed-criteria-summary endpoint.
     
     Analyzes which criteria fail most often across deals.
+    Uses vectorized join instead of per-row BT lookups for performance.
     """
     t0 = time.perf_counter()
     
@@ -2293,92 +2254,51 @@ def handle_failed_criteria_summary(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
     
+    # Add row index for bitmap lookups
+    deal_df = deal_df.with_row_index("_row_idx")
+    
+    # Prepare for join: add _bid_str and _auction_key
+    deals_prepared = prepare_deals_with_bid_str(deal_df)
+    
     # Filter deals by auction pattern if provided
     if auction_pattern:
         try:
-            bid_dtype = deal_df.schema.get("bid")
-            if bid_dtype == pl.List(pl.Utf8):
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").list.join("-").alias("bid_str"))
-            elif bid_dtype == pl.Utf8:
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").fill_null("").alias("bid_str"))
-            else:
-                deal_df_with_str = deal_df.with_columns(
-                    pl.col("bid").map_elements(
-                        lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                        return_dtype=pl.Utf8,
-                    ).alias("bid_str")
-                )
             regex_pattern = f"(?i){normalize_auction_pattern(auction_pattern)}"
-            filtered_df = deal_df_with_str.filter(pl.col("bid_str").str.contains(regex_pattern))
+            deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
+    
+    total_deals = deals_prepared.height
+    
+    # Sample for performance
+    sample_size = min(10000, total_deals)
+    if sample_size < total_deals:
+        sample_df = deals_prepared.sample(n=sample_size, seed=42)
     else:
-        filtered_df = deal_df
+        sample_df = deals_prepared
     
-    # Add row index for bitmap lookups
-    if "_row_idx" not in filtered_df.columns:
-        filtered_df = filtered_df.with_row_index("_row_idx")
+    analyzed_deals = sample_df.height
     
-    total_deals = filtered_df.height
-    
-    # Build bt lookup
-    bt_lookup_df = bt_seat1_df
-    if "is_completed_auction" in bt_lookup_df.columns:
-        bt_lookup_df = bt_lookup_df.filter(pl.col("is_completed_auction"))
+    # Prepare BT for join and join once (eliminates per-row filter operations)
+    bt_prepared = prepare_bt_for_join(bt_seat1_df)
+    joined_df = join_deals_with_bt(sample_df, bt_prepared)
     
     # Track criteria failures
     criteria_fail_counts: Dict[str, int] = {}
     criteria_check_counts: Dict[str, int] = {}
     criteria_by_seat: Dict[int, Dict[str, int]] = {1: {}, 2: {}, 3: {}, 4: {}}
     
-    # Sample for performance
-    sample_size = min(10000, total_deals)
-    if sample_size < total_deals:
-        sample_df = filtered_df.sample(n=sample_size, seed=42)
-    else:
-        sample_df = filtered_df
-    
-    analyzed_deals = sample_df.height
-    
-    # Get bid column as string
-    bid_dtype = sample_df.schema.get("bid")
-    if bid_dtype == pl.List(pl.Utf8):
-        sample_df = sample_df.with_columns(pl.col("bid").list.join("-").alias("_bid_str"))
-    elif bid_dtype == pl.Utf8:
-        sample_df = sample_df.with_columns(pl.col("bid").fill_null("").alias("_bid_str"))
-    else:
-        sample_df = sample_df.with_columns(
-            pl.col("bid").map_elements(
-                lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                return_dtype=pl.Utf8,
-            ).alias("_bid_str")
-        )
-    
-    # Process each deal
-    for row in sample_df.iter_rows(named=True):
+    # Process each deal - now without per-row BT lookups (already joined)
+    seats_to_check = [seat] if seat else list(range(1, 5))
+    for row in joined_df.iter_rows(named=True):
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
-        bid_str = row.get("_bid_str", "")
-        
-        # Look up bt_info
-        auction_for_search = re.sub(r"^(p-)+", "", bid_str.lower()) if bid_str else ""
-        bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search)
-        if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
-            bt_match = bt_lookup_df.filter(
-                pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search + "-p-p-p"
-            )
-        
-        if bt_match.height == 0:
-            continue
-        
-        bt_row = bt_match.row(0, named=True)
         
         # Check each seat's criteria
-        seats_to_check = [seat] if seat else range(1, 5)
         for s in seats_to_check:
             if s is None:
                 continue
-            criteria_list = bt_row.get(f"Agg_Expr_Seat_{s}")
+            criteria_list = row.get(f"Agg_Expr_Seat_{s}")
             if not criteria_list:
                 continue
             
@@ -2451,6 +2371,7 @@ def handle_wrong_bid_leaderboard(
     """Handle /wrong-bid-leaderboard endpoint.
     
     Returns leaderboard of bids with highest error rates.
+    Uses vectorized join instead of per-row BT lookups for performance.
     """
     t0 = time.perf_counter()
     
@@ -2462,69 +2383,38 @@ def handle_wrong_bid_leaderboard(
         raise ValueError("bt_seat1_df not loaded")
     
     # Add row index
-    deal_df_indexed = deal_df.with_row_index("_row_idx")
+    deal_df = deal_df.with_row_index("_row_idx")
     
-    # Build bt lookup
-    bt_lookup_df = bt_seat1_df
-    if "is_completed_auction" in bt_lookup_df.columns:
-        bt_lookup_df = bt_lookup_df.filter(pl.col("is_completed_auction"))
+    # Prepare for join: add _bid_str and _auction_key
+    deals_prepared = prepare_deals_with_bid_str(deal_df)
+    
+    # Sample for performance
+    total_deals = deals_prepared.height
+    sample_size = min(10000, total_deals)
+    if sample_size < total_deals:
+        sample_df = deals_prepared.sample(n=sample_size, seed=42)
+    else:
+        sample_df = deals_prepared
+    
+    analyzed_deals = sample_df.height
+    
+    # Prepare BT for join and join once (eliminates per-row filter operations)
+    bt_prepared = prepare_bt_for_join(bt_seat1_df)
+    joined_df = join_deals_with_bt(sample_df, bt_prepared)
     
     # Track wrong bids by (bid, seat)
     bid_seat_wrong: Dict[Tuple[str, int], int] = {}
     bid_seat_total: Dict[Tuple[str, int], int] = {}
     bid_failed_criteria: Dict[Tuple[str, int], Dict[str, int]] = {}
     
-    # Sample for performance
-    total_deals = deal_df_indexed.height
-    sample_size = min(10000, total_deals)
-    if sample_size < total_deals:
-        sample_df = deal_df_indexed.sample(n=sample_size, seed=42)
-    else:
-        sample_df = deal_df_indexed
-    
-    analyzed_deals = sample_df.height
-    
-    # Get bid column as string
-    bid_dtype = sample_df.schema.get("bid")
-    if bid_dtype == pl.List(pl.Utf8):
-        sample_df = sample_df.with_columns(pl.col("bid").list.join("-").alias("_bid_str"))
-    elif bid_dtype == pl.Utf8:
-        sample_df = sample_df.with_columns(pl.col("bid").fill_null("").alias("_bid_str"))
-    else:
-        sample_df = sample_df.with_columns(
-            pl.col("bid").map_elements(
-                lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                return_dtype=pl.Utf8,
-            ).alias("_bid_str")
-        )
-    
-    # Process each deal
-    for row in sample_df.iter_rows(named=True):
+    # Process each deal - now without per-row BT lookups (already joined)
+    seats_to_check = [seat] if seat else list(range(1, 5))
+    for row in joined_df.iter_rows(named=True):
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         bid_str = row.get("_bid_str", "")
         
-        # Look up bt_info
-        auction_for_search = re.sub(r"^(p-)+", "", bid_str.lower()) if bid_str else ""
-        bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search)
-        if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
-            bt_match = bt_lookup_df.filter(
-                pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search + "-p-p-p"
-            )
-        
-        if bt_match.height == 0:
-            continue
-        
-        bt_row = bt_match.row(0, named=True)
-        bt_info = {
-            "Agg_Expr_Seat_1": bt_row.get("Agg_Expr_Seat_1"),
-            "Agg_Expr_Seat_2": bt_row.get("Agg_Expr_Seat_2"),
-            "Agg_Expr_Seat_3": bt_row.get("Agg_Expr_Seat_3"),
-            "Agg_Expr_Seat_4": bt_row.get("Agg_Expr_Seat_4"),
-        }
-        
         # For each seat, track the bid and whether it's wrong
-        seats_to_check = [seat] if seat else range(1, 5)
         for s in seats_to_check:
             if s is None:
                 continue
@@ -2535,8 +2425,8 @@ def handle_wrong_bid_leaderboard(
             key = (bid_at_seat.upper(), s)
             bid_seat_total[key] = bid_seat_total.get(key, 0) + 1
             
-            # Check this seat's criteria
-            criteria_list = bt_info.get(f"Agg_Expr_Seat_{s}")
+            # Check this seat's criteria (from joined data)
+            criteria_list = row.get(f"Agg_Expr_Seat_{s}")
             if not criteria_list:
                 continue
             
@@ -2812,6 +2702,7 @@ def handle_bidding_arena(
     Provides comprehensive head-to-head comparison between two bidding models.
     Currently supports "Rules" and "Actual" models.
     Future: "NN", "RF", "Fuzzy", etc.
+    Uses vectorized join instead of per-row BT lookups for performance.
     
     Args:
         deals_uri: Optional file path or URL to load custom deals from.
@@ -2846,61 +2737,40 @@ def handle_bidding_arena(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
     
+    # Add row index
+    deal_df = deal_df.with_row_index("_row_idx")
+    
+    # Prepare for join: add _bid_str and _auction_key
+    deals_prepared = prepare_deals_with_bid_str(deal_df)
+    
     # Filter deals by auction pattern if provided
     if auction_pattern:
         try:
-            bid_dtype = deal_df.schema.get("bid")
-            if bid_dtype == pl.List(pl.Utf8):
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").list.join("-").alias("bid_str"))
-            elif bid_dtype == pl.Utf8:
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").fill_null("").alias("bid_str"))
-            else:
-                deal_df_with_str = deal_df.with_columns(
-                    pl.col("bid").map_elements(
-                        lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                        return_dtype=pl.Utf8,
-                    ).alias("bid_str")
-                )
             regex_pattern = f"(?i){normalize_auction_pattern(auction_pattern)}"
-            filtered_df = deal_df_with_str.filter(pl.col("bid_str").str.contains(regex_pattern))
+            deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
-    else:
-        filtered_df = deal_df
     
-    # Add row index and bid string
-    if "_row_idx" not in filtered_df.columns:
-        filtered_df = filtered_df.with_row_index("_row_idx")
-    
-    bid_dtype = filtered_df.schema.get("bid")
-    if "bid_str" not in filtered_df.columns:
-        if bid_dtype == pl.List(pl.Utf8):
-            filtered_df = filtered_df.with_columns(pl.col("bid").list.join("-").alias("bid_str"))
-        elif bid_dtype == pl.Utf8:
-            filtered_df = filtered_df.with_columns(pl.col("bid").fill_null("").alias("bid_str"))
-        else:
-            filtered_df = filtered_df.with_columns(
-                pl.col("bid").map_elements(
-                    lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                    return_dtype=pl.Utf8,
-                ).alias("bid_str")
-            )
-    
-    total_deals = filtered_df.height
+    total_deals = deals_prepared.height
     
     # Sample deals
     effective_seed = _effective_seed(seed)
     if sample_size < total_deals:
-        sample_df = filtered_df.sample(n=sample_size, seed=effective_seed)
+        sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
     else:
-        sample_df = filtered_df
+        sample_df = deals_prepared
     
     analyzed_deals = sample_df.height
     
-    # Build bt lookup
-    bt_lookup_df = bt_seat1_df
-    if "is_completed_auction" in bt_lookup_df.columns:
-        bt_lookup_df = bt_lookup_df.filter(pl.col("is_completed_auction"))
+    # Prepare BT for join - include Auction column for Rules contract lookup
+    bt_prepared = prepare_bt_for_join(bt_seat1_df)
+    bt_cols = ["Auction"] + [agg_expr_col(s) for s in SEAT_RANGE]
+    joined_df = join_deals_with_bt(sample_df, bt_prepared, bt_cols=bt_cols)
+    
+    # Rename joined Auction to avoid conflict with deal's bid
+    if "Auction" in joined_df.columns and "Auction_right" not in joined_df.columns:
+        # The join may have created Auction_right if there was a conflict
+        pass  # Auction column from BT is what we want for Rules model
     
     # Metrics accumulators
     model_a_wins = 0
@@ -2948,13 +2818,16 @@ def handle_bidding_arena(
         "W": {"a_wins": 0, "b_wins": 0, "ties": 0, "count": 0},
     }
     
-    # Process each deal
-    for row in sample_df.iter_rows(named=True):
+    # Process each deal - now using joined data (no per-row BT lookups)
+    for row in joined_df.iter_rows(named=True):
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         vul = row.get("Vul", "None")
-        bid_str = row.get("bid_str", "")
+        bid_str = row.get("_bid_str", "")
         par_score = row.get("ParScore")
+        
+        # BT auction from the join (for Rules model)
+        bt_auction = row.get("Auction")  # From joined BT data
         
         # Get opener's HCP (seat 1)
         dir_map = _seat_direction_map(1)
@@ -2971,24 +2844,15 @@ def handle_bidding_arena(
             dd_score_a = row.get("DD_Score_Declarer")
             auction_a = bid_str
         else:  # Rules
-            # Look up Rules contract from bt_seat1_df
-            auction_for_search = re.sub(r"^(p-)+", "", bid_str.lower()) if bid_str else ""
-            bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search)
-            if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
-                bt_match = bt_lookup_df.filter(
-                    pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search + "-p-p-p"
-                )
-            
-            if bt_match.height > 0:
-                bt_auction = bt_match.row(0, named=True).get("Auction", "")
+            # Use pre-joined BT auction
+            if bt_auction:
                 contract_a = get_ai_contract(bt_auction, dealer)
                 auction_a = bt_auction
             else:
                 contract_a = None
                 auction_a = None
             
-            # Get DD score for Rules contract - need to look it up
-            # For now, use the precomputed DD_Score_Rules if available
+            # Get DD score for Rules contract
             dd_score_a = row.get("DD_Score_Rules") if "DD_Score_Rules" in row else None
         
         # Model B
@@ -2997,15 +2861,8 @@ def handle_bidding_arena(
             dd_score_b = row.get("DD_Score_Declarer")
             auction_b = bid_str
         else:  # Rules
-            auction_for_search = re.sub(r"^(p-)+", "", bid_str.lower()) if bid_str else ""
-            bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search)
-            if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
-                bt_match = bt_lookup_df.filter(
-                    pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search + "-p-p-p"
-                )
-            
-            if bt_match.height > 0:
-                bt_auction = bt_match.row(0, named=True).get("Auction", "")
+            # Use pre-joined BT auction
+            if bt_auction:
                 contract_b = get_ai_contract(bt_auction, dealer)
                 auction_b = bt_auction
             else:
