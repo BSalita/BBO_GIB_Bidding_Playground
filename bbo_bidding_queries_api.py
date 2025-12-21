@@ -685,6 +685,14 @@ class AuctionDDAnalysisRequest(BaseModel):
     include_scores: bool = True  # Include DD_Score columns in addition to DD tricks
 
 
+class RankBidsByEVRequest(BaseModel):
+    """Request for Rank Next Bids by EV: rank all possible next bids after an auction by EV."""
+    auction: str = ""  # Auction prefix (empty = opening bids)
+    max_deals: int = 500  # Max deals to sample for EV calculation
+    seed: Optional[int] = 0  # Random seed for sampling (0 = non-reproducible)
+    vul_filter: Optional[str] = None  # Filter by vulnerability: None, Both, NS, EW (None = all)
+
+
 # Import model registry for Bidding Arena
 from bbo_bidding_models import MODEL_REGISTRY
 
@@ -917,13 +925,13 @@ def _heavy_init() -> None:
         # - is_opening_bid, is_completed_auction: filtering
         # - seat: seat identification
         # - Agg_Expr_Seat_1-4: opening bid criteria matching
-        # - previous_bid_indices: auction sequence queries
-        # Exclude: Expr, Agg_Expr, *_right columns, next_bid_indices (not used at runtime)
+        # - previous_bid_indices, next_bid_indices: auction sequence queries
+        # Exclude: Expr, Agg_Expr, *_right columns
         required_cols = [
             "bt_index", "Auction", "is_opening_bid", "is_completed_auction", 
             "seat", "candidate_bid", "npasses", "auction_len",
             "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
-            "previous_bid_indices",
+            "previous_bid_indices", "next_bid_indices",
         ]
         # Only select columns that exist in the file
         cols_to_load = [c for c in required_cols if c in available_cols]
@@ -1938,6 +1946,36 @@ def auction_dd_analysis(req: AuctionDDAnalysisRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("auction-dd-analysis", e)
+
+
+@app.post("/rank-bids-by-ev")
+def rank_bids_by_ev(req: RankBidsByEVRequest) -> Dict[str, Any]:
+    """Rank all possible next bids after an auction by Expected Value (EV).
+    
+    Given an auction prefix (or empty for opening bids), finds all possible next bids
+    using next_bid_indices and computes average EV for each bid across matching deals.
+    """
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    
+    with _STATE_LOCK:
+        state = dict(STATE)
+    
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_rank_bids_by_ev(
+            state=state,
+            auction=req.auction,
+            max_deals=req.max_deals,
+            seed=req.seed,
+            vul_filter=req.vul_filter,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("rank-bids-by-ev", e)
 
 
 if __name__ == "__main__":  # pragma: no cover

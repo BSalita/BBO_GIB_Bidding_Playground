@@ -2280,30 +2280,35 @@ def render_wrong_bid_analysis():
 
 
 # ---------------------------------------------------------------------------
-# Auction DD Analysis – DD columns for deals matching an auction's criteria
+# Rank Next Bids by EV – Rank next bids after an auction by Expected Value
 # ---------------------------------------------------------------------------
 
-def render_auction_dd_analysis():
-    """Render the Auction DD Analysis tool.
+def render_rank_by_ev():
+    """Render the Rank Next Bids by EV tool.
     
-    Given a partial or complete auction, find matching deals and return their DD columns.
+    Given an auction prefix (or empty for opening bids), ranks all possible next bids
+    by Expected Value (average Par score for matching deals).
     """
-    st.header("🎯 Auction DD Analysis")
-    st.markdown("Get Double Dummy results for deals matching an auction's criteria. Helps analyze best bid choices.")
+    st.header("🎯 Rank Next Bids by EV")
+    st.markdown("""
+    Rank possible next bids by Expected Value (EV). 
+    - **Empty input**: Show all opening bids ranked
+    - **Auction prefix**: Show all responses/rebids ranked
+    """)
     
     # Sidebar inputs
     auction_input = st.sidebar.text_input(
-        "Auction",
-        value="1N-p-3N-p-p-p",
-        help="Enter a partial or complete auction (e.g., '1N-p', '1N-p-3N-p-p-p')"
+        "Auction Prefix",
+        value="",
+        help="Enter an auction prefix (e.g., '1N' for responses to 1NT), or leave empty for opening bids"
     )
     
     max_deals = st.sidebar.number_input(
-        "Max Deals",
+        "Max Deals per Bid",
         value=500,
         min_value=1,
         max_value=10000,
-        help="Maximum number of matching deals to return"
+        help="Maximum deals to sample per bid for EV calculation"
     )
     
     st.sidebar.divider()
@@ -2317,17 +2322,7 @@ def render_auction_dd_analysis():
     )
     
     st.sidebar.divider()
-    st.sidebar.subheader("Output Options")
-    
-    include_hands = st.sidebar.checkbox("Include Hands", value=True, help="Include Hand_N/E/S/W columns")
-    include_scores = st.sidebar.checkbox("Include DD Scores", value=True, help="Include DD_Score columns in Deal Data table")
-    
-    st.sidebar.divider()
-    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_dd_analysis"))
-    
-    if not auction_input:
-        st.info("Enter an auction in the sidebar to analyze.")
-        return
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_rank_ev"))
     
     # Call the API
     payload = {
@@ -2335,225 +2330,91 @@ def render_auction_dd_analysis():
         "max_deals": int(max_deals),
         "seed": seed,
         "vul_filter": vul_filter if vul_filter != "all" else None,
-        "include_hands": include_hands,
-        "include_scores": include_scores,
     }
     
-    with st.spinner(f"Analyzing auction '{auction_input}'..."):
+    desc = f"responses to '{auction_input}'" if auction_input else "opening bids"
+    with st.spinner(f"Analyzing {desc}..."):
         try:
-            data = api_post("/auction-dd-analysis", payload)
+            data = api_post("/rank-bids-by-ev", payload)
         except Exception as e:
             st.error(f"API call failed: {e}")
             return
     
     elapsed_ms = data.get("elapsed_ms", 0)
-    total_matches = data.get("total_matches", 0)
-    returned_count = data.get("returned_count", 0)
+    total_bids = data.get("total_next_bids", 0)
     
-    st.info(f"Found {total_matches:,} matching deals, returning {returned_count:,} ({elapsed_ms:.1f}ms)")
-    
-    # Show BT row
-    bt_row = data.get("bt_row")
-    if not bt_row:
-        st.warning("No matching completed auction found in the Bidding Table.")
-        return
-    
-    # Show error if any
+    # Show error or message
     if "error" in data:
         st.error(f"⚠️ {data['error']}")
-        if "available_columns" in data:
-            with st.expander("Available DD columns"):
-                st.write(data["available_columns"])
         return
     
-    # -------------------------------------------------------------------------
-    # Auction Details & Criteria Breakdown
-    # -------------------------------------------------------------------------
-    st.subheader("🎴 Auction Details")
+    if "message" in data:
+        st.info(data["message"])
     
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.write(f"**Input:** `{data.get('auction_input', auction_input)}`")
-        st.write(f"**Normalized:** `{data.get('auction_normalized', '')}`")
-        if bt_row.get("bt_index") is not None:
-            st.write(f"**BT Index:** {bt_row.get('bt_index')}")
+    st.info(f"Analyzed {total_bids} bids ({elapsed_ms:.1f}ms)")
     
-    with col2:
-        # Criteria breakdown
-        criteria_breakdown = data.get("criteria_breakdown", {})
-        if criteria_breakdown:
-            st.write("**Seat Criteria:**")
-            for seat_label, criteria in criteria_breakdown.items():
-                criteria_str = ", ".join(criteria) if criteria else "(none)"
-                st.caption(f"• {seat_label}: {criteria_str}")
-    
-    # Show BT row in a table
-    with st.expander("📋 Bidding Table Row", expanded=False):
-        bt_df = pl.DataFrame([bt_row])
-        render_aggrid(bt_df, key="dd_analysis_bt_row", height=80, table_name="bt_row")
-    
-    # -------------------------------------------------------------------------
-    # Contract Recommendations
-    # -------------------------------------------------------------------------
-    contract_recs = data.get("contract_recommendations", [])
-    if contract_recs:
-        st.subheader("🏆 Contract Recommendations")
-        st.markdown("*All contracts analyzed based on DD scores and EV. Compare DD Score and EV to Par.*")
-        
-        rec_df = pl.DataFrame(contract_recs)
-        # Rename columns for display
-        if "make_pct" in rec_df.columns:
-            rec_df = rec_df.with_columns(
-                (pl.col("make_pct").round(0).cast(pl.Int32).cast(pl.Utf8) + "%").alias("Makes %")
-            )
-        
-        # Use existing columns or aliases - separate rows for each vulnerability
-        display_cols = []
-        col_map = [
-            ("contract", "Contract"),
-            ("declarer", "Declarer"),
-            ("vul", "Vul"),  # Vulnerability state (NV or V)
-            ("Makes %", "Makes %"),
-            ("ev", "EV"),  # Expected Value for this vulnerability
-            ("sample_size", "Sample"),
-        ]
-        for c, alias in col_map:
-            if c in rec_df.columns:
-                display_cols.append(pl.col(c).alias(alias))
-            elif alias in rec_df.columns:
-                display_cols.append(pl.col(alias))
-        
-        if display_cols:
-            rec_df = rec_df.select(display_cols)
-            render_aggrid(rec_df, key="dd_analysis_recommendations", height=calc_grid_height(len(rec_df)), table_name="recommendations")
-    
-    # -------------------------------------------------------------------------
-    # Par Score Comparison
-    # -------------------------------------------------------------------------
-    # Par Contract Statistics (Sacrifices, Sets, etc.)
-    # -------------------------------------------------------------------------
-    par_contract_stats = data.get("par_contract_stats", [])
-    if par_contract_stats:
-        st.subheader("📊 Par Contract Breakdown")
-        st.markdown("*Distribution of par results split by vulnerability (NV vs V)*")
-        
-        par_stats_df = pl.DataFrame(par_contract_stats)
-        # Reorder columns with NV/V split for both Avg Score and EV
-        display_cols = ["category", "count", "pct", "count_nv", "avg_nv", "ev_nv", "count_v", "avg_v", "ev_v"]
-        col_aliases = {
-            "category": "Category", 
-            "count": "Total", 
-            "pct": "%",
-            "count_nv": "# NV",
-            "avg_nv": "Par NV",
-            "ev_nv": "EV NV",
-            "count_v": "# V",
-            "avg_v": "Par V",
-            "ev_v": "EV V",
-        }
-        par_stats_df = par_stats_df.select([c for c in display_cols if c in par_stats_df.columns])
-        par_stats_df = par_stats_df.rename({c: col_aliases.get(c, c) for c in par_stats_df.columns if c in col_aliases})
-        render_aggrid(par_stats_df, key="dd_analysis_par_stats", height=calc_grid_height(len(par_stats_df), max_height=350), table_name="par_stats")
-    
-    # -------------------------------------------------------------------------
-    # Deal Data Table
-    # -------------------------------------------------------------------------
-    dd_data = data.get("dd_data", [])
-    if not dd_data:
-        st.info("No deals matched the auction criteria.")
-        return
-    
-    st.subheader(f"📈 Deal Data ({len(dd_data)} deals)")
-    
-    shown_count = len(dd_data)
-    if total_matches > shown_count:
-        st.warning(f"⚠️ Showing a random sample of {shown_count:,} out of {total_matches:,} total matches.")
-    
-    dd_df = pl.DataFrame(dd_data)
-    
-    # Order columns sensibly
-    priority_cols = ["index", "Dealer", "Vul"]
-    hand_cols = ["Hand_N", "Hand_E", "Hand_S", "Hand_W"]
-    par_cols = ["ParScore", "ParContracts"]
-    
-    dd_cols = data.get("dd_columns", [])
-    ordered_dd = []
-    
-    # Check if we have raw trick columns or DD_Score columns
-    has_raw_tricks = any(col.startswith("DD_") and not col.startswith("DD_Score") for col in dd_cols)
-    
-    if has_raw_tricks:
-        # Order raw trick columns by direction then strain
-        for direction in ['N', 'E', 'S', 'W']:
-            for strain in ['C', 'D', 'H', 'S', 'N']:
-                col = f"DD_{direction}_{strain}"
-                if col in dd_cols:
-                    ordered_dd.append(col)
+    # Show parent BT row if present
+    parent_bt = data.get("parent_bt_row")
+    if parent_bt:
+        st.subheader("🎴 Parent Auction")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"**Auction:** `{parent_bt.get('Auction', '')}`")
+        with col2:
+            st.write(f"**Last Bid:** `{parent_bt.get('candidate_bid', '')}`")
+    elif auction_input:
+        st.write(f"**Input:** `{auction_input}`")
     else:
-        # Order DD_Score columns by level then strain then direction
-        for level in range(1, 8):
-            for strain in ['N', 'S', 'H', 'D', 'C']:
-                for direction in ['N', 'E', 'S', 'W']:
-                    col = f"DD_Score_{level}{strain}_{direction}"
-                    if col in dd_cols:
-                        ordered_dd.append(col)
-        # Add any remaining DD_Score columns not in the order
-        for col in dd_cols:
-            if col not in ordered_dd:
-                ordered_dd.append(col)
+        st.write("**Analyzing:** Opening bids (first bid of the auction)")
     
-    # Build final column order
-    final_cols = []
-    for c in priority_cols + hand_cols + par_cols:
-        if c in dd_df.columns:
-            final_cols.append(c)
-    final_cols.extend(ordered_dd)
+    # -------------------------------------------------------------------------
+    # Bid Rankings Table
+    # -------------------------------------------------------------------------
+    bid_rankings = data.get("bid_rankings", [])
+    if not bid_rankings:
+        st.warning("No next bids found.")
+        return
     
-    # Add any remaining columns (like DD_Score columns)
-    for c in dd_df.columns:
-        if c not in final_cols:
-            final_cols.append(c)
+    st.subheader(f"🏆 Bid Rankings ({len(bid_rankings)} bids)")
+    st.markdown("*Bids ranked by average Par score (higher = better for NS)*")
     
-    dd_df = dd_df.select([c for c in final_cols if c in dd_df.columns])
+    rankings_df = pl.DataFrame(bid_rankings)
+    
+    # Select and rename columns for display
+    display_cols = []
+    col_map = [
+        ("bid", "Bid"),
+        ("match_count", "Matches"),
+        ("sample_size", "Sample"),
+        ("nv_count", "NV Deals"),
+        ("v_count", "V Deals"),
+        ("avg_par_nv", "Avg Par NV"),
+        ("avg_par_v", "Avg Par V"),
+        ("auction", "Full Auction"),
+    ]
+    
+    for col, alias in col_map:
+        if col in rankings_df.columns:
+            display_cols.append(pl.col(col).alias(alias))
+    
+    if display_cols:
+        rankings_df = rankings_df.select(display_cols)
+    
+    render_aggrid(rankings_df, key="rank_bids_rankings", height=calc_grid_height(len(rankings_df), max_height=600), table_name="bid_rankings")
     
     # Add download button
-    # Convert list/nested columns to strings for CSV export (CSV doesn't support nested data)
-    csv_df = dd_df.clone()
-    for col_name in csv_df.columns:
-        col_dtype = csv_df[col_name].dtype
-        dtype_str = str(col_dtype)
-        # Check for nested types: List, Array, Struct - cast all to string
-        if any(x in dtype_str for x in ["List", "Array", "Struct"]):
-            # For list of strings, try join; otherwise cast to string repr
-            try:
-                if "List(String)" in dtype_str or "List(Utf8)" in dtype_str:
-                    csv_df = csv_df.with_columns(pl.col(col_name).list.join(", ").alias(col_name))
-                else:
-                    # Cast entire column to string representation
-                    csv_df = csv_df.with_columns(pl.col(col_name).cast(pl.Utf8).alias(col_name))
-            except Exception:
-                # If casting fails, convert via Python repr
-                csv_df = csv_df.with_columns(
-                    pl.col(col_name).map_elements(lambda x: str(x) if x is not None else "", return_dtype=pl.Utf8).alias(col_name)
-                )
     try:
-        csv_str = csv_df.write_csv(file=None)
+        csv_str = rankings_df.write_csv(file=None)
+        csv_bytes = ("\ufeff" + csv_str).encode("utf-8") if csv_str else b""
+        safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", auction_input).strip("._-") if auction_input else "opening_bids"
+        st.download_button(
+            label="📥 Download Rankings as CSV",
+            data=csv_bytes,
+            file_name=f"bid_rankings_{safe_auction}.csv",
+            mime="text/csv; charset=utf-8",
+        )
     except Exception:
-        # Fallback: drop any remaining nested columns
-        simple_cols = [c for c in csv_df.columns if not any(x in str(csv_df[c].dtype) for x in ["List", "Struct", "Array"])]
-        csv_str = csv_df.select(simple_cols).write_csv(file=None) if simple_cols else ""
-    
-    # Ensure UTF-8 encoding with BOM for Excel compatibility
-    csv_bytes = ("\ufeff" + csv_str).encode("utf-8") if csv_str else b""
-    safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", str(data.get("auction_normalized", "auction"))).strip("._-") or "auction"
-    st.download_button(
-        label="📥 Download Results as CSV",
-        data=csv_bytes,
-        file_name=f"dd_analysis_{safe_auction}.csv",
-        mime="text/csv; charset=utf-8",
-    )
-    
-    render_aggrid(dd_df, key="dd_analysis_results", height=400, table_name="dd_results")
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -2569,7 +2430,7 @@ func_choice = st.sidebar.selectbox(
         "Analyze Actual Auctions",       # Group deals by bid column, analyze outcomes
         "Bidding Arena",                 # NEW: Head-to-head model comparison
         "Wrong Bid Analysis",            # NEW: Wrong bid statistics and leaderboard
-        "Auction DD Analysis",           # NEW: DD columns for deals matching auction criteria
+        "Rank Next Bids by EV",               # Rank next bids after an auction by EV
         "Analyze Deal (PBN/LIN)",        # Input a deal, find matching auctions
         "Bidding Table Explorer",        # Browse bt_df with statistics
         "Find Auction Sequences",        # Regex search bt_df
@@ -2586,7 +2447,7 @@ FUNC_DESCRIPTIONS = {
     "Analyze Actual Auctions": "Group deals by their actual auction (bid column). Analyze criteria compliance, score deltas, and outcomes.",
     "Bidding Arena": "Head-to-head model comparison. Compare bidding models (Rules, Actual, NN, etc.) with DD scores, EV, and IMP differentials.",
     "Wrong Bid Analysis": "Analyze wrong bids: statistics, failed criteria summary, and leaderboard of auctions with highest wrong bid rates.",
-    "Auction DD Analysis": "Get DD columns (DD_[NESW]_[CDHSN]) for deals matching an auction's Agg_Expr_Seat criteria. Helps analyze best bid choices.",
+    "Rank Next Bids by EV": "Rank all possible next bids after an auction by EV. Empty input shows opening bids.",
     "Analyze Deal (PBN/LIN)": "Input a PBN/LIN deal and find which bidding table auctions match the hand characteristics.",
     "Bidding Table Explorer": "Browse bidding table entries with aggregate statistics (min/max ranges) for hand criteria per auction.",
     "Find Auction Sequences": "Search for auction sequences matching a regex pattern. Shows criteria per seat.",
@@ -2624,8 +2485,8 @@ match func_choice:
         render_bidding_arena()
     case "Wrong Bid Analysis":
         render_wrong_bid_analysis()
-    case "Auction DD Analysis":
-        render_auction_dd_analysis()
+    case "Rank Next Bids by EV":
+        render_rank_by_ev()
     case "Analyze Deal (PBN/LIN)":
         render_analyze_deal()
     case "Bidding Table Explorer":

@@ -3382,38 +3382,39 @@ _VUL_UI_TO_DATA = {
 }
 
 
-def _find_bt_row_for_auction(bt_completed: pl.DataFrame, auction_normalized: str) -> pl.DataFrame:
+def _find_bt_row_for_auction(bt_df: pl.DataFrame, auction_normalized: str) -> pl.DataFrame:
     """Find a BT row matching the normalized auction string.
     
-    Tries: exact match → regex match → prefix match.
+    Works with both partial and completed auctions.
+    Tries: exact match → case-insensitive exact → prefix match.
     Returns the matching rows DataFrame or empty DataFrame if no match.
     """
-    auction_col = bt_completed["Auction"].cast(pl.Utf8).str.replace(r"(?i)^(p-)+", "")
+    auction_col = bt_df["Auction"].cast(pl.Utf8).str.replace(r"(?i)^(p-)+", "")
     
-    # Try exact match first
-    matches = bt_completed.filter(auction_col == auction_normalized)
+    # Try exact match first (case-sensitive)
+    matches = bt_df.filter(auction_col == auction_normalized)
     if matches.height > 0:
         return matches
     
-    # Try as regex pattern (exact)
+    # Try case-insensitive exact match
     try:
         regex_pattern = f"(?i)^{re.escape(auction_normalized)}$"
-        matches = bt_completed.filter(auction_col.str.contains(regex_pattern))
+        matches = bt_df.filter(auction_col.str.contains(regex_pattern))
         if matches.height > 0:
             return matches
     except Exception as e:
         print(f"[auction-dd-analysis] Regex match failed: {e}")
     
-    # Try prefix match (partial auction)
+    # Try prefix match (for finding auctions that start with the input)
     try:
-        prefix_pattern = f"(?i)^{re.escape(auction_normalized)}"
-        matches = bt_completed.filter(auction_col.str.contains(prefix_pattern))
+        prefix_pattern = f"(?i)^{re.escape(auction_normalized)}(-|$)"
+        matches = bt_df.filter(auction_col.str.contains(prefix_pattern))
         if matches.height > 0:
             return matches
     except Exception as e:
         print(f"[auction-dd-analysis] Prefix match failed: {e}")
     
-    return bt_completed.head(0)  # Empty DataFrame
+    return bt_df.head(0)  # Empty DataFrame
 
 
 def _build_criteria_mask_for_all_seats(
@@ -3627,19 +3628,17 @@ def handle_auction_dd_analysis(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
     
-    # Filter to completed auctions only
-    if "is_completed_auction" in bt_seat1_df.columns:
-        bt_completed = bt_seat1_df.filter(pl.col("is_completed_auction"))
-    else:
-        bt_completed = bt_seat1_df
+    # DO NOT filter to completed auctions - we want to support partial auctions like "1N"
+    # The BT contains rows for all auction prefixes with their accumulated criteria
+    bt_df = bt_seat1_df
     
     # Normalize auction: strip leading passes to match seat-1 view
     auction_normalized = re.sub(r"(?i)^(p-)+", "", auction.strip())
     if not auction_normalized:
         raise ValueError(f"Invalid auction: '{auction}'")
     
-    # Find matching BT row
-    exact_matches = _find_bt_row_for_auction(bt_completed, auction_normalized)
+    # Find matching BT row (exact, regex, or prefix match)
+    exact_matches = _find_bt_row_for_auction(bt_df, auction_normalized)
     
     if exact_matches.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -3650,7 +3649,7 @@ def handle_auction_dd_analysis(
             "criteria_breakdown": {},
             "dd_data": [],
             "total_matches": 0,
-            "sql_query": f"-- No completed auction found in BT for: {auction_normalized}",
+            "sql_query": f"-- No auction found in BT for: {auction_normalized}",
             "elapsed_ms": round(elapsed_ms, 1),
         }
     
@@ -3990,3 +3989,215 @@ LIMIT {max_deals}"""
         "elapsed_ms": round(elapsed_ms, 1),
     }
 
+
+# ---------------------------------------------------------------------------
+# Rank Next Bids by EV – Rank next bids after an auction by Expected Value
+# ---------------------------------------------------------------------------
+
+def handle_rank_bids_by_ev(
+    state: Dict[str, Any],
+    auction: str,
+    max_deals: int,
+    seed: Optional[int],
+    vul_filter: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Handle /rank-bids-by-ev endpoint.
+    
+    Given an auction prefix (or empty for opening bids), finds all possible next bids
+    using next_bid_indices and computes average EV for each bid across matching deals.
+    
+    Returns:
+        - auction_input: The input auction
+        - auction_normalized: Normalized (leading p- removed)
+        - parent_bt_row: The BT row for the input auction (None for opening bids)
+        - bid_rankings: List of dicts with bid, count, avg_ev_nv, avg_ev_v, avg_par, etc.
+        - total_next_bids: Total number of next bid options
+        - elapsed_ms: Processing time
+    """
+    t0 = time.perf_counter()
+    
+    deal_df = state["deal_df"]
+    bt_seat1_df = state.get("bt_seat1_df")
+    deal_criteria_by_seat_dfs = state["deal_criteria_by_seat_dfs"]
+    
+    if bt_seat1_df is None:
+        raise ValueError("bt_seat1_df not loaded")
+    
+    # Check if next_bid_indices is available
+    if "next_bid_indices" not in bt_seat1_df.columns:
+        raise ValueError("next_bid_indices column not loaded in bt_seat1_df. Restart API server to load it.")
+    
+    auction_input = auction.strip()
+    auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
+    
+    parent_bt_row: Optional[Dict[str, Any]] = None
+    next_bid_rows: pl.DataFrame
+    
+    if not auction_normalized:
+        # Empty auction: get all opening bids
+        next_bid_rows = bt_seat1_df.filter(pl.col("is_opening_bid"))
+    else:
+        # Find the BT row for the auction
+        bt_matches = _find_bt_row_for_auction(bt_seat1_df, auction_normalized)
+        
+        if bt_matches.height == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "auction_input": auction_input,
+                "auction_normalized": auction_normalized,
+                "parent_bt_row": None,
+                "bid_rankings": [],
+                "total_next_bids": 0,
+                "error": f"Auction '{auction_normalized}' not found in BT",
+                "elapsed_ms": round(elapsed_ms, 1),
+            }
+        
+        parent_row = bt_matches.row(0, named=True)
+        parent_bt_row = {
+            "bt_index": parent_row.get("bt_index"),
+            "Auction": parent_row.get("Auction"),
+            "candidate_bid": parent_row.get("candidate_bid"),
+        }
+        
+        # Get next_bid_indices
+        next_indices = parent_row.get("next_bid_indices") or []
+        if not next_indices:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "auction_input": auction_input,
+                "auction_normalized": auction_normalized,
+                "parent_bt_row": parent_bt_row,
+                "bid_rankings": [],
+                "total_next_bids": 0,
+                "message": "No next bids found (auction may be completed)",
+                "elapsed_ms": round(elapsed_ms, 1),
+            }
+        
+        # Get the BT rows for all next bids
+        next_bid_rows = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
+    
+    total_next_bids = next_bid_rows.height
+    
+    if total_next_bids == 0:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "auction_input": auction_input,
+            "auction_normalized": auction_normalized,
+            "parent_bt_row": parent_bt_row,
+            "bid_rankings": [],
+            "total_next_bids": 0,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    
+    # For each next bid, compute stats
+    bid_rankings: List[Dict[str, Any]] = []
+    effective_seed = _effective_seed(seed)
+    
+    for i, row in enumerate(next_bid_rows.iter_rows(named=True)):
+        bid_name = row.get("candidate_bid", "?")
+        bt_index = row.get("bt_index")
+        bid_auction = row.get("Auction", "")
+        
+        # Build criteria mask for ALL seats (inherited from parent + this bid's criteria)
+        global_mask, invalid_criteria = _build_criteria_mask_for_all_seats(
+            deal_df, row, deal_criteria_by_seat_dfs
+        )
+        
+        if global_mask is None or not global_mask.any():
+            bid_rankings.append({
+                "bid": bid_name,
+                "bt_index": bt_index,
+                "auction": bid_auction,
+                "match_count": 0,
+                "avg_par_nv": None,
+                "avg_par_v": None,
+            })
+            continue
+        
+        matched_df = deal_df.filter(global_mask)
+        match_count = matched_df.height
+        
+        if match_count == 0:
+            bid_rankings.append({
+                "bid": bid_name,
+                "bt_index": bt_index,
+                "auction": bid_auction,
+                "match_count": 0,
+                "avg_par_nv": None,
+                "avg_par_v": None,
+            })
+            continue
+        
+        # Apply vulnerability filter if specified
+        if vul_filter and vul_filter != "all":
+            data_vul = _VUL_UI_TO_DATA.get(vul_filter, vul_filter)
+            if "Vul" in matched_df.columns:
+                matched_df = matched_df.filter(pl.col("Vul") == data_vul)
+                match_count = matched_df.height
+        
+        # Sample if needed
+        if match_count > max_deals:
+            sample_seed = effective_seed + i if effective_seed else None
+            matched_df = matched_df.sample(n=max_deals, seed=sample_seed)
+        
+        # Compute stats by vulnerability
+        # NS NV: Vul in [None, E_W], NS V: Vul in [N_S, Both]
+        nv_mask = matched_df["Vul"].is_in(["None", "E_W"]) if "Vul" in matched_df.columns else pl.Series([True] * matched_df.height)
+        v_mask = matched_df["Vul"].is_in(["N_S", "Both"]) if "Vul" in matched_df.columns else pl.Series([False] * matched_df.height)
+        
+        nv_df = matched_df.filter(nv_mask)
+        v_df = matched_df.filter(v_mask)
+        
+        # Compute average ParScore for NV and V
+        avg_par_nv = None
+        avg_par_v = None
+        
+        if "ParScore" in matched_df.columns:
+            nv_par = nv_df["ParScore"].drop_nulls() if nv_df.height > 0 else pl.Series([])
+            v_par = v_df["ParScore"].drop_nulls() if v_df.height > 0 else pl.Series([])
+            
+            if nv_par.len() > 0:
+                par_mean = nv_par.mean()
+                if par_mean is not None:
+                    avg_par_nv = round(float(str(par_mean)) if not isinstance(par_mean, (int, float)) else float(par_mean), 0)
+            if v_par.len() > 0:
+                par_mean = v_par.mean()
+                if par_mean is not None:
+                    avg_par_v = round(float(str(par_mean)) if not isinstance(par_mean, (int, float)) else float(par_mean), 0)
+        
+        bid_rankings.append({
+            "bid": bid_name,
+            "bt_index": bt_index,
+            "auction": bid_auction,
+            "match_count": match_count,
+            "sample_size": matched_df.height,
+            "nv_count": nv_df.height,
+            "v_count": v_df.height,
+            "avg_par_nv": avg_par_nv,
+            "avg_par_v": avg_par_v,
+        })
+    
+    # Sort by avg_par (using avg_par_nv as primary, falling back to avg_par_v)
+    def sort_key(r: Dict) -> float:
+        nv = r.get("avg_par_nv")
+        v = r.get("avg_par_v")
+        if nv is not None:
+            return -nv  # Higher is better for NS
+        if v is not None:
+            return -v
+        return float("inf")  # No data goes to bottom
+    
+    bid_rankings.sort(key=sort_key)
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[rank-bids-by-ev] {total_next_bids} bids analyzed in {elapsed_ms:.1f}ms")
+    
+    return {
+        "auction_input": auction_input,
+        "auction_normalized": auction_normalized,
+        "parent_bt_row": parent_bt_row,
+        "bid_rankings": bid_rankings,
+        "total_next_bids": total_next_bids,
+        "vul_filter": vul_filter,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
