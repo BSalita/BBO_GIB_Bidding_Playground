@@ -2043,84 +2043,105 @@ def render_bidding_arena():
             help="Regex pattern to filter auctions (e.g., '^1N-p-3N')")
     
     # Optional: Custom deals URI
-    deals_uri = st.text_input("Custom Deals URI (optional)", value="",
-        help="Path to a parquet/CSV file or URL with custom deals. Leave blank to use default dataset.")
-    
-    if st.button("⚔️ Run Arena Comparison", type="primary"):
-        with st.spinner("Running arena comparison..."):
-            try:
-                payload = {
-                    "model_a": model_a,
-                    "model_b": model_b,
-                    "sample_size": sample_size,
-                    "seed": seed,
-                    "auction_pattern": auction_pattern if auction_pattern else None,
-                    "deals_uri": deals_uri if deals_uri else None,
-                }
-                response = requests.post(f"{API_BASE}/bidding-arena", json=payload, timeout=120)
-                response.raise_for_status()
-                data = response.json()
-                
-                # Display summary
-                st.subheader("📊 Summary")
-                summary = data.get("summary", {})
-                summary_cols = st.columns(4)
-                with summary_cols[0]:
-                    st.metric("Deals Compared", summary.get("total_deals", 0))
-                with summary_cols[1]:
-                    st.metric(f"{model_a} Avg Score", f"{summary.get(f'avg_dd_score_{model_a.lower()}', 0):.1f}")
-                with summary_cols[2]:
-                    st.metric(f"{model_b} Avg Score", f"{summary.get(f'avg_dd_score_{model_b.lower()}', 0):.1f}")
-                with summary_cols[3]:
-                    imp_diff = summary.get(f"avg_imp_{model_a.lower()}_vs_{model_b.lower()}", 0)
-                    st.metric(f"Avg IMP ({model_a} vs {model_b})", f"{imp_diff:+.2f}")
-                
-                # Head-to-head stats
-                st.subheader("🥊 Head-to-Head")
-                h2h = data.get("head_to_head", {})
-                h2h_cols = st.columns(3)
-                with h2h_cols[0]:
-                    st.metric(f"{model_a} Wins", h2h.get(f"{model_a.lower()}_wins", 0))
-                with h2h_cols[1]:
-                    st.metric("Ties", h2h.get("ties", 0))
-                with h2h_cols[2]:
-                    st.metric(f"{model_b} Wins", h2h.get(f"{model_b.lower()}_wins", 0))
-                
-                # Contract quality metrics
-                if "contract_quality" in data:
-                    st.subheader("📈 Contract Quality")
-                    cq = data["contract_quality"]
-                    cq_df = pl.DataFrame([
+    deals_uri = st.text_input(
+        "Custom Deals URI (optional)",
+        value="",
+        help="Path to a parquet/CSV file or URL with custom deals. Leave blank to use default dataset.",
+    )
+
+    # Auto-run arena comparison when this page is active (no button).
+    if len(model_names) < 2:
+        st.warning("At least two models are required to run the Bidding Arena.")
+        return
+
+    if model_a == model_b:
+        st.error("Please choose two different models for comparison (Model A and Model B must differ).")
+        return
+
+    with st.spinner("Running arena comparison..."):
+        try:
+            payload = {
+                "model_a": model_a,
+                "model_b": model_b,
+                "sample_size": sample_size,
+                "seed": seed,
+                "auction_pattern": auction_pattern if auction_pattern else None,
+                "deals_uri": deals_uri if deals_uri else None,
+            }
+            response = requests.post(f"{API_BASE}/bidding-arena", json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+
+            # Display summary
+            st.subheader("📊 Summary")
+            summary = data.get("summary", {})
+            summary_cols = st.columns(4)
+            with summary_cols[0]:
+                st.metric("Deals Compared", summary.get("total_deals", 0))
+            with summary_cols[1]:
+                st.metric(f"{model_a} Avg Score", f"{summary.get(f'avg_dd_score_{model_a.lower()}', 0):.1f}")
+            with summary_cols[2]:
+                st.metric(f"{model_b} Avg Score", f"{summary.get(f'avg_dd_score_{model_b.lower()}', 0):.1f}")
+            with summary_cols[3]:
+                imp_diff = summary.get(f"avg_imp_{model_a.lower()}_vs_{model_b.lower()}", 0)
+                st.metric(f"Avg IMP ({model_a} vs {model_b})", f"{imp_diff:+.2f}")
+
+            # Head-to-head stats
+            st.subheader("🥊 Head-to-Head")
+            h2h = data.get("head_to_head", {})
+            h2h_cols = st.columns(3)
+            with h2h_cols[0]:
+                st.metric(f"{model_a} Wins", h2h.get(f"{model_a.lower()}_wins", 0))
+            with h2h_cols[1]:
+                st.metric("Ties", h2h.get("ties", 0))
+            with h2h_cols[2]:
+                st.metric(f"{model_b} Wins", h2h.get(f"{model_b.lower()}_wins", 0))
+
+            # Contract quality metrics
+            if "contract_quality" in data:
+                st.subheader("📈 Contract Quality")
+                cq = data["contract_quality"]
+                cq_df = pl.DataFrame(
+                    [
                         {"Metric": k, model_a: v.get(model_a.lower(), 0), model_b: v.get(model_b.lower(), 0)}
                         for k, v in cq.items()
-                    ])
-                    st.dataframe(cq_df.to_pandas(), use_container_width=True)
-                
-                # Segmentation
-                if "segmentation" in data:
-                    st.subheader("📊 Segmentation Analysis")
-                    for seg_name, seg_data in data["segmentation"].items():
-                        with st.expander(f"By {seg_name.replace('_', ' ').title()}"):
-                            if seg_data:
-                                seg_df = pl.DataFrame(seg_data)
-                                st.dataframe(seg_df.to_pandas(), use_container_width=True)
-                            else:
-                                st.info("No segmentation data available.")
-                
-                # Sample deals
-                if "sample_deals" in data and data["sample_deals"]:
-                    st.subheader("🎯 Sample Deal Comparisons")
-                    sample_df = pl.DataFrame(data["sample_deals"])
-                    # Order columns sensibly
-                    priority_cols = ["PBN", "Dealer", "Vul", f"Auction_{model_a}", f"Auction_{model_b}",
-                                     f"DD_Score_{model_a}", f"DD_Score_{model_b}", "IMP_Diff"]
-                    existing = [c for c in priority_cols if c in sample_df.columns]
-                    remaining = [c for c in sample_df.columns if c not in existing]
-                    sample_df = sample_df.select(existing + remaining)
-                    st.dataframe(sample_df.to_pandas(), use_container_width=True)
-                    
-            except Exception as e:
-                st.error(f"Arena comparison failed: {e}")
+                    ]
+                )
+                render_aggrid(cq_df, key="arena_contract_quality", height=calc_grid_height(len(cq_df)))
+
+            # Segmentation
+            if "segmentation" in data:
+                st.subheader("📊 Segmentation Analysis")
+                for seg_idx, (seg_name, seg_data) in enumerate(data["segmentation"].items()):
+                    with st.expander(f"By {seg_name.replace('_', ' ').title()}"):
+                        if seg_data:
+                            seg_df = pl.DataFrame(seg_data)
+                            render_aggrid(seg_df, key=f"arena_seg_{seg_idx}", height=calc_grid_height(len(seg_df)))
+                        else:
+                            st.info("No segmentation data available.")
+
+            # Sample deals
+            if "sample_deals" in data and data["sample_deals"]:
+                st.subheader("🎯 Sample Deal Comparisons")
+                sample_df = pl.DataFrame(data["sample_deals"])
+                # Order columns sensibly - Hand_[NESW] in NESW order
+                priority_cols = [
+                    "Dealer",
+                    "Vul",
+                    "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                    f"Auction_{model_a}",
+                    f"Auction_{model_b}",
+                    f"DD_Score_{model_a}",
+                    f"DD_Score_{model_b}",
+                    "IMP_Diff",
+                ]
+                existing = [c for c in priority_cols if c in sample_df.columns]
+                remaining = [c for c in sample_df.columns if c not in existing]
+                sample_df = sample_df.select(existing + remaining)
+                render_aggrid(sample_df, key="arena_sample_deals", height=calc_grid_height(len(sample_df)), table_name="arena_samples")
+
+        except Exception as e:
+            st.error(f"Arena comparison failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2136,104 +2157,403 @@ def render_wrong_bid_analysis():
     
     with tab1:
         st.subheader("Wrong Bid Statistics")
-        if st.button("Load Wrong Bid Stats", key="load_wrong_bid_stats"):
-            with st.spinner("Loading statistics..."):
-                try:
-                    response = requests.post(f"{API_BASE}/wrong-bid-stats", json={}, timeout=60)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    # Overall stats
-                    stats = data.get("overall_stats", {})
-                    cols = st.columns(4)
-                    with cols[0]:
-                        st.metric("Total Deals Analyzed", stats.get("total_deals", 0))
-                    with cols[1]:
-                        st.metric("Deals with Wrong Bids", stats.get("deals_with_wrong_bids", 0))
-                    with cols[2]:
-                        rate = stats.get("wrong_bid_rate", 0) * 100
-                        st.metric("Wrong Bid Rate", f"{rate:.2f}%")
-                    with cols[3]:
-                        st.metric("Unique Auctions", stats.get("unique_auctions_with_wrong_bids", 0))
-                    
-                    # Per-seat breakdown
-                    if "per_seat" in data:
-                        st.subheader("Per-Seat Breakdown")
-                        seat_data = data["per_seat"]
-                        seat_df = pl.DataFrame([
-                            {"Seat": f"Seat {i}", "Wrong Bids": seat_data.get(f"seat_{i}_wrong_bids", 0),
-                             "Rate": f"{seat_data.get(f'seat_{i}_rate', 0) * 100:.2f}%"}
+        # Auto-load overall stats when this tab is active.
+        with st.spinner("Loading statistics..."):
+            try:
+                response = requests.post(f"{API_BASE}/wrong-bid-stats", json={}, timeout=60)
+                response.raise_for_status()
+                data = response.json()
+
+                # Overall stats
+                stats = data.get("overall_stats", {})
+                cols = st.columns(4)
+                with cols[0]:
+                    st.metric("Total Deals Analyzed", stats.get("total_deals", 0))
+                with cols[1]:
+                    st.metric("Deals with Wrong Bids", stats.get("deals_with_wrong_bids", 0))
+                with cols[2]:
+                    rate = stats.get("wrong_bid_rate", 0) * 100
+                    st.metric("Wrong Bid Rate", f"{rate:.2f}%")
+                with cols[3]:
+                    st.metric("Unique Auctions", stats.get("unique_auctions_with_wrong_bids", 0))
+
+                # Per-seat breakdown
+                if "per_seat" in data:
+                    st.subheader("Per-Seat Breakdown")
+                    seat_data = data["per_seat"]
+                    seat_df = pl.DataFrame(
+                        [
+                            {
+                                "Seat": f"Seat {i}",
+                                "Wrong Bids": seat_data.get(f"seat_{i}_wrong_bids", 0),
+                                "Rate": f"{seat_data.get(f'seat_{i}_rate', 0) * 100:.2f}%",
+                            }
                             for i in range(1, 5)
-                        ])
-                        st.dataframe(seat_df.to_pandas(), use_container_width=True)
-                        
-                except Exception as e:
-                    st.error(f"Failed to load stats: {e}")
+                        ]
+                    )
+                    render_aggrid(seat_df, key="wrong_bid_per_seat", height=calc_grid_height(len(seat_df)))
+
+            except Exception as e:
+                st.error(f"Failed to load stats: {e}")
     
     with tab2:
         st.subheader("Failed Criteria Summary")
         top_n = st.number_input("Top N Criteria", min_value=5, max_value=100, value=20, key="failed_criteria_top_n")
-        
-        if st.button("Load Failed Criteria", key="load_failed_criteria"):
-            with st.spinner("Analyzing failed criteria..."):
-                try:
-                    response = requests.post(f"{API_BASE}/failed-criteria-summary", 
-                                           json={"top_n": top_n}, timeout=60)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    if "criteria" in data and data["criteria"]:
-                        criteria_df = pl.DataFrame(data["criteria"])
-                        st.dataframe(criteria_df.to_pandas(), use_container_width=True)
-                        
-                        # Visualization
-                        if len(data["criteria"]) > 0:
-                            st.subheader("📊 Top Failed Criteria")
-                            import altair as alt
-                            chart_data = criteria_df.head(min(10, len(criteria_df))).to_pandas()
-                            chart = alt.Chart(chart_data).mark_bar().encode(
-                                x=alt.X('failure_count:Q', title='Failure Count'),
-                                y=alt.Y('criterion:N', sort='-x', title='Criterion'),
-                                tooltip=['criterion', 'failure_count', 'affected_auctions']
-                            ).properties(height=300)
-                            st.altair_chart(chart, use_container_width=True)
-                    else:
-                        st.info("No failed criteria found.")
-                        
-                except Exception as e:
-                    st.error(f"Failed to load criteria: {e}")
+
+        # Auto-load failed criteria summary when this tab is active.
+        with st.spinner("Analyzing failed criteria..."):
+            try:
+                response = requests.post(
+                    f"{API_BASE}/failed-criteria-summary",
+                    json={"top_n": int(top_n)},
+                    timeout=60,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if "criteria" in data and data["criteria"]:
+                    criteria_df = pl.DataFrame(data["criteria"])
+                    render_aggrid(criteria_df, key="failed_criteria_grid", height=calc_grid_height(len(criteria_df)))
+
+                    # Visualization
+                    if len(data["criteria"]) > 0:
+                        st.subheader("📊 Top Failed Criteria")
+                        import altair as alt
+
+                        chart_data = criteria_df.head(min(10, len(criteria_df))).to_pandas()
+                        chart = (
+                            alt.Chart(chart_data)
+                            .mark_bar()
+                            .encode(
+                                x=alt.X("failure_count:Q", title="Failure Count"),
+                                y=alt.Y("criterion:N", sort="-x", title="Criterion"),
+                                tooltip=["criterion", "failure_count", "affected_auctions"],
+                            )
+                            .properties(height=300)
+                        )
+                        st.altair_chart(chart, width="stretch")
+                else:
+                    st.info("No failed criteria found.")
+
+            except Exception as e:
+                st.error(f"Failed to load criteria: {e}")
     
     with tab3:
         st.subheader("Wrong Bid Leaderboard")
         st.markdown("Auctions with the highest wrong bid rates.")
-        
+
         top_n_lb = st.number_input("Top N Auctions", min_value=5, max_value=100, value=20, key="leaderboard_top_n")
-        min_deals = st.number_input("Minimum Deals", min_value=1, max_value=1000, value=10, 
-                                    help="Only show auctions with at least this many deals")
+        min_deals = st.number_input(
+            "Minimum Deals",
+            min_value=1,
+            max_value=1000,
+            value=10,
+            help="Only show auctions with at least this many deals",
+        )
+
+        # Auto-load leaderboard when this page is active (no button).
+        with st.spinner("Loading leaderboard..."):
+            try:
+                response = requests.post(
+                    f"{API_BASE}/wrong-bid-leaderboard",
+                    json={"top_n": int(top_n_lb), "min_deals": int(min_deals)},
+                    timeout=60,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if "leaderboard" in data and data["leaderboard"]:
+                    lb_df = pl.DataFrame(data["leaderboard"])
+
+                    # Format rate as percentage
+                    if "wrong_bid_rate" in lb_df.columns:
+                        lb_df = lb_df.with_columns(
+                            (pl.col("wrong_bid_rate") * 100).round(2).alias("wrong_bid_rate_%")
+                        )
+
+                    render_aggrid(lb_df, key="wrong_bid_leaderboard", height=calc_grid_height(len(lb_df)), table_name="leaderboard")
+                else:
+                    st.info("No auctions found matching criteria.")
+
+            except Exception as e:
+                st.error(f"Failed to load leaderboard: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Auction DD Analysis – DD columns for deals matching an auction's criteria
+# ---------------------------------------------------------------------------
+
+def render_auction_dd_analysis():
+    """Render the Auction DD Analysis tool.
+    
+    Given a partial or complete auction, find matching deals and return their DD columns.
+    """
+    st.header("🎯 Auction DD Analysis")
+    st.markdown("Get Double Dummy results for deals matching an auction's criteria. Helps analyze best bid choices.")
+    
+    # Sidebar inputs
+    auction_input = st.sidebar.text_input(
+        "Auction",
+        value="1N-p-3N-p-p-p",
+        help="Enter a partial or complete auction (e.g., '1N-p', '1N-p-3N-p-p-p')"
+    )
+    
+    max_deals = st.sidebar.number_input(
+        "Max Deals",
+        value=500,
+        min_value=1,
+        max_value=10000,
+        help="Maximum number of matching deals to return"
+    )
+    
+    st.sidebar.divider()
+    st.sidebar.subheader("Filters")
+    
+    vul_filter = st.sidebar.selectbox(
+        "Vulnerability",
+        ["all", "None", "Both", "NS", "EW"],
+        index=0,
+        help="Filter deals by vulnerability"
+    )
+    
+    st.sidebar.divider()
+    st.sidebar.subheader("Output Options")
+    
+    include_hands = st.sidebar.checkbox("Include Hands", value=True, help="Include Hand_N/E/S/W columns")
+    include_scores = st.sidebar.checkbox("Include DD Scores", value=True, help="Include DD_Score columns in Deal Data table")
+    
+    st.sidebar.divider()
+    seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_dd_analysis"))
+    
+    if not auction_input:
+        st.info("Enter an auction in the sidebar to analyze.")
+        return
+    
+    # Call the API
+    payload = {
+        "auction": auction_input,
+        "max_deals": int(max_deals),
+        "seed": seed,
+        "vul_filter": vul_filter if vul_filter != "all" else None,
+        "include_hands": include_hands,
+        "include_scores": include_scores,
+    }
+    
+    with st.spinner(f"Analyzing auction '{auction_input}'..."):
+        try:
+            data = api_post("/auction-dd-analysis", payload)
+        except Exception as e:
+            st.error(f"API call failed: {e}")
+            return
+    
+    elapsed_ms = data.get("elapsed_ms", 0)
+    total_matches = data.get("total_matches", 0)
+    returned_count = data.get("returned_count", 0)
+    
+    st.info(f"Found {total_matches:,} matching deals, returning {returned_count:,} ({elapsed_ms:.1f}ms)")
+    
+    # Show BT row
+    bt_row = data.get("bt_row")
+    if not bt_row:
+        st.warning("No matching completed auction found in the Bidding Table.")
+        return
+    
+    # Show error if any
+    if "error" in data:
+        st.error(f"⚠️ {data['error']}")
+        if "available_columns" in data:
+            with st.expander("Available DD columns"):
+                st.write(data["available_columns"])
+        return
+    
+    # -------------------------------------------------------------------------
+    # Auction Details & Criteria Breakdown
+    # -------------------------------------------------------------------------
+    st.subheader("🎴 Auction Details")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.write(f"**Input:** `{data.get('auction_input', auction_input)}`")
+        st.write(f"**Normalized:** `{data.get('auction_normalized', '')}`")
+        if bt_row.get("bt_index") is not None:
+            st.write(f"**BT Index:** {bt_row.get('bt_index')}")
+    
+    with col2:
+        # Criteria breakdown
+        criteria_breakdown = data.get("criteria_breakdown", {})
+        if criteria_breakdown:
+            st.write("**Seat Criteria:**")
+            for seat_label, criteria in criteria_breakdown.items():
+                criteria_str = ", ".join(criteria) if criteria else "(none)"
+                st.caption(f"• {seat_label}: {criteria_str}")
+    
+    # Show BT row in a table
+    with st.expander("📋 Bidding Table Row", expanded=False):
+        bt_df = pl.DataFrame([bt_row])
+        render_aggrid(bt_df, key="dd_analysis_bt_row", height=80, table_name="bt_row")
+    
+    # -------------------------------------------------------------------------
+    # Contract Recommendations
+    # -------------------------------------------------------------------------
+    contract_recs = data.get("contract_recommendations", [])
+    if contract_recs:
+        st.subheader("🏆 Contract Recommendations")
+        st.markdown("*All contracts analyzed based on DD scores and EV. Compare DD Score and EV to Par.*")
         
-        if st.button("Load Leaderboard", key="load_leaderboard"):
-            with st.spinner("Loading leaderboard..."):
-                try:
-                    response = requests.post(f"{API_BASE}/wrong-bid-leaderboard",
-                                           json={"top_n": top_n_lb, "min_deals": min_deals}, timeout=60)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    if "leaderboard" in data and data["leaderboard"]:
-                        lb_df = pl.DataFrame(data["leaderboard"])
-                        
-                        # Format rate as percentage
-                        if "wrong_bid_rate" in lb_df.columns:
-                            lb_df = lb_df.with_columns(
-                                (pl.col("wrong_bid_rate") * 100).round(2).alias("wrong_bid_rate_%")
-                            )
-                        
-                        st.dataframe(lb_df.to_pandas(), use_container_width=True)
-                    else:
-                        st.info("No auctions found matching criteria.")
-                        
-                except Exception as e:
-                    st.error(f"Failed to load leaderboard: {e}")
+        rec_df = pl.DataFrame(contract_recs)
+        # Rename columns for display
+        if "make_pct" in rec_df.columns:
+            rec_df = rec_df.with_columns(
+                (pl.col("make_pct").round(0).cast(pl.Int32).cast(pl.Utf8) + "%").alias("Makes %")
+            )
+        
+        # Use existing columns or aliases - separate rows for each vulnerability
+        display_cols = []
+        col_map = [
+            ("contract", "Contract"),
+            ("declarer", "Declarer"),
+            ("vul", "Vul"),  # Vulnerability state (NV or V)
+            ("Makes %", "Makes %"),
+            ("ev", "EV"),  # Expected Value for this vulnerability
+            ("sample_size", "Sample"),
+        ]
+        for c, alias in col_map:
+            if c in rec_df.columns:
+                display_cols.append(pl.col(c).alias(alias))
+            elif alias in rec_df.columns:
+                display_cols.append(pl.col(alias))
+        
+        if display_cols:
+            rec_df = rec_df.select(display_cols)
+            render_aggrid(rec_df, key="dd_analysis_recommendations", height=calc_grid_height(len(rec_df)), table_name="recommendations")
+    
+    # -------------------------------------------------------------------------
+    # Par Score Comparison
+    # -------------------------------------------------------------------------
+    # Par Contract Statistics (Sacrifices, Sets, etc.)
+    # -------------------------------------------------------------------------
+    par_contract_stats = data.get("par_contract_stats", [])
+    if par_contract_stats:
+        st.subheader("📊 Par Contract Breakdown")
+        st.markdown("*Distribution of par results split by vulnerability (NV vs V)*")
+        
+        par_stats_df = pl.DataFrame(par_contract_stats)
+        # Reorder columns with NV/V split for both Avg Score and EV
+        display_cols = ["category", "count", "pct", "count_nv", "avg_nv", "ev_nv", "count_v", "avg_v", "ev_v"]
+        col_aliases = {
+            "category": "Category", 
+            "count": "Total", 
+            "pct": "%",
+            "count_nv": "# NV",
+            "avg_nv": "Par NV",
+            "ev_nv": "EV NV",
+            "count_v": "# V",
+            "avg_v": "Par V",
+            "ev_v": "EV V",
+        }
+        par_stats_df = par_stats_df.select([c for c in display_cols if c in par_stats_df.columns])
+        par_stats_df = par_stats_df.rename({c: col_aliases.get(c, c) for c in par_stats_df.columns if c in col_aliases})
+        render_aggrid(par_stats_df, key="dd_analysis_par_stats", height=calc_grid_height(len(par_stats_df), max_height=350), table_name="par_stats")
+    
+    # -------------------------------------------------------------------------
+    # Deal Data Table
+    # -------------------------------------------------------------------------
+    dd_data = data.get("dd_data", [])
+    if not dd_data:
+        st.info("No deals matched the auction criteria.")
+        return
+    
+    st.subheader(f"📈 Deal Data ({len(dd_data)} deals)")
+    
+    shown_count = len(dd_data)
+    if total_matches > shown_count:
+        st.warning(f"⚠️ Showing a random sample of {shown_count:,} out of {total_matches:,} total matches.")
+    
+    dd_df = pl.DataFrame(dd_data)
+    
+    # Order columns sensibly
+    priority_cols = ["index", "Dealer", "Vul"]
+    hand_cols = ["Hand_N", "Hand_E", "Hand_S", "Hand_W"]
+    par_cols = ["ParScore", "ParContracts"]
+    
+    dd_cols = data.get("dd_columns", [])
+    ordered_dd = []
+    
+    # Check if we have raw trick columns or DD_Score columns
+    has_raw_tricks = any(col.startswith("DD_") and not col.startswith("DD_Score") for col in dd_cols)
+    
+    if has_raw_tricks:
+        # Order raw trick columns by direction then strain
+        for direction in ['N', 'E', 'S', 'W']:
+            for strain in ['C', 'D', 'H', 'S', 'N']:
+                col = f"DD_{direction}_{strain}"
+                if col in dd_cols:
+                    ordered_dd.append(col)
+    else:
+        # Order DD_Score columns by level then strain then direction
+        for level in range(1, 8):
+            for strain in ['N', 'S', 'H', 'D', 'C']:
+                for direction in ['N', 'E', 'S', 'W']:
+                    col = f"DD_Score_{level}{strain}_{direction}"
+                    if col in dd_cols:
+                        ordered_dd.append(col)
+        # Add any remaining DD_Score columns not in the order
+        for col in dd_cols:
+            if col not in ordered_dd:
+                ordered_dd.append(col)
+    
+    # Build final column order
+    final_cols = []
+    for c in priority_cols + hand_cols + par_cols:
+        if c in dd_df.columns:
+            final_cols.append(c)
+    final_cols.extend(ordered_dd)
+    
+    # Add any remaining columns (like DD_Score columns)
+    for c in dd_df.columns:
+        if c not in final_cols:
+            final_cols.append(c)
+    
+    dd_df = dd_df.select([c for c in final_cols if c in dd_df.columns])
+    
+    # Add download button
+    # Convert list/nested columns to strings for CSV export (CSV doesn't support nested data)
+    csv_df = dd_df.clone()
+    for col_name in csv_df.columns:
+        col_dtype = csv_df[col_name].dtype
+        dtype_str = str(col_dtype)
+        # Check for nested types: List, Array, Struct - cast all to string
+        if any(x in dtype_str for x in ["List", "Array", "Struct"]):
+            # For list of strings, try join; otherwise cast to string repr
+            try:
+                if "List(String)" in dtype_str or "List(Utf8)" in dtype_str:
+                    csv_df = csv_df.with_columns(pl.col(col_name).list.join(", ").alias(col_name))
+                else:
+                    # Cast entire column to string representation
+                    csv_df = csv_df.with_columns(pl.col(col_name).cast(pl.Utf8).alias(col_name))
+            except Exception:
+                # If casting fails, convert via Python repr
+                csv_df = csv_df.with_columns(
+                    pl.col(col_name).map_elements(lambda x: str(x) if x is not None else "", return_dtype=pl.Utf8).alias(col_name)
+                )
+    try:
+        csv_str = csv_df.write_csv(file=None)
+    except Exception:
+        # Fallback: drop any remaining nested columns
+        simple_cols = [c for c in csv_df.columns if not any(x in str(csv_df[c].dtype) for x in ["List", "Struct", "Array"])]
+        csv_str = csv_df.select(simple_cols).write_csv(file=None) if simple_cols else ""
+    
+    # Ensure UTF-8 encoding with BOM for Excel compatibility
+    csv_bytes = ("\ufeff" + csv_str).encode("utf-8") if csv_str else b""
+    safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", str(data.get("auction_normalized", "auction"))).strip("._-") or "auction"
+    st.download_button(
+        label="📥 Download Results as CSV",
+        data=csv_bytes,
+        file_name=f"dd_analysis_{safe_auction}.csv",
+        mime="text/csv; charset=utf-8",
+    )
+    
+    render_aggrid(dd_df, key="dd_analysis_results", height=400, table_name="dd_results")
 
 
 # ---------------------------------------------------------------------------
@@ -2249,6 +2569,7 @@ func_choice = st.sidebar.selectbox(
         "Analyze Actual Auctions",       # Group deals by bid column, analyze outcomes
         "Bidding Arena",                 # NEW: Head-to-head model comparison
         "Wrong Bid Analysis",            # NEW: Wrong bid statistics and leaderboard
+        "Auction DD Analysis",           # NEW: DD columns for deals matching auction criteria
         "Analyze Deal (PBN/LIN)",        # Input a deal, find matching auctions
         "Bidding Table Explorer",        # Browse bt_df with statistics
         "Find Auction Sequences",        # Regex search bt_df
@@ -2265,6 +2586,7 @@ FUNC_DESCRIPTIONS = {
     "Analyze Actual Auctions": "Group deals by their actual auction (bid column). Analyze criteria compliance, score deltas, and outcomes.",
     "Bidding Arena": "Head-to-head model comparison. Compare bidding models (Rules, Actual, NN, etc.) with DD scores, EV, and IMP differentials.",
     "Wrong Bid Analysis": "Analyze wrong bids: statistics, failed criteria summary, and leaderboard of auctions with highest wrong bid rates.",
+    "Auction DD Analysis": "Get DD columns (DD_[NESW]_[CDHSN]) for deals matching an auction's Agg_Expr_Seat criteria. Helps analyze best bid choices.",
     "Analyze Deal (PBN/LIN)": "Input a PBN/LIN deal and find which bidding table auctions match the hand characteristics.",
     "Bidding Table Explorer": "Browse bidding table entries with aggregate statistics (min/max ranges) for hand criteria per auction.",
     "Find Auction Sequences": "Search for auction sequences matching a regex pattern. Shows criteria per seat.",
@@ -2302,6 +2624,8 @@ match func_choice:
         render_bidding_arena()
     case "Wrong Bid Analysis":
         render_wrong_bid_analysis()
+    case "Auction DD Analysis":
+        render_auction_dd_analysis()
     case "Analyze Deal (PBN/LIN)":
         render_analyze_deal()
     case "Bidding Table Explorer":

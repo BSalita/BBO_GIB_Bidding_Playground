@@ -249,12 +249,10 @@ _cli_data_dir = _parse_data_dir_arg()
 # Check for --deal-rows (limit deal_df rows for faster debugging)
 _cli_deal_rows = _parse_deal_rows_arg()
 _cli_prewarm = _parse_prewarm_arg()
-if _cli_prewarm:
-    print("DEBUG MODE: Pre-warming endpoints is ENABLED (use --no-prewarm to disable)")
-else:
-    print("DEBUG MODE: Pre-warming endpoints is DISABLED (--no-prewarm)")
+if not _cli_prewarm:
+    print("[config] Pre-warming disabled (--no-prewarm)")
 if _cli_deal_rows is not None:
-    print(f"DEBUG MODE: Limiting deal_df to {_cli_deal_rows:,} rows")
+    print(f"[config] Limiting deal_df to {_cli_deal_rows:,} rows (--deal-rows)")
 
 # Default to 'data' subdirectory if --data-dir not specified
 dataPath = _cli_data_dir if _cli_data_dir is not None else pathlib.Path("data")
@@ -270,7 +268,7 @@ else:
 # ---------------------------------------------------------------------------
 
 exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
-bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
+bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented_matches.parquet")
 bt_seat1_file = dataPath.joinpath("bbo_bt_seat1.parquet")  # Clean seat-1-only table
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
@@ -677,6 +675,16 @@ class BiddingArenaRequest(BaseModel):
     deals_uri: Optional[str] = None
 
 
+class AuctionDDAnalysisRequest(BaseModel):
+    """Request for Auction DD Analysis: get DD columns for deals matching an auction's criteria."""
+    auction: str  # Partial or complete auction string (e.g., "1N-p", "1N-p-3N-p-p-p")
+    max_deals: int = 1000  # Maximum number of matching deals to return
+    seed: Optional[int] = 0  # Random seed for sampling (0 = non-reproducible)
+    vul_filter: Optional[str] = None  # Filter by vulnerability: None, Both, NS, EW (None = all)
+    include_hands: bool = True  # Include Hand_N/E/S/W columns in output
+    include_scores: bool = True  # Include DD_Score columns in addition to DD tricks
+
+
 # Import model registry for Bidding Arena
 from bbo_bidding_models import MODEL_REGISTRY
 
@@ -844,7 +852,7 @@ def _heavy_init() -> None:
 
         # Load deals (optionally limited by --deal-rows for faster debugging)
         n_rows_msg = f" (limited to {_cli_deal_rows:,} rows)" if _cli_deal_rows else ""
-        _update_loading_status(2, f"Loading deal_df (bbo_mldf_augmented.parquet){n_rows_msg}...")
+        _update_loading_status(2, f"Loading deal_df ({bbo_mldf_augmented_file.name}){n_rows_msg}...")
         deal_df = load_deal_df(bbo_mldf_augmented_file, valid_deal_columns, mldf_n_rows=_cli_deal_rows)
         
         # Get total row count for display (when using --deal-rows)
@@ -862,8 +870,16 @@ def _heavy_init() -> None:
         if 'bid' in deal_df.columns and deal_df['bid'].dtype == pl.List(pl.Utf8):
             deal_df = deal_df.with_columns(pl.col('bid').list.join('-'))
         
-        # Build criteria bitmaps and derive per-seat/per-dealer views
-        # Pass file paths for caching - bitmaps will be saved/loaded based on staleness
+        # Load criteria bitmaps (must be pre-built by pipeline)
+        # Bitmap file is named based on deal file: {stem}_criteria_bitmaps.parquet
+        bitmap_file = bbo_mldf_augmented_file.parent / f"{bbo_mldf_augmented_file.stem.replace('_matches', '')}_criteria_bitmaps.parquet"
+        if not bitmap_file.exists():
+            raise FileNotFoundError(
+                f"Criteria bitmaps file not found: {bitmap_file}\n"
+                "Run the pipeline first: python bbo_bt_deal_matches.py"
+            )
+        
+        _update_loading_status(3, f"Loading criteria bitmaps ({bitmap_file.name})...")
         criteria_deal_dfs_directional = build_or_load_directional_criteria_bitmaps(
             deal_df,
             pythonized_exprs_by_direction,
@@ -871,7 +887,7 @@ def _heavy_init() -> None:
             deal_file=bbo_mldf_augmented_file,
             exec_plan_file=exec_plan_file,
         )
-        _log_memory("after build_or_load_directional_criteria_bitmaps")
+        _log_memory("after load_directional_criteria_bitmaps")
 
         _update_loading_status(4, "Processing criteria views...")
         deal_criteria_by_direction_dfs, deal_criteria_by_seat_dfs = directional_to_directionless(
@@ -1885,6 +1901,43 @@ def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("bidding-arena", e)
+
+
+# ---------------------------------------------------------------------------
+# API: auction DD analysis (deals matching auction with DD columns)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/auction-dd-analysis")
+def auction_dd_analysis(req: AuctionDDAnalysisRequest) -> Dict[str, Any]:
+    """Get DD columns for deals matching an auction's criteria.
+    
+    Finds the auction in BT, matches its Agg_Expr_Seat_[1-4] criteria against
+    the deal bitmaps, and returns DD_[NESW]_[CDHSN] columns for matched deals.
+    """
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    
+    with _STATE_LOCK:
+        state = dict(STATE)
+    
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_auction_dd_analysis(
+            state=state,
+            auction=req.auction,
+            max_deals=req.max_deals,
+            seed=req.seed,
+            vul_filter=req.vul_filter,
+            include_hands=req.include_hands,
+            include_scores=req.include_scores,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("auction-dd-analysis", e)
 
 
 if __name__ == "__main__":  # pragma: no cover

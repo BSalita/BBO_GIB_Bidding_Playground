@@ -960,6 +960,7 @@ def handle_pbn_lookup(
     """Handle /pbn-lookup endpoint."""
     t0 = time.perf_counter()
     deal_df = state["deal_df"]
+    bt_seat1_df = state.get("bt_seat1_df")
     
     pbn_input = pbn.strip()
     
@@ -983,20 +984,43 @@ def handle_pbn_lookup(
     if matching.height > max_results:
         matching = matching.head(max_results)
     
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[pbn-lookup] Found {matching.height} matches in {elapsed_ms:.1f}ms")
-    
     # Rename 'bid' to 'Actual_Auction' in output
     matches_list = matching.to_dicts()
     for m in matches_list:
         if "bid" in m:
             m["Actual_Auction"] = _bid_value_to_str(m.pop("bid"))
     
+    # Find matched BT auctions for this PBN (on-the-fly)
+    matched_bt_auctions: List[str] = []
+    if bt_seat1_df is not None:
+        try:
+            from bbo_bidding_queries_lib import find_matching_bt_auctions_from_pbn
+            # Get completed auctions
+            if "is_completed_auction" in bt_seat1_df.columns:
+                bt_completed = bt_seat1_df.filter(pl.col("is_completed_auction"))
+            else:
+                bt_completed = bt_seat1_df
+            # Limit for performance
+            if "matching_deal_count" in bt_completed.columns:
+                bt_completed = bt_completed.sort("matching_deal_count", descending=True).head(2000)
+            else:
+                bt_completed = bt_completed.head(2000)
+            
+            matched_bt_auctions = find_matching_bt_auctions_from_pbn(
+                pbn_input, bt_completed, max_matches=10
+            )
+        except Exception as e:
+            print(f"[pbn-lookup] Warning: Could not find matched BT auctions: {e}")
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[pbn-lookup] Found {matching.height} matches, {len(matched_bt_auctions)} BT auctions in {elapsed_ms:.1f}ms")
+    
     return {
         "matches": matches_list,
         "count": matching.height,
         "total_in_df": deal_df.height,
         "pbn_searched": pbn_input,
+        "matched_bt_auctions": matched_bt_auctions,
         "elapsed_ms": round(elapsed_ms, 1),
         "sql_query": sql_query,
     }
@@ -2081,7 +2105,7 @@ LIMIT {n_auction_groups}"""
                 deal_row["first_wrong_seat"] = None
             # Remove internal row index from output
             deal_row.pop("_row_idx", None)
-
+        
         auction_groups.append({
             "auction": bid_auction, "bt_auction": bt_auction, "deal_count": deal_count,
             "sample_count": group_deals.height, "bt_info": bt_info, "stats": stats,
@@ -2742,7 +2766,10 @@ def handle_bidding_arena(
     Provides comprehensive head-to-head comparison between two bidding models.
     Currently supports "Rules" and "Actual" models.
     Future: "NN", "RF", "Fuzzy", etc.
-    Uses vectorized join instead of per-row BT lookups for performance.
+    
+    IMPORTANT: "Rules" model finds the BT completed auction whose criteria ALL match
+    the deal's hand features (using bitmap lookups). This is NOT the same as looking
+    up the BT row by the actual auction string.
     
     Args:
         deals_uri: Optional file path or URL to load custom deals from.
@@ -2780,10 +2807,10 @@ def handle_bidding_arena(
     # Add row index
     deal_df = deal_df.with_row_index("_row_idx")
     
-    # Prepare for join: add _bid_str and _auction_key
+    # Prepare deals: add _bid_str (for Actual auction display)
     deals_prepared = prepare_deals_with_bid_str(deal_df)
     
-    # Filter deals by auction pattern if provided
+    # Filter deals by auction pattern if provided (filters on ACTUAL auction)
     if auction_pattern:
         try:
             regex_pattern = f"(?i){normalize_auction_pattern(auction_pattern)}"
@@ -2802,15 +2829,80 @@ def handle_bidding_arena(
     
     analyzed_deals = sample_df.height
     
-    # Prepare BT for join - include Auction column for Rules contract lookup
-    bt_prepared = prepare_bt_for_join(bt_seat1_df)
-    bt_cols = ["Auction"] + [agg_expr_col(s) for s in SEAT_RANGE]
-    joined_df = join_deals_with_bt(sample_df, bt_prepared, bt_cols=bt_cols)
+    # ---------------------------------------------------------------------------
+    # Rules Auction Matching Strategy
+    # ---------------------------------------------------------------------------
+    # Check if pre-computed Matched_BT_Indices column exists
+    has_precomputed_matches = "Matched_BT_Indices" in sample_df.columns
     
-    # Rename joined Auction to avoid conflict with deal's bid
-    if "Auction" in joined_df.columns and "Auction_right" not in joined_df.columns:
-        # The join may have created Auction_right if there was a conflict
-        pass  # Auction column from BT is what we want for Rules model
+    if has_precomputed_matches:
+        print("[bidding-arena] Using pre-computed Matched_BT_Indices column")
+        # Build bt_index -> Auction lookup
+        bt_idx_to_auction = {}
+        for row in bt_seat1_df.iter_rows(named=True):
+            bt_idx = row.get("bt_index")
+            auction = row.get("Auction")
+            if bt_idx is not None and auction:
+                bt_idx_to_auction[int(bt_idx)] = auction
+        
+        def _find_rules_auction_precomputed(matched_indices: List[int] | None) -> Optional[str]:
+            """Look up Rules auction from pre-computed match indices."""
+            if not matched_indices:
+                return None
+            # Return first matching auction
+            for bt_idx in matched_indices:
+                auction = bt_idx_to_auction.get(int(bt_idx))
+                if auction:
+                    return auction
+            return None
+    else:
+        print("[bidding-arena] Using on-the-fly criteria matching (Matched_BT_Indices not available)")
+        # Get completed auctions with their criteria for on-the-fly matching
+        if "is_completed_auction" in bt_seat1_df.columns:
+            bt_completed = bt_seat1_df.filter(pl.col("is_completed_auction"))
+        else:
+            bt_completed = bt_seat1_df
+        
+        # Limit to most common completed auctions for performance
+        if "matching_deal_count" in bt_completed.columns:
+            bt_completed = bt_completed.sort("matching_deal_count", descending=True).head(5000)
+        else:
+            bt_completed = bt_completed.head(5000)
+        
+        # Convert to list of dicts for iteration
+        bt_completed_rows = bt_completed.select([
+            "Auction",
+            agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4),
+        ]).to_dicts()
+        
+        def _deal_meets_all_seat_criteria(deal_idx: int, dealer: str, bt_row: Dict[str, Any]) -> bool:
+            """Check if a deal meets ALL seat criteria for a BT row."""
+            for seat in SEAT_RANGE:
+                criteria_list = bt_row.get(agg_expr_col(seat))
+                if not criteria_list:
+                    continue  # No criteria for this seat = passes
+                
+                seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
+                criteria_df = seat_dfs.get(dealer)
+                if criteria_df is None or criteria_df.is_empty():
+                    return False  # Can't verify = fail
+                
+                for criterion in criteria_list:
+                    if criterion not in criteria_df.columns:
+                        continue  # Criterion not tracked = ignore
+                    try:
+                        if not bool(criteria_df[criterion][deal_idx]):
+                            return False  # Failed this criterion
+                    except (IndexError, KeyError):
+                        return False
+            return True
+        
+        def _find_rules_auction_onthefly(deal_idx: int, dealer: str) -> Optional[str]:
+            """Find the first completed auction whose criteria ALL match this deal."""
+            for bt_row in bt_completed_rows:
+                if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row):
+                    return bt_row.get("Auction")
+            return None
     
     # Metrics accumulators
     model_a_wins = 0
@@ -2861,16 +2953,13 @@ def handle_bidding_arena(
         "W": {"a_wins": 0, "b_wins": 0, "ties": 0, "count": 0},
     }
     
-    # Process each deal - now using joined data (no per-row BT lookups)
-    for row in joined_df.iter_rows(named=True):
+    # Process each deal
+    for row in sample_df.iter_rows(named=True):
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         vul = row.get("Vul", "None")
         bid_str = row.get("_bid_str", "")
         par_score = row.get("ParScore")
-        
-        # BT auction from the join (for Rules model)
-        bt_auction = row.get("Auction")  # From joined BT data
         
         # Get opener's HCP (seat 1)
         dir_map = _seat_direction_map(1)
@@ -2880,19 +2969,28 @@ def handle_bidding_arena(
         if hcp_label not in by_hcp_range:
             by_hcp_range[hcp_label] = {"a_wins": 0, "b_wins": 0, "ties": 0, "count": 0}
         
-        # Determine contracts and scores for each model
+        # ---------------------------------------------------------------------------
+        # Get auction for each model
+        # ---------------------------------------------------------------------------
+        # Helper to get Rules auction (uses pre-computed if available)
+        def get_rules_auction() -> Optional[str]:
+            if has_precomputed_matches:
+                matched_indices = row.get("Matched_BT_Indices")
+                return _find_rules_auction_precomputed(matched_indices)
+            else:
+                return _find_rules_auction_onthefly(int(deal_idx), dealer)
+        
         # Model A
         if model_a == "Actual":
             contract_a = row.get("Contract", "")
             dd_score_a = row.get("DD_Score_Declarer")
             auction_a = bid_str
         else:  # Rules
-            # Use pre-joined BT auction
-            if bt_auction:
-                contract_a = get_ai_contract(bt_auction, dealer)
-                auction_a = bt_auction
-                # Compute DD score for Rules contract on-the-fly
-                dd_score_a = get_dd_score_for_auction(bt_auction, dealer, row)
+            rules_auction = get_rules_auction()
+            if rules_auction:
+                contract_a = get_ai_contract(rules_auction, dealer)
+                auction_a = rules_auction
+                dd_score_a = get_dd_score_for_auction(rules_auction, dealer, row)
             else:
                 contract_a = None
                 auction_a = None
@@ -2904,12 +3002,11 @@ def handle_bidding_arena(
             dd_score_b = row.get("DD_Score_Declarer")
             auction_b = bid_str
         else:  # Rules
-            # Use pre-joined BT auction
-            if bt_auction:
-                contract_b = get_ai_contract(bt_auction, dealer)
-                auction_b = bt_auction
-                # Compute DD score for Rules contract on-the-fly
-                dd_score_b = get_dd_score_for_auction(bt_auction, dealer, row)
+            rules_auction = get_rules_auction()
+            if rules_auction:
+                contract_b = get_ai_contract(rules_auction, dealer)
+                auction_b = rules_auction
+                dd_score_b = get_dd_score_for_auction(rules_auction, dealer, row)
             else:
                 contract_b = None
                 auction_b = None
@@ -2945,16 +3042,22 @@ def handle_bidding_arena(
 
         # Collect a small sample of deal-level comparisons for UI
         if len(sample_deals) < 50:
+            # Include whether the auctions match
+            auctions_match = (auction_a == auction_b) if auction_a and auction_b else False
             sample_deals.append(
                 {
-                    "PBN": row.get("PBN"),
                     "Dealer": dealer,
                     "Vul": vul,
+                    "Hand_N": row.get("Hand_N"),
+                    "Hand_E": row.get("Hand_E"),
+                    "Hand_S": row.get("Hand_S"),
+                    "Hand_W": row.get("Hand_W"),
                     f"Auction_{model_a}": auction_a,
                     f"Auction_{model_b}": auction_b,
                     f"DD_Score_{model_a}": score_a,
                     f"DD_Score_{model_b}": score_b,
                     "IMP_Diff": imp_signed,
+                    "Auctions_Match": auctions_match,
                 }
             )
         
@@ -3245,6 +3348,645 @@ def handle_bidding_arena(
         },
         "segmentation": segmentation,
         "sample_deals": sample_deals,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Handler: /auction-dd-analysis
+# ---------------------------------------------------------------------------
+
+# Constants for DD analysis
+_DD_ANALYSIS_STATS_THRESHOLD = 5000  # Use full data if <= this many matches
+_DD_ANALYSIS_MAKE_PCT_THRESHOLD = 0  # Show all contracts (0 = no threshold)
+_DD_ANALYSIS_TOP_RECOMMENDATIONS = 100  # Max contract recommendations to show (high = show all)
+_DD_ANALYSIS_SQL_COLS_LIMIT = 15  # Limit columns in SQL display
+
+# Seat labels for display
+_SEAT_LABELS = {
+    1: "Seat 1 (Opener/Dealer)",
+    2: "Seat 2 (LHO)", 
+    3: "Seat 3 (Partner)",
+    4: "Seat 4 (RHO)",
+}
+
+# Valid vulnerability values (data uses underscores: N_S, E_W)
+_VALID_VUL_VALUES = {"None", "Both", "NS", "EW", "N_S", "E_W"}
+
+# Map UI values to data values (UI uses "NS"/"EW", data uses "N_S"/"E_W")
+_VUL_UI_TO_DATA = {
+    "NS": "N_S",
+    "EW": "E_W",
+    "None": "None",
+    "Both": "Both",
+}
+
+
+def _find_bt_row_for_auction(bt_completed: pl.DataFrame, auction_normalized: str) -> pl.DataFrame:
+    """Find a BT row matching the normalized auction string.
+    
+    Tries: exact match → regex match → prefix match.
+    Returns the matching rows DataFrame or empty DataFrame if no match.
+    """
+    auction_col = bt_completed["Auction"].cast(pl.Utf8).str.replace(r"(?i)^(p-)+", "")
+    
+    # Try exact match first
+    matches = bt_completed.filter(auction_col == auction_normalized)
+    if matches.height > 0:
+        return matches
+    
+    # Try as regex pattern (exact)
+    try:
+        regex_pattern = f"(?i)^{re.escape(auction_normalized)}$"
+        matches = bt_completed.filter(auction_col.str.contains(regex_pattern))
+        if matches.height > 0:
+            return matches
+    except Exception as e:
+        print(f"[auction-dd-analysis] Regex match failed: {e}")
+    
+    # Try prefix match (partial auction)
+    try:
+        prefix_pattern = f"(?i)^{re.escape(auction_normalized)}"
+        matches = bt_completed.filter(auction_col.str.contains(prefix_pattern))
+        if matches.height > 0:
+            return matches
+    except Exception as e:
+        print(f"[auction-dd-analysis] Prefix match failed: {e}")
+    
+    return bt_completed.head(0)  # Empty DataFrame
+
+
+def _build_criteria_mask_for_all_seats(
+    deal_df: pl.DataFrame,
+    bt_row: Dict[str, Any],
+    deal_criteria_by_seat_dfs: Dict[int, Dict[str, pl.DataFrame]],
+) -> Tuple[Optional[pl.Series], List[str]]:
+    """Build a mask matching ALL 4 seats' criteria against the deal DataFrame.
+    
+    Returns:
+        (mask, invalid_criteria) - mask is None if no deals match
+    """
+    dealer_series = deal_df["Dealer"]
+    global_mask: pl.Series | None = None
+    invalid_criteria: List[str] = []
+    
+    for dealer in DIRECTIONS:
+        dealer_mask = dealer_series == dealer
+        all_seats_mask: pl.Series | None = None
+        
+        for seat in range(1, 5):
+            criteria_col = f"Agg_Expr_Seat_{seat}"
+            criteria_list = bt_row.get(criteria_col) or []
+            
+            if not criteria_list:
+                continue
+            
+            seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat, {})
+            seat_criteria_df = seat_criteria_for_seat.get(dealer)
+            
+            if seat_criteria_df is None or seat_criteria_df.is_empty():
+                all_seats_mask = pl.Series([False] * deal_df.height)
+                break
+            
+            available_cols = set(seat_criteria_df.columns)
+            
+            seat_mask: pl.Series | None = None
+            for crit in criteria_list:
+                if crit not in available_cols:
+                    if crit not in invalid_criteria:
+                        invalid_criteria.append(crit)
+                    continue
+                col = seat_criteria_df[crit]
+                seat_mask = col if seat_mask is None else (seat_mask & col)
+            
+            if seat_mask is None:
+                continue
+            
+            all_seats_mask = seat_mask if all_seats_mask is None else (all_seats_mask & seat_mask)
+        
+        if all_seats_mask is None:
+            combined = dealer_mask
+        else:
+            combined = dealer_mask & all_seats_mask
+        
+        global_mask = combined if global_mask is None else (global_mask | combined)
+    
+    return global_mask, invalid_criteria
+
+
+def _compute_contract_recommendations(
+    stats_df: pl.DataFrame,
+    dd_cols: List[str],
+) -> List[Dict[str, Any]]:
+    """Compute which contracts are most likely to make based on DD analysis.
+    
+    Works with either:
+    - Raw trick columns: DD_{direction}_{strain} (if available)
+    - DD Score columns: DD_Score_{level}{strain}_{direction} (fallback)
+    
+    For DD Score columns, a contract "makes" if the score is >= 0.
+    """
+    contract_recommendations: List[Dict[str, Any]] = []
+    strain_names = {'N': 'NT', 'S': '♠', 'H': '♥', 'D': '♦', 'C': '♣'}
+    
+    # Compute average ParScore once for the whole dataset
+    avg_par_score = None
+    if "ParScore" in stats_df.columns:
+        par_series = stats_df["ParScore"].drop_nulls()
+        if par_series.len() > 0:
+            par_mean = par_series.mean()
+            if par_mean is not None:
+                avg_par_score = float(str(par_mean)) if not isinstance(par_mean, (int, float)) else float(par_mean)
+    
+    # Check if we have raw trick columns or DD_Score columns
+    has_raw_tricks = any(col.startswith("DD_") and not col.startswith("DD_Score") for col in dd_cols)
+    
+    if has_raw_tricks:
+        # Original logic for raw trick columns
+        for direction in ['N', 'E', 'S', 'W']:
+            for strain in ['N', 'S', 'H', 'D', 'C']:
+                col = f"DD_{direction}_{strain}"
+                if col not in stats_df.columns:
+                    continue
+                
+                tricks_series = stats_df[col].drop_nulls()
+                if tricks_series.len() == 0:
+                    continue
+                
+                mean_tricks_val = tricks_series.mean()
+                if mean_tricks_val is None:
+                    continue
+                mean_tricks = float(str(mean_tricks_val)) if not isinstance(mean_tricks_val, (int, float)) else float(mean_tricks_val)
+                
+                for level in range(1, 8):
+                    tricks_needed = level + 6
+                    makes_count = (tricks_series >= tricks_needed).sum()
+                    make_pct = float(makes_count / tricks_series.len()) * 100 if tricks_series.len() > 0 else 0.0
+                    
+                    if make_pct >= _DD_ANALYSIS_MAKE_PCT_THRESHOLD:
+                        contract_recommendations.append({
+                            "contract": f"{level}{strain_names[strain]}",
+                            "declarer": direction,
+                            "make_pct": round(make_pct, 1),
+                            "avg_tricks": round(mean_tricks, 1),
+                            "sample_size": int(tricks_series.len()),
+                        })
+    else:
+        # Use DD_Score columns: contract makes if score >= 0
+        for direction in ['N', 'E', 'S', 'W']:
+            for strain in ['N', 'S', 'H', 'D', 'C']:
+                for level in range(1, 8):
+                    col = f"DD_Score_{level}{strain}_{direction}"
+                    if col not in stats_df.columns:
+                        continue
+                    
+                    score_series = stats_df[col].drop_nulls()
+                    if score_series.len() == 0:
+                        continue
+                    
+                    # Contract makes if DD score >= 0
+                    makes_count = (score_series >= 0).sum()
+                    make_pct = float(makes_count / score_series.len()) * 100 if score_series.len() > 0 else 0.0
+                    
+                    mean_score_val = score_series.mean()
+                    avg_score = float(str(mean_score_val)) if mean_score_val is not None and not isinstance(mean_score_val, (int, float)) else (float(mean_score_val) if mean_score_val is not None else 0.0)
+                    
+                    # Calculate EV (Expected Value) - separate ROWS for V and NV
+                    # EV columns: EV_{pair}_{declarer}_{strain}_{level}_{vul}
+                    pair = "NS" if direction in ["N", "S"] else "EW"
+                    
+                    ev_col_v = f"EV_{pair}_{direction}_{strain}_{level}_V"
+                    ev_col_nv = f"EV_{pair}_{direction}_{strain}_{level}_NV"
+                    
+                    if make_pct >= _DD_ANALYSIS_MAKE_PCT_THRESHOLD:
+                        # Create separate row for Not Vulnerable
+                        if ev_col_nv in stats_df.columns:
+                            ev_series_nv = stats_df[ev_col_nv].drop_nulls()
+                            if ev_series_nv.len() > 0:
+                                ev_mean_nv = ev_series_nv.mean()
+                                if ev_mean_nv is not None:
+                                    ev_nv = float(str(ev_mean_nv)) if not isinstance(ev_mean_nv, (int, float)) else float(ev_mean_nv)
+                                    contract_recommendations.append({
+                                        "contract": f"{level}{strain_names[strain]}",
+                                        "declarer": direction,
+                                        "vul": "NV",
+                                        "make_pct": round(make_pct, 1),
+                                        "ev": round(ev_nv, 0),
+                                        "sample_size": int(score_series.len()),
+                                    })
+                        
+                        # Create separate row for Vulnerable
+                        if ev_col_v in stats_df.columns:
+                            ev_series_v = stats_df[ev_col_v].drop_nulls()
+                            if ev_series_v.len() > 0:
+                                ev_mean_v = ev_series_v.mean()
+                                if ev_mean_v is not None:
+                                    ev_v = float(str(ev_mean_v)) if not isinstance(ev_mean_v, (int, float)) else float(ev_mean_v)
+                                    contract_recommendations.append({
+                                        "contract": f"{level}{strain_names[strain]}",
+                                        "declarer": direction,
+                                        "vul": "V",
+                                        "make_pct": round(make_pct, 1),
+                                        "ev": round(ev_v, 0),
+                                        "sample_size": int(score_series.len()),
+                                    })
+    
+    # Sort by EV descending
+    contract_recommendations.sort(key=lambda x: -x.get("ev", float("-inf")))
+    return contract_recommendations[:_DD_ANALYSIS_TOP_RECOMMENDATIONS]
+
+
+def handle_auction_dd_analysis(
+    state: Dict[str, Any],
+    auction: str,
+    max_deals: int,
+    seed: Optional[int],
+    vul_filter: Optional[str] = None,
+    include_hands: bool = True,
+    include_scores: bool = True,
+) -> Dict[str, Any]:
+    """Handle /auction-dd-analysis endpoint.
+    
+    Finds deals matching an auction's criteria and returns their DD columns.
+    
+    Returns:
+        - bt_row: The matched BT row (Auction, Agg_Expr_Seat_1-4)
+        - criteria_breakdown: Criteria for each seat
+        - dd_data: List of dicts with DD columns, hands, scores
+        - contract_recommendations: Best contracts based on DD analysis
+        - par_comparison: How often auction reaches par
+        - total_matches: Total number of deals matching all criteria
+        - sql_query: Example SQL query for the result
+    """
+    t0 = time.perf_counter()
+    
+    deal_df = state["deal_df"]
+    bt_seat1_df = state.get("bt_seat1_df")
+    deal_criteria_by_seat_dfs = state["deal_criteria_by_seat_dfs"]
+    
+    if bt_seat1_df is None:
+        raise ValueError("bt_seat1_df not loaded")
+    
+    # Filter to completed auctions only
+    if "is_completed_auction" in bt_seat1_df.columns:
+        bt_completed = bt_seat1_df.filter(pl.col("is_completed_auction"))
+    else:
+        bt_completed = bt_seat1_df
+    
+    # Normalize auction: strip leading passes to match seat-1 view
+    auction_normalized = re.sub(r"(?i)^(p-)+", "", auction.strip())
+    if not auction_normalized:
+        raise ValueError(f"Invalid auction: '{auction}'")
+    
+    # Find matching BT row
+    exact_matches = _find_bt_row_for_auction(bt_completed, auction_normalized)
+    
+    if exact_matches.height == 0:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "auction_input": auction,
+            "auction_normalized": auction_normalized,
+            "bt_row": None,
+            "criteria_breakdown": {},
+            "dd_data": [],
+            "total_matches": 0,
+            "sql_query": f"-- No completed auction found in BT for: {auction_normalized}",
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    
+    # Use first match
+    bt_row = exact_matches.row(0, named=True)
+    bt_row_display = {
+        "Auction": bt_row.get("Auction"),
+        "bt_index": bt_row.get("bt_index"),
+    }
+    
+    # Build criteria breakdown for each seat
+    criteria_breakdown: Dict[str, List[str]] = {}
+    for s in range(1, 5):
+        col = f"Agg_Expr_Seat_{s}"
+        criteria_list = bt_row.get(col) or []
+        bt_row_display[col] = criteria_list
+        seat_label = _SEAT_LABELS[s]
+        if criteria_list:
+            criteria_breakdown[seat_label] = list(criteria_list)
+        else:
+            criteria_breakdown[seat_label] = ["(no criteria)"]
+    
+    # Build global mask matching ALL 4 seats' criteria
+    global_mask, invalid_criteria = _build_criteria_mask_for_all_seats(
+        deal_df, bt_row, deal_criteria_by_seat_dfs
+    )
+    
+    if invalid_criteria:
+        print(f"[auction-dd-analysis] Warning: {len(invalid_criteria)} criteria not found in bitmaps: {invalid_criteria[:5]}")
+    
+    if global_mask is None or not global_mask.any():
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "auction_input": auction,
+            "auction_normalized": auction_normalized,
+            "bt_row": bt_row_display,
+            "criteria_breakdown": criteria_breakdown,
+            "dd_data": [],
+            "total_matches": 0,
+            "sql_query": f"-- No deals matched the criteria for auction: {auction_normalized}",
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    
+    matched_df = deal_df.filter(global_mask)
+    
+    # Debug: Log unique Vul values to diagnose mapping issues
+    vul_breakdown: Dict[str, int] = {}
+    if "Vul" in matched_df.columns:
+        try:
+            vul_counts = matched_df.group_by("Vul").len().to_dicts()
+            for row in vul_counts:
+                vul_val = str(row.get("Vul", "unknown"))
+                vul_breakdown[vul_val] = row.get("len", 0)
+            print(f"[auction-dd-analysis] Vul distribution before filter: {vul_breakdown}")
+        except Exception as e:
+            print(f"[auction-dd-analysis] Failed to get Vul breakdown: {e}")
+    
+    # Apply vulnerability filter if specified
+    # Map UI values (NS, EW) to data values (N_S, E_W)
+    if vul_filter and vul_filter != "all" and "Vul" in matched_df.columns:
+        data_vul_value = _VUL_UI_TO_DATA.get(vul_filter, vul_filter)
+        matched_df = matched_df.filter(pl.col("Vul") == data_vul_value)
+    
+    total_matches = matched_df.height
+    
+    # Sample if needed (but keep full df for statistics)
+    full_matched_df = matched_df
+    if total_matches > max_deals and max_deals > 0:
+        effective_seed = _effective_seed(seed)
+        matched_df = matched_df.sample(n=max_deals, seed=effective_seed)
+    
+    # Collect DD Score columns: DD_Score_{level}{strain}_{direction}
+    # Note: Raw trick columns DD_[NESW]_[CDHSN] don't exist in deal_df.
+    # We use DD_Score columns which contain the actual scores for each contract.
+    dd_cols = []
+    
+    # First try raw trick columns (DD_N_C format) - may not exist
+    for direction in ['N', 'E', 'S', 'W']:
+        for strain in ['C', 'D', 'H', 'S', 'N']:
+            col_name = f"DD_{direction}_{strain}"
+            if col_name in matched_df.columns:
+                dd_cols.append(col_name)
+    
+    # If no raw trick columns, use DD_Score columns for common contracts
+    if not dd_cols:
+        # Priority contracts for analysis: games and slams
+        priority_contracts = [
+            (1, 'N'), (2, 'N'), (3, 'N'),  # NT partials and game
+            (4, 'H'), (4, 'S'),             # Major games
+            (5, 'C'), (5, 'D'),             # Minor games
+            (6, 'N'), (6, 'H'), (6, 'S'), (6, 'C'), (6, 'D'),  # Small slams
+            (7, 'N'), (7, 'H'), (7, 'S'),   # Grand slams
+        ]
+        for level, strain in priority_contracts:
+            for direction in ['N', 'E', 'S', 'W']:  # All declarers
+                col_name = f"DD_Score_{level}{strain}_{direction}"
+                if col_name in matched_df.columns:
+                    dd_cols.append(col_name)
+    
+    if not dd_cols:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "auction_input": auction,
+            "auction_normalized": auction_normalized,
+            "bt_row": bt_row_display,
+            "criteria_breakdown": criteria_breakdown,
+            "dd_data": [],
+            "total_matches": total_matches,
+            "error": "No DD columns found in deal_df. Neither DD_[NESW]_[CDHSN] nor DD_Score_* columns are available.",
+            "available_columns": [c for c in matched_df.columns if c.startswith("DD_")][:20],
+            "sql_query": f"-- DD columns not available",
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    
+    # Build select columns
+    context_cols = ["index", "Dealer"]
+    if vul_filter or "Vul" in matched_df.columns:
+        context_cols.append("Vul")
+    # Add Vul_NS and Vul_EW for detailed vulnerability info
+    for vul_col in ["Vul_NS", "Vul_EW"]:
+        if vul_col in matched_df.columns:
+            context_cols.append(vul_col)
+    
+    select_cols = [c for c in context_cols if c in matched_df.columns]
+    
+    # Add hand columns if requested
+    hand_cols = []
+    if include_hands:
+        for d in ['N', 'E', 'S', 'W']:
+            col = f"Hand_{d}"
+            if col in matched_df.columns:
+                hand_cols.append(col)
+        select_cols.extend(hand_cols)
+    
+    # Add DD score columns if requested
+    # Note: dd_cols contains DD_Score columns (raw DD trick columns don't exist in our data)
+    if include_scores:
+        select_cols.extend(dd_cols)
+    
+    # Add ParScore if available
+    if "ParScore" in matched_df.columns:
+        select_cols.append("ParScore")
+    if "ParContracts" in matched_df.columns:
+        select_cols.append("ParContracts")
+    
+    result_df = matched_df.select([c for c in select_cols if c in matched_df.columns])
+    dd_data = result_df.to_dicts()
+    
+    # Format ParContracts from nested list/struct to readable string
+    if "ParContracts" in select_cols:
+        for row in dd_data:
+            if "ParContracts" in row:
+                row["ParContracts"] = _format_par_contracts(row["ParContracts"])
+    
+    # -------------------------------------------------------------------------
+    # Contract Recommendations: Analyze which contracts are most likely to make
+    # -------------------------------------------------------------------------
+    # Use the full matched set for statistics (not just sampled)
+    stats_df = full_matched_df if total_matches <= _DD_ANALYSIS_STATS_THRESHOLD else matched_df
+    
+    contract_recommendations = _compute_contract_recommendations(stats_df, dd_cols)
+    
+    # -------------------------------------------------------------------------
+    # Par Score Comparison
+    # -------------------------------------------------------------------------
+    par_comparison: Dict[str, Any] = {}
+    if "ParScore" in stats_df.columns:
+        par_series = stats_df["ParScore"].drop_nulls()
+        if par_series.len() > 0:
+            par_comparison["avg_par"] = round(par_series.mean(), 1) if par_series.mean() else 0
+            par_comparison["min_par"] = int(par_series.min()) if par_series.min() else 0
+            par_comparison["max_par"] = int(par_series.max()) if par_series.max() else 0
+            par_comparison["sample_size"] = int(par_series.len())
+    
+    # -------------------------------------------------------------------------
+    # Par Contract Analysis - Stats on par contracts, sacrifices, sets
+    # Split by vulnerability: separate columns for NV and V
+    # -------------------------------------------------------------------------
+    par_contract_stats: List[Dict[str, Any]] = []
+    if "ParContracts" in stats_df.columns and "ParScore" in stats_df.columns and "Vul" in stats_df.columns:
+        # Helper to compute avg score for a filtered series
+        def _safe_mean(series: pl.Series) -> Optional[float]:
+            if series.len() == 0:
+                return None
+            m = series.mean()
+            if m is None:
+                return None
+            return float(str(m)) if not isinstance(m, (int, float)) else float(m)
+        
+        # Define vulnerability groups
+        # NV for NS: None, E_W (NS not vulnerable)
+        # V for NS: N_S, Both (NS vulnerable)
+        ns_nv_mask = stats_df["Vul"].is_in(["None", "E_W"])
+        ns_v_mask = stats_df["Vul"].is_in(["N_S", "Both"])
+        
+        par_scores = stats_df["ParScore"].drop_nulls()
+        total = par_scores.len()
+        
+        if total > 0:
+            # Score categories to analyze
+            categories = [
+                ("NS Makes (Par > 0)", lambda s: s > 0),
+                ("EW Makes (Par < 0)", lambda s: s < 0),
+                ("Pass Out (Par = 0)", lambda s: s == 0),
+                ("Slam (1000+)", lambda s: s >= 1000),
+                ("Game (300-999)", lambda s: (s >= 300) & (s <= 999)),
+                ("Partscore (50-299)", lambda s: (s >= 50) & (s <= 299)),
+                ("Small (-49 to 49)", lambda s: (s >= -49) & (s <= 49)),
+                ("Set 1-2 (-50 to -299)", lambda s: (s >= -299) & (s <= -50)),
+                ("Set 3+ (-300 to -999)", lambda s: (s >= -999) & (s <= -300)),
+                ("Doubled Set (-1000-)", lambda s: s <= -1000),
+            ]
+            
+            for cat_name, filter_fn in categories:
+                # Get scores for this category
+                cat_mask = filter_fn(stats_df["ParScore"])
+                cat_count = int(cat_mask.sum())
+                
+                if cat_count == 0:
+                    continue
+                
+                # Get NV and V subsets
+                nv_df = stats_df.filter(cat_mask & ns_nv_mask)
+                v_df = stats_df.filter(cat_mask & ns_v_mask)
+                
+                nv_scores = nv_df["ParScore"].drop_nulls() if nv_df.height > 0 else pl.Series([])
+                v_scores = v_df["ParScore"].drop_nulls() if v_df.height > 0 else pl.Series([])
+                
+                rec: Dict[str, Any] = {
+                    "category": cat_name,
+                    "count": cat_count,
+                    "pct": round(cat_count / total * 100, 1),
+                }
+                
+                # Avg Score NV and V
+                avg_nv = _safe_mean(nv_scores)
+                avg_v = _safe_mean(v_scores)
+                rec["avg_nv"] = round(avg_nv, 0) if avg_nv is not None else None
+                rec["avg_v"] = round(avg_v, 0) if avg_v is not None else None
+                rec["count_nv"] = nv_scores.len()
+                rec["count_v"] = v_scores.len()
+                
+                # Compute EV for actual par contracts using the native ParContracts structure
+                cat_df = stats_df.filter(cat_mask)
+                ev_nv_vals: List[float] = []
+                ev_v_vals: List[float] = []
+                
+                for row in cat_df.iter_rows(named=True):
+                    # Get EV for this deal's actual par contract
+                    ev_list = _ev_list_for_par_contracts(row)
+                    if ev_list:
+                        # Use the first (best) par contract EV
+                        ev_val = ev_list[0]
+                        if ev_val is not None:
+                            # Determine if NS is vulnerable based on the deal's Vul
+                            vul = row.get("Vul", "None")
+                            if vul in ["N_S", "Both"]:
+                                ev_v_vals.append(ev_val)
+                            else:
+                                ev_nv_vals.append(ev_val)
+                
+                if ev_nv_vals:
+                    rec["ev_nv"] = round(sum(ev_nv_vals) / len(ev_nv_vals), 0)
+                if ev_v_vals:
+                    rec["ev_v"] = round(sum(ev_v_vals) / len(ev_v_vals), 0)
+                
+                par_contract_stats.append(rec)
+    
+    # -------------------------------------------------------------------------
+    # DD Statistics Summary
+    # -------------------------------------------------------------------------
+    dd_stats: List[Dict[str, Any]] = []
+    for col in dd_cols:
+        col_data = stats_df[col].drop_nulls()
+        if col_data.len() > 0:
+            # Parse column name based on format
+            # DD_N_C format: direction=N, strain=C
+            # DD_Score_3N_N format: level=3, strain=N, direction=N
+            parts = col.split("_")
+            if col.startswith("DD_Score_"):
+                # DD_Score_{level}{strain}_{direction} e.g. DD_Score_3N_N
+                level_strain = parts[2]  # "3N"
+                level = level_strain[0]
+                strain = level_strain[1] if len(level_strain) > 1 else "?"
+                direction = parts[3] if len(parts) > 3 else "?"
+                stat_entry = {
+                    "column": col,
+                    "contract": f"{level}{strain}",
+                    "direction": direction,
+                    "mean": round(col_data.mean(), 0) if col_data.mean() is not None else None,
+                    "min": int(col_data.min()) if col_data.min() is not None else None,
+                    "max": int(col_data.max()) if col_data.max() is not None else None,
+                    "makes%": round((col_data >= 0).mean() * 100, 1) if col_data.len() > 0 else None,
+                }
+            else:
+                # DD_{direction}_{strain} format
+                direction = parts[1] if len(parts) > 1 else "?"
+                strain = parts[2] if len(parts) > 2 else "?"
+                stat_entry = {
+                    "column": col,
+                    "direction": direction,
+                    "strain": strain,
+                    "mean": round(col_data.mean(), 2) if col_data.mean() is not None else None,
+                    "min": int(col_data.min()) if col_data.min() is not None else None,
+                    "max": int(col_data.max()) if col_data.max() is not None else None,
+                    "std": round(col_data.std(), 2) if col_data.std() is not None else None,
+                }
+            dd_stats.append(stat_entry)
+    
+    # Build SQL query for display
+    selected_cols_sql = ", ".join([f'"{c}"' for c in select_cols[:_DD_ANALYSIS_SQL_COLS_LIMIT]])
+    vul_clause = f"\n  AND Vul = '{vul_filter}'" if vul_filter and vul_filter != "all" else ""
+    sql_query = f"""SELECT {selected_cols_sql}
+FROM deals
+WHERE -- criteria matching for auction '{auction_normalized}'{vul_clause}
+LIMIT {max_deals}"""
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[auction-dd-analysis] Found {total_matches} matches, returning {len(dd_data)} rows in {elapsed_ms:.1f}ms")
+    
+    return {
+        "auction_input": auction,
+        "auction_normalized": auction_normalized,
+        "bt_row": bt_row_display,
+        "criteria_breakdown": criteria_breakdown,
+        "dd_data": dd_data,
+        "dd_columns": dd_cols,
+        "dd_stats": dd_stats,
+        "contract_recommendations": contract_recommendations,
+        "par_comparison": par_comparison,
+        "par_contract_stats": par_contract_stats,  # Par contract analysis (sacrifices, sets, etc.)
+        "total_matches": total_matches,
+        "returned_count": len(dd_data),
+        "vul_filter": vul_filter,
+        "vul_breakdown": vul_breakdown,  # Show distribution of Vul values in matched deals
+        "sql_query": sql_query,
         "elapsed_ms": round(elapsed_ms, 1),
     }
 

@@ -823,3 +823,195 @@ def evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, int]) -> 
     
     return True
 
+
+# ---------------------------------------------------------------------------
+# On-the-fly BT Auction Matching (for PBN/non-deal_df)
+# ---------------------------------------------------------------------------
+
+DIRECTIONS_LIST = ["N", "E", "S", "W"]
+RANGE_METRICS = ["HCP", "SL_C", "SL_D", "SL_H", "SL_S", "Total_Points"]
+
+DEFAULT_METRIC_RANGES = {
+    "HCP": (0, 40),
+    "SL_C": (0, 13),
+    "SL_D": (0, 13),
+    "SL_H": (0, 13),
+    "SL_S": (0, 13),
+    "Total_Points": (0, 50),
+}
+
+# Regex patterns for parsing criteria
+_PATTERN_LE = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*<=\s*(\d+)$")
+_PATTERN_GE = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*>=\s*(\d+)$")
+_PATTERN_EQ = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*==\s*(\d+)$")
+_PATTERN_LT = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*<\s*(\d+)$")
+_PATTERN_GT = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*>\s*(\d+)$")
+
+
+def _parse_criteria_to_ranges(criteria_list: list | None) -> Dict[str, tuple]:
+    """Parse criteria expressions into min/max ranges per metric."""
+    if not criteria_list:
+        return {m: DEFAULT_METRIC_RANGES[m] for m in RANGE_METRICS}
+    
+    mins = {m: [] for m in RANGE_METRICS}
+    maxs = {m: [] for m in RANGE_METRICS}
+    
+    for expr in criteria_list:
+        expr = str(expr).strip()
+        
+        for pattern, is_min, offset in [
+            (_PATTERN_GE, True, 0),
+            (_PATTERN_LE, False, 0),
+            (_PATTERN_GT, True, 1),
+            (_PATTERN_LT, False, -1),
+        ]:
+            m = pattern.match(expr)
+            if m:
+                metric, val = m.groups()
+                if is_min:
+                    mins[metric].append(int(val) + offset)
+                else:
+                    maxs[metric].append(int(val) + offset)
+                break
+        else:
+            m = _PATTERN_EQ.match(expr)
+            if m:
+                metric, val = m.groups()
+                mins[metric].append(int(val))
+                maxs[metric].append(int(val))
+    
+    result = {}
+    for metric in RANGE_METRICS:
+        d_min, d_max = DEFAULT_METRIC_RANGES[metric]
+        final_min = max(mins[metric]) if mins[metric] else d_min
+        final_max = min(maxs[metric]) if maxs[metric] else d_max
+        result[metric] = (final_min, final_max)
+    
+    return result
+
+
+def _get_seat_direction(dealer: str, seat: int) -> str:
+    """Map seat number (1-4) to direction (N/E/S/W) based on dealer."""
+    dealer_idx = DIRECTIONS_LIST.index(dealer) if dealer in DIRECTIONS_LIST else 0
+    return DIRECTIONS_LIST[(dealer_idx + seat - 1) % 4]
+
+
+def _hand_matches_ranges(
+    hand_features: Dict[str, int],
+    ranges: Dict[str, tuple],
+) -> bool:
+    """Check if a hand's features fall within the specified ranges."""
+    for metric, (lo, hi) in ranges.items():
+        val = hand_features.get(metric)
+        if val is None:
+            continue
+        if val < lo or val > hi:
+            return False
+    return True
+
+
+def find_matching_bt_auctions(
+    hands: Dict[str, str],
+    dealer: str,
+    bt_completed_df,
+    max_matches: int = 10,
+) -> list:
+    """Find completed BT auctions matching a deal's hand criteria.
+    
+    This is for on-the-fly matching of PBN deals not in deal_df.
+    Uses range pre-filtering for efficiency.
+    
+    Args:
+        hands: Dict mapping direction to hand string, e.g.:
+               {"N": "AKQ2.JT9.876.543", "E": "...", "S": "...", "W": "..."}
+        dealer: Dealer direction ('N', 'E', 'S', 'W')
+        bt_completed_df: DataFrame of completed auctions with Agg_Expr_Seat_1..4
+        max_matches: Maximum number of matches to return
+    
+    Returns:
+        List of matching auction strings (e.g., ["1N-p-3N-p-p-p", ...])
+    """
+    import polars as pl
+    
+    # Compute hand features for all directions
+    hand_features = {}
+    for direction in DIRECTIONS_LIST:
+        hand_str = hands.get(direction, "")
+        if hand_str:
+            features = compute_hand_features(hand_str)
+            hand_features[direction] = features
+    
+    if not hand_features:
+        return []
+    
+    matches = []
+    
+    for row in bt_completed_df.iter_rows(named=True):
+        auction = row.get("Auction")
+        if not auction:
+            continue
+        
+        # Check each seat's criteria
+        all_seats_pass = True
+        
+        for seat in range(1, 5):
+            criteria_list = row.get(f"Agg_Expr_Seat_{seat}")
+            if not criteria_list:
+                continue
+            
+            direction = _get_seat_direction(dealer, seat)
+            features = hand_features.get(direction)
+            
+            if not features:
+                all_seats_pass = False
+                break
+            
+            # Parse criteria to ranges
+            ranges = _parse_criteria_to_ranges(criteria_list)
+            
+            # Check range criteria
+            if not _hand_matches_ranges(features, ranges):
+                all_seats_pass = False
+                break
+            
+            # For non-range criteria (Biddable, Stopper, etc.), we'd need
+            # additional logic. For now, range-based is a good approximation.
+        
+        if all_seats_pass:
+            matches.append(auction)
+    
+    # Sort alphabetically descending, then limit to max_matches
+    matches.sort(reverse=True)
+    return matches[:max_matches]
+
+
+def find_matching_bt_auctions_from_pbn(
+    pbn_str: str,
+    bt_completed_df,
+    max_matches: int = 10,
+) -> list:
+    """Find matching BT auctions for a PBN deal string.
+    
+    Convenience wrapper that parses the PBN and calls find_matching_bt_auctions.
+    
+    Args:
+        pbn_str: PBN format deal string (e.g., "N:AKQ2.JT9.876.543 ...")
+        bt_completed_df: DataFrame of completed auctions
+        max_matches: Maximum matches to return
+    
+    Returns:
+        List of matching auction strings
+    """
+    parsed = parse_pbn_deal(pbn_str)
+    if not parsed:
+        return []
+    
+    hands = {
+        "N": parsed.get("Hand_N", ""),
+        "E": parsed.get("Hand_E", ""),
+        "S": parsed.get("Hand_S", ""),
+        "W": parsed.get("Hand_W", ""),
+    }
+    dealer = parsed.get("Dealer", "N")
+    
+    return find_matching_bt_auctions(hands, dealer, bt_completed_df, max_matches)
