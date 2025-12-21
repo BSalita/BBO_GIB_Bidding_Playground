@@ -240,6 +240,51 @@ def bid_value_to_str(bid_val: Any) -> str:
     return str(bid_val)
 
 
+def count_leading_passes(auction: Any) -> int:
+    """Count leading passes in an auction.
+    
+    Args:
+        auction: Auction as string ("p-p-1N-...") or list (["p", "p", "1N", ...])
+    
+    Returns:
+        Number of leading passes (0-3)
+    """
+    if auction is None:
+        return 0
+    
+    # Convert to list of bids
+    if isinstance(auction, str):
+        if not auction.strip():
+            return 0
+        bids = [b.strip().lower() for b in auction.split("-")]
+    elif isinstance(auction, list):
+        bids = [str(b).strip().lower() for b in auction]
+    else:
+        return 0
+    
+    count = 0
+    for bid in bids:
+        if bid in ("p", "pass"):
+            count += 1
+        else:
+            break
+    return min(count, 3)  # Max 3 leading passes before all-pass
+
+
+def auction_matches_opening_seat(actual_auction: Any, expected_passes: int) -> bool:
+    """Check if a deal's actual auction starts with the expected number of passes.
+    
+    Args:
+        actual_auction: The deal's actual auction (string or list)
+        expected_passes: Expected number of leading passes (0-3)
+    
+    Returns:
+        True if the actual auction starts with exactly the expected number of passes
+    """
+    actual_passes = count_leading_passes(actual_auction)
+    return actual_passes == expected_passes
+
+
 def extract_bid_at_seat(auction: str, seat: int) -> str | None:
     """Extract the bid at a specific seat position from an auction string.
     

@@ -39,6 +39,122 @@ from bbo_bidding_queries_lib import normalize_auction_pattern, normalize_auction
 
 API_BASE = "http://127.0.0.1:8000"
 
+
+# ---------------------------------------------------------------------------
+# Par Contract formatting (copied from plugins.bbo_handlers_common to avoid
+# import path issues with mlBridgeLib dependencies)
+# ---------------------------------------------------------------------------
+
+def _to_python_list(x: Any) -> list:
+    """Convert Polars list/Series or Python list to Python list."""
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    # Handle Polars Series or list types
+    if hasattr(x, "to_list"):
+        try:
+            return x.to_list()
+        except Exception:
+            pass
+    # Fallback: try to iterate
+    try:
+        return list(x)
+    except Exception:
+        return []
+
+
+def _par_contract_signature(c: Any) -> str:
+    """Stable signature for a par-contract dict (used for de-duping)."""
+    # Handle Polars struct which may not be a dict
+    if hasattr(c, "get"):
+        get_fn = c.get
+    elif isinstance(c, dict):
+        get_fn = c.get
+    else:
+        # Try to convert to dict
+        try:
+            c = dict(c) if hasattr(c, "__iter__") else {"_raw": c}
+            get_fn = c.get
+        except Exception:
+            return str(c)
+    
+    level = get_fn("Level", "")
+    strain = get_fn("Strain", "")
+    dbl = get_fn("Doubled", "")
+    if dbl == "":
+        dbl = get_fn("Double", "")
+    pair_dir = get_fn("Pair_Direction", "")
+    result = get_fn("Result", "")
+    return f"{level}|{strain}|{dbl}|{pair_dir}|{result}"
+
+
+def _dedup_par_contracts(par_contracts: Any) -> list[dict]:
+    """Return de-duplicated par contracts (preserving first-seen order)."""
+    # Convert to Python list first
+    contracts_list = _to_python_list(par_contracts)
+    if not contracts_list:
+        return []
+    
+    seen: set[str] = set()
+    out: list[dict] = []
+    for c in contracts_list:
+        # Convert struct to dict if needed
+        if not isinstance(c, dict) and hasattr(c, "__iter__"):
+            try:
+                c = dict(c)
+            except Exception:
+                continue
+        if not isinstance(c, dict):
+            continue
+        sig = _par_contract_signature(c)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(c)
+    return out
+
+
+def _format_par_contracts(par_contracts: Any) -> str | None:
+    """Format ParContracts into a readable string, de-duped and with correct 'Doubled' key."""
+    if par_contracts is None:
+        return None
+    
+    # If already a string, return as-is
+    if isinstance(par_contracts, str):
+        return par_contracts
+    
+    # Convert and dedup
+    contracts = _dedup_par_contracts(par_contracts)
+    if not contracts:
+        # Fallback to string representation if we couldn't parse
+        return str(par_contracts) if par_contracts else None
+    
+    formatted: list[str] = []
+    for c in contracts:
+        level = c.get("Level", "")
+        strain = c.get("Strain", "")
+        dbl = c.get("Doubled", "")
+        if dbl == "":
+            dbl = c.get("Double", "")
+        pair_dir = c.get("Pair_Direction", "")
+        result = c.get("Result", "")
+        contract_str = f"{level}{strain}{dbl}"
+        if pair_dir:
+            contract_str += f" {pair_dir}"
+        if result is not None and result != "":
+            if isinstance(result, int):
+                if result == 0:
+                    contract_str += " ="
+                elif result > 0:
+                    contract_str += f" +{result}"
+                else:
+                    contract_str += f" {result}"
+            else:
+                contract_str += f" {result}"
+        formatted.append(contract_str.strip())
+    return ", ".join(formatted)
+
 # Shared constants
 SEAT_ROLES = {1: "Opener/Dealer", 2: "LHO", 3: "Partner", 4: "RHO"}
 MATCH_ALL_DEALERS_HELP = (
@@ -566,7 +682,13 @@ def generate_passthrough_sql(df: pl.DataFrame, table_name: str) -> str:
     return f"SELECT\n    {cols_str}\nFROM {table_name}"
 
 
-def render_aggrid(records: Any, key: str, height: int | None = None, table_name: str | None = None) -> None:
+def render_aggrid(
+    records: Any, 
+    key: str, 
+    height: int | None = None, 
+    table_name: str | None = None,
+    update_mode: GridUpdateMode = GridUpdateMode.NO_UPDATE
+) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
     
     Args:
@@ -574,10 +696,14 @@ def render_aggrid(records: Any, key: str, height: int | None = None, table_name:
         key: Unique key for the AgGrid component
         height: Optional height in pixels
         table_name: Optional table name for SQL display (shows SQL expander if provided)
+        update_mode: GridUpdateMode (default: NO_UPDATE for performance)
+    
+    Returns:
+        List of selected rows (dicts)
     """
     if records is None:
         st.info("No data.")
-        return
+        return []
     if isinstance(records, pl.DataFrame):
         df = records
     else:
@@ -585,10 +711,10 @@ def render_aggrid(records: Any, key: str, height: int | None = None, table_name:
             df = pl.DataFrame(records)
         except Exception:
             st.json(records)
-            return
+            return []
     if df.is_empty():
         st.info("No rows to display.")
-        return
+        return []
 
     # Show SQL expander if table_name is provided
     if table_name:
@@ -627,6 +753,18 @@ def render_aggrid(records: Any, key: str, height: int | None = None, table_name:
         except Exception:
             # Best-effort: leave as-is if conversion fails
             pass
+    
+    # For ParContracts (list of structs), format using the same logic as API handlers
+    if "ParContracts" in df.columns:
+        # Only process if it's not already a string column
+        if df["ParContracts"].dtype not in (pl.Utf8, pl.String):
+            try:
+                df = df.with_columns(
+                    pl.col("ParContracts").map_elements(_format_par_contracts, return_dtype=pl.Utf8).alias("ParContracts")
+                )
+            except Exception:
+                # Best-effort: leave as-is if conversion fails
+                pass
 
     # Dynamic height based on explicit row/header heights set below.
     # rowHeight=28, headerHeight=32, plus border/scrollbar buffer.
@@ -659,7 +797,7 @@ def render_aggrid(records: Any, key: str, height: int | None = None, table_name:
     default_col_def.setdefault("cellStyle", {"padding": "2px 6px"})
     grid_options["defaultColDef"] = default_col_def
 
-    AgGrid(
+    response = AgGrid(
         df.to_pandas(),
         gridOptions=grid_options,
         height=height,
@@ -667,10 +805,17 @@ def render_aggrid(records: Any, key: str, height: int | None = None, table_name:
         key=key,
         columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
         # Critical UX: clicking a row should only highlight it locally and NOT
-        # emit selection/model updates back to Streamlit (which would cause a rerun).
-        update_mode=GridUpdateMode.NO_UPDATE,
+        # emit selection/model updates back to Streamlit (which would cause a rerun)
+        # unless specifically requested via update_mode.
+        update_mode=update_mode,
         data_return_mode=DataReturnMode.AS_INPUT,
     )
+    
+    selected_rows: Any = response.get("selected_rows", [])
+    # AgGrid returns a list of dicts or a list of dataframes depending on version
+    if selected_rows is not None and hasattr(selected_rows, "to_dict"):
+        return selected_rows.to_dict("records")
+    return list(selected_rows) if selected_rows is not None else []
 
 if st.session_state.get("first_run", True):
     st.session_state.app_datetime = datetime.fromtimestamp(pathlib.Path(__file__).stat().st_mtime, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
@@ -2288,6 +2433,7 @@ def render_rank_by_ev():
     
     Given an auction prefix (or empty for opening bids), ranks all possible next bids
     by Expected Value (average Par score for matching deals).
+    Also shows DD analysis (contract recommendations, par breakdown) for the auction.
     """
     st.header("🎯 Rank Next Bids by EV")
     st.markdown("""
@@ -2304,11 +2450,11 @@ def render_rank_by_ev():
     )
     
     max_deals = st.sidebar.number_input(
-        "Max Deals per Bid",
+        "Max Deals",
         value=500,
         min_value=1,
         max_value=10000,
-        help="Maximum deals to sample per bid for EV calculation"
+        help="Maximum deals to sample for analysis"
     )
     
     st.sidebar.divider()
@@ -2322,26 +2468,54 @@ def render_rank_by_ev():
     )
     
     st.sidebar.divider()
+    st.sidebar.subheader("Output Options")
+    
+    include_hands = st.sidebar.checkbox("Include Hands", value=True, help="Include Hand_N/E/S/W columns")
+    include_scores = st.sidebar.checkbox("Include DD Scores", value=True, help="Include DD_Score columns in Deal Data table")
+    
+    st.sidebar.divider()
     seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_rank_ev"))
     
-    # Call the API
+    # =========================================================================
+    # Call API (single endpoint provides both bid rankings and DD analysis)
+    # =========================================================================
+    # Cache version: increment when API response format changes
+    CACHE_VERSION = 5  # v5: renamed DD_Bid/EV_Bid to DD_Score/EV_Score
+    
+    # Always fetch all columns from API; filter display based on checkboxes
+    # This prevents cache busting when output options change
     payload = {
         "auction": auction_input,
         "max_deals": int(max_deals),
         "seed": seed,
         "vul_filter": vul_filter if vul_filter != "all" else None,
+        "include_hands": True,  # Always fetch hands; filter display later
+        "include_scores": True,  # Always fetch scores; filter display later
+        "_cache_version": CACHE_VERSION,  # Busts cache when API response format changes
     }
     
+    # Cache the API response to make row selection nearly instantaneous
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_rank_data(p: Dict[str, Any]) -> Dict[str, Any]:
+        return api_post("/rank-bids-by-ev", p)
+    
     desc = f"responses to '{auction_input}'" if auction_input else "opening bids"
-    with st.spinner(f"Analyzing {desc}..."):
+    
+    # Use st.status for better loading UX with expandable details
+    with st.status(f"🔍 Analyzing {desc}...", expanded=True) as status:
+        status.write("⏳ Matching deals to bid criteria (this may take 1-3 minutes for opening bids)...")
         try:
-            data = api_post("/rank-bids-by-ev", payload)
+            data = fetch_rank_data(payload)
+            status.update(label="✅ Analysis complete!", state="complete", expanded=False)
         except Exception as e:
+            status.update(label="❌ Analysis failed", state="error")
             st.error(f"API call failed: {e}")
             return
     
     elapsed_ms = data.get("elapsed_ms", 0)
     total_bids = data.get("total_next_bids", 0)
+    total_matches = data.get("total_matches", 0)
+    returned_count = data.get("returned_count", 0)
     
     # Show error or message
     if "error" in data:
@@ -2351,7 +2525,8 @@ def render_rank_by_ev():
     if "message" in data:
         st.info(data["message"])
     
-    st.info(f"Analyzed {total_bids} bids ({elapsed_ms:.1f}ms)")
+    opening_seat = data.get("opening_seat", "Dealer (Seat 1)")
+    st.success(f"✅ Analyzed {total_bids} bids, {total_matches:,} matched deals ({elapsed_ms/1000:.1f}s) — Opener: {opening_seat}")
     
     # Show parent BT row if present
     parent_bt = data.get("parent_bt_row")
@@ -2368,53 +2543,344 @@ def render_rank_by_ev():
         st.write("**Analyzing:** Opening bids (first bid of the auction)")
     
     # -------------------------------------------------------------------------
-    # Bid Rankings Table
+    # Bid Rankings Table (with row selection)
     # -------------------------------------------------------------------------
     bid_rankings = data.get("bid_rankings", [])
-    if not bid_rankings:
+    selected_bid = None
+    
+    if bid_rankings:
+        st.subheader(f"🏆 Next Bid Rankings ({len(bid_rankings)} bids)")
+        st.markdown("*Bids ranked by average Par score (higher = better for NS). Click a row to see matching deals.*")
+        
+        rankings_df = pl.DataFrame(bid_rankings)
+        
+        # Select and rename columns for display
+        display_cols = []
+        col_map = [
+            ("bid", "Bid"),
+            ("match_count", "Matches"),
+            ("nv_count", "NV Deals"),
+            ("v_count", "V Deals"),
+            ("avg_par_nv", "Avg Par NV"),
+            ("avg_par_v", "Avg Par V"),
+            ("ev_score_nv", "EV NV"),
+            ("ev_std_nv", "EV Std NV"),
+            ("ev_score_v", "EV V"),
+            ("ev_std_v", "EV Std V"),
+            ("auction", "Full Auction"),
+        ]
+        
+        for col, alias in col_map:
+            if col in rankings_df.columns:
+                display_cols.append(pl.col(col).alias(alias))
+        
+        if display_cols:
+            rankings_df = rankings_df.select(display_cols)
+        
+        selected_bid_rows = render_aggrid(
+            rankings_df, 
+            key="rank_bids_rankings", 
+            height=calc_grid_height(len(rankings_df), max_height=400), 
+            table_name="bid_rankings",
+            update_mode=GridUpdateMode.SELECTION_CHANGED
+        )
+        
+        # Capture the selected bid if any
+        if selected_bid_rows is not None and len(selected_bid_rows) > 0:
+            selected_bid = selected_bid_rows[0]
+        
+        # Add download button for rankings
+        try:
+            csv_str = rankings_df.write_csv(file=None)
+            csv_bytes = ("\ufeff" + csv_str).encode("utf-8") if csv_str else b""
+            safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", auction_input).strip("._-") if auction_input else "opening_bids"
+            st.download_button(
+                label="📥 Download Rankings as CSV",
+                data=csv_bytes,
+                file_name=f"bid_rankings_{safe_auction}.csv",
+                mime="text/csv; charset=utf-8",
+                key="download_rankings",
+            )
+        except Exception:
+            pass
+    else:
         st.warning("No next bids found.")
         return
     
-    st.subheader(f"🏆 Bid Rankings ({len(bid_rankings)} bids)")
-    st.markdown("*Bids ranked by average Par score (higher = better for NS)*")
+    # =========================================================================
+    # DD Analysis (from aggregated deals across all next bids)
+    # =========================================================================
+    st.divider()
+    st.subheader("📊 DD Analysis (Aggregated Across Next Bids)")
     
-    rankings_df = pl.DataFrame(bid_rankings)
+    selected_contract = None
     
-    # Select and rename columns for display
-    display_cols = []
-    col_map = [
-        ("bid", "Bid"),
-        ("match_count", "Matches"),
-        ("sample_size", "Sample"),
-        ("nv_count", "NV Deals"),
-        ("v_count", "V Deals"),
-        ("avg_par_nv", "Avg Par NV"),
-        ("avg_par_v", "Avg Par V"),
-        ("auction", "Full Auction"),
-    ]
+    # -------------------------------------------------------------------------
+    # Contract Recommendations (EV Rankings)
+    # -------------------------------------------------------------------------
+    contract_recs = data.get("contract_recommendations", [])
+    if contract_recs:
+        st.subheader("🏆 Contract Rankings by EV")
+        st.markdown("*Contracts ranked by EV.*")
+        
+        rec_df = pl.DataFrame(contract_recs)
+        # Rename columns for display
+        if "make_pct" in rec_df.columns:
+            rec_df = rec_df.with_columns(
+                (pl.col("make_pct").round(0).cast(pl.Int32).cast(pl.Utf8) + "%").alias("Makes %")
+            )
+        
+        # Use existing columns or aliases - separate rows for each vulnerability
+        display_cols = []
+        col_map = [
+            ("contract", "Contract"),
+            ("declarer", "Declarer"),
+            ("vul", "Vul"),  # Vulnerability state (NV or V)
+            ("Makes %", "Makes %"),
+            ("ev", "EV"),  # Expected Value for this vulnerability
+            ("sample_size", "Sample"),
+        ]
+        for c, alias in col_map:
+            if c in rec_df.columns:
+                display_cols.append(pl.col(c).alias(alias))
+            elif alias in rec_df.columns:
+                display_cols.append(pl.col(alias))
+        
+        if display_cols:
+            rec_df = rec_df.select(display_cols)
+            selected_contract_rows = render_aggrid(
+                rec_df, 
+                key="dd_analysis_recommendations", 
+                height=calc_grid_height(len(rec_df)), 
+                table_name="recommendations",
+                update_mode=GridUpdateMode.SELECTION_CHANGED
+            )
+            
+            # Capture the selected contract if any
+            if selected_contract_rows is not None and len(selected_contract_rows) > 0:
+                selected_contract = selected_contract_rows[0]
     
-    for col, alias in col_map:
-        if col in rankings_df.columns:
-            display_cols.append(pl.col(col).alias(alias))
+    # -------------------------------------------------------------------------
+    # Par Contract Statistics (Sacrifices, Sets, etc.)
+    # -------------------------------------------------------------------------
+    par_contract_stats = data.get("par_contract_stats", [])
+    if par_contract_stats:
+        st.subheader("📊 Par Contract Breakdown")
+        st.markdown("*Distribution of par results split by vulnerability (NV vs V)*")
+        
+        par_stats_df = pl.DataFrame(par_contract_stats)
+        # Reorder columns with NV/V split for both Avg Score and EV
+        display_cols = ["category", "count", "pct", "count_nv", "avg_nv", "ev_nv", "count_v", "avg_v", "ev_v"]
+        col_aliases = {
+            "category": "Category", 
+            "count": "Total", 
+            "pct": "%",
+            "count_nv": "# NV",
+            "avg_nv": "Par NV",
+            "ev_nv": "EV NV",
+            "count_v": "# V",
+            "avg_v": "Par V",
+            "ev_v": "EV V",
+        }
+        par_stats_df = par_stats_df.select([c for c in display_cols if c in par_stats_df.columns])
+        par_stats_df = par_stats_df.rename({c: col_aliases.get(c, c) for c in par_stats_df.columns if c in col_aliases})
+        render_aggrid(par_stats_df, key="dd_analysis_par_stats", height=calc_grid_height(len(par_stats_df), max_height=350), table_name="par_stats")
     
-    if display_cols:
-        rankings_df = rankings_df.select(display_cols)
+    # -------------------------------------------------------------------------
+    # Deal Data Table - Shown when a bid or contract is selected
+    # -------------------------------------------------------------------------
+    dd_deals = data.get("dd_data", [])
+    dd_data_by_bid = data.get("dd_data_by_bid", {})  # bid -> list of deal dicts (up to max_deals each)
+    matched_by_bid = data.get("matched_by_bid", {})  # bid -> list of deal indices
     
-    render_aggrid(rankings_df, key="rank_bids_rankings", height=calc_grid_height(len(rankings_df), max_height=600), table_name="bid_rankings")
+    # Filter dd_deals based on selection (bid from Next Bid Rankings OR contract from Contract Rankings)
+    filtered_deals = dd_deals
+    selection_msg = ""
+    has_selection = selected_bid or selected_contract
     
-    # Add download button
-    try:
-        csv_str = rankings_df.write_csv(file=None)
+    if selected_bid:
+        # User clicked on a row in Next Bid Rankings
+        # Use dd_data_by_bid which has up to max_deals per bid
+        clicked_bid = selected_bid.get("Bid", "")
+        
+        # Get the pre-sampled deals for this specific bid (up to max_deals)
+        filtered_deals = dd_data_by_bid.get(clicked_bid, [])
+        
+        # Show how many deals matched vs how many are shown
+        total_matched = len(matched_by_bid.get(clicked_bid, []))
+        shown_count = len(filtered_deals)
+        if total_matched > shown_count:
+            selection_msg = f" (Showing {shown_count} of {total_matched} deals for bid: {clicked_bid})"
+        else:
+            selection_msg = f" (Deals matching bid: {clicked_bid})"
+    
+    elif selected_contract:
+        # User clicked on a row in Contract Rankings by EV
+        contract_str = selected_contract.get("Contract")
+        declarer = selected_contract.get("Declarer")
+        vul_state = selected_contract.get("Vul")
+        
+        # Convert contract_str (e.g. "3NT") back to level/strain for column lookup
+        inv_strains = {'NT': 'N', '♠': 'S', '♥': 'H', '♦': 'D', '♣': 'C'}
+        level = contract_str[0] if contract_str else ""
+        strain_alias = contract_str[1:] if contract_str and len(contract_str) > 1 else ""
+        strain = inv_strains.get(strain_alias, strain_alias)
+        
+        score_col = f"DD_Score_{level}{strain}_{declarer}"
+        
+        # Convert contract to bid format for filtering
+        # e.g., "1NT" -> "1N", "4♠" -> "4S"
+        expected_bid = f"{level}{strain}"
+        
+        # Get deal indices that matched this bid's criteria (O(1) lookup)
+        valid_indices = set(matched_by_bid.get(expected_bid, []))
+        
+        # Define vulnerability subsets for THIS declarer
+        if declarer in ["N", "S"]:
+            nv_vuls = ["None", "E_W"]
+            v_vuls = ["N_S", "Both"]
+        else:
+            nv_vuls = ["None", "N_S"]
+            v_vuls = ["E_W", "Both"]
+            
+        target_vuls = nv_vuls if vul_state == "NV" else v_vuls
+        
+        # For opening bids (seat 1), the opener is the dealer, so declarer should match dealer.
+        # For later bids, this relationship is more complex, but for now we filter by dealer.
+        # The declarer in the DD analysis represents who would play the contract.
+        # For a 1N opening by seat 1:
+        #   - If Dealer=N, then N opens 1N → N would declare 1NT
+        #   - If Dealer=S, then S opens 1N → S would declare 1NT
+        
+        # Filter deals: 
+        # 1. Deal index must be in valid_indices (matched this bid's criteria)
+        # 2. Dealer must match the clicked declarer (for opening bids)
+        # 3. Vulnerability must match
+        # 4. DD_Score column must be non-null
+        new_filtered = []
+        for d in dd_deals:
+            idx = d.get("index")
+            bid_ok = idx in valid_indices if valid_indices else True  # Fallback if no matched_by_bid
+            dealer_ok = d.get("Dealer") == declarer  # Opener (dealer) must match declarer
+            vul_ok = d.get("Vul") in target_vuls
+            score_ok = d.get(score_col) is not None
+            
+            if bid_ok and dealer_ok and vul_ok and score_ok:
+                new_filtered.append(d)
+        
+        filtered_deals = new_filtered
+        bid_filter_msg = f", bid={expected_bid}, dealer={declarer}" if valid_indices else ""
+        selection_msg = f" (Stats for {level}{strain_alias} by {declarer} ({vul_state}){bid_filter_msg})"
+    
+    if filtered_deals and has_selection:
+        st.subheader(f"📈 Deal Data ({len(filtered_deals)} deals){selection_msg}")
+        
+        shown_count = len(filtered_deals)
+        if total_matches > shown_count and not has_selection:
+            st.warning(f"⚠️ Showing a random sample of {shown_count:,} out of {total_matches:,} total matches.")
+        
+        dd_df = pl.DataFrame(filtered_deals)
+        
+        # Filter columns based on output options (data is always fetched; filter display here)
+        if not include_hands:
+            drop_hand_cols = [c for c in dd_df.columns if c.startswith("Hand_")]
+            if drop_hand_cols:
+                dd_df = dd_df.drop(drop_hand_cols)
+        
+        if not include_scores:
+            drop_score_cols = [c for c in dd_df.columns if c.startswith("DD_")]
+            if drop_score_cols:
+                dd_df = dd_df.drop(drop_score_cols)
+        
+        # Order columns sensibly
+        # DD_Score and EV_Score show the score/EV for the matching BT bid specifically
+        priority_cols = ["index", "Dealer", "Vul", "DD_Score", "EV_Score"]
+        hand_cols = ["Hand_N", "Hand_E", "Hand_S", "Hand_W"] if include_hands else []
+        par_cols = ["ParScore", "ParContracts"]
+        
+        dd_cols = data.get("dd_columns", []) if include_scores else []
+        ordered_dd = []
+        
+        # Check if we have raw trick columns or DD_Score columns
+        has_raw_tricks = any(col.startswith("DD_") and not col.startswith("DD_Score") for col in dd_cols)
+        
+        if has_raw_tricks:
+            # Order raw trick columns by direction then strain
+            for direction in ['N', 'E', 'S', 'W']:
+                for strain in ['C', 'D', 'H', 'S', 'N']:
+                    col = f"DD_{direction}_{strain}"
+                    if col in dd_cols:
+                        ordered_dd.append(col)
+        else:
+            # Order DD_Score columns by level then strain then direction
+            for level in range(1, 8):
+                for strain in ['N', 'S', 'H', 'D', 'C']:
+                    for direction in ['N', 'E', 'S', 'W']:
+                        col = f"DD_Score_{level}{strain}_{direction}"
+                        if col in dd_cols:
+                            ordered_dd.append(col)
+            # Add any remaining DD_Score columns not in the order
+            for col in dd_cols:
+                if col not in ordered_dd:
+                    ordered_dd.append(col)
+        
+        # Build final column order
+        final_cols = []
+        for c in priority_cols + hand_cols + par_cols:
+            if c in dd_df.columns:
+                final_cols.append(c)
+        final_cols.extend(ordered_dd)
+        
+        # Add any remaining columns (like DD_Score columns)
+        for c in dd_df.columns:
+            if c not in final_cols:
+                final_cols.append(c)
+        
+        dd_df = dd_df.select([c for c in final_cols if c in dd_df.columns])
+        
+        # Add download button for deal data
+        # Convert list/nested columns to strings for CSV export (CSV doesn't support nested data)
+        csv_df = dd_df.clone()
+        for col_name in csv_df.columns:
+            col_dtype = csv_df[col_name].dtype
+            dtype_str = str(col_dtype)
+            # Check for nested types: List, Array, Struct - cast all to string
+            if any(x in dtype_str for x in ["List", "Array", "Struct"]):
+                # For list of strings, try join; otherwise cast to string repr
+                try:
+                    if "List(String)" in dtype_str or "List(Utf8)" in dtype_str:
+                        csv_df = csv_df.with_columns(pl.col(col_name).list.join(", ").alias(col_name))
+                    else:
+                        # Cast entire column to string representation
+                        csv_df = csv_df.with_columns(pl.col(col_name).cast(pl.Utf8).alias(col_name))
+                except Exception:
+                    # If casting fails, convert via Python repr
+                    csv_df = csv_df.with_columns(
+                        pl.col(col_name).map_elements(lambda x: str(x) if x is not None else "", return_dtype=pl.Utf8).alias(col_name)
+                    )
+        try:
+            csv_str = csv_df.write_csv(file=None)
+        except Exception:
+            # Fallback: drop any remaining nested columns
+            simple_cols = [c for c in csv_df.columns if not any(x in str(csv_df[c].dtype) for x in ["List", "Struct", "Array"])]
+            csv_str = csv_df.select(simple_cols).write_csv(file=None) if simple_cols else ""
+        
+        # Ensure UTF-8 encoding with BOM for Excel compatibility
         csv_bytes = ("\ufeff" + csv_str).encode("utf-8") if csv_str else b""
-        safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", auction_input).strip("._-") if auction_input else "opening_bids"
+        safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", str(data.get("auction_normalized", "auction"))).strip("._-") or "auction"
         st.download_button(
-            label="📥 Download Rankings as CSV",
+            label="📥 Download Deal Data as CSV",
             data=csv_bytes,
-            file_name=f"bid_rankings_{safe_auction}.csv",
+            file_name=f"dd_analysis_{safe_auction}.csv",
             mime="text/csv; charset=utf-8",
+            key="download_deals",
         )
-    except Exception:
-        pass
+        
+        render_aggrid(dd_df, key="dd_analysis_results", height=400, table_name="dd_results")
+    elif has_selection:
+        st.info(f"No matching deals found for the selection{selection_msg}.")
+    else:
+        st.info("Click a row in 'Next Bid Rankings' or 'Contract Rankings by EV' to see matched deals.")
 
 
 # ---------------------------------------------------------------------------

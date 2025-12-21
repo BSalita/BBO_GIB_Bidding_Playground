@@ -691,6 +691,8 @@ class RankBidsByEVRequest(BaseModel):
     max_deals: int = 500  # Max deals to sample for EV calculation
     seed: Optional[int] = 0  # Random seed for sampling (0 = non-reproducible)
     vul_filter: Optional[str] = None  # Filter by vulnerability: None, Both, NS, EW (None = all)
+    include_hands: bool = True  # Include Hand_N/E/S/W columns in output
+    include_scores: bool = True  # Include DD_Score columns in deal data
 
 
 # Import model registry for Bidding Arena
@@ -1972,6 +1974,8 @@ def rank_bids_by_ev(req: RankBidsByEVRequest) -> Dict[str, Any]:
             max_deals=req.max_deals,
             seed=req.seed,
             vul_filter=req.vul_filter,
+            include_hands=req.include_hands,
+            include_scores=req.include_scores,
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:

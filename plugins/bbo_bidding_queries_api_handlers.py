@@ -17,8 +17,9 @@ from __future__ import annotations
 import json
 import random
 import re
+import statistics
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import duckdb  # pyright: ignore[reportMissingImports]
 import polars as pl
@@ -64,6 +65,7 @@ from plugins.bbo_handlers_common import (
     safe_float as _safe_float,
     # Bid/Contract helpers
     bid_value_to_str as _bid_value_to_str,
+    count_leading_passes as _count_leading_passes,
     extract_bid_at_seat as _extract_bid_at_seat,
     seat_direction_map as _seat_direction_map,
     # Par contract helpers
@@ -3560,41 +3562,164 @@ def _compute_contract_recommendations(
                     ev_col_nv = f"EV_{pair}_{direction}_{strain}_{level}_NV"
                     
                     if make_pct >= _DD_ANALYSIS_MAKE_PCT_THRESHOLD:
+                        # Define vulnerability subsets for THIS declarer
+                        if direction in ["N", "S"]:
+                            nv_vuls = ["None", "E_W"]
+                            v_vuls = ["N_S", "Both"]
+                        else:
+                            nv_vuls = ["None", "N_S"]
+                            v_vuls = ["E_W", "Both"]
+                            
                         # Create separate row for Not Vulnerable
                         if ev_col_nv in stats_df.columns:
-                            ev_series_nv = stats_df[ev_col_nv].drop_nulls()
+                            nv_subset = stats_df.filter(pl.col("Vul").is_in(nv_vuls))
+                            ev_series_nv = nv_subset[ev_col_nv].drop_nulls()
                             if ev_series_nv.len() > 0:
                                 ev_mean_nv = ev_series_nv.mean()
+                                # Compute stats for this subset
+                                nv_score_series = nv_subset[col].drop_nulls()
+                                nv_makes_count = (nv_score_series >= 0).sum()
+                                nv_make_pct = float(nv_makes_count / nv_score_series.len()) * 100 if nv_score_series.len() > 0 else 0.0
+                                
                                 if ev_mean_nv is not None:
                                     ev_nv = float(str(ev_mean_nv)) if not isinstance(ev_mean_nv, (int, float)) else float(ev_mean_nv)
                                     contract_recommendations.append({
                                         "contract": f"{level}{strain_names[strain]}",
                                         "declarer": direction,
                                         "vul": "NV",
-                                        "make_pct": round(make_pct, 1),
+                                        "make_pct": round(nv_make_pct, 1),
                                         "ev": round(ev_nv, 0),
-                                        "sample_size": int(score_series.len()),
+                                        "sample_size": int(ev_series_nv.len()),
                                     })
                         
                         # Create separate row for Vulnerable
                         if ev_col_v in stats_df.columns:
-                            ev_series_v = stats_df[ev_col_v].drop_nulls()
+                            v_subset = stats_df.filter(pl.col("Vul").is_in(v_vuls))
+                            ev_series_v = v_subset[ev_col_v].drop_nulls()
                             if ev_series_v.len() > 0:
                                 ev_mean_v = ev_series_v.mean()
+                                # Compute stats for this subset
+                                v_score_series = v_subset[col].drop_nulls()
+                                v_makes_count = (v_score_series >= 0).sum()
+                                v_make_pct = float(v_makes_count / v_score_series.len()) * 100 if v_score_series.len() > 0 else 0.0
+                                
                                 if ev_mean_v is not None:
                                     ev_v = float(str(ev_mean_v)) if not isinstance(ev_mean_v, (int, float)) else float(ev_mean_v)
                                     contract_recommendations.append({
                                         "contract": f"{level}{strain_names[strain]}",
                                         "declarer": direction,
                                         "vul": "V",
-                                        "make_pct": round(make_pct, 1),
+                                        "make_pct": round(v_make_pct, 1),
                                         "ev": round(ev_v, 0),
-                                        "sample_size": int(score_series.len()),
+                                        "sample_size": int(ev_series_v.len()),
                                     })
     
     # Sort by EV descending
     contract_recommendations.sort(key=lambda x: -x.get("ev", float("-inf")))
     return contract_recommendations[:_DD_ANALYSIS_TOP_RECOMMENDATIONS]
+
+
+def _compute_par_contract_stats(stats_df: pl.DataFrame) -> List[Dict[str, Any]]:
+    """Compute par contract statistics split by vulnerability.
+    
+    Returns a list of dicts with category, count, pct, avg scores, and EV by vulnerability.
+    """
+    par_contract_stats: List[Dict[str, Any]] = []
+    
+    if "ParContracts" not in stats_df.columns or "ParScore" not in stats_df.columns or "Vul" not in stats_df.columns:
+        return par_contract_stats
+    
+    # Helper to compute avg score for a filtered series
+    def _safe_mean(series: pl.Series) -> Optional[float]:
+        if series.len() == 0:
+            return None
+        m = series.mean()
+        if m is None:
+            return None
+        return float(str(m)) if not isinstance(m, (int, float)) else float(m)
+    
+    # Define vulnerability groups
+    # NV for NS: None, E_W (NS not vulnerable)
+    # V for NS: N_S, Both (NS vulnerable)
+    ns_nv_mask = stats_df["Vul"].is_in(["None", "E_W"])
+    ns_v_mask = stats_df["Vul"].is_in(["N_S", "Both"])
+    
+    par_scores = stats_df["ParScore"].drop_nulls()
+    total = par_scores.len()
+    
+    if total == 0:
+        return par_contract_stats
+    
+    # Score categories to analyze
+    categories = [
+        ("NS Makes (Par > 0)", lambda s: s > 0),
+        ("EW Makes (Par < 0)", lambda s: s < 0),
+        ("Pass Out (Par = 0)", lambda s: s == 0),
+        ("Slam (1000+)", lambda s: s >= 1000),
+        ("Game (300-999)", lambda s: (s >= 300) & (s <= 999)),
+        ("Partscore (50-299)", lambda s: (s >= 50) & (s <= 299)),
+        ("Small (-49 to 49)", lambda s: (s >= -49) & (s <= 49)),
+        ("Set 1-2 (-50 to -299)", lambda s: (s >= -299) & (s <= -50)),
+        ("Set 3+ (-300 to -999)", lambda s: (s >= -999) & (s <= -300)),
+        ("Doubled Set (-1000-)", lambda s: s <= -1000),
+    ]
+    
+    for cat_name, filter_fn in categories:
+        # Get scores for this category
+        cat_mask = filter_fn(stats_df["ParScore"])
+        cat_count = int(cat_mask.sum())
+        
+        if cat_count == 0:
+            continue
+        
+        # Get NV and V subsets
+        nv_df = stats_df.filter(cat_mask & ns_nv_mask)
+        v_df = stats_df.filter(cat_mask & ns_v_mask)
+        
+        nv_scores = nv_df["ParScore"].drop_nulls() if nv_df.height > 0 else pl.Series([])
+        v_scores = v_df["ParScore"].drop_nulls() if v_df.height > 0 else pl.Series([])
+        
+        rec: Dict[str, Any] = {
+            "category": cat_name,
+            "count": cat_count,
+            "pct": round(cat_count / total * 100, 1),
+        }
+        
+        # Avg Score NV and V
+        avg_nv = _safe_mean(nv_scores)
+        avg_v = _safe_mean(v_scores)
+        rec["avg_nv"] = round(avg_nv, 0) if avg_nv is not None else None
+        rec["avg_v"] = round(avg_v, 0) if avg_v is not None else None
+        rec["count_nv"] = nv_scores.len()
+        rec["count_v"] = v_scores.len()
+        
+        # Compute EV for actual par contracts using the native ParContracts structure
+        cat_df = stats_df.filter(cat_mask)
+        ev_nv_vals: List[float] = []
+        ev_v_vals: List[float] = []
+        
+        for row in cat_df.iter_rows(named=True):
+            # Get EV for this deal's actual par contract
+            ev_list = _ev_list_for_par_contracts(row)
+            if ev_list:
+                # Use the first (best) par contract EV
+                ev_val = ev_list[0]
+                if ev_val is not None:
+                    # Determine if NS is vulnerable based on the deal's Vul
+                    vul = row.get("Vul", "None")
+                    if vul in ["N_S", "Both"]:
+                        ev_v_vals.append(ev_val)
+                    else:
+                        ev_nv_vals.append(ev_val)
+        
+        if ev_nv_vals:
+            rec["ev_nv"] = round(sum(ev_nv_vals) / len(ev_nv_vals), 0)
+        if ev_v_vals:
+            rec["ev_v"] = round(sum(ev_v_vals) / len(ev_v_vals), 0)
+        
+        par_contract_stats.append(rec)
+    
+    return par_contract_stats
 
 
 def handle_auction_dd_analysis(
@@ -3828,95 +3953,7 @@ def handle_auction_dd_analysis(
     # Par Contract Analysis - Stats on par contracts, sacrifices, sets
     # Split by vulnerability: separate columns for NV and V
     # -------------------------------------------------------------------------
-    par_contract_stats: List[Dict[str, Any]] = []
-    if "ParContracts" in stats_df.columns and "ParScore" in stats_df.columns and "Vul" in stats_df.columns:
-        # Helper to compute avg score for a filtered series
-        def _safe_mean(series: pl.Series) -> Optional[float]:
-            if series.len() == 0:
-                return None
-            m = series.mean()
-            if m is None:
-                return None
-            return float(str(m)) if not isinstance(m, (int, float)) else float(m)
-        
-        # Define vulnerability groups
-        # NV for NS: None, E_W (NS not vulnerable)
-        # V for NS: N_S, Both (NS vulnerable)
-        ns_nv_mask = stats_df["Vul"].is_in(["None", "E_W"])
-        ns_v_mask = stats_df["Vul"].is_in(["N_S", "Both"])
-        
-        par_scores = stats_df["ParScore"].drop_nulls()
-        total = par_scores.len()
-        
-        if total > 0:
-            # Score categories to analyze
-            categories = [
-                ("NS Makes (Par > 0)", lambda s: s > 0),
-                ("EW Makes (Par < 0)", lambda s: s < 0),
-                ("Pass Out (Par = 0)", lambda s: s == 0),
-                ("Slam (1000+)", lambda s: s >= 1000),
-                ("Game (300-999)", lambda s: (s >= 300) & (s <= 999)),
-                ("Partscore (50-299)", lambda s: (s >= 50) & (s <= 299)),
-                ("Small (-49 to 49)", lambda s: (s >= -49) & (s <= 49)),
-                ("Set 1-2 (-50 to -299)", lambda s: (s >= -299) & (s <= -50)),
-                ("Set 3+ (-300 to -999)", lambda s: (s >= -999) & (s <= -300)),
-                ("Doubled Set (-1000-)", lambda s: s <= -1000),
-            ]
-            
-            for cat_name, filter_fn in categories:
-                # Get scores for this category
-                cat_mask = filter_fn(stats_df["ParScore"])
-                cat_count = int(cat_mask.sum())
-                
-                if cat_count == 0:
-                    continue
-                
-                # Get NV and V subsets
-                nv_df = stats_df.filter(cat_mask & ns_nv_mask)
-                v_df = stats_df.filter(cat_mask & ns_v_mask)
-                
-                nv_scores = nv_df["ParScore"].drop_nulls() if nv_df.height > 0 else pl.Series([])
-                v_scores = v_df["ParScore"].drop_nulls() if v_df.height > 0 else pl.Series([])
-                
-                rec: Dict[str, Any] = {
-                    "category": cat_name,
-                    "count": cat_count,
-                    "pct": round(cat_count / total * 100, 1),
-                }
-                
-                # Avg Score NV and V
-                avg_nv = _safe_mean(nv_scores)
-                avg_v = _safe_mean(v_scores)
-                rec["avg_nv"] = round(avg_nv, 0) if avg_nv is not None else None
-                rec["avg_v"] = round(avg_v, 0) if avg_v is not None else None
-                rec["count_nv"] = nv_scores.len()
-                rec["count_v"] = v_scores.len()
-                
-                # Compute EV for actual par contracts using the native ParContracts structure
-                cat_df = stats_df.filter(cat_mask)
-                ev_nv_vals: List[float] = []
-                ev_v_vals: List[float] = []
-                
-                for row in cat_df.iter_rows(named=True):
-                    # Get EV for this deal's actual par contract
-                    ev_list = _ev_list_for_par_contracts(row)
-                    if ev_list:
-                        # Use the first (best) par contract EV
-                        ev_val = ev_list[0]
-                        if ev_val is not None:
-                            # Determine if NS is vulnerable based on the deal's Vul
-                            vul = row.get("Vul", "None")
-                            if vul in ["N_S", "Both"]:
-                                ev_v_vals.append(ev_val)
-                            else:
-                                ev_nv_vals.append(ev_val)
-                
-                if ev_nv_vals:
-                    rec["ev_nv"] = round(sum(ev_nv_vals) / len(ev_nv_vals), 0)
-                if ev_v_vals:
-                    rec["ev_v"] = round(sum(ev_v_vals) / len(ev_v_vals), 0)
-                
-                par_contract_stats.append(rec)
+    par_contract_stats = _compute_par_contract_stats(stats_df)
     
     # -------------------------------------------------------------------------
     # DD Statistics Summary
@@ -4000,11 +4037,16 @@ def handle_rank_bids_by_ev(
     max_deals: int,
     seed: Optional[int],
     vul_filter: Optional[str] = None,
+    include_hands: bool = True,
+    include_scores: bool = True,
 ) -> Dict[str, Any]:
     """Handle /rank-bids-by-ev endpoint.
     
     Given an auction prefix (or empty for opening bids), finds all possible next bids
     using next_bid_indices and computes average EV for each bid across matching deals.
+    
+    Also computes DD analysis (contract recommendations, par stats) on the aggregated
+    deals from all next bids.
     
     Returns:
         - auction_input: The input auction
@@ -4012,6 +4054,9 @@ def handle_rank_bids_by_ev(
         - parent_bt_row: The BT row for the input auction (None for opening bids)
         - bid_rankings: List of dicts with bid, count, avg_ev_nv, avg_ev_v, avg_par, etc.
         - total_next_bids: Total number of next bid options
+        - contract_recommendations: Contracts ranked by EV (aggregated across all next bids)
+        - par_contract_stats: Par contract breakdown
+        - dd_data: Deal data for matched deals
         - elapsed_ms: Processing time
     """
     t0 = time.perf_counter()
@@ -4028,27 +4073,82 @@ def handle_rank_bids_by_ev(
         raise ValueError("next_bid_indices column not loaded in bt_seat1_df. Restart API server to load it.")
     
     auction_input = auction.strip()
+    
+    # Count expected leading passes from auction prefix
+    # E.g., "" -> 0 passes (dealer opens), "p-1N" -> 1 pass, "p-p-1N" -> 2 passes
+    expected_passes = _count_leading_passes(auction_input)
+    
+    # Normalize: strip trailing dash if present (e.g., "p-" -> "p", "p-p-" -> "p-p")
+    auction_for_lookup = auction_input.rstrip("-") if auction_input else ""
+    # For display, strip leading passes from the non-pass part
     auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
     
     parent_bt_row: Optional[Dict[str, Any]] = None
     next_bid_rows: pl.DataFrame
     
-    if not auction_normalized:
-        # Empty auction: get all opening bids
+    # Determine if this is purely passes (e.g., "", "p", "p-p", "p-p-p")
+    is_passes_only = not auction_normalized or auction_normalized.lower() in ("p", "")
+    
+    if not auction_input:
+        # Truly empty auction: get all opening bids (seat 1 bids)
         next_bid_rows = bt_seat1_df.filter(pl.col("is_opening_bid"))
-    else:
-        # Find the BT row for the auction
-        bt_matches = _find_bt_row_for_auction(bt_seat1_df, auction_normalized)
+    elif is_passes_only and expected_passes > 0:
+        # Pass-only prefix (e.g., "p-", "p-p-", "p-p-p-"): look up the passes in BT
+        # Build the pass sequence: "p", "p-p", or "p-p-p"
+        pass_auction = "-".join(["p"] * expected_passes)
+        bt_matches = _find_bt_row_for_auction(bt_seat1_df, pass_auction)
         
         if bt_matches.height == 0:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             return {
                 "auction_input": auction_input,
-                "auction_normalized": auction_normalized,
+                "auction_normalized": pass_auction,
                 "parent_bt_row": None,
                 "bid_rankings": [],
                 "total_next_bids": 0,
-                "error": f"Auction '{auction_normalized}' not found in BT",
+                "error": f"Pass sequence '{pass_auction}' not found in BT",
+                "elapsed_ms": round(elapsed_ms, 1),
+            }
+        
+        parent_row = bt_matches.row(0, named=True)
+        parent_bt_row = {
+            "bt_index": parent_row.get("bt_index"),
+            "Auction": parent_row.get("Auction"),
+            "candidate_bid": parent_row.get("candidate_bid"),
+        }
+        
+        # Get next_bid_indices for bids after the passes
+        next_indices = parent_row.get("next_bid_indices") or []
+        if not next_indices:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "auction_input": auction_input,
+                "auction_normalized": pass_auction,
+                "parent_bt_row": parent_bt_row,
+                "bid_rankings": [],
+                "total_next_bids": 0,
+                "message": f"No next bids found after {expected_passes} pass(es)",
+                "elapsed_ms": round(elapsed_ms, 1),
+            }
+        
+        # Get the BT rows for all next bids
+        next_bid_rows = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
+        
+        # Update auction_normalized for display
+        auction_normalized = pass_auction
+    else:
+        # Find the BT row for the auction (includes any leading passes)
+        bt_matches = _find_bt_row_for_auction(bt_seat1_df, auction_for_lookup)
+        
+        if bt_matches.height == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "auction_input": auction_input,
+                "auction_normalized": auction_for_lookup,
+                "parent_bt_row": None,
+                "bid_rankings": [],
+                "total_next_bids": 0,
+                "error": f"Auction '{auction_for_lookup}' not found in BT",
                 "elapsed_ms": round(elapsed_ms, 1),
             }
         
@@ -4089,16 +4189,22 @@ def handle_rank_bids_by_ev(
             "elapsed_ms": round(elapsed_ms, 1),
         }
     
-    # For each next bid, compute stats
-    bid_rankings: List[Dict[str, Any]] = []
     effective_seed = _effective_seed(seed)
+    
+    # =========================================================================
+    # For each bid, match deals using criteria bitmaps and track by bid
+    # =========================================================================
+    bid_rankings: List[Dict[str, Any]] = []
+    matched_by_bid: Dict[str, Set[int]] = {}  # Track which deals matched which bid
+    matched_dfs_by_bid: Dict[str, pl.DataFrame] = {}  # Store matched DataFrames for per-bid sampling
     
     for i, row in enumerate(next_bid_rows.iter_rows(named=True)):
         bid_name = row.get("candidate_bid", "?")
         bt_index = row.get("bt_index")
         bid_auction = row.get("Auction", "")
         
-        # Build criteria mask for ALL seats (inherited from parent + this bid's criteria)
+        # Build criteria mask for ALL seats using existing function
+        # (handles Dealer-based seat alignment correctly)
         global_mask, invalid_criteria = _build_criteria_mask_for_all_seats(
             deal_df, row, deal_criteria_by_seat_dfs
         )
@@ -4109,72 +4215,129 @@ def handle_rank_bids_by_ev(
                 "bt_index": bt_index,
                 "auction": bid_auction,
                 "match_count": 0,
+                "nv_count": 0,
+                "v_count": 0,
                 "avg_par_nv": None,
                 "avg_par_v": None,
             })
             continue
         
         matched_df = deal_df.filter(global_mask)
-        match_count = matched_df.height
         
-        if match_count == 0:
+        # Filter by expected opening seat (actual auction must have expected passes)
+        if "bid" in matched_df.columns and matched_df.height > 0:
+            def _check_passes(bid_val: Any) -> bool:
+                return _count_leading_passes(bid_val) == expected_passes
+            
+            passes_mask = matched_df["bid"].map_elements(_check_passes, return_dtype=pl.Boolean)
+            matched_df = matched_df.filter(passes_mask)
+        
+        if matched_df.height == 0:
             bid_rankings.append({
                 "bid": bid_name,
                 "bt_index": bt_index,
                 "auction": bid_auction,
                 "match_count": 0,
+                "nv_count": 0,
+                "v_count": 0,
                 "avg_par_nv": None,
                 "avg_par_v": None,
             })
             continue
         
-        # Apply vulnerability filter if specified
-        if vul_filter and vul_filter != "all":
-            data_vul = _VUL_UI_TO_DATA.get(vul_filter, vul_filter)
-            if "Vul" in matched_df.columns:
-                matched_df = matched_df.filter(pl.col("Vul") == data_vul)
-                match_count = matched_df.height
+        # Collect indices for this bid
+        bid_matched_indices: Set[int] = set()
+        if "index" in matched_df.columns:
+            bid_matched_indices = set(matched_df["index"].to_list())
         
-        # Sample if needed
-        if match_count > max_deals:
-            sample_seed = effective_seed + i if effective_seed else None
-            matched_df = matched_df.sample(n=max_deals, seed=sample_seed)
+        matched_by_bid[bid_name] = bid_matched_indices
+        match_count = len(bid_matched_indices)
         
-        # Compute stats by vulnerability
-        # NS NV: Vul in [None, E_W], NS V: Vul in [N_S, Both]
-        nv_mask = matched_df["Vul"].is_in(["None", "E_W"]) if "Vul" in matched_df.columns else pl.Series([True] * matched_df.height)
-        v_mask = matched_df["Vul"].is_in(["N_S", "Both"]) if "Vul" in matched_df.columns else pl.Series([False] * matched_df.height)
+        # Store the matched_df for this bid (for per-bid sampling later)
+        matched_dfs_by_bid[bid_name] = matched_df
         
-        nv_df = matched_df.filter(nv_mask)
-        v_df = matched_df.filter(v_mask)
+        # Parse bid to get level and strain for EV computation
+        bid_level = bid_name[0] if bid_name and bid_name[0].isdigit() else None
+        bid_strain = bid_name[1:].upper() if bid_name and len(bid_name) > 1 else None
+        if bid_strain == "NT":
+            bid_strain = "N"
         
-        # Compute average ParScore for NV and V
-        avg_par_nv = None
-        avg_par_v = None
+        # Compute stats by vulnerability (group matched deals)
+        nv_count = 0
+        v_count = 0
+        nv_par_sum = 0.0
+        v_par_sum = 0.0
+        ev_nv_values: List[float] = []
+        ev_v_values: List[float] = []
         
-        if "ParScore" in matched_df.columns:
-            nv_par = nv_df["ParScore"].drop_nulls() if nv_df.height > 0 else pl.Series([])
-            v_par = v_df["ParScore"].drop_nulls() if v_df.height > 0 else pl.Series([])
+        if "Vul" in matched_df.columns and "ParScore" in matched_df.columns:
+            # NS NV: Vul in [None, E_W], NS V: Vul in [N_S, Both]
+            nv_mask = matched_df["Vul"].is_in(["None", "E_W"])
+            v_mask = matched_df["Vul"].is_in(["N_S", "Both"])
             
-            if nv_par.len() > 0:
-                par_mean = nv_par.mean()
-                if par_mean is not None:
-                    avg_par_nv = round(float(str(par_mean)) if not isinstance(par_mean, (int, float)) else float(par_mean), 0)
-            if v_par.len() > 0:
-                par_mean = v_par.mean()
-                if par_mean is not None:
-                    avg_par_v = round(float(str(par_mean)) if not isinstance(par_mean, (int, float)) else float(par_mean), 0)
+            nv_df = matched_df.filter(nv_mask)
+            v_df = matched_df.filter(v_mask)
+            
+            nv_count = nv_df.height
+            v_count = v_df.height
+            
+            if nv_count > 0:
+                nv_par = nv_df["ParScore"].drop_nulls()
+                if nv_par.len() > 0:
+                    par_sum = nv_par.sum()
+                    nv_par_sum = float(par_sum) if par_sum is not None else 0
+                
+                # Compute EV for NV deals (look up EV column based on Dealer)
+                if bid_level and bid_strain and "Dealer" in nv_df.columns:
+                    for dealer in ["N", "E", "S", "W"]:
+                        pair = "NS" if dealer in ["N", "S"] else "EW"
+                        ev_col = f"EV_{pair}_{dealer}_{bid_strain}_{bid_level}_NV"
+                        if ev_col in nv_df.columns:
+                            dealer_df = nv_df.filter(pl.col("Dealer") == dealer)
+                            if dealer_df.height > 0:
+                                ev_series = dealer_df[ev_col].drop_nulls()
+                                ev_nv_values.extend(ev_series.to_list())
+            
+            if v_count > 0:
+                v_par = v_df["ParScore"].drop_nulls()
+                if v_par.len() > 0:
+                    par_sum = v_par.sum()
+                    v_par_sum = float(par_sum) if par_sum is not None else 0
+                
+                # Compute EV for V deals (look up EV column based on Dealer)
+                if bid_level and bid_strain and "Dealer" in v_df.columns:
+                    for dealer in ["N", "E", "S", "W"]:
+                        pair = "NS" if dealer in ["N", "S"] else "EW"
+                        ev_col = f"EV_{pair}_{dealer}_{bid_strain}_{bid_level}_V"
+                        if ev_col in v_df.columns:
+                            dealer_df = v_df.filter(pl.col("Dealer") == dealer)
+                            if dealer_df.height > 0:
+                                ev_series = dealer_df[ev_col].drop_nulls()
+                                ev_v_values.extend(ev_series.to_list())
+        
+        # Compute averages
+        avg_par_nv = round(nv_par_sum / nv_count, 0) if nv_count > 0 else None
+        avg_par_v = round(v_par_sum / v_count, 0) if v_count > 0 else None
+        
+        # Compute EV mean and std
+        ev_score_nv = round(statistics.mean(ev_nv_values), 1) if ev_nv_values else None
+        ev_std_nv = round(statistics.stdev(ev_nv_values), 1) if len(ev_nv_values) > 1 else None
+        ev_score_v = round(statistics.mean(ev_v_values), 1) if ev_v_values else None
+        ev_std_v = round(statistics.stdev(ev_v_values), 1) if len(ev_v_values) > 1 else None
         
         bid_rankings.append({
             "bid": bid_name,
             "bt_index": bt_index,
             "auction": bid_auction,
             "match_count": match_count,
-            "sample_size": matched_df.height,
-            "nv_count": nv_df.height,
-            "v_count": v_df.height,
+            "nv_count": nv_count,
+            "v_count": v_count,
             "avg_par_nv": avg_par_nv,
             "avg_par_v": avg_par_v,
+            "ev_score_nv": ev_score_nv,
+            "ev_std_nv": ev_std_nv,
+            "ev_score_v": ev_score_v,
+            "ev_std_v": ev_std_v,
         })
     
     # Sort by avg_par (using avg_par_nv as primary, falling back to avg_par_v)
@@ -4189,8 +4352,178 @@ def handle_rank_bids_by_ev(
     
     bid_rankings.sort(key=sort_key)
     
+    # =========================================================================
+    # STEP 3: Build deal data (bid tracking via matched_by_bid)
+    # =========================================================================
+    # Collect all matched indices (matched_by_bid already tracks bid -> deals)
+    all_matched_indices: Set[int] = set()
+    for indices in matched_by_bid.values():
+        all_matched_indices.update(indices)
+    
+    # Convert sets to lists for JSON serialization
+    matched_by_bid_json: Dict[str, List[int]] = {
+        bid: list(indices) for bid, indices in matched_by_bid.items()
+    }
+    
+    contract_recommendations: List[Dict[str, Any]] = []
+    par_contract_stats: List[Dict[str, Any]] = []
+    dd_data: List[Dict[str, Any]] = []
+    dd_cols: List[str] = []
+    total_matches = len(all_matched_indices)
+    vul_breakdown: Dict[str, int] = {}
+    
+    if all_matched_indices:
+        # Get the aggregated matched deals
+        aggregated_df = deal_df.filter(pl.col("index").is_in(list(all_matched_indices)))
+        
+        # Apply vulnerability filter
+        if vul_filter and vul_filter != "all":
+            data_vul = _VUL_UI_TO_DATA.get(vul_filter, vul_filter)
+            if "Vul" in aggregated_df.columns:
+                aggregated_df = aggregated_df.filter(pl.col("Vul") == data_vul)
+        
+        total_matches = aggregated_df.height
+        
+        # Vul breakdown for debugging
+        if "Vul" in aggregated_df.columns:
+            vul_grouped = aggregated_df.group_by("Vul").len()
+            vul_keys = vul_grouped["Vul"].to_list()
+            vul_counts = vul_grouped["len"].to_list()
+            vul_breakdown = {str(k): int(v) for k, v in zip(vul_keys, vul_counts)}
+        
+        # Sample for DD analysis
+        stats_df = aggregated_df
+        if aggregated_df.height > max_deals:
+            stats_df = aggregated_df.sample(n=max_deals, seed=effective_seed)
+        
+        # Find DD columns
+        dd_cols = [c for c in stats_df.columns if c.startswith("DD_")]
+        
+        # Compute contract recommendations
+        if dd_cols:
+            contract_recommendations = _compute_contract_recommendations(stats_df, dd_cols)
+        
+        # Compute par contract stats
+        par_contract_stats = _compute_par_contract_stats(stats_df)
+        
+        # Build output columns
+        select_cols = ["index", "Dealer", "Vul", "Vul_NS", "Vul_EW"]
+        if include_hands:
+            select_cols.extend(["Hand_N", "Hand_E", "Hand_S", "Hand_W"])
+        select_cols.extend(["ParScore", "ParContracts"])
+        if include_scores:
+            select_cols.extend(dd_cols)
+        
+        # Filter to available columns
+        select_cols = [c for c in select_cols if c in stats_df.columns]
+        
+        # Build deal data (bid tracking is via matched_by_bid, not per-deal)
+        output_df = stats_df.select(select_cols)
+        dd_data = output_df.to_dicts()
+        
+        # Format ParContracts
+        for row in dd_data:
+            if "ParContracts" in row:
+                row["ParContracts"] = _format_par_contracts(row["ParContracts"])
+    
+    # =========================================================================
+    # STEP 4: Build per-bid deal data (each bid gets up to max_deals)
+    # =========================================================================
+    dd_data_by_bid: Dict[str, List[Dict[str, Any]]] = {}
+    
+    for bid_name, bid_matched_df in matched_dfs_by_bid.items():
+        if bid_matched_df.height == 0:
+            dd_data_by_bid[bid_name] = []
+            continue
+        
+        # Apply vulnerability filter
+        filtered_bid_df = bid_matched_df
+        if vul_filter and vul_filter != "all":
+            data_vul = _VUL_UI_TO_DATA.get(vul_filter, vul_filter)
+            if "Vul" in filtered_bid_df.columns:
+                filtered_bid_df = filtered_bid_df.filter(pl.col("Vul") == data_vul)
+        
+        if filtered_bid_df.height == 0:
+            dd_data_by_bid[bid_name] = []
+            continue
+        
+        # Sample up to max_deals for this bid
+        sampled_bid_df = filtered_bid_df
+        if filtered_bid_df.height > max_deals:
+            sampled_bid_df = filtered_bid_df.sample(n=max_deals, seed=effective_seed)
+        
+        # Parse bid to get level and strain for DD_Score/EV_Score computation
+        # bid_name format: "1N", "2S", "3H", etc.
+        bid_level = bid_name[0] if bid_name and bid_name[0].isdigit() else None
+        bid_strain = bid_name[1:].upper() if bid_name and len(bid_name) > 1 else None
+        # Normalize strain: "NT" -> "N", keep S/H/D/C as is
+        if bid_strain == "NT":
+            bid_strain = "N"
+        
+        # Build output columns (use same columns as aggregated dd_data)
+        bid_select_cols = ["index", "Dealer", "Vul", "Vul_NS", "Vul_EW"]
+        if include_hands:
+            bid_select_cols.extend(["Hand_N", "Hand_E", "Hand_S", "Hand_W"])
+        bid_select_cols.extend(["ParScore", "ParContracts"])
+        if include_scores:
+            bid_dd_cols = [c for c in sampled_bid_df.columns if c.startswith("DD_")]
+            bid_select_cols.extend(bid_dd_cols)
+        
+        # Add specific EV columns needed for EV_Score (for all possible declarers and vul states)
+        ev_cols_found = []
+        if bid_level and bid_strain:
+            for pair in ["NS", "EW"]:
+                for decl in ["N", "E", "S", "W"]:
+                    for vul_st in ["NV", "V"]:
+                        ev_col = f"EV_{pair}_{decl}_{bid_strain}_{bid_level}_{vul_st}"
+                        if ev_col in sampled_bid_df.columns:
+                            bid_select_cols.append(ev_col)
+                            ev_cols_found.append(ev_col)
+        
+        
+        bid_select_cols = [c for c in bid_select_cols if c in sampled_bid_df.columns]
+        
+        bid_output_df = sampled_bid_df.select(bid_select_cols)
+        bid_dd_data = bid_output_df.to_dicts()
+        
+        # Format ParContracts and compute DD_Score/EV_Score
+        for row in bid_dd_data:
+            if "ParContracts" in row:
+                row["ParContracts"] = _format_par_contracts(row["ParContracts"])
+            
+            # Compute DD_Score and EV_Score for this specific bid
+            # For opening bids, the dealer is the declarer
+            dealer = row.get("Dealer")
+            vul = row.get("Vul")
+            
+            if bid_level and bid_strain and dealer:
+                # DD_Score: Look up DD_Score_{level}{strain}_{declarer}
+                dd_col = f"DD_Score_{bid_level}{bid_strain}_{dealer}"
+                row["DD_Score"] = row.get(dd_col)
+                
+                # EV_Score: Look up EV_{pair}_{declarer}_{strain}_{level}_{vul_state}
+                pair = "NS" if dealer in ["N", "S"] else "EW"
+                # Determine if declarer is vulnerable
+                if dealer in ["N", "S"]:
+                    is_vul = vul in ["N_S", "Both"]
+                else:
+                    is_vul = vul in ["E_W", "Both"]
+                vul_state = "V" if is_vul else "NV"
+                
+                ev_col = f"EV_{pair}_{dealer}_{bid_strain}_{bid_level}_{vul_state}"
+                row["EV_Score"] = row.get(ev_col)
+            else:
+                row["DD_Score"] = None
+                row["EV_Score"] = None
+        
+        dd_data_by_bid[bid_name] = bid_dd_data
+    
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[rank-bids-by-ev] {total_next_bids} bids analyzed in {elapsed_ms:.1f}ms")
+    print(f"[rank-bids-by-ev] {total_next_bids} bids analyzed, {total_matches} deals in {elapsed_ms:.1f}ms")
+    
+    # Describe the opening seat filter
+    opening_seat = expected_passes + 1  # Seat 1-4
+    opening_seat_desc = {0: "Dealer (Seat 1)", 1: "Seat 2 (after 1 pass)", 2: "Seat 3 (after 2 passes)", 3: "Seat 4 (after 3 passes)"}.get(expected_passes, f"Seat {opening_seat}")
     
     return {
         "auction_input": auction_input,
@@ -4199,5 +4532,17 @@ def handle_rank_bids_by_ev(
         "bid_rankings": bid_rankings,
         "total_next_bids": total_next_bids,
         "vul_filter": vul_filter,
+        "expected_passes": expected_passes,
+        "opening_seat": opening_seat_desc,
+        # DD analysis results
+        "contract_recommendations": contract_recommendations,
+        "par_contract_stats": par_contract_stats,
+        "dd_data": dd_data,
+        "dd_data_by_bid": dd_data_by_bid,  # bid -> list of deal dicts (up to max_deals each)
+        "dd_columns": dd_cols,
+        "matched_by_bid": matched_by_bid_json,  # bid -> list of deal indices
+        "total_matches": total_matches,
+        "returned_count": len(dd_data),
+        "vul_breakdown": vul_breakdown,
         "elapsed_ms": round(elapsed_ms, 1),
     }
