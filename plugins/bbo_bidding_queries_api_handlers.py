@@ -14,6 +14,7 @@ Refactored: Common helpers and constants are in handlers_common.py
 
 from __future__ import annotations
 
+import base64
 import json
 import random
 import re
@@ -22,6 +23,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import duckdb  # pyright: ignore[reportMissingImports]
+import numpy as np
 import polars as pl
 
 # These imports are needed for the handler logic
@@ -43,6 +45,7 @@ from bbo_bidding_queries_lib import (
 )
 
 from mlBridgeLib.mlBridgeBiddingLib import DIRECTIONS
+import mlBridgeLib.mlBridgeAugmentLib as mlBridgeAugmentLib
 
 # Import from common module (eliminates code duplication)
 from plugins.bbo_handlers_common import (
@@ -150,21 +153,23 @@ def _compute_seat_stats_for_bt_row(
         invalid_criteria = list(criteria_list)
 
     for dealer in DIRECTIONS:
+        dealer_mask = dealer_series == dealer
+        if not dealer_mask.any():
+            continue
+
         seat_criteria_df = seat_criteria_for_seat.get(dealer)
         if seat_criteria_df is None or seat_criteria_df.is_empty():
             continue
 
-        dealer_mask = dealer_series == dealer
-        crit_mask: pl.Series | None = None
+        combined = dealer_mask
         for crit in valid_criteria:
-            col = seat_criteria_df[crit]
-            crit_mask = col if crit_mask is None else (crit_mask & col)
+            combined = combined & seat_criteria_df[crit]
+            if not combined.any():
+                combined = None
+                break
 
-        if crit_mask is None:
-            continue
-
-        combined = dealer_mask & crit_mask
-        global_mask = combined if global_mask is None else (global_mask | combined)
+        if combined is not None:
+            global_mask = combined if global_mask is None else (global_mask | combined)
 
     if global_mask is None or not global_mask.any():
         return {"matching_deal_count": 0, "stats": None, "expr": criteria_list, "invalid_criteria": invalid_criteria}
@@ -1162,29 +1167,18 @@ def handle_deals_matching_auction(
                                         criteria_missing[seat_key].append(criterion)
                             break
 
+        # Pre-lookup criteria for the helper
+        criteria_for_helper = {int(s): cl for s, cl in auction_info["criteria_by_seat"].items()}
+        
         for dealer in DIRECTIONS:
-            dealer_mask = deal_df["Dealer"] == dealer
-            if not dealer_mask.any():
+            dealer_mask, _ = _build_criteria_mask_for_dealer(
+                deal_df, dealer, criteria_for_helper, deal_criteria_by_seat_dfs
+            )
+            
+            if dealer_mask is None:
                 continue
 
-            combined_mask = dealer_mask.clone()
-
-            for s in range(1, actual_final_seat + 1):
-                agg_col = f"Agg_Expr_Seat_{s}"
-                if agg_col not in auction_row:
-                    continue
-                criteria_list = auction_row[agg_col]
-                if not criteria_list:
-                    continue
-
-                if s in deal_criteria_by_seat_dfs and dealer in deal_criteria_by_seat_dfs[s]:
-                    seat_criteria_df = deal_criteria_by_seat_dfs[s][dealer]
-                    for criterion in criteria_list:
-                        if criterion in seat_criteria_df.columns:
-                            criterion_values = seat_criteria_df[criterion]
-                            combined_mask = combined_mask & criterion_values
-
-            matching_idx = combined_mask.arg_true()
+            matching_idx = dealer_mask.arg_true()
             if len(matching_idx) > 0:
                 total_matching_count += len(matching_idx)
                 # Take up to n_deal_samples candidates from this dealer, then do a final
@@ -1329,12 +1323,12 @@ def handle_deals_matching_auction(
             has_ev_rules = "EV_Rules" in deals_with_computed.columns
             
             if has_ev_contract:
-                agg_exprs.append(pl.col("EV_Score_Declarer").cast(pl.Float64, strict=False).mean().alias("Avg_EV_Contract"))
+                agg_exprs.append(pl.col("EV_Score_Declarer").cast(pl.Float32, strict=False).mean().alias("Avg_EV_Contract"))
             if has_ev_rules:
-                agg_exprs.append(pl.col("EV_Rules").cast(pl.Float64, strict=False).mean().alias("Avg_EV_Rules"))
+                agg_exprs.append(pl.col("EV_Rules").cast(pl.Float32, strict=False).mean().alias("Avg_EV_Rules"))
             if has_ev_contract and has_ev_rules:
                 agg_exprs.append(
-                    (pl.col("EV_Rules").cast(pl.Float64, strict=False) - pl.col("EV_Score_Declarer").cast(pl.Float64, strict=False))
+                    (pl.col("EV_Rules").cast(pl.Float32, strict=False) - pl.col("EV_Score_Declarer").cast(pl.Float32, strict=False))
                     .mean().alias("Avg_EV_Diff")
                 )
             
@@ -1374,16 +1368,16 @@ def handle_deals_matching_auction(
             auction_info["rules_par_count"] = int((dd_rules == par_score_col).sum())
             
             if has_ev_contract:
-                ev_contract_mean = deals_with_computed["EV_Score_Declarer"].cast(pl.Float64, strict=False).mean()
+                ev_contract_mean = deals_with_computed["EV_Score_Declarer"].cast(pl.Float32, strict=False).mean()
                 ev_contract_f = _safe_float(ev_contract_mean)
                 auction_info["avg_ev_contract"] = round(ev_contract_f, 2) if ev_contract_f is not None else None
             if has_ev_rules:
-                ev_rules_mean = deals_with_computed["EV_Rules"].cast(pl.Float64, strict=False).mean()
+                ev_rules_mean = deals_with_computed["EV_Rules"].cast(pl.Float32, strict=False).mean()
                 ev_rules_f = _safe_float(ev_rules_mean)
                 auction_info["avg_ev_rules"] = round(ev_rules_f, 2) if ev_rules_f is not None else None
             if has_ev_contract and has_ev_rules:
-                ev_diff_mean = (deals_with_computed["EV_Rules"].cast(pl.Float64, strict=False) - 
-                                deals_with_computed["EV_Score_Declarer"].cast(pl.Float64, strict=False)).mean()
+                ev_diff_mean = (deals_with_computed["EV_Rules"].cast(pl.Float32, strict=False) - 
+                                deals_with_computed["EV_Score_Declarer"].cast(pl.Float32, strict=False)).mean()
                 ev_diff_f = _safe_float(ev_diff_mean)
                 auction_info["avg_ev_diff"] = round(ev_diff_f, 2) if ev_diff_f is not None else None
         
@@ -2053,10 +2047,15 @@ LIMIT {n_auction_groups}"""
         if bt_auction:
             group_deals = group_deals.with_columns(pl.lit(bt_auction).alias("Auction"))
         
+        # Use library-style vectorized operations for score deltas and outcome flags
+        # Patterned after mlBridgeAugmentLib.create_score_diff_columns and add_trick_columns
         if "Score" in group_deals.columns and "ParScore" in group_deals.columns:
-            group_deals = group_deals.with_columns(
-                (pl.col("Score").cast(pl.Int64, strict=False) - pl.col("ParScore").cast(pl.Int64, strict=False)).alias("Score_Delta")
-            )
+            group_deals = group_deals.with_columns([
+                (pl.col("Score").cast(pl.Int64, strict=False) - pl.col("ParScore").cast(pl.Int64, strict=False)).alias("Score_Delta"),
+                (pl.col("Result") > 0).alias("OverTricks"),
+                (pl.col("Result") == 0).alias("JustMade"),
+                (pl.col("Result") < 0).alias("UnderTricks"),
+            ])
             group_deals = group_deals.with_columns(
                 pl.col("Score_Delta").map_elements(
                     lambda x: calculate_imp(x) * (1 if x >= 0 else -1) if x is not None else None,
@@ -3419,6 +3418,43 @@ def _find_bt_row_for_auction(bt_df: pl.DataFrame, auction_normalized: str) -> pl
     return bt_df.head(0)  # Empty DataFrame
 
 
+def _build_criteria_mask_for_dealer(
+    deal_df: pl.DataFrame,
+    dealer: str,
+    criteria_by_seat: Dict[int, List[str]],
+    deal_criteria_by_seat_dfs: Dict[int, Dict[str, pl.DataFrame]],
+) -> Tuple[Optional[pl.Series], List[str]]:
+    """Build a mask matching criteria for a specific dealer."""
+    dealer_mask = deal_df["Dealer"] == dealer
+    if not dealer_mask.any():
+        return None, []
+        
+    all_seats_mask = dealer_mask
+    invalid_criteria: List[str] = []
+    
+    for seat, criteria_list in criteria_by_seat.items():
+        seat_criteria_df = deal_criteria_by_seat_dfs.get(seat, {}).get(dealer)
+        
+        if seat_criteria_df is None or seat_criteria_df.is_empty():
+            return None, []
+        
+        available_cols = set(seat_criteria_df.columns)
+        
+        for crit in criteria_list:
+            if crit not in available_cols:
+                if crit not in invalid_criteria:
+                    invalid_criteria.append(crit)
+                continue
+            col = seat_criteria_df[crit]
+            all_seats_mask = all_seats_mask & col
+            
+            # Early exit if this dealer's mask is already empty
+            if not all_seats_mask.any():
+                return None, invalid_criteria
+                
+    return all_seats_mask, invalid_criteria
+
+
 def _build_criteria_mask_for_all_seats(
     deal_df: pl.DataFrame,
     bt_row: Dict[str, Any],
@@ -3429,52 +3465,34 @@ def _build_criteria_mask_for_all_seats(
     Returns:
         (mask, invalid_criteria) - mask is None if no deals match
     """
-    dealer_series = deal_df["Dealer"]
+    # Pre-lookup criteria lists to avoid repeated .get()
+    criteria_by_seat = {}
+    for seat in range(1, 5):
+        criteria_list = bt_row.get(f"Agg_Expr_Seat_{seat}") or []
+        if criteria_list:
+            criteria_by_seat[seat] = criteria_list
+            
+    if not criteria_by_seat:
+        # If no criteria at all, all deals match (or rather, no criteria to filter by)
+        return None, []
+
     global_mask: pl.Series | None = None
-    invalid_criteria: List[str] = []
+    all_invalid_criteria: List[str] = []
     
     for dealer in DIRECTIONS:
-        dealer_mask = dealer_series == dealer
-        all_seats_mask: pl.Series | None = None
+        dealer_mask, invalid_criteria = _build_criteria_mask_for_dealer(
+            deal_df, dealer, criteria_by_seat, deal_criteria_by_seat_dfs
+        )
         
-        for seat in range(1, 5):
-            criteria_col = f"Agg_Expr_Seat_{seat}"
-            criteria_list = bt_row.get(criteria_col) or []
-            
-            if not criteria_list:
-                continue
-            
-            seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat, {})
-            seat_criteria_df = seat_criteria_for_seat.get(dealer)
-            
-            if seat_criteria_df is None or seat_criteria_df.is_empty():
-                all_seats_mask = pl.Series([False] * deal_df.height)
-                break
-            
-            available_cols = set(seat_criteria_df.columns)
-            
-            seat_mask: pl.Series | None = None
-            for crit in criteria_list:
-                if crit not in available_cols:
-                    if crit not in invalid_criteria:
-                        invalid_criteria.append(crit)
-                    continue
-                col = seat_criteria_df[crit]
-                seat_mask = col if seat_mask is None else (seat_mask & col)
-            
-            if seat_mask is None:
-                continue
-            
-            all_seats_mask = seat_mask if all_seats_mask is None else (all_seats_mask & seat_mask)
-        
-        if all_seats_mask is None:
-            combined = dealer_mask
-        else:
-            combined = dealer_mask & all_seats_mask
-        
-        global_mask = combined if global_mask is None else (global_mask | combined)
+        if invalid_criteria:
+            for c in invalid_criteria:
+                if c not in all_invalid_criteria:
+                    all_invalid_criteria.append(c)
+                    
+        if dealer_mask is not None:
+            global_mask = dealer_mask if global_mask is None else (global_mask | dealer_mask)
     
-    return global_mask, invalid_criteria
+    return global_mask, all_invalid_criteria
 
 
 def _compute_contract_recommendations(
@@ -3920,6 +3938,23 @@ def handle_auction_dd_analysis(
     if "ParContracts" in matched_df.columns:
         select_cols.append("ParContracts")
     
+    # Use library-style vectorized operations for score deltas and outcome flags
+    # Patterned after mlBridgeAugmentLib.create_score_diff_columns and add_trick_columns
+    if "Score" in matched_df.columns and "ParScore" in matched_df.columns:
+        matched_df = matched_df.with_columns([
+            (pl.col("Score").cast(pl.Int64, strict=False) - pl.col("ParScore").cast(pl.Int64, strict=False)).alias("Score_Delta")
+        ])
+        if "Score_Delta" in matched_df.columns:
+            select_cols.append("Score_Delta")
+            
+    if "Result" in matched_df.columns:
+        matched_df = matched_df.with_columns([
+            (pl.col("Result") > 0).alias("OverTricks"),
+            (pl.col("Result") == 0).alias("JustMade"),
+            (pl.col("Result") < 0).alias("UnderTricks"),
+        ])
+        select_cols.extend(["OverTricks", "JustMade", "UnderTricks"])
+
     result_df = matched_df.select([c for c in select_cols if c in matched_df.columns])
     dd_data = result_df.to_dicts()
     
@@ -4192,24 +4227,128 @@ def handle_rank_bids_by_ev(
     effective_seed = _effective_seed(seed)
     
     # =========================================================================
+    # PRE-FILTER: Opening seat alignment
+    # =========================================================================
+    # All matched deals MUST match the expected opening seat (based on leading passes).
+    # Pre-compute this mask ONCE to avoid map_elements in the loop.
+    opening_seat_mask = None
+    if "bid" in deal_df.columns:
+        # Vectorized check for leading passes (normalize auction first)
+        # BBO format: "p-p-1H", "1N", etc.
+        prefix = "p-" * expected_passes
+        if expected_passes == 0:
+            # Must NOT start with 'p-'
+            opening_seat_mask = ~deal_df["bid"].str.starts_with("p-")
+        else:
+            # Must start with exactly 'p-' repeated expected_passes times
+            prefix = "p-" * expected_passes
+            not_extra_pass = ~deal_df["bid"].str.starts_with("p-" * (expected_passes + 1))
+            opening_seat_mask = deal_df["bid"].str.starts_with(prefix) & not_extra_pass
+
+    # =========================================================================
+    # OPTIMIZATION: Pre-calculate mask for constant seats (usually 1, 2, 3)
+    # =========================================================================
+    # Many next bids share the same parent auction, meaning seats 1-3 have the same criteria.
+    # We can pre-compute a "parent mask" and only add the next seat's criteria in the loop.
+    parent_mask_by_dealer: Dict[str, pl.Series] = {}
+    
+    # Identify which seats have constant criteria across all candidate bids
+    # For next_bid_indices, usually seats 1 to (parent_len + 1) are constant, 
+    # and only the seat of the next bid changes.
+    # For simplicity, we'll check which Agg_Expr_Seat_N columns are identical across all candidates.
+    constant_seats = []
+    for seat in range(1, 5):
+        unique_exprs = next_bid_rows[f"Agg_Expr_Seat_{seat}"].n_unique()
+        if unique_exprs == 1:
+            constant_seats.append(seat)
+    
+    if constant_seats and not next_bid_rows.is_empty():
+        first_row = next_bid_rows.row(0, named=True)
+        for dealer in DIRECTIONS:
+            dealer_mask = deal_df["Dealer"] == dealer
+            
+            # Combine with opening seat mask if it exists
+            if opening_seat_mask is not None:
+                dealer_mask = dealer_mask & opening_seat_mask
+                
+            parent_seat_mask = None
+            for seat in constant_seats:
+                criteria_list = first_row.get(f"Agg_Expr_Seat_{seat}") or []
+                if not criteria_list: continue
+                
+                seat_criteria_df = deal_criteria_by_seat_dfs.get(seat, {}).get(dealer)
+                if seat_criteria_df is None or seat_criteria_df.is_empty():
+                    parent_seat_mask = pl.Series([False] * deal_df.height)
+                    break
+                
+                available_cols = set(seat_criteria_df.columns)
+                for crit in criteria_list:
+                    if crit in available_cols:
+                        col = seat_criteria_df[crit]
+                        parent_seat_mask = col if parent_seat_mask is None else (parent_seat_mask & col)
+            
+            if parent_seat_mask is not None:
+                # Include dealer_mask in parent_mask to avoid repeating it in the loop
+                parent_mask_by_dealer[dealer] = dealer_mask & parent_seat_mask
+            else:
+                parent_mask_by_dealer[dealer] = dealer_mask
+    
+    non_constant_seats = [s for s in range(1, 5) if s not in constant_seats]
+
+    # =========================================================================
     # For each bid, match deals using criteria bitmaps and track by bid
     # =========================================================================
     bid_rankings: List[Dict[str, Any]] = []
     matched_by_bid: Dict[str, Set[int]] = {}  # Track which deals matched which bid
     matched_dfs_by_bid: Dict[str, pl.DataFrame] = {}  # Store matched DataFrames for per-bid sampling
     
+    # Pre-lookup seat criteria DFs to avoid repeated .get() calls
+    seat_dfs_prelookup = {
+        s: {d: deal_criteria_by_seat_dfs.get(s, {}).get(d) for d in DIRECTIONS}
+        for s in non_constant_seats
+    }
+
     for i, row in enumerate(next_bid_rows.iter_rows(named=True)):
         bid_name = row.get("candidate_bid", "?")
         bt_index = row.get("bt_index")
         bid_auction = row.get("Auction", "")
         
-        # Build criteria mask for ALL seats using existing function
-        # (handles Dealer-based seat alignment correctly)
-        global_mask, invalid_criteria = _build_criteria_mask_for_all_seats(
-            deal_df, row, deal_criteria_by_seat_dfs
-        )
+        # Build criteria mask using optimized parent mask where possible
+        global_mask = None
+        
+        # Optimization: Pre-fetch non-constant criteria lists
+        seat_criteria_lists = {s: row.get(f"Agg_Expr_Seat_{s}") or [] for s in non_constant_seats}
+        
+        for dealer in DIRECTIONS:
+            # Use pre-computed parent mask (includes dealer_mask and opening_seat_mask)
+            all_seats_mask = parent_mask_by_dealer.get(dealer)
+            
+            # If parent_mask is already all False for this dealer, skip
+            if all_seats_mask is not None and not all_seats_mask.any():
+                continue
+                
+            # Add non-constant seats
+            current_dealer_mask = all_seats_mask
+            for seat in non_constant_seats:
+                criteria_list = seat_criteria_lists[seat]
+                if not criteria_list: continue
+                
+                seat_criteria_df = seat_dfs_prelookup[seat][dealer]
+                if seat_criteria_df is None or seat_criteria_df.is_empty():
+                    current_dealer_mask = None
+                    break
+                
+                available_cols = set(seat_criteria_df.columns)
+                for crit in criteria_list:
+                    if crit in available_cols:
+                        col = seat_criteria_df[crit]
+                        current_dealer_mask = col if current_dealer_mask is None else (current_dealer_mask & col)
+            
+            if current_dealer_mask is not None:
+                global_mask = current_dealer_mask if global_mask is None else (global_mask | current_dealer_mask)
         
         if global_mask is None or not global_mask.any():
+            # ... (no changes to continue block) ...
             bid_rankings.append({
                 "bid": bid_name,
                 "bt_index": bt_index,
@@ -4221,18 +4360,46 @@ def handle_rank_bids_by_ev(
                 "avg_par_v": None,
             })
             continue
-        
+            
+        # Combine with opening seat mask ONLY if parent_mask optimization was NOT used
+        if not constant_seats and opening_seat_mask is not None:
+            global_mask = global_mask & opening_seat_mask
+            
+        if not global_mask.any():
+            # ... (no changes to continue block) ...
+            bid_rankings.append({
+                "bid": bid_name,
+                "bt_index": bt_index,
+                "auction": bid_auction,
+                "match_count": 0,
+                "nv_count": 0,
+                "v_count": 0,
+                "avg_par_nv": None,
+                "avg_par_v": None,
+            })
+            continue
+            
+        # Combine with opening seat mask
+        if opening_seat_mask is not None:
+            global_mask = global_mask & opening_seat_mask
+            
+        if not global_mask.any():
+            bid_rankings.append({
+                "bid": bid_name,
+                "bt_index": bt_index,
+                "auction": bid_auction,
+                "match_count": 0,
+                "nv_count": 0,
+                "v_count": 0,
+                "avg_par_nv": None,
+                "avg_par_v": None,
+            })
+            continue
+
         matched_df = deal_df.filter(global_mask)
         
-        # Filter by expected opening seat (actual auction must have expected passes)
-        if "bid" in matched_df.columns and matched_df.height > 0:
-            def _check_passes(bid_val: Any) -> bool:
-                return _count_leading_passes(bid_val) == expected_passes
-            
-            passes_mask = matched_df["bid"].map_elements(_check_passes, return_dtype=pl.Boolean)
-            matched_df = matched_df.filter(passes_mask)
-        
         if matched_df.height == 0:
+            # ... (already handled by mask.any() above, but kept for safety)
             bid_rankings.append({
                 "bid": bid_name,
                 "bt_index": bt_index,
@@ -4245,13 +4412,15 @@ def handle_rank_bids_by_ev(
             })
             continue
         
-        # Collect indices for this bid
-        bid_matched_indices: Set[int] = set()
+        # Collect indices for this bid - optimize by avoiding to_list() and using set() only if needed
+        # Actually, for serialization, a list is fine.
+        bid_matched_indices_list = []
         if "index" in matched_df.columns:
-            bid_matched_indices = set(matched_df["index"].to_list())
+            # Using to_numpy().tolist() is often faster than to_list() for large Series
+            bid_matched_indices_list = matched_df["index"].to_list()
         
-        matched_by_bid[bid_name] = bid_matched_indices
-        match_count = len(bid_matched_indices)
+        matched_by_bid[bid_name] = set(bid_matched_indices_list)
+        match_count = len(bid_matched_indices_list)
         
         # Store the matched_df for this bid (for per-bid sampling later)
         matched_dfs_by_bid[bid_name] = matched_df
@@ -4325,7 +4494,77 @@ def handle_rank_bids_by_ev(
         ev_score_v = round(statistics.mean(ev_v_values), 1) if ev_v_values else None
         ev_std_v = round(statistics.stdev(ev_v_values), 1) if len(ev_v_values) > 1 else None
         
-        bid_rankings.append({
+        # Compute EV and Makes % for all level-strain-vul-seat combinations (560 columns)
+        # Seat mapping: S1=N, S2=E, S3=S, S4=W
+        # Use vectorized Polars operations for performance
+        ev_all_combos: Dict[str, Optional[float]] = {}
+        seat_to_declarer = {1: "N", 2: "E", 3: "S", 4: "W"}
+        if matched_df.height > 0:
+            # Build mapping from source EV/DD column to output column key
+            ev_col_mapping: Dict[str, str] = {}  # ev_col -> col_key
+            makes_col_mapping: Dict[str, str] = {} # dd_col -> col_key
+            
+            # Map vulnerability states to deal_df['Vul'] values
+            # (used for filtering inside select if we want per-vul makes pct)
+            # Actually, for Makes %, we need to filter matched_df by Vul first
+            # to get correct pct for NV and V combinations.
+            
+            nv_mask = matched_df["Vul"].is_in(["None", "E_W"])
+            v_mask = matched_df["Vul"].is_in(["N_S", "Both"])
+            
+            nv_matched_df = matched_df.filter(nv_mask)
+            v_matched_df = matched_df.filter(v_mask)
+            
+            for level in range(1, 8):
+                for strain in ["C", "D", "H", "S", "N"]:
+                    for vul in ["NV", "V"]:
+                        for seat in [1, 2, 3, 4]:
+                            declarer = seat_to_declarer[seat]
+                            pair = "NS" if declarer in ["N", "S"] else "EW"
+                            
+                            ev_key = f"EV_Score_{level}{strain}_{vul}_S{seat}"
+                            makes_key = f"Makes_Pct_{level}{strain}_{vul}_S{seat}"
+                            
+                            ev_col = f"EV_{pair}_{declarer}_{strain}_{level}_{vul}"
+                            dd_col = f"DD_Score_{level}{strain}_{declarer}"
+                            
+                            ev_col_mapping[ev_col] = ev_key
+                            makes_col_mapping[(dd_col, vul)] = makes_key
+                            
+                            ev_all_combos[ev_key] = None
+                            ev_all_combos[makes_key] = None
+            
+            # 1. Compute EV means (vectorized)
+            existing_ev_cols = [c for c in ev_col_mapping.keys() if c in matched_df.columns]
+            if existing_ev_cols:
+                means_df = matched_df.select([pl.col(c).mean().alias(c) for c in existing_ev_cols])
+                means_row = means_df.row(0, named=True)
+                for ev_col, mean_val in means_row.items():
+                    if mean_val is not None:
+                        ev_all_combos[ev_col_mapping[ev_col]] = round(float(mean_val), 1)
+            
+            # 2. Compute Makes % (vectorized per vulnerability)
+            for vul_state, vul_df in [("NV", nv_matched_df), ("V", v_matched_df)]:
+                if vul_df.height == 0: continue
+                
+                existing_dd_cols = []
+                dd_col_to_key = {}
+                for (dd_col, v_st), key in makes_col_mapping.items():
+                    if v_st == vul_state and dd_col in vul_df.columns:
+                        existing_dd_cols.append(dd_col)
+                        dd_col_to_key[dd_col] = key
+                
+                if existing_dd_cols:
+                    # Makes % = (DD_Score >= 0).mean() * 100
+                    makes_df = vul_df.select([
+                        (pl.col(c) >= 0).mean().alias(c) for c in existing_dd_cols
+                    ])
+                    makes_row = makes_df.row(0, named=True)
+                    for dd_col, pct_val in makes_row.items():
+                        if pct_val is not None:
+                            ev_all_combos[dd_col_to_key[dd_col]] = round(float(pct_val) * 100, 1)
+        
+        bid_ranking_entry = {
             "bid": bid_name,
             "bt_index": bt_index,
             "auction": bid_auction,
@@ -4338,7 +4577,10 @@ def handle_rank_bids_by_ev(
             "ev_std_nv": ev_std_nv,
             "ev_score_v": ev_score_v,
             "ev_std_v": ev_std_v,
-        })
+        }
+        # Add all 280 EV columns (level-strain-vul-seat combinations)
+        bid_ranking_entry.update(ev_all_combos)
+        bid_rankings.append(bid_ranking_entry)
     
     # Sort by avg_par (using avg_par_nv as primary, falling back to avg_par_v)
     def sort_key(r: Dict) -> float:
@@ -4360,10 +4602,19 @@ def handle_rank_bids_by_ev(
     for indices in matched_by_bid.values():
         all_matched_indices.update(indices)
     
-    # Convert sets to lists for JSON serialization
-    matched_by_bid_json: Dict[str, List[int]] = {
-        bid: list(indices) for bid, indices in matched_by_bid.items()
-    }
+    # Serialization optimization: Base64 binary for matched_by_bid
+    # Converting millions of integers to JSON lists is VERY slow in Python.
+    # We send them as base64-encoded binary blobs of uint32 arrays.
+    matched_by_bid_b64: Dict[str, str] = {}
+    for bid, indices in matched_by_bid.items():
+        if indices:
+            # Convert set to sorted numpy uint32 array
+            arr = np.array(sorted(list(indices)), dtype=np.uint32)
+            # Encode to base64
+            b64_str = base64.b64encode(arr.tobytes()).decode('utf-8')
+            matched_by_bid_b64[bid] = b64_str
+        else:
+            matched_by_bid_b64[bid] = ""
     
     contract_recommendations: List[Dict[str, Any]] = []
     par_contract_stats: List[Dict[str, Any]] = []
@@ -4460,61 +4711,97 @@ def handle_rank_bids_by_ev(
         if bid_strain == "NT":
             bid_strain = "N"
         
-        # Build output columns (use same columns as aggregated dd_data)
+        # Build output columns - MINIMAL set for display (DD_Score/EV_Score computed separately)
         bid_select_cols = ["index", "Dealer", "Vul", "Vul_NS", "Vul_EW"]
         if include_hands:
             bid_select_cols.extend(["Hand_N", "Hand_E", "Hand_S", "Hand_W"])
         bid_select_cols.extend(["ParScore", "ParContracts"])
-        if include_scores:
-            bid_dd_cols = [c for c in sampled_bid_df.columns if c.startswith("DD_")]
-            bid_select_cols.extend(bid_dd_cols)
         
-        # Add specific EV columns needed for EV_Score (for all possible declarers and vul states)
-        ev_cols_found = []
+        # Only include the specific DD/EV columns needed for this bid (not all 280+)
         if bid_level and bid_strain:
+            # Add DD_Score column for each declarer
+            for decl in ["N", "E", "S", "W"]:
+                dd_col = f"DD_Score_{bid_level}{bid_strain}_{decl}"
+                if dd_col in sampled_bid_df.columns:
+                    bid_select_cols.append(dd_col)
+            # Add EV columns for this bid's level/strain only
             for pair in ["NS", "EW"]:
                 for decl in ["N", "E", "S", "W"]:
                     for vul_st in ["NV", "V"]:
                         ev_col = f"EV_{pair}_{decl}_{bid_strain}_{bid_level}_{vul_st}"
                         if ev_col in sampled_bid_df.columns:
                             bid_select_cols.append(ev_col)
-                            ev_cols_found.append(ev_col)
         
         
+        # Use library-style vectorized column mapping for DD_Score and EV_Score
+        # Patterned after mlBridgeAugmentLib.add_declarer_scores
+        if bid_level and bid_strain:
+            # 1. Add DD_Score for the matching bid (dependent on Dealer)
+            # Build expression: "DD_Score_{level}{strain}_{Dealer}"
+            dd_col_expr = pl.format("DD_Score_{}{}_{}", pl.lit(bid_level), pl.lit(bid_strain), pl.col("Dealer"))
+            
+            # 2. Add EV_Score for the matching bid (dependent on Dealer, Pair, and Vul)
+            # Determine Pair and Vul_State side-by-side
+            pair_expr = pl.when(pl.col("Dealer").is_in(["N", "S"])).then(pl.lit("NS")).otherwise(pl.lit("EW"))
+            is_vul_expr = pl.when(pl.col("Dealer").is_in(["N", "S"])) \
+                            .then(pl.col("Vul").is_in(["N_S", "Both"])) \
+                            .otherwise(pl.col("Vul").is_in(["E_W", "Both"]))
+            vul_state_expr = pl.when(is_vul_expr).then(pl.lit("V")).otherwise(pl.lit("NV"))
+            
+            # Build expression: "EV_{pair}_{declarer}_{strain}_{level}_{vul_state}"
+            ev_col_expr = pl.format("EV_{}_{}_{}_{}_{}", 
+                                    pair_expr, 
+                                    pl.col("Dealer"), 
+                                    pl.lit(bid_strain), 
+                                    pl.lit(bid_level), 
+                                    vul_state_expr)
+            
+            # Add alias columns using map_elements or dynamic selection
+            # Since we can't easily use a dynamic column name in pl.col(), 
+            # we'll use a trick: combine all possible columns into a struct and then pick one.
+            
+            # For DD_Score:
+            dd_cols_for_bid = [f"DD_Score_{bid_level}{bid_strain}_{d}" for d in ["N", "E", "S", "W"]]
+            existing_dd = [c for c in dd_cols_for_bid if c in sampled_bid_df.columns]
+            if existing_dd:
+                sampled_bid_df = sampled_bid_df.with_columns(
+                    pl.struct(existing_dd).map_elements(
+                        lambda r: r.get(f"DD_Score_{bid_level}{bid_strain}_{r.get('Dealer')}") if 'Dealer' in r else None,
+                        return_dtype=pl.Int16
+                    ).alias("DD_Score")
+                )
+            
+            # For EV_Score:
+            # (Similar logic but more complex, we'll keep the 8 columns for now but add the alias)
+            existing_ev = [c for c in sampled_bid_df.columns if c.startswith(f"EV_") and f"_{bid_strain}_{bid_level}_" in c]
+            if existing_ev:
+                # We already added these to bid_select_cols, now pick the right one for each row
+                def _get_ev_for_row(r):
+                    d = r.get("Dealer")
+                    v = "V" if (r.get("Vul") in ["N_S", "Both"] if d in ["N", "S"] else r.get("Vul") in ["E_W", "Both"]) else "NV"
+                    p = "NS" if d in ["N", "S"] else "EW"
+                    col = f"EV_{p}_{d}_{bid_strain}_{bid_level}_{v}"
+                    return r.get(col)
+                
+                sampled_bid_df = sampled_bid_df.with_columns(
+                    pl.struct(existing_ev + ["Dealer", "Vul"]).map_elements(
+                        _get_ev_for_row, return_dtype=pl.Float64
+                    ).cast(pl.Float32).alias("EV_Score")
+                )
+
         bid_select_cols = [c for c in bid_select_cols if c in sampled_bid_df.columns]
+        # Ensure our new alias columns are included
+        for alias in ["DD_Score", "EV_Score"]:
+            if alias in sampled_bid_df.columns:
+                bid_select_cols.append(alias)
         
         bid_output_df = sampled_bid_df.select(bid_select_cols)
         bid_dd_data = bid_output_df.to_dicts()
         
-        # Format ParContracts and compute DD_Score/EV_Score
+        # Format ParContracts
         for row in bid_dd_data:
             if "ParContracts" in row:
                 row["ParContracts"] = _format_par_contracts(row["ParContracts"])
-            
-            # Compute DD_Score and EV_Score for this specific bid
-            # For opening bids, the dealer is the declarer
-            dealer = row.get("Dealer")
-            vul = row.get("Vul")
-            
-            if bid_level and bid_strain and dealer:
-                # DD_Score: Look up DD_Score_{level}{strain}_{declarer}
-                dd_col = f"DD_Score_{bid_level}{bid_strain}_{dealer}"
-                row["DD_Score"] = row.get(dd_col)
-                
-                # EV_Score: Look up EV_{pair}_{declarer}_{strain}_{level}_{vul_state}
-                pair = "NS" if dealer in ["N", "S"] else "EW"
-                # Determine if declarer is vulnerable
-                if dealer in ["N", "S"]:
-                    is_vul = vul in ["N_S", "Both"]
-                else:
-                    is_vul = vul in ["E_W", "Both"]
-                vul_state = "V" if is_vul else "NV"
-                
-                ev_col = f"EV_{pair}_{dealer}_{bid_strain}_{bid_level}_{vul_state}"
-                row["EV_Score"] = row.get(ev_col)
-            else:
-                row["DD_Score"] = None
-                row["EV_Score"] = None
         
         dd_data_by_bid[bid_name] = bid_dd_data
     
@@ -4540,7 +4827,7 @@ def handle_rank_bids_by_ev(
         "dd_data": dd_data,
         "dd_data_by_bid": dd_data_by_bid,  # bid -> list of deal dicts (up to max_deals each)
         "dd_columns": dd_cols,
-        "matched_by_bid": matched_by_bid_json,  # bid -> list of deal indices
+        "matched_by_bid_b64": matched_by_bid_b64,  # Optimized binary encoding
         "total_matches": total_matches,
         "returned_count": len(dd_data),
         "vul_breakdown": vul_breakdown,

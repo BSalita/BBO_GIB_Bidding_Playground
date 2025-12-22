@@ -23,13 +23,15 @@ import duckdb  # type: ignore[import-not-found]
 import pandas as pd
 import time
 import requests
+import base64
+import numpy as np
 from datetime import datetime, timezone
 import importlib.metadata as importlib_metadata
 import pathlib
 import os
 import sys
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List, Set
 
 # Add mlBridgeLib to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mlBridgeLib"))
@@ -777,11 +779,21 @@ def render_aggrid(
         height = min(10 * ROW_HEIGHT + HEADER_HEIGHT + BUFFER,
                      n_rows * ROW_HEIGHT + HEADER_HEIGHT + BUFFER)
 
+    # Build the grid options
     gb = GridOptionsBuilder.from_dataframe(df.to_pandas())
     # Disable pagination entirely to allow scrolling within the fixed height
     gb.configure_pagination(enabled=False)
     # Make all columns read-only (not editable), resizable, filterable, sortable
     gb.configure_default_column(resizable=True, filter=True, sortable=True, editable=False)
+    
+    # Custom formatting for columns that should display as percentages
+    pct_cols = [c for c in df.columns if 
+                "Makes %" in c or "make_pct" in c or "Makes_Pct" in c or
+                "Rate" in c or "rate" in c or "Percentage" in c or "percentage" in c or "pct" in c or
+                "Frequency" in c or "%" in c]
+    for col in pct_cols:
+        gb.configure_column(col, valueFormatter="x !== null ? x.toFixed(1) + '%' : ''")
+        
     # Enable row selection - clicking anywhere on a row highlights the entire row
     gb.configure_selection(selection_mode="single", use_checkbox=False, suppressRowClickSelection=False)
     # Explicitly set row/header heights to ensure consistent sizing
@@ -1298,14 +1310,12 @@ def render_deals_by_auction_pattern(pattern: str | None):
                 # DD Makes row (only if data exists)
                 if ai_makes > 0 or contract_makes > 0:
                     makes_diff = ai_makes_pct - contract_makes_pct
-                    makes_diff_str = f"+{makes_diff:.1f}%" if makes_diff >= 0 else f"{makes_diff:.1f}%"
-                    stats_rows.append({"Metric": "DD Makes", "AI": f"{ai_makes_pct:.1f}%", "Actual": f"{contract_makes_pct:.1f}%", "Diff": makes_diff_str})
+                    stats_rows.append({"Metric": "DD Makes %", "AI": round(ai_makes_pct, 1), "Actual": round(contract_makes_pct, 1), "Diff": round(makes_diff, 1)})
                 
                 # Par Achieved row (only if data exists)
                 if ai_par > 0 or contract_par > 0:
                     par_diff = ai_par_pct - contract_par_pct
-                    par_diff_str = f"+{par_diff:.1f}%" if par_diff >= 0 else f"{par_diff:.1f}%"
-                    stats_rows.append({"Metric": "Par Achieved", "AI": f"{ai_par_pct:.1f}%", "Actual": f"{contract_par_pct:.1f}%", "Diff": par_diff_str})
+                    stats_rows.append({"Metric": "Par Achieved %", "AI": round(ai_par_pct, 1), "Actual": round(contract_par_pct, 1), "Diff": round(par_diff, 1)})
                 
                 # EV row (only if data exists)
                 if avg_ev_ai is not None and avg_ev_contract is not None:
@@ -1928,9 +1938,9 @@ def render_analyze_actual_auctions():
                         pl.col("Dir").cast(pl.Utf8)
                     )
                 if "HCP_avg" in dir_df.columns:
-                    dir_df = dir_df.with_columns(pl.col("HCP_avg").cast(pl.Float64).round(1))
+                    dir_df = dir_df.with_columns(pl.col("HCP_avg").cast(pl.Float32).round(1))
                 if "Total_Points_avg" in dir_df.columns:
-                    dir_df = dir_df.with_columns(pl.col("Total_Points_avg").cast(pl.Float64).round(1))
+                    dir_df = dir_df.with_columns(pl.col("Total_Points_avg").cast(pl.Float32).round(1))
                 render_aggrid(dir_df, key=f"group_by_bid_stats_{i}", height=160, table_name="bid_direction_stats")
 
             # Score summary (separate row, avoids mixing with per-direction stats)
@@ -2331,7 +2341,7 @@ def render_wrong_bid_analysis():
                             {
                                 "Seat": f"Seat {i}",
                                 "Wrong Bids": seat_data.get(f"seat_{i}_wrong_bids", 0),
-                                "Rate": f"{seat_data.get(f'seat_{i}_rate', 0) * 100:.2f}%",
+                                "Wrong Bid Rate": seat_data.get(f"seat_{i}_rate", 0) * 100,
                             }
                             for i in range(1, 5)
                         ]
@@ -2480,7 +2490,7 @@ def render_rank_by_ev():
     # Call API (single endpoint provides both bid rankings and DD analysis)
     # =========================================================================
     # Cache version: increment when API response format changes
-    CACHE_VERSION = 5  # v5: renamed DD_Bid/EV_Bid to DD_Score/EV_Score
+    CACHE_VERSION = 17  # v17: broadened AgGrid percentage detection and fixed numeric sorting
     
     # Always fetch all columns from API; filter display based on checkboxes
     # This prevents cache busting when output options change
@@ -2554,6 +2564,13 @@ def render_rank_by_ev():
         
         rankings_df = pl.DataFrame(bid_rankings)
         
+        # Cast all EV_Score columns to Float32 for efficiency
+        ev_cols = [c for c in rankings_df.columns if c.startswith("EV_Score_")]
+        if ev_cols:
+            rankings_df = rankings_df.with_columns([
+                pl.col(c).cast(pl.Float32) for c in ev_cols
+            ])
+        
         # Select and rename columns for display
         display_cols = []
         col_map = [
@@ -2567,8 +2584,8 @@ def render_rank_by_ev():
             ("ev_std_nv", "EV Std NV"),
             ("ev_score_v", "EV V"),
             ("ev_std_v", "EV Std V"),
-            ("auction", "Full Auction"),
         ]
+        col_map.append(("auction", "Full Auction"))
         
         for col, alias in col_map:
             if col in rankings_df.columns:
@@ -2585,9 +2602,86 @@ def render_rank_by_ev():
             update_mode=GridUpdateMode.SELECTION_CHANGED
         )
         
-        # Capture the selected bid if any
+        # Capture the selected bid (default to first row if none selected)
+        selected_bid_name = None
         if selected_bid_rows is not None and len(selected_bid_rows) > 0:
             selected_bid = selected_bid_rows[0]
+            selected_bid_name = selected_bid.get("Bid")
+        elif len(bid_rankings) > 0:
+            # Fallback to first row
+            selected_bid = bid_rankings[0]
+            selected_bid_name = selected_bid.get("bid")
+            
+        # ---------------------------------------------------------------------
+        # RANKINGS OF CONTRACTS BY HIGHEST EV
+        # ---------------------------------------------------------------------
+        if selected_bid_name:
+            st.subheader(f"🥇 Rankings of Contracts by Highest EV")
+            
+            # Extract EV_Score_ and Makes_Pct_ columns from the original bid_rankings dict
+            # (since rankings_df was filtered to display only core columns)
+            original_row = next((r for r in bid_rankings if r.get("bid") == selected_bid_name), None)
+            
+            if original_row:
+                ev_data = []
+                strain_names = {'N': 'NT', 'S': '♠', 'H': '♥', 'D': '♦', 'C': '♣'}
+                seat_names = {1: 'N', 2: 'E', 3: 'S', 4: 'W'}
+                
+                # First collect all available EV scores
+                for k, v in original_row.items():
+                    if k.startswith("EV_Score_") and v is not None:
+                        # Format: EV_Score_{level}{strain}_{vul}_S{seat}
+                        # e.g., EV_Score_3N_NV_S1
+                        parts = k.split("_")
+                        if len(parts) >= 5:
+                            contract_part = parts[2] # "3N"
+                            vul_part = parts[3]      # "NV" or "V"
+                            seat_part = parts[4]     # "S1"
+                            
+                            level = contract_part[0]
+                            strain = contract_part[1:]
+                            seat_num = int(seat_part[1:])
+                            
+                            strain_display = strain_names.get(strain, strain)
+                            seat_display = seat_names.get(seat_num, seat_part)
+                            
+                            # Look up corresponding Makes %
+                            makes_key = f"Makes_Pct_{contract_part}_{vul_part}_{seat_part}"
+                            makes_pct = original_row.get(makes_key)
+                            
+                            ev_data.append({
+                                "Contract": f"{level}{strain_display}",
+                                "Declarer": seat_display,
+                                "Vul": vul_part,
+                                "EV": round(float(v), 1),
+                                "Makes %": round(float(makes_pct), 1) if makes_pct is not None else None,
+                                "_level": int(level),
+                                "_strain": strain
+                            })
+                
+                if ev_data:
+                    ev_df = pl.DataFrame(ev_data)
+                    
+                    # Use Polars vectorized "when" logic for contract type classification
+                    # (Patterned after mlBridgeAugmentLib.add_contract_type)
+                    ev_df = ev_df.with_columns(
+                        pl.when(pl.col('_level').eq(5) & pl.col('_strain').is_in(['C', 'D'])).then(pl.lit("Game"))
+                        .when(pl.col('_level').is_in([4, 5]) & pl.col('_strain').is_in(['H', 'S'])).then(pl.lit("Game"))
+                        .when(pl.col('_level').is_in([3, 4, 5]) & pl.col('_strain').eq('N')).then(pl.lit("Game"))
+                        .when(pl.col('_level').eq(6)).then(pl.lit("SSlam"))
+                        .when(pl.col('_level').eq(7)).then(pl.lit("GSlam"))
+                        .otherwise(pl.lit("Partial"))
+                        .alias('Type')
+                    )
+                    
+                    # Sort and select columns for display
+                    ev_df = ev_df.sort("EV", descending=True)
+                    display_cols = ["Contract", "Declarer", "Vul", "Type", "EV", "Makes %"]
+                    ev_df = ev_df.select([c for c in display_cols if c in ev_df.columns])
+                    
+                    render_aggrid(ev_df, key=f"top_ev_contracts_{selected_bid_name}", height=400, table_name="top_ev")
+                else:
+                    st.info("No contract-level EV data available for this bid.")
         
         # Add download button for rankings
         try:
@@ -2611,7 +2705,6 @@ def render_rank_by_ev():
     # DD Analysis (from aggregated deals across all next bids)
     # =========================================================================
     st.divider()
-    st.subheader("📊 DD Analysis (Aggregated Across Next Bids)")
     
     selected_contract = None
     
@@ -2624,10 +2717,10 @@ def render_rank_by_ev():
         st.markdown("*Contracts ranked by EV.*")
         
         rec_df = pl.DataFrame(contract_recs)
-        # Rename columns for display
+        # Keep numeric values for numeric sorting
         if "make_pct" in rec_df.columns:
             rec_df = rec_df.with_columns(
-                (pl.col("make_pct").round(0).cast(pl.Int32).cast(pl.Utf8) + "%").alias("Makes %")
+                pl.col("make_pct").alias("Makes %")
             )
         
         # Use existing columns or aliases - separate rows for each vulnerability
@@ -2691,7 +2784,21 @@ def render_rank_by_ev():
     # -------------------------------------------------------------------------
     dd_deals = data.get("dd_data", [])
     dd_data_by_bid = data.get("dd_data_by_bid", {})  # bid -> list of deal dicts (up to max_deals each)
-    matched_by_bid = data.get("matched_by_bid", {})  # bid -> list of deal indices
+    
+    # Decode matched_by_bid from base64 if present (optimized binary encoding)
+    matched_by_bid_b64 = data.get("matched_by_bid_b64", {})
+    matched_by_bid: Dict[str, Set[int]] = {}
+    if matched_by_bid_b64:
+        for bid, b64_str in matched_by_bid_b64.items():
+            if b64_str:
+                indices = np.frombuffer(base64.b64decode(b64_str), dtype=np.uint32)
+                matched_by_bid[bid] = set(indices.tolist())
+            else:
+                matched_by_bid[bid] = set()
+    else:
+        # Fallback to legacy field if present
+        legacy_matched = data.get("matched_by_bid", {})
+        matched_by_bid = {bid: set(indices) for bid, indices in legacy_matched.items()}
     
     # Filter dd_deals based on selection (bid from Next Bid Rankings OR contract from Contract Rankings)
     filtered_deals = dd_deals
@@ -2702,6 +2809,7 @@ def render_rank_by_ev():
         # User clicked on a row in Next Bid Rankings
         # Use dd_data_by_bid which has up to max_deals per bid
         clicked_bid = selected_bid.get("Bid", "")
+        full_auction = selected_bid.get("Full Auction", clicked_bid)
         
         # Get the pre-sampled deals for this specific bid (up to max_deals)
         filtered_deals = dd_data_by_bid.get(clicked_bid, [])
@@ -2710,9 +2818,9 @@ def render_rank_by_ev():
         total_matched = len(matched_by_bid.get(clicked_bid, []))
         shown_count = len(filtered_deals)
         if total_matched > shown_count:
-            selection_msg = f" (Showing {shown_count} of {total_matched} deals for bid: {clicked_bid})"
+            selection_msg = f" (Showing {shown_count} of {total_matched} deals for auction: {full_auction})"
         else:
-            selection_msg = f" (Deals matching bid: {clicked_bid})"
+            selection_msg = f" (Deals matching auction: {full_auction})"
     
     elif selected_contract:
         # User clicked on a row in Contract Rankings by EV
@@ -2794,9 +2902,9 @@ def render_rank_by_ev():
         
         # Order columns sensibly
         # DD_Score and EV_Score show the score/EV for the matching BT bid specifically
-        priority_cols = ["index", "Dealer", "Vul", "DD_Score", "EV_Score"]
+        priority_cols = ["index", "Dealer", "Vul"]
         hand_cols = ["Hand_N", "Hand_E", "Hand_S", "Hand_W"] if include_hands else []
-        par_cols = ["ParScore", "ParContracts"]
+        score_cols = ["DD_Score", "EV_Score", "ParScore", "ParContracts"]
         
         dd_cols = data.get("dd_columns", []) if include_scores else []
         ordered_dd = []
@@ -2826,7 +2934,7 @@ def render_rank_by_ev():
         
         # Build final column order
         final_cols = []
-        for c in priority_cols + hand_cols + par_cols:
+        for c in priority_cols + hand_cols + score_cols:
             if c in dd_df.columns:
                 final_cols.append(c)
         final_cols.extend(ordered_dd)

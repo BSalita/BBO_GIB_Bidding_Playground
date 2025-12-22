@@ -1119,6 +1119,9 @@ def _heavy_init() -> None:
             _prewarm_endpoint("bidding-arena",
                 bidding_arena, BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
 
+            _prewarm_endpoint("rank-bids-by-ev",
+                rank_bids_by_ev, RankBidsByEVRequest(auction="", max_deals=10, seed=42))
+
             total_prewarm_s = time.perf_counter() - prewarm_t0
             print(f"[init] All endpoints pre-warmed in {total_prewarm_s:.2f}s")
 
