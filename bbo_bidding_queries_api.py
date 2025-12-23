@@ -695,6 +695,17 @@ class RankBidsByEVRequest(BaseModel):
     include_scores: bool = True  # Include DD_Score columns in deal data
 
 
+class ContractEVDealsRequest(BaseModel):
+    """Request for deals matching a selected next bid + contract EV row."""
+    auction: str = ""          # Auction prefix (same as Rank Next Bids by EV)
+    next_bid: str              # Bid from Next Bid Rankings (e.g. "4N")
+    contract: str              # Contract string (e.g. "4H", "3N")
+    declarer: str              # N/E/S/W
+    vul: str                   # NV or V
+    max_deals: int = 500
+    seed: Optional[int] = 0
+    include_hands: bool = True
+
 # Import model registry for Bidding Arena
 from bbo_bidding_models import MODEL_REGISTRY
 
@@ -1983,6 +1994,33 @@ def rank_bids_by_ev(req: RankBidsByEVRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("rank-bids-by-ev", e)
+
+
+@app.post("/contract-ev-deals")
+def contract_ev_deals(req: ContractEVDealsRequest) -> Dict[str, Any]:
+    """Return deals matching a selected next bid and a specific contract EV row."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+        resp = handler_module.handle_contract_ev_deals(
+            state=state,
+            auction=req.auction,
+            next_bid=req.next_bid,
+            contract=req.contract,
+            declarer=req.declarer,
+            vul=req.vul,
+            max_deals=req.max_deals,
+            seed=req.seed,
+            include_hands=req.include_hands,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("contract-ev-deals", e)
 
 
 if __name__ == "__main__":  # pragma: no cover

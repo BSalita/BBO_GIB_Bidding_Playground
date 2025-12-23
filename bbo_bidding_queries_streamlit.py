@@ -290,7 +290,7 @@ def parse_sorted_shape(pattern: str) -> list[int] | None:
     Parse a sorted shape pattern (e.g., '5431', '4432', '5332').
     
     Sorted shapes match any suit arrangement. E.g., '5431' matches:
-    - 5♠-4♥-3♦-1♣, 5♠-4♦-3♥-1♣, 5♥-4♠-3♦-1♣, etc.
+    - 5S-4H-3D-1C, 5S-4D-3H-1C, 5H-4S-3D-1C, etc.
     
     Returns:
         List of 4 integers sorted descending, or None if invalid.
@@ -473,13 +473,13 @@ def format_distribution_help() -> str:
     return """**Ordered Distribution** (S-H-D-C order)
 
 **Notations:**
-- `4-3-3-3` — exact: 4♠, 3♥, 3♦, 3♣
+- `4-3-3-3` — exact: 4S, 3H, 3D, 3C
 - `4333` — compact: same as above
 - `5+-3-3-2` — 5+ spades
 - `3--4-4-2` — 3 or fewer spades  
 - `[2-4]-3-5-3` — 2-4 spades (range)
 - `2:4-3-5-3` — 2-4 spades (range)
-- `5-4-x-x` — any ♦/♣
+- `5-4-x-x` — any D/C
 
 **Sorted Shape** (any suit order)
 - `5431` — matches 5-4-3-1 in ANY suits
@@ -2490,7 +2490,7 @@ def render_rank_by_ev():
     # Call API (single endpoint provides both bid rankings and DD analysis)
     # =========================================================================
     # Cache version: increment when API response format changes
-    CACHE_VERSION = 17  # v17: broadened AgGrid percentage detection and fixed numeric sorting
+    CACHE_VERSION = 23  # v23: fix /contract-ev-deals for empty auction + bust stale cache
     
     # Always fetch all columns from API; filter display based on checkboxes
     # This prevents cache busting when output options change
@@ -2508,6 +2508,10 @@ def render_rank_by_ev():
     @st.cache_data(ttl=3600, show_spinner=False)
     def fetch_rank_data(p: Dict[str, Any]) -> Dict[str, Any]:
         return api_post("/rank-bids-by-ev", p)
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_contract_ev_deals(p: Dict[str, Any]) -> Dict[str, Any]:
+        return api_post("/contract-ev-deals", p)
     
     desc = f"responses to '{auction_input}'" if auction_input else "opening bids"
     
@@ -2613,10 +2617,26 @@ def render_rank_by_ev():
             selected_bid_name = selected_bid.get("bid")
             
         # ---------------------------------------------------------------------
-        # RANKINGS OF CONTRACTS BY HIGHEST EV
+        # Contract EV Rankings (for selected next bid only)
         # ---------------------------------------------------------------------
         if selected_bid_name:
-            st.subheader(f"🥇 Rankings of Contracts by Highest EV")
+            # Show which next-bid auction is being used for this contract table
+            selected_bid_auction = None
+            if selected_bid_rows is not None and len(selected_bid_rows) > 0:
+                if selected_bid is not None:
+                    selected_bid_auction = selected_bid.get("Full Auction")
+            if not selected_bid_auction:
+                original_row_for_title = next((r for r in bid_rankings if r.get("bid") == selected_bid_name), None)
+                selected_bid_auction = original_row_for_title.get("auction") if original_row_for_title else None
+            selected_bid_auction = selected_bid_auction or selected_bid_name
+
+            # Add sample size in title when it is a fixed value (use bid-level match_count).
+            original_row_for_title = next((r for r in bid_rankings if r.get("bid") == selected_bid_name), None)
+            bid_match_n = original_row_for_title.get("match_count") if original_row_for_title else None
+            n_str = f" (N={int(bid_match_n):,})" if isinstance(bid_match_n, (int, float)) else ""
+
+            st.subheader(f"🥇 Contract EV Rankings (Auction: {selected_bid_auction}){n_str}")
+            st.caption("Computed using only the deals that match the selected next-bid's criteria (not the aggregated pool).")
             
             # Extract EV_Score_ and Makes_Pct_ columns from the original bid_rankings dict
             # (since rankings_df was filtered to display only core columns)
@@ -2624,7 +2644,7 @@ def render_rank_by_ev():
             
             if original_row:
                 ev_data = []
-                strain_names = {'N': 'NT', 'S': '♠', 'H': '♥', 'D': '♦', 'C': '♣'}
+                strain_names = {'N': 'NT', 'S': 'S', 'H': 'H', 'D': 'D', 'C': 'C'}
                 seat_names = {1: 'N', 2: 'E', 3: 'S', 4: 'W'}
                 
                 # First collect all available EV scores
@@ -2678,8 +2698,60 @@ def render_rank_by_ev():
                     ev_df = ev_df.sort("EV", descending=True)
                     display_cols = ["Contract", "Declarer", "Vul", "Type", "EV", "Makes %"]
                     ev_df = ev_df.select([c for c in display_cols if c in ev_df.columns])
-                    
-                    render_aggrid(ev_df, key=f"top_ev_contracts_{selected_bid_name}", height=400, table_name="top_ev")
+
+                    selected_contract_ev_rows = render_aggrid(
+                        ev_df,
+                        key=f"contract_ev_rankings_{selected_bid_name}",
+                        height=400,
+                        table_name="top_ev",
+                        update_mode=GridUpdateMode.SELECTION_CHANGED,
+                    )
+                    selected_contract_ev = selected_contract_ev_rows[0] if selected_contract_ev_rows else (ev_df.to_dicts()[0] if ev_df.height > 0 else None)
+
+                    # -----------------------------------------------------------------
+                    # Deal table for Contract EV Rankings (per selected next bid)
+                    # -----------------------------------------------------------------
+                    if selected_contract_ev:
+                        inv_strains = {'NT': 'N', 'S': 'S', 'H': 'H', 'D': 'D', 'C': 'C'}
+                        contract_str = selected_contract_ev.get("Contract")
+                        declarer = selected_contract_ev.get("Declarer")
+                        vul_state = selected_contract_ev.get("Vul")
+
+                        level = contract_str[0] if isinstance(contract_str, str) and contract_str else ""
+                        strain_alias = contract_str[1:] if isinstance(contract_str, str) and len(contract_str) > 1 else ""
+                        strain = inv_strains.get(strain_alias, strain_alias)
+                        contract_api = f"{level}{strain}" if level and strain else ""
+
+                        if contract_api and declarer and vul_state and selected_bid_name:
+                            deals_payload = {
+                                "auction": auction_input,
+                                "next_bid": selected_bid_name,
+                                "contract": contract_api,
+                                "declarer": declarer,
+                                "vul": vul_state,
+                                "max_deals": int(max_deals),
+                                "seed": seed,
+                                "include_hands": bool(include_hands),
+                                "_cache_version": CACHE_VERSION,  # Bust cache on version change
+                            }
+                            try:
+                                deals_resp = fetch_contract_ev_deals(deals_payload)
+                                deals = deals_resp.get("deals", [])
+                                total_m = int(deals_resp.get("total_matches", 0) or 0)
+                                shown = len(deals)
+
+                                st.subheader(f"📄 Deals matching Contract EV Rankings (Showing {shown:,} of {total_m:,})")
+                                if deals:
+                                    ddf = pl.DataFrame(deals)
+                                    if not include_hands:
+                                        drop_hand_cols = [c for c in ddf.columns if c.startswith("Hand_")]
+                                        if drop_hand_cols:
+                                            ddf = ddf.drop(drop_hand_cols)
+                                    render_aggrid(ddf, key=f"contract_ev_deals_{selected_bid_name}", height=calc_grid_height(len(ddf), max_height=450), table_name="contract_ev_deals")
+                                else:
+                                    st.info("No deals found for this selection.")
+                            except Exception as e:
+                                st.warning(f"Could not load deals for Contract EV Rankings: {e}")
                 else:
                     st.info("No contract-level EV data available for this bid.")
         
@@ -2713,8 +2785,17 @@ def render_rank_by_ev():
     # -------------------------------------------------------------------------
     contract_recs = data.get("contract_recommendations", [])
     if contract_recs:
-        st.subheader("🏆 Contract Rankings by EV")
-        st.markdown("*Contracts ranked by EV.*")
+        # Include sample size in title only when it's a single fixed value across rows.
+        n_hint = ""
+        try:
+            ns = [int(r.get("sample_size") or 0) for r in contract_recs if r.get("sample_size") is not None]
+            if ns and min(ns) == max(ns) and ns[0] > 0:
+                n_hint = f" (N={ns[0]:,})"
+        except Exception:
+            n_hint = ""
+
+        st.subheader(f"🏆 Contract Rankings by EV (Aggregated across all next-bid matches){n_hint}")
+        st.markdown("*Contracts ranked by EV using the aggregated deal pool across all next bids for this auction prefix.*")
         
         rec_df = pl.DataFrame(contract_recs)
         # Keep numeric values for numeric sorting
@@ -2754,33 +2835,7 @@ def render_rank_by_ev():
                 selected_contract = selected_contract_rows[0]
     
     # -------------------------------------------------------------------------
-    # Par Contract Statistics (Sacrifices, Sets, etc.)
-    # -------------------------------------------------------------------------
-    par_contract_stats = data.get("par_contract_stats", [])
-    if par_contract_stats:
-        st.subheader("📊 Par Contract Breakdown")
-        st.markdown("*Distribution of par results split by vulnerability (NV vs V)*")
-        
-        par_stats_df = pl.DataFrame(par_contract_stats)
-        # Reorder columns with NV/V split for both Avg Score and EV
-        display_cols = ["category", "count", "pct", "count_nv", "avg_nv", "ev_nv", "count_v", "avg_v", "ev_v"]
-        col_aliases = {
-            "category": "Category", 
-            "count": "Total", 
-            "pct": "%",
-            "count_nv": "# NV",
-            "avg_nv": "Par NV",
-            "ev_nv": "EV NV",
-            "count_v": "# V",
-            "avg_v": "Par V",
-            "ev_v": "EV V",
-        }
-        par_stats_df = par_stats_df.select([c for c in display_cols if c in par_stats_df.columns])
-        par_stats_df = par_stats_df.rename({c: col_aliases.get(c, c) for c in par_stats_df.columns if c in col_aliases})
-        render_aggrid(par_stats_df, key="dd_analysis_par_stats", height=calc_grid_height(len(par_stats_df), max_height=350), table_name="par_stats")
-    
-    # -------------------------------------------------------------------------
-    # Deal Data Table - Shown when a bid or contract is selected
+    # Deal Data Table - Shown only for Contract Rankings by EV (default first row)
     # -------------------------------------------------------------------------
     dd_deals = data.get("dd_data", [])
     dd_data_by_bid = data.get("dd_data_by_bid", {})  # bid -> list of deal dicts (up to max_deals each)
@@ -2800,36 +2855,32 @@ def render_rank_by_ev():
         legacy_matched = data.get("matched_by_bid", {})
         matched_by_bid = {bid: set(indices) for bid, indices in legacy_matched.items()}
     
-    # Filter dd_deals based on selection (bid from Next Bid Rankings OR contract from Contract Rankings)
+    # Filter dd_deals based on selection (Contract Rankings by EV only)
     filtered_deals = dd_deals
     selection_msg = ""
-    has_selection = selected_bid or selected_contract
-    
-    if selected_bid:
-        # User clicked on a row in Next Bid Rankings
-        # Use dd_data_by_bid which has up to max_deals per bid
-        clicked_bid = selected_bid.get("Bid", "")
-        full_auction = selected_bid.get("Full Auction", clicked_bid)
-        
-        # Get the pre-sampled deals for this specific bid (up to max_deals)
-        filtered_deals = dd_data_by_bid.get(clicked_bid, [])
-        
-        # Show how many deals matched vs how many are shown
-        total_matched = len(matched_by_bid.get(clicked_bid, []))
-        shown_count = len(filtered_deals)
-        if total_matched > shown_count:
-            selection_msg = f" (Showing {shown_count} of {total_matched} deals for auction: {full_auction})"
-        else:
-            selection_msg = f" (Deals matching auction: {full_auction})"
-    
-    elif selected_contract:
+    has_selection = bool(selected_contract)
+
+    # Default to first contract row if none selected
+    if contract_recs and not selected_contract:
+        try:
+            selected_contract = {
+                "Contract": contract_recs[0].get("contract"),
+                "Declarer": contract_recs[0].get("declarer"),
+                "Vul": contract_recs[0].get("vul"),
+            }
+            has_selection = True
+        except Exception:
+            selected_contract = None
+            has_selection = False
+
+    if selected_contract:
         # User clicked on a row in Contract Rankings by EV
         contract_str = selected_contract.get("Contract")
         declarer = selected_contract.get("Declarer")
         vul_state = selected_contract.get("Vul")
         
         # Convert contract_str (e.g. "3NT") back to level/strain for column lookup
-        inv_strains = {'NT': 'N', '♠': 'S', '♥': 'H', '♦': 'D', '♣': 'C'}
+        inv_strains = {'NT': 'N', 'S': 'S', 'H': 'H', 'D': 'D', 'C': 'C'}
         level = contract_str[0] if contract_str else ""
         strain_alias = contract_str[1:] if contract_str and len(contract_str) > 1 else ""
         strain = inv_strains.get(strain_alias, strain_alias)
@@ -2837,7 +2888,7 @@ def render_rank_by_ev():
         score_col = f"DD_Score_{level}{strain}_{declarer}"
         
         # Convert contract to bid format for filtering
-        # e.g., "1NT" -> "1N", "4♠" -> "4S"
+        # e.g., "1NT" -> "1N", "4S" -> "4S"
         expected_bid = f"{level}{strain}"
         
         # Get deal indices that matched this bid's criteria (O(1) lookup)
@@ -2860,25 +2911,25 @@ def render_rank_by_ev():
         #   - If Dealer=N, then N opens 1N → N would declare 1NT
         #   - If Dealer=S, then S opens 1N → S would declare 1NT
         
-        # Filter deals: 
-        # 1. Deal index must be in valid_indices (matched this bid's criteria)
-        # 2. Dealer must match the clicked declarer (for opening bids)
-        # 3. Vulnerability must match
-        # 4. DD_Score column must be non-null
+        # Filter deals to match the same population used for the aggregated
+        # Contract Rankings by EV row:
+        # - vulnerability subset for the declarer's side (NV vs V)
+        # - deals must have a non-null DD_Score for the selected contract when available
+        #
+        # IMPORTANT: do NOT filter by Dealer here. For non-opening auctions the declarer
+        # is not necessarily the dealer, and the backend aggregation does not filter by Dealer.
         new_filtered = []
         for d in dd_deals:
-            idx = d.get("index")
-            bid_ok = idx in valid_indices if valid_indices else True  # Fallback if no matched_by_bid
-            dealer_ok = d.get("Dealer") == declarer  # Opener (dealer) must match declarer
             vul_ok = d.get("Vul") in target_vuls
-            score_ok = d.get(score_col) is not None
+            # If the score column isn't present in the sampled dd_deals (e.g. include_scores=False),
+            # we can't filter on it; otherwise require non-null.
+            score_ok = (d.get(score_col) is not None) if score_col in d else True
             
-            if bid_ok and dealer_ok and vul_ok and score_ok:
+            if vul_ok and score_ok:
                 new_filtered.append(d)
         
         filtered_deals = new_filtered
-        bid_filter_msg = f", bid={expected_bid}, dealer={declarer}" if valid_indices else ""
-        selection_msg = f" (Stats for {level}{strain_alias} by {declarer} ({vul_state}){bid_filter_msg})"
+        selection_msg = f" (Stats for {level}{strain_alias} by {declarer} ({vul_state}))"
     
     if filtered_deals and has_selection:
         st.subheader(f"📈 Deal Data ({len(filtered_deals)} deals){selection_msg}")
@@ -2988,7 +3039,32 @@ def render_rank_by_ev():
     elif has_selection:
         st.info(f"No matching deals found for the selection{selection_msg}.")
     else:
-        st.info("Click a row in 'Next Bid Rankings' or 'Contract Rankings by EV' to see matched deals.")
+        st.info("Click a row in 'Contract Rankings by EV' to see matched deals (defaults to the first row).")
+
+    # -------------------------------------------------------------------------
+    # Par Contract Statistics (Sacrifices, Sets, etc.)  [LAST]
+    # -------------------------------------------------------------------------
+    par_contract_stats = data.get("par_contract_stats", [])
+    if par_contract_stats:
+        st.subheader("📊 Par Contract Breakdown")
+        st.markdown("*Distribution of par results split by vulnerability (NV vs V)*")
+
+        par_stats_df = pl.DataFrame(par_contract_stats)
+        display_cols = ["category", "count", "pct", "count_nv", "avg_nv", "ev_nv", "count_v", "avg_v", "ev_v"]
+        col_aliases = {
+            "category": "Category",
+            "count": "Total",
+            "pct": "%",
+            "count_nv": "# NV",
+            "avg_nv": "Par NV",
+            "ev_nv": "EV NV",
+            "count_v": "# V",
+            "avg_v": "Par V",
+            "ev_v": "EV V",
+        }
+        par_stats_df = par_stats_df.select([c for c in display_cols if c in par_stats_df.columns])
+        par_stats_df = par_stats_df.rename({c: col_aliases.get(c, c) for c in par_stats_df.columns if c in col_aliases})
+        render_aggrid(par_stats_df, key="dd_analysis_par_stats", height=calc_grid_height(len(par_stats_df), max_height=350), table_name="par_stats")
 
 
 # ---------------------------------------------------------------------------

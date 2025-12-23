@@ -3508,7 +3508,7 @@ def _compute_contract_recommendations(
     For DD Score columns, a contract "makes" if the score is >= 0.
     """
     contract_recommendations: List[Dict[str, Any]] = []
-    strain_names = {'N': 'NT', 'S': '♠', 'H': '♥', 'D': '♦', 'C': '♣'}
+    strain_names = {'N': 'NT', 'S': 'S', 'H': 'H', 'D': 'D', 'C': 'C'}
     
     # Compute average ParScore once for the whole dataset
     avg_par_score = None
@@ -3585,6 +3585,9 @@ def _compute_contract_recommendations(
                             nv_vuls = ["None", "E_W"]
                             v_vuls = ["N_S", "Both"]
                         else:
+                            # For E/W declarers, vulnerability is determined by whether E/W is vulnerable
+                            # NV: None or N_S (E/W not vulnerable)
+                            # V:  E_W or Both (E/W vulnerable)
                             nv_vuls = ["None", "N_S"]
                             v_vuls = ["E_W", "Both"]
                             
@@ -4509,11 +4512,28 @@ def handle_rank_bids_by_ev(
             # Actually, for Makes %, we need to filter matched_df by Vul first
             # to get correct pct for NV and V combinations.
             
-            nv_mask = matched_df["Vul"].is_in(["None", "E_W"])
-            v_mask = matched_df["Vul"].is_in(["N_S", "Both"])
-            
-            nv_matched_df = matched_df.filter(nv_mask)
-            v_matched_df = matched_df.filter(v_mask)
+            # Precompute per-seat vulnerability masks (NV/V depends on declarer's side)
+            # NS declarer: NV if Vul in [None, E_W], V if Vul in [N_S, Both]
+            # EW declarer: NV if Vul in [None, N_S], V if Vul in [E_W, Both]
+            vul_series = matched_df["Vul"] if "Vul" in matched_df.columns else None
+            seat_nv_mask: Dict[int, Optional[pl.Series]] = {}
+            seat_v_mask: Dict[int, Optional[pl.Series]] = {}
+            if vul_series is not None:
+                ns_nv = vul_series.is_in(["None", "E_W"])
+                ns_v = vul_series.is_in(["N_S", "Both"])
+                ew_nv = vul_series.is_in(["None", "N_S"])
+                ew_v = vul_series.is_in(["E_W", "Both"])
+                for seat, decl in seat_to_declarer.items():
+                    if decl in ["N", "S"]:
+                        seat_nv_mask[seat] = ns_nv
+                        seat_v_mask[seat] = ns_v
+                    else:
+                        seat_nv_mask[seat] = ew_nv
+                        seat_v_mask[seat] = ew_v
+            else:
+                for seat in seat_to_declarer:
+                    seat_nv_mask[seat] = None
+                    seat_v_mask[seat] = None
             
             for level in range(1, 8):
                 for strain in ["C", "D", "H", "S", "N"]:
@@ -4534,35 +4554,53 @@ def handle_rank_bids_by_ev(
                             ev_all_combos[ev_key] = None
                             ev_all_combos[makes_key] = None
             
-            # 1. Compute EV means (vectorized)
-            existing_ev_cols = [c for c in ev_col_mapping.keys() if c in matched_df.columns]
-            if existing_ev_cols:
-                means_df = matched_df.select([pl.col(c).mean().alias(c) for c in existing_ev_cols])
-                means_row = means_df.row(0, named=True)
-                for ev_col, mean_val in means_row.items():
-                    if mean_val is not None:
-                        ev_all_combos[ev_col_mapping[ev_col]] = round(float(mean_val), 1)
-            
-            # 2. Compute Makes % (vectorized per vulnerability)
-            for vul_state, vul_df in [("NV", nv_matched_df), ("V", v_matched_df)]:
-                if vul_df.height == 0: continue
-                
-                existing_dd_cols = []
-                dd_col_to_key = {}
-                for (dd_col, v_st), key in makes_col_mapping.items():
-                    if v_st == vul_state and dd_col in vul_df.columns:
-                        existing_dd_cols.append(dd_col)
-                        dd_col_to_key[dd_col] = key
-                
-                if existing_dd_cols:
-                    # Makes % = (DD_Score >= 0).mean() * 100
-                    makes_df = vul_df.select([
-                        (pl.col(c) >= 0).mean().alias(c) for c in existing_dd_cols
-                    ])
-                    makes_row = makes_df.row(0, named=True)
-                    for dd_col, pct_val in makes_row.items():
-                        if pct_val is not None:
-                            ev_all_combos[dd_col_to_key[dd_col]] = round(float(pct_val) * 100, 1)
+            # 1) Compute EV means with correct declarer-vulnerability subsetting
+            # For each seat and vul_state, filter deals to those where that seat's side is NV/V.
+            for seat in [1, 2, 3, 4]:
+                decl = seat_to_declarer[seat]
+                pair = "NS" if decl in ["N", "S"] else "EW"
+                for vul_state in ["NV", "V"]:
+                    m = seat_nv_mask.get(seat) if vul_state == "NV" else seat_v_mask.get(seat)
+                    seat_df = matched_df if m is None else matched_df.filter(m)
+                    if seat_df.height == 0:
+                        continue
+                    ev_cols = []
+                    ev_col_to_key: Dict[str, str] = {}
+                    for level in range(1, 8):
+                        for strain in ["C", "D", "H", "S", "N"]:
+                            ev_col = f"EV_{pair}_{decl}_{strain}_{level}_{vul_state}"
+                            if ev_col in seat_df.columns:
+                                ev_cols.append(ev_col)
+                                ev_col_to_key[ev_col] = f"EV_Score_{level}{strain}_{vul_state}_S{seat}"
+                    if ev_cols:
+                        means_df = seat_df.select([pl.col(c).mean().alias(c) for c in ev_cols])
+                        means_row = means_df.row(0, named=True)
+                        for ev_col, mean_val in means_row.items():
+                            if mean_val is not None:
+                                ev_all_combos[ev_col_to_key[ev_col]] = round(float(mean_val), 1)
+
+            # 2) Compute Makes % with correct declarer-vulnerability subsetting
+            for seat in [1, 2, 3, 4]:
+                decl = seat_to_declarer[seat]
+                for vul_state in ["NV", "V"]:
+                    m = seat_nv_mask.get(seat) if vul_state == "NV" else seat_v_mask.get(seat)
+                    seat_df = matched_df if m is None else matched_df.filter(m)
+                    if seat_df.height == 0:
+                        continue
+                    dd_cols = []
+                    dd_col_to_key: Dict[str, str] = {}
+                    for level in range(1, 8):
+                        for strain in ["C", "D", "H", "S", "N"]:
+                            dd_col = f"DD_Score_{level}{strain}_{decl}"
+                            if dd_col in seat_df.columns:
+                                dd_cols.append(dd_col)
+                                dd_col_to_key[dd_col] = f"Makes_Pct_{level}{strain}_{vul_state}_S{seat}"
+                    if dd_cols:
+                        makes_df = seat_df.select([(pl.col(c) >= 0).mean().alias(c) for c in dd_cols])
+                        makes_row = makes_df.row(0, named=True)
+                        for dd_col, pct_val in makes_row.items():
+                            if pct_val is not None:
+                                ev_all_combos[dd_col_to_key[dd_col]] = round(float(pct_val) * 100, 1)
         
         bid_ranking_entry = {
             "bid": bid_name,
@@ -4831,5 +4869,174 @@ def handle_rank_bids_by_ev(
         "total_matches": total_matches,
         "returned_count": len(dd_data),
         "vul_breakdown": vul_breakdown,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def handle_contract_ev_deals(
+    state: Dict[str, Any],
+    auction: str,
+    next_bid: str,
+    contract: str,
+    declarer: str,
+    vul: str,
+    max_deals: int,
+    seed: Optional[int],
+    include_hands: bool = True,
+) -> Dict[str, Any]:
+    """Return deal rows matching (auction prefix + selected next bid) AND a specific contract EV row.
+
+    This is used to populate the Streamlit table under "Contract EV Rankings".
+    It returns only the deal columns needed for display + the single EV/DD columns for the selected contract.
+    """
+    t0 = time.perf_counter()
+    deal_df = state["deal_df"]
+    bt_seat1_df = state.get("bt_seat1_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs") or {}
+
+    if bt_seat1_df is None:
+        raise ValueError("bt_seat1_df not loaded")
+
+    auction_input = (auction or "").strip()
+
+    # Match the same BT lookup semantics as handle_rank_bids_by_ev
+    expected_passes = _count_leading_passes(auction_input)
+    auction_for_lookup = auction_input.rstrip("-") if auction_input else ""
+    auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
+    is_passes_only = not auction_normalized or auction_normalized.lower() in ("p", "")
+
+    bt_row: Optional[Dict[str, Any]] = None
+
+    if not auction_input:
+        # Opening bids: bt rows are directly selectable by is_opening_bid + candidate_bid
+        open_df = bt_seat1_df.filter(pl.col("is_opening_bid"))
+        if "candidate_bid" not in open_df.columns:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+        bid_df = open_df.filter(pl.col("candidate_bid") == next_bid)
+        if bid_df.height == 0:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+        bt_row = bid_df.row(0, named=True)
+    else:
+        # Find the parent BT row for this auction prefix (including pass-only prefixes)
+        if is_passes_only and expected_passes > 0:
+            pass_auction = "-".join(["p"] * expected_passes)
+            parent_matches = _find_bt_row_for_auction(bt_seat1_df, pass_auction)
+        else:
+            parent_matches = _find_bt_row_for_auction(bt_seat1_df, auction_for_lookup)
+
+        if parent_matches.height == 0:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+        parent_row = parent_matches.row(0, named=True)
+
+        # Find candidate row for the selected next bid using next_bid_indices (same as handle_rank_bids_by_ev)
+        next_indices = parent_row.get("next_bid_indices") or []
+        if not next_indices:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+        idx_df = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
+        if idx_df.height == 0:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+        if "candidate_bid" not in idx_df.columns:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+        next_bid_row_df = idx_df.filter(pl.col("candidate_bid") == next_bid)
+        if next_bid_row_df.height == 0:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+        bt_row = next_bid_row_df.row(0, named=True)
+
+    if bt_row is None:
+        return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+    opening_seat_mask = None
+    if "bid" in deal_df.columns:
+        if expected_passes == 0:
+            opening_seat_mask = ~deal_df["bid"].str.starts_with("p-")
+        else:
+            prefix = "p-" * expected_passes
+            not_extra_pass = ~deal_df["bid"].str.starts_with("p-" * (expected_passes + 1))
+            opening_seat_mask = deal_df["bid"].str.starts_with(prefix) & not_extra_pass
+
+    # Criteria mask for this bt_row
+    global_mask, _invalid = _build_criteria_mask_for_all_seats(deal_df, bt_row, deal_criteria_by_seat_dfs)
+    if global_mask is None or not global_mask.any():
+        return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+    if opening_seat_mask is not None:
+        global_mask = global_mask & opening_seat_mask
+        if not global_mask.any():
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+    matched_df = deal_df.filter(global_mask)
+    if matched_df.height == 0:
+        return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+    # Parse contract (supports "4H" and "3N")
+    contract = (contract or "").strip().upper()
+    if len(contract) < 2 or not contract[0].isdigit():
+        return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+    level = contract[0]
+    strain = contract[1:]
+    if strain == "NT":
+        strain = "N"
+    if strain not in ["C", "D", "H", "S", "N"]:
+        # Standardize suit names to letters
+        inv = {"C": "C", "D": "D", "H": "H", "S": "S"}
+        strain = inv.get(strain, strain)
+
+    declarer = (declarer or "").strip().upper()
+    if declarer not in ["N", "E", "S", "W"]:
+        return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+    vul_state = (vul or "").strip().upper()
+    if vul_state not in ["NV", "V"]:
+        vul_state = "NV"
+
+    # Filter by declarer-side vulnerability subset
+    if "Vul" in matched_df.columns:
+        if declarer in ["N", "S"]:
+            nv_vuls = ["None", "E_W"]
+            v_vuls = ["N_S", "Both"]
+        else:
+            nv_vuls = ["None", "N_S"]
+            v_vuls = ["E_W", "Both"]
+        target_vuls = nv_vuls if vul_state == "NV" else v_vuls
+        matched_df = matched_df.filter(pl.col("Vul").is_in(target_vuls))
+
+    total_matches = matched_df.height
+    if total_matches == 0:
+        return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+    effective_seed = _effective_seed(seed)
+    if max_deals and total_matches > max_deals:
+        matched_df = matched_df.sample(n=max_deals, seed=effective_seed)
+
+    # Select minimal output columns + contract-specific DD/EV
+    out_cols = ["index", "Dealer", "Vul", "Vul_NS", "Vul_EW", "ParScore", "ParContracts"]
+    if include_hands:
+        out_cols.extend(["Hand_N", "Hand_E", "Hand_S", "Hand_W"])
+
+    dd_col = f"DD_Score_{level}{strain}_{declarer}"
+    if dd_col in matched_df.columns:
+        out_cols.append(dd_col)
+
+    pair = "NS" if declarer in ["N", "S"] else "EW"
+    ev_col = f"EV_{pair}_{declarer}_{strain}_{level}_{vul_state}"
+    if ev_col in matched_df.columns:
+        out_cols.append(ev_col)
+
+    out_df = matched_df.select([c for c in out_cols if c in matched_df.columns])
+    deals = out_df.to_dicts()
+    for row in deals:
+        if "ParContracts" in row:
+            row["ParContracts"] = _format_par_contracts(row["ParContracts"])
+        row["DD_Score"] = row.get(dd_col)
+        row["EV_Score"] = row.get(ev_col)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "deals": deals,
+        "total_matches": int(total_matches),
+        "returned_count": int(len(deals)),
         "elapsed_ms": round(elapsed_ms, 1),
     }
