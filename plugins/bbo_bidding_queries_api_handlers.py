@@ -4549,109 +4549,74 @@ def handle_rank_bids_by_ev(
             ev_std_v = None
         
         # Compute EV and Makes % for all level-strain-vul-seat combinations (560 columns)
-        # Seat mapping: S1=N, S2=E, S3=S, S4=W
-        # Use vectorized Polars operations for performance
+        # IMPORTANT: S1..S4 are SEATS RELATIVE TO DEALER (Seat 1 = Dealer), not fixed N/E/S/W.
+        # We must therefore compute the declarer direction per deal using (Dealer + Seat).
+        # Use vectorized Polars expressions for performance.
         ev_all_combos: Dict[str, Optional[float]] = {}
-        seat_to_declarer = {1: "N", 2: "E", 3: "S", 4: "W"}
         if matched_df.height > 0:
-            # Build mapping from source EV/DD column to output column key
-            ev_col_mapping: Dict[str, str] = {}  # ev_col -> col_key
-            makes_col_mapping: Dict[tuple[str, str], str] = {} # (dd_col, vul_state) -> col_key
-            
-            # Map vulnerability states to deal_df['Vul'] values
-            # (used for filtering inside select if we want per-vul makes pct)
-            # Actually, for Makes %, we need to filter matched_df by Vul first
-            # to get correct pct for NV and V combinations.
-            
-            # Precompute per-seat vulnerability masks (NV/V depends on declarer's side)
-            # NS declarer: NV if Vul in [None, E_W], V if Vul in [N_S, Both]
-            # EW declarer: NV if Vul in [None, N_S], V if Vul in [E_W, Both]
-            vul_series = matched_df["Vul"] if "Vul" in matched_df.columns else None
-            seat_nv_mask: Dict[int, Optional[pl.Series]] = {}
-            seat_v_mask: Dict[int, Optional[pl.Series]] = {}
-            if vul_series is not None:
-                ns_nv = vul_series.is_in(["None", "E_W"])
-                ns_v = vul_series.is_in(["N_S", "Both"])
-                ew_nv = vul_series.is_in(["None", "N_S"])
-                ew_v = vul_series.is_in(["E_W", "Both"])
-                for seat, decl in seat_to_declarer.items():
-                    if decl in ["N", "S"]:
-                        seat_nv_mask[seat] = ns_nv
-                        seat_v_mask[seat] = ns_v
-                    else:
-                        seat_nv_mask[seat] = ew_nv
-                        seat_v_mask[seat] = ew_v
-            else:
-                for seat in seat_to_declarer:
-                    seat_nv_mask[seat] = None
-                    seat_v_mask[seat] = None
-            
+            # Initialize keys to None for stable schema
             for level in range(1, 8):
                 for strain in ["C", "D", "H", "S", "N"]:
-                    for vul in ["NV", "V"]:
+                    for vul_state in ["NV", "V"]:
                         for seat in [1, 2, 3, 4]:
-                            declarer = seat_to_declarer[seat]
-                            pair = "NS" if declarer in ["N", "S"] else "EW"
-                            
-                            ev_key = f"EV_Score_{level}{strain}_{vul}_S{seat}"
-                            makes_key = f"Makes_Pct_{level}{strain}_{vul}_S{seat}"
-                            
-                            ev_col = f"EV_{pair}_{declarer}_{strain}_{level}_{vul}"
-                            dd_col = f"DD_Score_{level}{strain}_{declarer}"
-                            
-                            ev_col_mapping[ev_col] = ev_key
-                            makes_col_mapping[(dd_col, vul)] = makes_key
-                            
-                            ev_all_combos[ev_key] = None
-                            ev_all_combos[makes_key] = None
-            
-            # 1) Compute EV means with correct declarer-vulnerability subsetting
-            # For each seat and vul_state, filter deals to those where that seat's side is NV/V.
-            for seat in [1, 2, 3, 4]:
-                decl = seat_to_declarer[seat]
-                pair = "NS" if decl in ["N", "S"] else "EW"
-                for vul_state in ["NV", "V"]:
-                    m = seat_nv_mask.get(seat) if vul_state == "NV" else seat_v_mask.get(seat)
-                    seat_df = matched_df if m is None else matched_df.filter(m)
-                    if seat_df.height == 0:
-                        continue
-                    ev_cols = []
-                    ev_col_to_key: Dict[str, str] = {}
-                    for level in range(1, 8):
-                        for strain in ["C", "D", "H", "S", "N"]:
-                            ev_col = f"EV_{pair}_{decl}_{strain}_{level}_{vul_state}"
-                            if ev_col in seat_df.columns:
-                                ev_cols.append(ev_col)
-                                ev_col_to_key[ev_col] = f"EV_Score_{level}{strain}_{vul_state}_S{seat}"
-                    if ev_cols:
-                        means_df = seat_df.select([pl.col(c).mean().alias(c) for c in ev_cols])
-                        means_row = means_df.row(0, named=True)
-                        for ev_col, mean_val in means_row.items():
-                            if mean_val is not None:
-                                ev_all_combos[ev_col_to_key[ev_col]] = round(float(mean_val), 1)
+                            ev_all_combos[f"EV_Score_{level}{strain}_{vul_state}_S{seat}"] = None
+                            ev_all_combos[f"Makes_Pct_{level}{strain}_{vul_state}_S{seat}"] = None
 
-            # 2) Compute Makes % with correct declarer-vulnerability subsetting
-            for seat in [1, 2, 3, 4]:
-                decl = seat_to_declarer[seat]
-                for vul_state in ["NV", "V"]:
-                    m = seat_nv_mask.get(seat) if vul_state == "NV" else seat_v_mask.get(seat)
-                    seat_df = matched_df if m is None else matched_df.filter(m)
-                    if seat_df.height == 0:
-                        continue
-                    dd_cols = []
-                    dd_col_to_key: Dict[str, str] = {}
-                    for level in range(1, 8):
-                        for strain in ["C", "D", "H", "S", "N"]:
-                            dd_col = f"DD_Score_{level}{strain}_{decl}"
-                            if dd_col in seat_df.columns:
-                                dd_cols.append(dd_col)
-                                dd_col_to_key[dd_col] = f"Makes_Pct_{level}{strain}_{vul_state}_S{seat}"
-                    if dd_cols:
-                        makes_df = seat_df.select([(pl.col(c) >= 0).mean().alias(c) for c in dd_cols])
-                        makes_row = makes_df.row(0, named=True)
-                        for dd_col, pct_val in makes_row.items():
-                            if pct_val is not None:
-                                ev_all_combos[dd_col_to_key[dd_col]] = round(float(pct_val) * 100, 1)
+            if "Dealer" in matched_df.columns and "Vul" in matched_df.columns:
+                for seat in [1, 2, 3, 4]:
+                    dealer_to_decl = _seat_direction_map(seat)
+                    seat_df0 = matched_df.with_columns(
+                        pl.col("Dealer").replace(dealer_to_decl).alias("_DeclDir")
+                    )
+
+                    is_decl_ns = pl.col("_DeclDir").is_in(["N", "S"])
+                    is_vul_expr = pl.when(is_decl_ns).then(pl.col("Vul").is_in(["N_S", "Both"])) \
+                                    .otherwise(pl.col("Vul").is_in(["E_W", "Both"]))
+
+                    for vul_state in ["NV", "V"]:
+                        seat_df = seat_df0.filter(is_vul_expr if vul_state == "V" else ~is_vul_expr)
+                        if seat_df.height == 0:
+                            continue
+
+                        exprs: List[pl.Expr] = []
+                        for level in range(1, 8):
+                            for strain in ["C", "D", "H", "S", "N"]:
+                                ev_key = f"EV_Score_{level}{strain}_{vul_state}_S{seat}"
+                                makes_key = f"Makes_Pct_{level}{strain}_{vul_state}_S{seat}"
+
+                                # EV: pick correct EV column per-deal based on _DeclDir, then mean
+                                w_ev = None
+                                for d in ["N", "E", "S", "W"]:
+                                    pair = "NS" if d in ["N", "S"] else "EW"
+                                    col = f"EV_{pair}_{d}_{strain}_{level}_{vul_state}"
+                                    if col in seat_df.columns:
+                                        if w_ev is None:
+                                            w_ev = pl.when(pl.col("_DeclDir") == d).then(pl.col(col))
+                                        else:
+                                            w_ev = w_ev.when(pl.col("_DeclDir") == d).then(pl.col(col))
+                                if w_ev is not None:
+                                    exprs.append(w_ev.otherwise(None).mean().alias(ev_key))
+
+                                # Makes %: pick correct DD_Score per-deal based on _DeclDir, then mean(made)*100
+                                w_dd = None
+                                for d in ["N", "E", "S", "W"]:
+                                    col = f"DD_Score_{level}{strain}_{d}"
+                                    if col in seat_df.columns:
+                                        if w_dd is None:
+                                            w_dd = pl.when(pl.col("_DeclDir") == d).then(pl.col(col))
+                                        else:
+                                            w_dd = w_dd.when(pl.col("_DeclDir") == d).then(pl.col(col))
+                                if w_dd is not None:
+                                    exprs.append(((w_dd.otherwise(None) >= 0).mean() * 100).alias(makes_key))
+
+                        if exprs:
+                            row = seat_df.select(exprs).row(0, named=True)
+                            for k, v in row.items():
+                                if v is not None:
+                                    if k.startswith("EV_Score_"):
+                                        ev_all_combos[k] = round(float(v), 1)
+                                    else:
+                                        ev_all_combos[k] = round(float(v), 1)
         
         # Store large EV/Makes blob once per bid (used by Streamlit "Contract EV Rankings")
         ev_all_combos_by_bid[bid_name] = ev_all_combos
@@ -4946,6 +4911,7 @@ def handle_contract_ev_deals(
     next_bid: str,
     contract: str,
     declarer: str,
+    seat: Optional[int],
     vul: str,
     max_deals: int,
     seed: Optional[int],
@@ -5052,7 +5018,15 @@ def handle_contract_ev_deals(
         strain = inv.get(strain, strain)
 
     declarer = (declarer or "").strip().upper()
-    if declarer not in ["N", "E", "S", "W"]:
+    seat_i: Optional[int] = None
+    try:
+        if seat is not None:
+            seat_i = max(1, min(4, int(seat)))
+    except Exception:
+        seat_i = None
+
+    # For backwards compatibility, if seat is not provided, require declarer direction.
+    if seat_i is None and declarer not in ["N", "E", "S", "W"]:
         return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
     vul_state = (vul or "").strip().upper()
@@ -5061,14 +5035,25 @@ def handle_contract_ev_deals(
 
     # Filter by declarer-side vulnerability subset
     if "Vul" in matched_df.columns:
-        if declarer in ["N", "S"]:
-            nv_vuls = ["None", "E_W"]
-            v_vuls = ["N_S", "Both"]
+        if seat_i is None:
+            # Legacy: declarer is fixed direction for all sampled deals
+            if declarer in ["N", "S"]:
+                nv_vuls = ["None", "E_W"]
+                v_vuls = ["N_S", "Both"]
+            else:
+                nv_vuls = ["None", "N_S"]
+                v_vuls = ["E_W", "Both"]
+            target_vuls = nv_vuls if vul_state == "NV" else v_vuls
+            matched_df = matched_df.filter(pl.col("Vul").is_in(target_vuls))
         else:
-            nv_vuls = ["None", "N_S"]
-            v_vuls = ["E_W", "Both"]
-        target_vuls = nv_vuls if vul_state == "NV" else v_vuls
-        matched_df = matched_df.filter(pl.col("Vul").is_in(target_vuls))
+            # Seat-relative: declarer direction varies per deal based on Dealer + seat number
+            dealer_to_decl = _seat_direction_map(seat_i)
+            decl_expr = pl.col("Dealer").replace(dealer_to_decl).alias("_DeclDir")
+            is_decl_ns = pl.col("_DeclDir").is_in(["N", "S"])
+            is_vul_expr = pl.when(is_decl_ns).then(pl.col("Vul").is_in(["N_S", "Both"])) \
+                            .otherwise(pl.col("Vul").is_in(["E_W", "Both"]))
+            matched_df = matched_df.with_columns(decl_expr)
+            matched_df = matched_df.filter(is_vul_expr if vul_state == "V" else ~is_vul_expr)
 
     total_matches = matched_df.height
     if total_matches == 0:
@@ -5084,19 +5069,53 @@ def handle_contract_ev_deals(
         out_cols.extend(["Hand_N", "Hand_E", "Hand_S", "Hand_W"])
 
     dd_col = f"DD_Score_{level}{strain}_{declarer}"
-    if dd_col in matched_df.columns:
-        out_cols.append(dd_col)
-
     pair = "NS" if declarer in ["N", "S"] else "EW"
     ev_col = f"EV_{pair}_{declarer}_{strain}_{level}_{vul_state}"
-    if ev_col in matched_df.columns:
-        out_cols.append(ev_col)
+
+    # Seat-relative: compute DD_<contract> and EV_<contract> by selecting direction per deal.
+    if seat_i is not None:
+        # Ensure _DeclDir exists (we added it above when filtering by vul; add if not present)
+        if "_DeclDir" not in matched_df.columns:
+            matched_df = matched_df.with_columns(pl.col("Dealer").replace(_seat_direction_map(seat_i)).alias("_DeclDir"))
+
+        # DD per deal: pick correct DD_Score_{contract}_{dir}
+        dd_expr = None
+        for d in ["N", "E", "S", "W"]:
+            c = f"DD_Score_{level}{strain}_{d}"
+            if c in matched_df.columns:
+                e = pl.when(pl.col("_DeclDir") == d).then(pl.col(c))
+                dd_expr = e if dd_expr is None else dd_expr.when(pl.col("_DeclDir") == d).then(pl.col(c))
+        if dd_expr is not None:
+            dd_expr = dd_expr.otherwise(None).alias(f"DD_{level}{strain}")
+            matched_df = matched_df.with_columns(dd_expr)
+
+        # EV per deal: pick correct EV_{pair}_{dir}_{strain}_{level}_{vul_state}
+        ev_expr = None
+        for d in ["N", "E", "S", "W"]:
+            pair_d = "NS" if d in ["N", "S"] else "EW"
+            c = f"EV_{pair_d}_{d}_{strain}_{level}_{vul_state}"
+            if c in matched_df.columns:
+                e = pl.when(pl.col("_DeclDir") == d).then(pl.col(c))
+                ev_expr = e if ev_expr is None else ev_expr.when(pl.col("_DeclDir") == d).then(pl.col(c))
+        if ev_expr is not None:
+            ev_expr = ev_expr.otherwise(None).alias(f"EV_{level}{strain}")
+            matched_df = matched_df.with_columns(ev_expr)
+
+        # Add derived columns to output
+        out_cols.extend([f"DD_{level}{strain}", f"EV_{level}{strain}"])
+    else:
+        # Legacy: include direction-specific raw columns and also DD_Score / EV_Score aliases
+        if dd_col in matched_df.columns:
+            out_cols.append(dd_col)
+        if ev_col in matched_df.columns:
+            out_cols.append(ev_col)
 
     out_df = matched_df.select([c for c in out_cols if c in matched_df.columns])
     deals = out_df.to_dicts()
     for row in deals:
         if "ParContracts" in row:
             row["ParContracts"] = _format_par_contracts(row["ParContracts"])
+        # Keep legacy aliases for other UI surfaces
         row["DD_Score"] = row.get(dd_col)
         row["EV_Score"] = row.get(ev_col)
 

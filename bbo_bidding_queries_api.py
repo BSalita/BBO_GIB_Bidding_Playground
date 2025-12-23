@@ -701,6 +701,7 @@ class ContractEVDealsRequest(BaseModel):
     next_bid: str              # Bid from Next Bid Rankings (e.g. "4N")
     contract: str              # Contract string (e.g. "4H", "3N")
     declarer: str              # N/E/S/W
+    seat: Optional[int] = None # Optional seat number 1-4 (relative to Dealer). If provided, server computes per-deal declarer direction from seat.
     vul: str                   # NV or V
     max_deals: int = 500
     seed: Optional[int] = 0
@@ -2013,6 +2014,7 @@ def contract_ev_deals(req: ContractEVDealsRequest) -> Dict[str, Any]:
             next_bid=req.next_bid,
             contract=req.contract,
             declarer=req.declarer,
+            seat=req.seat,
             vul=req.vul,
             max_deals=req.max_deals,
             seed=req.seed,

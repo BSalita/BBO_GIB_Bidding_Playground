@@ -696,6 +696,7 @@ def render_aggrid(
     table_name: str | None = None,
     update_mode: GridUpdateMode = GridUpdateMode.NO_UPDATE,
     sort_model: list[dict[str, Any]] | None = None,
+    hide_cols: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
     
@@ -799,6 +800,12 @@ def render_aggrid(
                 "Frequency" in c or "%" in c]
     for col in pct_cols:
         gb.configure_column(col, valueFormatter="x !== null ? x.toFixed(1) + '%' : ''")
+
+    # Optionally hide helper columns (e.g., sort keys)
+    if hide_cols:
+        for c in hide_cols:
+            if c in df.columns:
+                gb.configure_column(c, hide=True)
         
     # Enable row selection - clicking anywhere on a row highlights the entire row
     gb.configure_selection(selection_mode="single", use_checkbox=False, suppressRowClickSelection=False)
@@ -2598,7 +2605,7 @@ def render_rank_by_ev():
             ("next_seat", "Seat"),
             ("vul", "Vul"),
             ("match_count", "Matches"),
-            ("avg_par", "Avg Par"),
+            ("avg_par", "Avg Par Contract"),
             ("ev_score", "EV at Bid"),
             ("ev_std", "EV Std"),
         ]
@@ -2638,6 +2645,19 @@ def render_rank_by_ev():
         # Contract EV Rankings (for selected next bid only)
         # ---------------------------------------------------------------------
         if selected_bid_name:
+            # Seat number (1-4) from the clicked row; used to filter contract table to that seat only.
+            selected_next_seat = None
+            try:
+                if selected_bid_rows is not None and len(selected_bid_rows) > 0 and selected_bid is not None:
+                    seat_raw = selected_bid.get("Seat")
+                    selected_next_seat = int(seat_raw) if seat_raw is not None else None
+                if selected_next_seat is None:
+                    # Fallback to raw API key if we fell back to the first row
+                    seat_raw = selected_bid.get("next_seat") if selected_bid else None
+                    selected_next_seat = int(seat_raw) if seat_raw is not None else None
+            except Exception:
+                selected_next_seat = None
+
             # Show which next-bid auction is being used for this contract table
             selected_bid_auction = None
             if selected_bid_rows is not None and len(selected_bid_rows) > 0:
@@ -2653,15 +2673,20 @@ def render_rank_by_ev():
             bid_match_n = original_row_for_title.get("match_total") if original_row_for_title else None
             n_val = f"{int(bid_match_n):,}" if isinstance(bid_match_n, (int, float)) else "?"
 
-            st.subheader(f"🥇 Best scoring contracts for deals matching auction: {selected_bid_auction}?")
+            seat_suffix = f" (Seat {selected_next_seat})" if isinstance(selected_next_seat, int) else ""
+            st.subheader(f"🥇 Best scoring contracts for deals matching auction: {selected_bid_auction}{seat_suffix}")
             st.caption(f"Expected Value (EV) for all possible final contracts, computed from the {n_val} deals that matched this specific auction.")
             
             # Extract EV_Score_ and Makes_Pct_ columns from the separate per-bid blob.
             ev_blob = (data.get("ev_all_combos_by_bid") or {}).get(selected_bid_name)
             if ev_blob:
+                # Get the two rows for this bid (NV and V) from bid_rankings to extract their Avg Par Contract
+                rows_for_bid = [r for r in bid_rankings if r.get("bid") == selected_bid_name]
+                avg_par_map = {r.get("vul"): r.get("avg_par") for r in rows_for_bid}
+
                 ev_data = []
                 strain_names = {'N': 'NT', 'S': 'S', 'H': 'H', 'D': 'D', 'C': 'C'}
-                seat_names = {1: 'N', 2: 'E', 3: 'S', 4: 'W'}
+                # Seat numbers are relative to dealer (Seat 1 = Dealer)
                 
                 # First collect all available EV scores
                 for k, v in ev_blob.items():
@@ -2677,22 +2702,25 @@ def render_rank_by_ev():
                             level = contract_part[0]
                             strain = contract_part[1:]
                             seat_num = int(seat_part[1:])
+
+                            # IMPORTANT: Filter this table to the seat of the clicked bid row.
+                            if isinstance(selected_next_seat, int) and seat_num != selected_next_seat:
+                                continue
                             
                             strain_display = strain_names.get(strain, strain)
-                            seat_display = seat_names.get(seat_num, seat_part)
-                            
                             # Look up corresponding Makes %
                             makes_key = f"Makes_Pct_{contract_part}_{vul_part}_{seat_part}"
                             makes_pct = ev_blob.get(makes_key)
                             
                             ev_data.append({
                                 "Contract": f"{level}{strain_display}",
-                                "Declarer": seat_display,
+                                "Seat": seat_num,
                                 "Vul": vul_part,
-                                "EV": round(float(v), 1),
+                                "Avg Par Contract": avg_par_map.get(vul_part),
+                                "EV at Bid": round(float(v), 1),
                                 "Makes %": round(float(makes_pct), 1) if makes_pct is not None else None,
                                 "_level": int(level),
-                                "_strain": strain
+                                "_strain": strain,
                             })
                 
                 if ev_data:
@@ -2711,8 +2739,9 @@ def render_rank_by_ev():
                     )
                     
                     # Sort and select columns for display
-                    ev_df = ev_df.sort("EV", descending=True)
-                    display_cols = ["Contract", "Declarer", "Vul", "Type", "EV", "Makes %"]
+                    ev_df = ev_df.sort("EV at Bid", descending=True)
+                    # Keep _level/_strain only for internal use (hidden in AgGrid)
+                    display_cols = ["Contract", "Seat", "Vul", "Type", "Avg Par Contract", "EV at Bid", "Makes %", "_level", "_strain"]
                     ev_df = ev_df.select([c for c in display_cols if c in ev_df.columns])
 
                     selected_contract_ev_rows = render_aggrid(
@@ -2721,6 +2750,7 @@ def render_rank_by_ev():
                         height=400,
                         table_name="top_ev",
                         update_mode=GridUpdateMode.SELECTION_CHANGED,
+                        hide_cols=["_level", "_strain"]
                     )
                     selected_contract_ev = selected_contract_ev_rows[0] if selected_contract_ev_rows else (ev_df.to_dicts()[0] if ev_df.height > 0 else None)
 
@@ -2730,7 +2760,7 @@ def render_rank_by_ev():
                     if selected_contract_ev:
                         inv_strains = {'NT': 'N', 'S': 'S', 'H': 'H', 'D': 'D', 'C': 'C'}
                         contract_str = selected_contract_ev.get("Contract")
-                        declarer = selected_contract_ev.get("Declarer")
+                        seat_num = selected_contract_ev.get("Seat")
                         vul_state = selected_contract_ev.get("Vul")
 
                         level = contract_str[0] if isinstance(contract_str, str) and contract_str else ""
@@ -2738,12 +2768,14 @@ def render_rank_by_ev():
                         strain = inv_strains.get(strain_alias, strain_alias)
                         contract_api = f"{level}{strain}" if level and strain else ""
 
-                        if contract_api and declarer and vul_state and selected_bid_name:
+                        if contract_api and vul_state and selected_bid_name:
                             deals_payload = {
                                 "auction": auction_input,
                                 "next_bid": selected_bid_name,
                                 "contract": contract_api,
-                                "declarer": declarer,
+                                # declarer is ignored when seat is provided (kept for backwards compatibility)
+                                "declarer": "N",
+                                "seat": int(seat_num) if isinstance(seat_num, (int, float)) else None,
                                 "vul": vul_state,
                                 "max_deals": int(max_deals),
                                 "seed": seed,
@@ -2756,14 +2788,42 @@ def render_rank_by_ev():
                                 total_m = int(deals_resp.get("total_matches", 0) or 0)
                                 shown = len(deals)
 
-                                st.subheader(f"📄 Deals matching auction: {selected_bid_auction} (Showing {shown:,} of {total_m:,})")
+                                seat_label = f"Seat {int(seat_num)}" if isinstance(seat_num, (int, float)) else "Seat ?"
+                                st.subheader(f"📄 Deals matching auction: {selected_bid_auction} ({seat_label}) (Showing {shown:,} of {total_m:,})")
                                 if deals:
                                     ddf = pl.DataFrame(deals)
                                     if not include_hands:
                                         drop_hand_cols = [c for c in ddf.columns if c.startswith("Hand_")]
                                         if drop_hand_cols:
                                             ddf = ddf.drop(drop_hand_cols)
-                                    render_aggrid(ddf, key=f"contract_ev_deals_{selected_bid_name}", height=calc_grid_height(len(ddf), max_height=450), table_name="contract_ev_deals")
+
+                                    # Drop legacy alias columns (seat-relative DD_*/EV_* are shown instead)
+                                    drop_legacy = [c for c in ["DD_Score", "EV_Score"] if c in ddf.columns]
+                                    if drop_legacy:
+                                        ddf = ddf.drop(drop_legacy)
+
+                                    # Ensure stable ordering: sort by global deal index ascending.
+                                    # (AgGrid can persist user sorting per-key; we also bust the key below.)
+                                    if "index" in ddf.columns:
+                                        try:
+                                            ddf = ddf.with_columns(pl.col("index").cast(pl.Int64, strict=False))
+                                        except Exception:
+                                            pass
+                                        try:
+                                            ddf = ddf.sort("index")
+                                        except Exception:
+                                            pass
+
+                                    # Seat-aware /contract-ev-deals already returns seat-relative DD_<contract> / EV_<contract>
+                                    # when "seat" is provided, so no additional renaming is required here.
+
+                                    render_aggrid(
+                                        ddf,
+                                        key=f"contract_ev_deals_{selected_bid_name}_{contract_api}_{seat_label}_{CACHE_VERSION}",
+                                        height=calc_grid_height(len(ddf), max_height=450),
+                                        table_name="contract_ev_deals",
+                                        sort_model=[{"colId": "index", "sort": "asc"}],
+                                    )
                                 else:
                                     st.info("No deals found for this selection.")
                             except Exception as e:
@@ -3012,8 +3072,25 @@ def render_rank_by_ev():
                 final_cols.append(c)
         
         dd_df = dd_df.select([c for c in final_cols if c in dd_df.columns])
+
+        # Ensure stable ordering: sort by global deal index ascending.
+        if "index" in dd_df.columns:
+            try:
+                dd_df = dd_df.with_columns(pl.col("index").cast(pl.Int64, strict=False))
+            except Exception:
+                pass
+            try:
+                dd_df = dd_df.sort("index")
+            except Exception:
+                pass
         
-        render_aggrid(dd_df, key="dd_analysis_results", height=400, table_name="dd_results")
+        render_aggrid(
+            dd_df,
+            key=f"dd_analysis_results_{CACHE_VERSION}",
+            height=400,
+            table_name="dd_results",
+            sort_model=[{"colId": "index", "sort": "asc"}],
+        )
     elif has_selection:
         st.info(f"No matching deals found for the selection{selection_msg}.")
     else:
