@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import polars as pl
 
-from bbo_bidding_queries_lib import normalize_auction_pattern
+from bbo_bidding_queries_lib import normalize_auction_pattern, normalize_auction_input, normalize_auction_user_text
 from mlBridgeLib.mlBridgeBiddingLib import DIRECTIONS
 
 # ===========================================================================
@@ -113,7 +113,7 @@ def normalize_to_seat1(pattern: str) -> str:
     """Normalize auction regex then strip any leading 'p-' prefixes (seat-1 view)."""
     if not pattern or not pattern.strip():
         return pattern
-    p = normalize_auction_pattern(pattern)
+    p = normalize_auction_user_text(pattern)
     # Strip leading p- (case-insensitive) after optional start anchor
     p = re.sub(r"(?i)^\^(p-)+", "^", p)
     p = re.sub(r"(?i)^(p-)+", "", p)
@@ -256,7 +256,9 @@ def count_leading_passes(auction: Any) -> int:
     if isinstance(auction, str):
         if not auction.strip():
             return 0
-        bids = [b.strip().lower() for b in auction.split("-")]
+        # Normalize separators (space/comma/dash) to canonical dash format
+        norm = normalize_auction_input(auction)
+        bids = [b.strip().lower() for b in norm.split("-")] if norm else []
     elif isinstance(auction, list):
         bids = [str(b).strip().lower() for b in auction]
     else:

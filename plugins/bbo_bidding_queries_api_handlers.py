@@ -20,7 +20,7 @@ import random
 import re
 import statistics
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 import duckdb  # pyright: ignore[reportMissingImports]
 import numpy as np
@@ -33,6 +33,8 @@ from endplay.dds import calc_dd_table, par
 from bbo_bidding_queries_lib import (
     calculate_imp,
     normalize_auction_pattern,
+    normalize_auction_input,
+    normalize_auction_user_text,
     get_ai_contract,
     get_dd_score_for_auction,
     get_ev_for_auction,
@@ -733,7 +735,7 @@ def handle_auction_sequences_matching(
         auction_expr = pl.col("Auction").cast(pl.Utf8).str.replace(r"(?i)^(p-)+", "")
     else:
         # Literal matching against raw Auction string.
-        pattern = normalize_auction_pattern(pattern)
+        pattern = normalize_auction_user_text(pattern)
         auction_expr = pl.col("Auction").cast(pl.Utf8)
     
     is_regex = pattern.startswith("^") or pattern.endswith("$")
@@ -1079,7 +1081,7 @@ def handle_deals_matching_auction(
         pattern = _normalize_to_seat1(pattern)
         auction_expr = pl.col("Auction").cast(pl.Utf8).str.replace(r"(?i)^(p-)+", "")
     else:
-        pattern = normalize_auction_pattern(pattern)
+        pattern = normalize_auction_user_text(pattern)
         auction_expr = pl.col("Auction").cast(pl.Utf8)
 
     regex_pattern = f"(?i){pattern}"
@@ -1362,10 +1364,11 @@ def handle_deals_matching_auction(
             dd_rules = deals_with_computed["DD_Score_Rules"].cast(pl.Int64, strict=False)
             par_score_col = deals_with_computed["ParScore"].cast(pl.Int64, strict=False)
             
-            auction_info["contract_makes_count"] = int((dd_actual >= 0).sum())
-            auction_info["rules_makes_count"] = int((dd_rules >= 0).sum())
-            auction_info["contract_par_count"] = int((dd_actual == par_score_col).sum())
-            auction_info["rules_par_count"] = int((dd_rules == par_score_col).sum())
+            # Polars stubs sometimes type these aggregations as Expr; cast via Any for type-checkers.
+            auction_info["contract_makes_count"] = int(cast(Any, (dd_actual >= 0).sum()))
+            auction_info["rules_makes_count"] = int(cast(Any, (dd_rules >= 0).sum()))
+            auction_info["contract_par_count"] = int(cast(Any, (dd_actual == par_score_col).sum()))
+            auction_info["rules_par_count"] = int(cast(Any, (dd_rules == par_score_col).sum()))
             
             if has_ev_contract:
                 ev_contract_mean = deals_with_computed["EV_Score_Declarer"].cast(pl.Float32, strict=False).mean()
@@ -1451,7 +1454,7 @@ def handle_bidding_table_statistics(
             auction_pattern = _normalize_to_seat1(auction_pattern)
             auction_expr = pl.col("Auction").cast(pl.Utf8).str.replace(r"(?i)^(p-)+", "")
         else:
-            auction_pattern = normalize_auction_pattern(auction_pattern)
+            auction_pattern = normalize_auction_user_text(auction_pattern)
             auction_expr = pl.col("Auction").cast(pl.Utf8)
         regex_pattern = f"(?i){auction_pattern}"
         matched_df = base_df.filter(auction_expr.str.contains(regex_pattern))
@@ -1947,7 +1950,7 @@ def handle_group_by_bid(
     if 'bid' not in deal_df.columns:
         raise ValueError("Column 'bid' not found in deal_df")
     
-    pattern = normalize_auction_pattern(auction_pattern)
+    pattern = normalize_auction_user_text(auction_pattern)
     
     try:
         # Add row index to track original position for bitmap lookups
@@ -2115,17 +2118,7 @@ LIMIT {n_auction_groups}"""
         })
     
     # Sort groups by number of leading passes (seat order: 1, 2, 3, 4)
-    def count_leading_passes(auction: str) -> int:
-        count = 0
-        parts = auction.lower().split("-")
-        for part in parts:
-            if part == "p":
-                count += 1
-            else:
-                break
-        return count
-    
-    auction_groups.sort(key=lambda g: count_leading_passes(g.get("auction", "")))
+    auction_groups.sort(key=lambda g: _count_leading_passes(g.get("auction", "")))
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
     total_deals_out = sum(g["sample_count"] for g in auction_groups)
@@ -2170,7 +2163,7 @@ def handle_wrong_bid_stats(
     # Filter deals by auction pattern if provided
     if auction_pattern:
         try:
-            regex_pattern = f"(?i){normalize_auction_pattern(auction_pattern)}"
+            regex_pattern = f"(?i){normalize_auction_user_text(auction_pattern)}"
             deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
@@ -2323,7 +2316,7 @@ def handle_failed_criteria_summary(
     # Filter deals by auction pattern if provided
     if auction_pattern:
         try:
-            regex_pattern = f"(?i){normalize_auction_pattern(auction_pattern)}"
+            regex_pattern = f"(?i){normalize_auction_user_text(auction_pattern)}"
             deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
@@ -2814,7 +2807,7 @@ def handle_bidding_arena(
     # Filter deals by auction pattern if provided (filters on ACTUAL auction)
     if auction_pattern:
         try:
-            regex_pattern = f"(?i){normalize_auction_pattern(auction_pattern)}"
+            regex_pattern = f"(?i){normalize_auction_user_text(auction_pattern)}"
             deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
@@ -3541,8 +3534,8 @@ def _compute_contract_recommendations(
                 
                 for level in range(1, 8):
                     tricks_needed = level + 6
-                    makes_count = (tricks_series >= tricks_needed).sum()
-                    make_pct = float(makes_count / tricks_series.len()) * 100 if tricks_series.len() > 0 else 0.0
+                    makes_count = int(cast(Any, (tricks_series >= tricks_needed).sum()))
+                    make_pct = (float(makes_count) / float(tricks_series.len()) * 100.0) if tricks_series.len() > 0 else 0.0
                     
                     if make_pct >= _DD_ANALYSIS_MAKE_PCT_THRESHOLD:
                         contract_recommendations.append({
@@ -3566,8 +3559,8 @@ def _compute_contract_recommendations(
                         continue
                     
                     # Contract makes if DD score >= 0
-                    makes_count = (score_series >= 0).sum()
-                    make_pct = float(makes_count / score_series.len()) * 100 if score_series.len() > 0 else 0.0
+                    makes_count = int(cast(Any, (score_series >= 0).sum()))
+                    make_pct = (float(makes_count) / float(score_series.len()) * 100.0) if score_series.len() > 0 else 0.0
                     
                     mean_score_val = score_series.mean()
                     avg_score = float(str(mean_score_val)) if mean_score_val is not None and not isinstance(mean_score_val, (int, float)) else (float(mean_score_val) if mean_score_val is not None else 0.0)
@@ -3599,8 +3592,8 @@ def _compute_contract_recommendations(
                                 ev_mean_nv = ev_series_nv.mean()
                                 # Compute stats for this subset
                                 nv_score_series = nv_subset[col].drop_nulls()
-                                nv_makes_count = (nv_score_series >= 0).sum()
-                                nv_make_pct = float(nv_makes_count / nv_score_series.len()) * 100 if nv_score_series.len() > 0 else 0.0
+                                nv_makes_count = int(cast(Any, (nv_score_series >= 0).sum()))
+                                nv_make_pct = (float(nv_makes_count) / float(nv_score_series.len()) * 100.0) if nv_score_series.len() > 0 else 0.0
                                 
                                 if ev_mean_nv is not None:
                                     ev_nv = float(str(ev_mean_nv)) if not isinstance(ev_mean_nv, (int, float)) else float(ev_mean_nv)
@@ -3621,8 +3614,8 @@ def _compute_contract_recommendations(
                                 ev_mean_v = ev_series_v.mean()
                                 # Compute stats for this subset
                                 v_score_series = v_subset[col].drop_nulls()
-                                v_makes_count = (v_score_series >= 0).sum()
-                                v_make_pct = float(v_makes_count / v_score_series.len()) * 100 if v_score_series.len() > 0 else 0.0
+                                v_makes_count = int(cast(Any, (v_score_series >= 0).sum()))
+                                v_make_pct = (float(v_makes_count) / float(v_score_series.len()) * 100.0) if v_score_series.len() > 0 else 0.0
                                 
                                 if ev_mean_v is not None:
                                     ev_v = float(str(ev_mean_v)) if not isinstance(ev_mean_v, (int, float)) else float(ev_mean_v)
@@ -3778,8 +3771,8 @@ def handle_auction_dd_analysis(
     # The BT contains rows for all auction prefixes with their accumulated criteria
     bt_df = bt_seat1_df
     
-    # Normalize auction: strip leading passes to match seat-1 view
-    auction_normalized = re.sub(r"(?i)^(p-)+", "", auction.strip())
+    # Normalize auction input (supports '-', whitespace, or ',' separators), then strip leading passes to match seat-1 view
+    auction_normalized = re.sub(r"(?i)^(p-)+", "", normalize_auction_input(auction))
     if not auction_normalized:
         raise ValueError(f"Invalid auction: '{auction}'")
     
@@ -4110,7 +4103,7 @@ def handle_rank_bids_by_ev(
     if "next_bid_indices" not in bt_seat1_df.columns:
         raise ValueError("next_bid_indices column not loaded in bt_seat1_df. Restart API server to load it.")
     
-    auction_input = auction.strip()
+    auction_input = normalize_auction_input(auction)
     
     # Count expected leading passes from auction prefix
     # E.g., "" -> 0 passes (dealer opens), "p-1N" -> 1 pass, "p-p-1N" -> 2 passes
@@ -4126,6 +4119,11 @@ def handle_rank_bids_by_ev(
     
     # Determine if this is purely passes (e.g., "", "p", "p-p", "p-p-p")
     is_passes_only = not auction_normalized or auction_normalized.lower() in ("p", "")
+
+    # Seat (1-4) of the *next bidder* relative to the dealer (Seat 1 = dealer).
+    # This is constant for all candidate next bids for a given auction prefix.
+    call_tokens = [t for t in auction_for_lookup.split("-") if t] if auction_for_lookup else []
+    next_seat = (len(call_tokens) % 4) + 1
     
     if not auction_input:
         # Truly empty auction: get all opening bids (seat 1 bids)
@@ -4302,6 +4300,9 @@ def handle_rank_bids_by_ev(
     # For each bid, match deals using criteria bitmaps and track by bid
     # =========================================================================
     bid_rankings: List[Dict[str, Any]] = []
+    # Keep the large per-bid EV/Makes blob separate so we don't duplicate it when
+    # emitting 2 rows per bid (NV/V) in bid_rankings.
+    ev_all_combos_by_bid: Dict[str, Dict[str, Optional[float]]] = {}
     matched_by_bid: Dict[str, Set[int]] = {}  # Track which deals matched which bid
     matched_dfs_by_bid: Dict[str, pl.DataFrame] = {}  # Store matched DataFrames for per-bid sampling
     
@@ -4434,18 +4435,29 @@ def handle_rank_bids_by_ev(
         if bid_strain == "NT":
             bid_strain = "N"
         
-        # Compute stats by vulnerability (group matched deals)
+        # Compute stats by vulnerability relative to the *next bidder seat* (seat-based, not direction-based)
         nv_count = 0
         v_count = 0
         nv_par_sum = 0.0
         v_par_sum = 0.0
-        ev_nv_values: List[float] = []
-        ev_v_values: List[float] = []
+        ev_nv_sum = 0.0
+        ev_nv_sum_sq = 0.0
+        ev_nv_n = 0
+        ev_v_sum = 0.0
+        ev_v_sum_sq = 0.0
+        ev_v_n = 0
         
         if "Vul" in matched_df.columns and "ParScore" in matched_df.columns:
-            # NS NV: Vul in [None, E_W], NS V: Vul in [N_S, Both]
-            nv_mask = matched_df["Vul"].is_in(["None", "E_W"])
-            v_mask = matched_df["Vul"].is_in(["N_S", "Both"])
+            # Determine the next bidder direction per deal using the seat mapping.
+            dealer_to_bidder = _seat_direction_map(next_seat)
+            bidder_expr = pl.col("Dealer").replace(dealer_to_bidder)
+
+            # Vulnerability relative to bidder's side
+            is_bidder_ns = bidder_expr.is_in(["N", "S"])
+            is_vul_expr = pl.when(is_bidder_ns).then(pl.col("Vul").is_in(["N_S", "Both"])) \
+                            .otherwise(pl.col("Vul").is_in(["E_W", "Both"]))
+            nv_mask = ~is_vul_expr
+            v_mask = is_vul_expr
             
             nv_df = matched_df.filter(nv_mask)
             v_df = matched_df.filter(v_mask)
@@ -4459,16 +4471,21 @@ def handle_rank_bids_by_ev(
                     par_sum = nv_par.sum()
                     nv_par_sum = float(par_sum) if par_sum is not None else 0
                 
-                # Compute EV for NV deals (look up EV column based on Dealer)
+                # Compute EV for NV deals relative to bidder direction (seat-based)
                 if bid_level and bid_strain and "Dealer" in nv_df.columns:
-                    for dealer in ["N", "E", "S", "W"]:
-                        pair = "NS" if dealer in ["N", "S"] else "EW"
-                        ev_col = f"EV_{pair}_{dealer}_{bid_strain}_{bid_level}_NV"
-                        if ev_col in nv_df.columns:
-                            dealer_df = nv_df.filter(pl.col("Dealer") == dealer)
-                            if dealer_df.height > 0:
-                                ev_series = dealer_df[ev_col].drop_nulls()
-                                ev_nv_values.extend(ev_series.to_list())
+                    bidder_nv_df = nv_df.with_columns(bidder_expr.alias("_Bidder"))
+                    for bidder in ["N", "E", "S", "W"]:
+                        pair = "NS" if bidder in ["N", "S"] else "EW"
+                        ev_col = f"EV_{pair}_{bidder}_{bid_strain}_{bid_level}_NV"
+                        if ev_col in bidder_nv_df.columns:
+                            sub = bidder_nv_df.filter(pl.col("_Bidder") == bidder)[ev_col].drop_nulls()
+                            n = sub.len()
+                            if n:
+                                s = float(sub.sum())
+                                ss = float((sub * sub).sum())
+                                ev_nv_sum += s
+                                ev_nv_sum_sq += ss
+                                ev_nv_n += int(n)
             
             if v_count > 0:
                 v_par = v_df["ParScore"].drop_nulls()
@@ -4476,26 +4493,40 @@ def handle_rank_bids_by_ev(
                     par_sum = v_par.sum()
                     v_par_sum = float(par_sum) if par_sum is not None else 0
                 
-                # Compute EV for V deals (look up EV column based on Dealer)
+                # Compute EV for V deals relative to bidder direction (seat-based)
                 if bid_level and bid_strain and "Dealer" in v_df.columns:
-                    for dealer in ["N", "E", "S", "W"]:
-                        pair = "NS" if dealer in ["N", "S"] else "EW"
-                        ev_col = f"EV_{pair}_{dealer}_{bid_strain}_{bid_level}_V"
-                        if ev_col in v_df.columns:
-                            dealer_df = v_df.filter(pl.col("Dealer") == dealer)
-                            if dealer_df.height > 0:
-                                ev_series = dealer_df[ev_col].drop_nulls()
-                                ev_v_values.extend(ev_series.to_list())
+                    bidder_v_df = v_df.with_columns(bidder_expr.alias("_Bidder"))
+                    for bidder in ["N", "E", "S", "W"]:
+                        pair = "NS" if bidder in ["N", "S"] else "EW"
+                        ev_col = f"EV_{pair}_{bidder}_{bid_strain}_{bid_level}_V"
+                        if ev_col in bidder_v_df.columns:
+                            sub = bidder_v_df.filter(pl.col("_Bidder") == bidder)[ev_col].drop_nulls()
+                            n = sub.len()
+                            if n:
+                                s = float(sub.sum())
+                                ss = float((sub * sub).sum())
+                                ev_v_sum += s
+                                ev_v_sum_sq += ss
+                                ev_v_n += int(n)
         
         # Compute averages
         avg_par_nv = round(nv_par_sum / nv_count, 0) if nv_count > 0 else None
         avg_par_v = round(v_par_sum / v_count, 0) if v_count > 0 else None
         
-        # Compute EV mean and std
-        ev_score_nv = round(statistics.mean(ev_nv_values), 1) if ev_nv_values else None
-        ev_std_nv = round(statistics.stdev(ev_nv_values), 1) if len(ev_nv_values) > 1 else None
-        ev_score_v = round(statistics.mean(ev_v_values), 1) if ev_v_values else None
-        ev_std_v = round(statistics.stdev(ev_v_values), 1) if len(ev_v_values) > 1 else None
+        # Compute EV mean and std (sample stddev)
+        ev_score_nv = round(ev_nv_sum / ev_nv_n, 1) if ev_nv_n > 0 else None
+        if ev_nv_n > 1:
+            var = (ev_nv_sum_sq - (ev_nv_sum * ev_nv_sum) / ev_nv_n) / (ev_nv_n - 1)
+            ev_std_nv = round(var ** 0.5, 1) if var >= 0 else None
+        else:
+            ev_std_nv = None
+
+        ev_score_v = round(ev_v_sum / ev_v_n, 1) if ev_v_n > 0 else None
+        if ev_v_n > 1:
+            var = (ev_v_sum_sq - (ev_v_sum * ev_v_sum) / ev_v_n) / (ev_v_n - 1)
+            ev_std_v = round(var ** 0.5, 1) if var >= 0 else None
+        else:
+            ev_std_v = None
         
         # Compute EV and Makes % for all level-strain-vul-seat combinations (560 columns)
         # Seat mapping: S1=N, S2=E, S3=S, S4=W
@@ -4505,7 +4536,7 @@ def handle_rank_bids_by_ev(
         if matched_df.height > 0:
             # Build mapping from source EV/DD column to output column key
             ev_col_mapping: Dict[str, str] = {}  # ev_col -> col_key
-            makes_col_mapping: Dict[str, str] = {} # dd_col -> col_key
+            makes_col_mapping: Dict[tuple[str, str], str] = {} # (dd_col, vul_state) -> col_key
             
             # Map vulnerability states to deal_df['Vul'] values
             # (used for filtering inside select if we want per-vul makes pct)
@@ -4602,35 +4633,48 @@ def handle_rank_bids_by_ev(
                             if pct_val is not None:
                                 ev_all_combos[dd_col_to_key[dd_col]] = round(float(pct_val) * 100, 1)
         
-        bid_ranking_entry = {
-            "bid": bid_name,
-            "bt_index": bt_index,
-            "auction": bid_auction,
-            "match_count": match_count,
-            "nv_count": nv_count,
-            "v_count": v_count,
-            "avg_par_nv": avg_par_nv,
-            "avg_par_v": avg_par_v,
-            "ev_score_nv": ev_score_nv,
-            "ev_std_nv": ev_std_nv,
-            "ev_score_v": ev_score_v,
-            "ev_std_v": ev_std_v,
-        }
-        # Add all 280 EV columns (level-strain-vul-seat combinations)
-        bid_ranking_entry.update(ev_all_combos)
-        bid_rankings.append(bid_ranking_entry)
+        # Store large EV/Makes blob once per bid (used by Streamlit "Contract EV Rankings")
+        ev_all_combos_by_bid[bid_name] = ev_all_combos
+
+        # Emit TWO rows per bid: one for NV, one for V (clearer UI, fewer columns)
+        bid_rankings.append(
+            {
+                "bid": bid_name,
+                "bt_index": bt_index,
+                "auction": bid_auction,
+                "next_seat": next_seat,
+                "vul": "NV",
+                "match_count": nv_count,
+                "match_total": match_count,
+                "avg_par": avg_par_nv,
+                "ev_score": ev_score_nv,
+                "ev_std": ev_std_nv,
+            }
+        )
+        bid_rankings.append(
+            {
+                "bid": bid_name,
+                "bt_index": bt_index,
+                "auction": bid_auction,
+                "next_seat": next_seat,
+                "vul": "V",
+                "match_count": v_count,
+                "match_total": match_count,
+                "avg_par": avg_par_v,
+                "ev_score": ev_score_v,
+                "ev_std": ev_std_v,
+            }
+        )
     
-    # Sort by avg_par (using avg_par_nv as primary, falling back to avg_par_v)
-    def sort_key(r: Dict) -> float:
-        nv = r.get("avg_par_nv")
-        v = r.get("avg_par_v")
-        if nv is not None:
-            return -nv  # Higher is better for NS
-        if v is not None:
-            return -v
-        return float("inf")  # No data goes to bottom
-    
-    bid_rankings.sort(key=sort_key)
+    # Sort by Avg Par desc; prefer NV rows when equal; stabilize by bid name.
+    def sort_key(r: Dict[str, Any]) -> Tuple[float, int, str]:
+        ap = r.get("avg_par")
+        ap_f = float(ap) if isinstance(ap, (int, float)) else float("-inf")
+        vul_rank = 1 if r.get("vul") == "NV" else 0
+        bid = str(r.get("bid") or "")
+        return (ap_f, vul_rank, bid)
+
+    bid_rankings.sort(key=sort_key, reverse=True)
     
     # =========================================================================
     # STEP 3: Build deal data (bid tracking via matched_by_bid)
@@ -4864,6 +4908,7 @@ def handle_rank_bids_by_ev(
         "par_contract_stats": par_contract_stats,
         "dd_data": dd_data,
         "dd_data_by_bid": dd_data_by_bid,  # bid -> list of deal dicts (up to max_deals each)
+        "ev_all_combos_by_bid": ev_all_combos_by_bid,  # bid -> {EV_Score_*, Makes_Pct_*}
         "dd_columns": dd_cols,
         "matched_by_bid_b64": matched_by_bid_b64,  # Optimized binary encoding
         "total_matches": total_matches,
@@ -4897,7 +4942,7 @@ def handle_contract_ev_deals(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
 
-    auction_input = (auction or "").strip()
+    auction_input = normalize_auction_input(auction)
 
     # Match the same BT lookup semantics as handle_rank_bids_by_ev
     expected_passes = _count_leading_passes(auction_input)

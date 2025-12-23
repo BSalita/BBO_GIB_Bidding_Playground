@@ -70,6 +70,85 @@ def calculate_imp(score_diff: int) -> int:
 # Auction/Contract Parsing
 # ---------------------------------------------------------------------------
 
+def normalize_auction_input(auction: str) -> str:
+    """Normalize a user-entered auction *string* into canonical dash-separated form.
+
+    - Accepts bid separators: '-', whitespace, or ','
+    - Canonical output separator is '-'
+    - Normalizes passes: 'pass' -> 'p'
+    - Normalizes NT: '1nt', '1n' -> '1N'
+    - Uppercases strain letters (CDHSN) and level digits are preserved
+
+    This is intended for literal auction strings (not regex patterns).
+    """
+    if auction is None:
+        return ""
+    s = str(auction).strip()
+    if not s:
+        return ""
+
+    # Replace any supported separator (dash, comma, whitespace) with '-'
+    parts = [p for p in re.split(r"[\s,\-]+", s) if p]
+    out: list[str] = []
+    suit_map = {"♣": "C", "♦": "D", "♥": "H", "♠": "S"}
+
+    for raw in parts:
+        t = raw.strip()
+        if not t:
+            continue
+        tl = t.lower()
+        if tl in ("p", "pass"):
+            out.append("p")
+            continue
+        # Normalize suit symbols if user pasted them
+        if any(sym in t for sym in suit_map):
+            for sym, rep in suit_map.items():
+                t = t.replace(sym, rep)
+            tl = t.lower()
+
+        # Contract bids like 1c/1d/1h/1s/1n/1nt
+        if tl[0].isdigit() and len(tl) >= 2:
+            level = tl[0]
+            strain_raw = tl[1:]
+            if strain_raw in ("n", "nt"):
+                out.append(f"{level}N")
+                continue
+            if strain_raw and strain_raw[0] in ("c", "d", "h", "s"):
+                out.append(f"{level}{strain_raw[0].upper()}")
+                continue
+
+        # Fallback: preserve token but uppercase it (e.g., X/XX)
+        out.append(t.upper())
+
+    return "-".join(out)
+
+
+_REGEX_META_RE = re.compile(r"[\\^$.*+?()[\]{}|]")
+
+
+def normalize_auction_user_text(text: str) -> str:
+    """Normalize user-entered auction text, choosing literal vs regex normalization.
+
+    Policy:
+    - If **regex meta characters** are detected, treat input as a regex pattern and run
+      `normalize_auction_pattern()` on the text as-is.
+    - Otherwise, treat input as a literal auction string and run `normalize_auction_input()`.
+
+    This provides a single point of truth for both Streamlit and API server inputs.
+    """
+    if text is None:
+        return ""
+    s = str(text).strip()
+    if not s:
+        return ""
+
+    if _REGEX_META_RE.search(s):
+        # Regex mode: do not rewrite user input; assume '-' is used in the pattern.
+        return normalize_auction_pattern(s)
+
+    # Literal mode
+    return normalize_auction_input(s)
+
 def normalize_auction_pattern(pattern: str) -> str:
     """
     Normalize an auction regex pattern by appending implied trailing passes.

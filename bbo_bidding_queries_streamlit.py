@@ -36,7 +36,12 @@ from typing import Any, Dict, List, Set
 # Add mlBridgeLib to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mlBridgeLib"))
 
-from bbo_bidding_queries_lib import normalize_auction_pattern, normalize_auction_pattern_to_seat1
+from bbo_bidding_queries_lib import (
+    normalize_auction_pattern,
+    normalize_auction_pattern_to_seat1,
+    normalize_auction_input,
+    normalize_auction_user_text,
+)
 
 
 API_BASE = "http://127.0.0.1:8000"
@@ -821,6 +826,15 @@ def render_aggrid(
         # unless specifically requested via update_mode.
         update_mode=update_mode,
         data_return_mode=DataReturnMode.AS_INPUT,
+        # For clickable grids (selection triggers actions), add a hover highlight + pointer cursor.
+        custom_css=(
+            {
+                ".ag-row": {"cursor": "pointer"},
+                ".ag-row-hover": {"background-color": "#E8F4FF !important"},
+            }
+            if update_mode != GridUpdateMode.NO_UPDATE
+            else None
+        ),
     )
     
     selected_rows: Any = response.get("selected_rows", [])
@@ -1383,7 +1397,7 @@ def render_bidding_table_explorer():
         help=MATCH_ALL_DEALERS_HELP,
         key="allow_initial_passes_bt",
     )
-    auction_pattern = normalize_auction_pattern(raw_auction_pattern)
+    auction_pattern = normalize_auction_user_text(raw_auction_pattern)
     # Show the effective pattern including (p-)* prefix when matching all seats
     if allow_initial_passes:
         display_pattern = prepend_all_seats_prefix(auction_pattern)
@@ -1821,7 +1835,7 @@ def render_analyze_actual_auctions():
         help=MATCH_ALL_DEALERS_HELP,
         key="match_all_dealers_group",
     )
-    auction_regex = normalize_auction_pattern(raw_auction_regex)
+    auction_regex = normalize_auction_user_text(raw_auction_regex)
     # Prepend (p-)* when matching all dealers
     if match_all_dealers:
         auction_regex = prepend_all_seats_prefix(auction_regex)
@@ -2448,16 +2462,25 @@ def render_rank_by_ev():
     st.header("🎯 Rank Next Bids by EV")
     st.markdown("""
     Rank possible next bids by Expected Value (EV). 
-    - **Empty input**: Show all opening bids ranked
-    - **Auction prefix**: Show all responses/rebids ranked
     """)
     
     # Sidebar inputs
-    auction_input = st.sidebar.text_input(
+    auction_input_raw = st.sidebar.text_input(
         "Auction Prefix",
         value="",
         help="Enter an auction prefix (e.g., '1N' for responses to 1NT), or leave empty for opening bids"
     )
+    auction_input = normalize_auction_input(auction_input_raw)
+    if auction_input_raw and auction_input != auction_input_raw:
+        st.sidebar.caption(f"Normalized: `{auction_input}`")
+
+    st.sidebar.markdown(
+        """
+        - **Empty input**: show all opening bids ranked
+        - **Auction prefix**: show all next bids after that prefix (e.g. `1N`, `1H-p-3H-p`)
+        """
+    )
+    st.sidebar.divider()
     
     max_deals = st.sidebar.number_input(
         "Max Deals",
@@ -2564,32 +2587,26 @@ def render_rank_by_ev():
     
     if bid_rankings:
         st.subheader(f"🏆 Next Bid Rankings ({len(bid_rankings)} bids)")
-        st.markdown("*Bids ranked by average Par score (higher = better for NS). Click a row to see matching deals.*")
+        st.markdown("*Show choices of next bids ranked by average Par score. Click a row to see matching deals below.*")
         
         rankings_df = pl.DataFrame(bid_rankings)
         
-        # Cast all EV_Score columns to Float32 for efficiency
-        ev_cols = [c for c in rankings_df.columns if c.startswith("EV_Score_")]
-        if ev_cols:
-            rankings_df = rankings_df.with_columns([
-                pl.col(c).cast(pl.Float32) for c in ev_cols
-            ])
+        # (EV_Score_* columns moved out of bid_rankings to ev_all_combos_by_bid)
         
         # Select and rename columns for display
         display_cols = []
         col_map = [
             ("bid", "Bid"),
+            ("auction", "Full Auction"),
+            ("next_seat", "Seat"),
+            ("vul", "Vul"),
+            ("match_total", "Total"),
             ("match_count", "Matches"),
-            ("nv_count", "NV Deals"),
-            ("v_count", "V Deals"),
-            ("avg_par_nv", "Avg Par NV"),
-            ("avg_par_v", "Avg Par V"),
-            ("ev_score_nv", "EV NV"),
-            ("ev_std_nv", "EV Std NV"),
-            ("ev_score_v", "EV V"),
-            ("ev_std_v", "EV Std V"),
+            ("avg_par", "Avg Par"),
+            ("ev_score", "EV"),
+            ("ev_std", "EV Std"),
         ]
-        col_map.append(("auction", "Full Auction"))
+        # Full Auction placed immediately after Bid above
         
         for col, alias in col_map:
             if col in rankings_df.columns:
@@ -2632,23 +2649,21 @@ def render_rank_by_ev():
 
             # Add sample size in title when it is a fixed value (use bid-level match_count).
             original_row_for_title = next((r for r in bid_rankings if r.get("bid") == selected_bid_name), None)
-            bid_match_n = original_row_for_title.get("match_count") if original_row_for_title else None
+            bid_match_n = original_row_for_title.get("match_total") if original_row_for_title else None
             n_str = f" (N={int(bid_match_n):,})" if isinstance(bid_match_n, (int, float)) else ""
 
             st.subheader(f"🥇 Contract EV Rankings (Auction: {selected_bid_auction}){n_str}")
             st.caption("Computed using only the deals that match the selected next-bid's criteria (not the aggregated pool).")
             
-            # Extract EV_Score_ and Makes_Pct_ columns from the original bid_rankings dict
-            # (since rankings_df was filtered to display only core columns)
-            original_row = next((r for r in bid_rankings if r.get("bid") == selected_bid_name), None)
-            
-            if original_row:
+            # Extract EV_Score_ and Makes_Pct_ columns from the separate per-bid blob.
+            ev_blob = (data.get("ev_all_combos_by_bid") or {}).get(selected_bid_name)
+            if ev_blob:
                 ev_data = []
                 strain_names = {'N': 'NT', 'S': 'S', 'H': 'H', 'D': 'D', 'C': 'C'}
                 seat_names = {1: 'N', 2: 'E', 3: 'S', 4: 'W'}
                 
                 # First collect all available EV scores
-                for k, v in original_row.items():
+                for k, v in ev_blob.items():
                     if k.startswith("EV_Score_") and v is not None:
                         # Format: EV_Score_{level}{strain}_{vul}_S{seat}
                         # e.g., EV_Score_3N_NV_S1
@@ -2667,7 +2682,7 @@ def render_rank_by_ev():
                             
                             # Look up corresponding Makes %
                             makes_key = f"Makes_Pct_{contract_part}_{vul_part}_{seat_part}"
-                            makes_pct = original_row.get(makes_key)
+                            makes_pct = ev_blob.get(makes_key)
                             
                             ev_data.append({
                                 "Contract": f"{level}{strain_display}",
@@ -3115,7 +3130,7 @@ pattern = None
 if func_choice in ["Find Auction Sequences", "Deals by Auction Pattern"]:
     raw_pattern = st.sidebar.text_input("Auction Regex", value="^1N-p-3N$",
         help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')")
-    pattern = normalize_auction_pattern(raw_pattern)
+    pattern = normalize_auction_user_text(raw_pattern)
     if pattern != raw_pattern:
         st.sidebar.caption(f"→ {pattern}")
     st.sidebar.divider()
