@@ -694,7 +694,8 @@ def render_aggrid(
     key: str, 
     height: int | None = None, 
     table_name: str | None = None,
-    update_mode: GridUpdateMode = GridUpdateMode.NO_UPDATE
+    update_mode: GridUpdateMode = GridUpdateMode.NO_UPDATE,
+    sort_model: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
     
@@ -805,6 +806,11 @@ def render_aggrid(
     # suppressCellFocus prevents cell-level focus (keeps row selection clean)
     gb.configure_grid_options(rowHeight=28, headerHeight=32, suppressCellFocus=True)
     grid_options = gb.build()
+
+    # If provided, set an initial sort. (AgGrid can persist user sorts per-key; this
+    # plus changing the key is the most reliable way to enforce the default.)
+    if sort_model is not None and "sortModel" not in grid_options:
+        grid_options["sortModel"] = sort_model
     
     # Make columns feel tighter (AgGrid defaults can be quite wide)
     # - Smaller minWidth prevents excess whitespace in narrow columns
@@ -2513,7 +2519,7 @@ def render_rank_by_ev():
     # Call API (single endpoint provides both bid rankings and DD analysis)
     # =========================================================================
     # Cache version: increment when API response format changes
-    CACHE_VERSION = 23  # v23: fix /contract-ev-deals for empty auction + bust stale cache
+    CACHE_VERSION = 25  # v25: force 'Which candidate bids perform best' nulls-last sort
     
     # Always fetch all columns from API; filter display based on checkboxes
     # This prevents cache busting when output options change
@@ -2548,6 +2554,11 @@ def render_rank_by_ev():
             status.update(label="❌ Analysis failed", state="error")
             st.error(f"API call failed: {e}")
             return
+
+    # Use auction_normalized (falling back to "Opening Bids") instead of auction_input
+    # for all aggregated section headers.
+    auction_normalized = data.get("auction_normalized", "")
+    auction_display = auction_normalized if auction_normalized else "Opening Bids"
     
     elapsed_ms = data.get("elapsed_ms", 0)
     total_bids = data.get("total_next_bids", 0)
@@ -2565,20 +2576,6 @@ def render_rank_by_ev():
     opening_seat = data.get("opening_seat", "Dealer (Seat 1)")
     st.success(f"✅ Analyzed {total_bids} bids, {total_matches:,} matched deals ({elapsed_ms/1000:.1f}s) — Opener: {opening_seat}")
     
-    # Show parent BT row if present
-    parent_bt = data.get("parent_bt_row")
-    if parent_bt:
-        st.subheader("🎴 Parent Auction")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write(f"**Auction:** `{parent_bt.get('Auction', '')}`")
-        with col2:
-            st.write(f"**Last Bid:** `{parent_bt.get('candidate_bid', '')}`")
-    elif auction_input:
-        st.write(f"**Input:** `{auction_input}`")
-    else:
-        st.write("**Analyzing:** Opening bids (first bid of the auction)")
-    
     # -------------------------------------------------------------------------
     # Bid Rankings Table (with row selection)
     # -------------------------------------------------------------------------
@@ -2586,8 +2583,8 @@ def render_rank_by_ev():
     selected_bid = None
     
     if bid_rankings:
-        st.subheader(f"🏆 Next Bid Rankings ({len(bid_rankings)} bids)")
-        st.markdown("*Show choices of next bids ranked by average Par score. Click a row to see matching deals below.*")
+        st.subheader(f"🏆 Which candidate bids perform best? ({len(bid_rankings)} bids)")
+        st.markdown("*Evaluate the potential success of each candidate bid. 'EV at Bid' shows the average score achieved when that bid becomes the final contract, based on all historical deals that followed this auction sequence. Click a row to see matching deals below.*")
         
         rankings_df = pl.DataFrame(bid_rankings)
         
@@ -2600,10 +2597,9 @@ def render_rank_by_ev():
             ("auction", "Full Auction"),
             ("next_seat", "Seat"),
             ("vul", "Vul"),
-            ("match_total", "Total"),
             ("match_count", "Matches"),
             ("avg_par", "Avg Par"),
-            ("ev_score", "EV"),
+            ("ev_score", "EV at Bid"),
             ("ev_std", "EV Std"),
         ]
         # Full Auction placed immediately after Bid above
@@ -2614,13 +2610,18 @@ def render_rank_by_ev():
         
         if display_cols:
             rankings_df = rankings_df.select(display_cols)
+
+        # Ensure initial display is sorted by EV at Bid (AgGrid can persist old sort state)
+        if "EV at Bid" in rankings_df.columns:
+            rankings_df = rankings_df.sort("EV at Bid", descending=True, nulls_last=True)
         
         selected_bid_rows = render_aggrid(
             rankings_df, 
-            key="rank_bids_rankings", 
+            key=f"rank_bids_rankings_ev_{CACHE_VERSION}",
             height=calc_grid_height(len(rankings_df), max_height=400), 
             table_name="bid_rankings",
-            update_mode=GridUpdateMode.SELECTION_CHANGED
+            update_mode=GridUpdateMode.SELECTION_CHANGED,
+            sort_model=[{"colId": "EV at Bid", "sort": "desc"}],
         )
         
         # Capture the selected bid (default to first row if none selected)
@@ -2650,10 +2651,10 @@ def render_rank_by_ev():
             # Add sample size in title when it is a fixed value (use bid-level match_count).
             original_row_for_title = next((r for r in bid_rankings if r.get("bid") == selected_bid_name), None)
             bid_match_n = original_row_for_title.get("match_total") if original_row_for_title else None
-            n_str = f" (N={int(bid_match_n):,})" if isinstance(bid_match_n, (int, float)) else ""
+            n_val = f"{int(bid_match_n):,}" if isinstance(bid_match_n, (int, float)) else "?"
 
-            st.subheader(f"🥇 Contract EV Rankings (Auction: {selected_bid_auction}){n_str}")
-            st.caption("Computed using only the deals that match the selected next-bid's criteria (not the aggregated pool).")
+            st.subheader(f"🥇 Best scoring contracts for deals matching auction: {selected_bid_auction}?")
+            st.caption(f"Expected Value (EV) for all possible final contracts, computed from the {n_val} deals that matched this specific auction.")
             
             # Extract EV_Score_ and Makes_Pct_ columns from the separate per-bid blob.
             ev_blob = (data.get("ev_all_combos_by_bid") or {}).get(selected_bid_name)
@@ -2755,7 +2756,7 @@ def render_rank_by_ev():
                                 total_m = int(deals_resp.get("total_matches", 0) or 0)
                                 shown = len(deals)
 
-                                st.subheader(f"📄 Deals matching Contract EV Rankings (Showing {shown:,} of {total_m:,})")
+                                st.subheader(f"📄 Deals matching auction: {selected_bid_auction} (Showing {shown:,} of {total_m:,})")
                                 if deals:
                                     ddf = pl.DataFrame(deals)
                                     if not include_hands:
@@ -2770,20 +2771,6 @@ def render_rank_by_ev():
                 else:
                     st.info("No contract-level EV data available for this bid.")
         
-        # Add download button for rankings
-        try:
-            csv_str = rankings_df.write_csv(file=None)
-            csv_bytes = ("\ufeff" + csv_str).encode("utf-8") if csv_str else b""
-            safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", auction_input).strip("._-") if auction_input else "opening_bids"
-            st.download_button(
-                label="📥 Download Rankings as CSV",
-                data=csv_bytes,
-                file_name=f"bid_rankings_{safe_auction}.csv",
-                mime="text/csv; charset=utf-8",
-                key="download_rankings",
-            )
-        except Exception:
-            pass
     else:
         st.warning("No next bids found.")
         return
@@ -2809,8 +2796,10 @@ def render_rank_by_ev():
         except Exception:
             n_hint = ""
 
-        st.subheader(f"🏆 Contract Rankings by EV (Aggregated across all next-bid matches){n_hint}")
-        st.markdown("*Contracts ranked by EV using the aggregated deal pool across all next bids for this auction prefix.*")
+        total_matches = data.get("total_matches", 0)
+
+        st.subheader("🏆 Which final contracts score best?")
+        st.caption(f"Compare the Expected Value (EV) of all possible outcomes across the entire pool of {total_matches:,} deals after grouping by contract, declarer, vulnerability. This is without regard to any auction sequence.")
         
         rec_df = pl.DataFrame(contract_recs)
         # Keep numeric values for numeric sorting
@@ -2874,6 +2863,12 @@ def render_rank_by_ev():
     filtered_deals = dd_deals
     selection_msg = ""
     has_selection = bool(selected_contract)
+    
+    # Placeholder values for linter
+    sel_level = ""
+    sel_strain = ""
+    sel_declarer = ""
+    sel_vul = ""
 
     # Default to first contract row if none selected
     if contract_recs and not selected_contract:
@@ -2899,6 +2894,12 @@ def render_rank_by_ev():
         level = contract_str[0] if contract_str else ""
         strain_alias = contract_str[1:] if contract_str and len(contract_str) > 1 else ""
         strain = inv_strains.get(strain_alias, strain_alias)
+        
+        # Store for display
+        sel_level = level
+        sel_strain = strain_alias
+        sel_declarer = declarer
+        sel_vul = vul_state
         
         score_col = f"DD_Score_{level}{strain}_{declarer}"
         
@@ -2947,7 +2948,7 @@ def render_rank_by_ev():
         selection_msg = f" (Stats for {level}{strain_alias} by {declarer} ({vul_state}))"
     
     if filtered_deals and has_selection:
-        st.subheader(f"📈 Deal Data ({len(filtered_deals)} deals){selection_msg}")
+        st.subheader(f"📈 Deals matching {sel_level}{sel_strain} by {sel_declarer} ({sel_vul}) ({len(filtered_deals)} deals)")
         
         shown_count = len(filtered_deals)
         if total_matches > shown_count and not has_selection:
@@ -3011,44 +3012,6 @@ def render_rank_by_ev():
                 final_cols.append(c)
         
         dd_df = dd_df.select([c for c in final_cols if c in dd_df.columns])
-        
-        # Add download button for deal data
-        # Convert list/nested columns to strings for CSV export (CSV doesn't support nested data)
-        csv_df = dd_df.clone()
-        for col_name in csv_df.columns:
-            col_dtype = csv_df[col_name].dtype
-            dtype_str = str(col_dtype)
-            # Check for nested types: List, Array, Struct - cast all to string
-            if any(x in dtype_str for x in ["List", "Array", "Struct"]):
-                # For list of strings, try join; otherwise cast to string repr
-                try:
-                    if "List(String)" in dtype_str or "List(Utf8)" in dtype_str:
-                        csv_df = csv_df.with_columns(pl.col(col_name).list.join(", ").alias(col_name))
-                    else:
-                        # Cast entire column to string representation
-                        csv_df = csv_df.with_columns(pl.col(col_name).cast(pl.Utf8).alias(col_name))
-                except Exception:
-                    # If casting fails, convert via Python repr
-                    csv_df = csv_df.with_columns(
-                        pl.col(col_name).map_elements(lambda x: str(x) if x is not None else "", return_dtype=pl.Utf8).alias(col_name)
-                    )
-        try:
-            csv_str = csv_df.write_csv(file=None)
-        except Exception:
-            # Fallback: drop any remaining nested columns
-            simple_cols = [c for c in csv_df.columns if not any(x in str(csv_df[c].dtype) for x in ["List", "Struct", "Array"])]
-            csv_str = csv_df.select(simple_cols).write_csv(file=None) if simple_cols else ""
-        
-        # Ensure UTF-8 encoding with BOM for Excel compatibility
-        csv_bytes = ("\ufeff" + csv_str).encode("utf-8") if csv_str else b""
-        safe_auction = re.sub(r'[^A-Za-z0-9_.-]+', "_", str(data.get("auction_normalized", "auction"))).strip("._-") or "auction"
-        st.download_button(
-            label="📥 Download Deal Data as CSV",
-            data=csv_bytes,
-            file_name=f"dd_analysis_{safe_auction}.csv",
-            mime="text/csv; charset=utf-8",
-            key="download_deals",
-        )
         
         render_aggrid(dd_df, key="dd_analysis_results", height=400, table_name="dd_results")
     elif has_selection:

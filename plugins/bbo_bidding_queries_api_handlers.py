@@ -4466,14 +4466,25 @@ def handle_rank_bids_by_ev(
             v_count = v_df.height
             
             if nv_count > 0:
-                nv_par = nv_df["ParScore"].drop_nulls()
+                # ParScore is NS-oriented; convert to "par from bidder's side" so it is
+                # comparable to EV which is computed relative to the bidder's partnership.
+                bidder_nv_df = nv_df.with_columns(bidder_expr.alias("_Bidder"))
+                nv_par = (
+                    bidder_nv_df
+                    .with_columns(
+                        pl.when(pl.col("_Bidder").is_in(["N", "S"]))
+                        .then(pl.col("ParScore"))
+                        .otherwise(-pl.col("ParScore"))
+                        .alias("_ParForBidder")
+                    )["_ParForBidder"]
+                    .drop_nulls()
+                )
                 if nv_par.len() > 0:
                     par_sum = nv_par.sum()
                     nv_par_sum = float(par_sum) if par_sum is not None else 0
                 
                 # Compute EV for NV deals relative to bidder direction (seat-based)
                 if bid_level and bid_strain and "Dealer" in nv_df.columns:
-                    bidder_nv_df = nv_df.with_columns(bidder_expr.alias("_Bidder"))
                     for bidder in ["N", "E", "S", "W"]:
                         pair = "NS" if bidder in ["N", "S"] else "EW"
                         ev_col = f"EV_{pair}_{bidder}_{bid_strain}_{bid_level}_NV"
@@ -4488,14 +4499,23 @@ def handle_rank_bids_by_ev(
                                 ev_nv_n += int(n)
             
             if v_count > 0:
-                v_par = v_df["ParScore"].drop_nulls()
+                bidder_v_df = v_df.with_columns(bidder_expr.alias("_Bidder"))
+                v_par = (
+                    bidder_v_df
+                    .with_columns(
+                        pl.when(pl.col("_Bidder").is_in(["N", "S"]))
+                        .then(pl.col("ParScore"))
+                        .otherwise(-pl.col("ParScore"))
+                        .alias("_ParForBidder")
+                    )["_ParForBidder"]
+                    .drop_nulls()
+                )
                 if v_par.len() > 0:
                     par_sum = v_par.sum()
                     v_par_sum = float(par_sum) if par_sum is not None else 0
                 
                 # Compute EV for V deals relative to bidder direction (seat-based)
                 if bid_level and bid_strain and "Dealer" in v_df.columns:
-                    bidder_v_df = v_df.with_columns(bidder_expr.alias("_Bidder"))
                     for bidder in ["N", "E", "S", "W"]:
                         pair = "NS" if bidder in ["N", "S"] else "EW"
                         ev_col = f"EV_{pair}_{bidder}_{bid_strain}_{bid_level}_V"
@@ -4666,13 +4686,15 @@ def handle_rank_bids_by_ev(
             }
         )
     
-    # Sort by Avg Par desc; prefer NV rows when equal; stabilize by bid name.
-    def sort_key(r: Dict[str, Any]) -> Tuple[float, int, str]:
+    # Sort by EV-at-bid desc; then Avg Par desc; prefer NV rows; stabilize by bid name.
+    def sort_key(r: Dict[str, Any]) -> Tuple[float, float, int, str]:
+        ev = r.get("ev_score")
+        ev_f = float(ev) if isinstance(ev, (int, float)) else float("-inf")
         ap = r.get("avg_par")
         ap_f = float(ap) if isinstance(ap, (int, float)) else float("-inf")
         vul_rank = 1 if r.get("vul") == "NV" else 0
         bid = str(r.get("bid") or "")
-        return (ap_f, vul_rank, bid)
+        return (ev_f, ap_f, vul_rank, bid)
 
     bid_rankings.sort(key=sort_key, reverse=True)
     
