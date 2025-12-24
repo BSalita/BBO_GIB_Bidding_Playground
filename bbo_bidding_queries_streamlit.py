@@ -801,6 +801,10 @@ def render_aggrid(
     for col in pct_cols:
         gb.configure_column(col, valueFormatter="x !== null ? x.toFixed(1) + '%' : ''")
 
+    # Enforce 1 decimal place for EV columns (display only; keeps numeric sorting)
+    for col in [c for c in df.columns if c in ("EV at Bid", "EV Std")]:
+        gb.configure_column(col, valueFormatter="x !== null ? x.toFixed(1) : ''")
+
     # Optionally hide helper columns (e.g., sort keys)
     if hide_cols:
         for c in hide_cols:
@@ -1129,29 +1133,69 @@ def render_find_auction_sequences(pattern: str | None):
     else:
         st.success(f"Found {len(samples)} matching auction(s) in {elapsed_ms/1000:.1f}s")
         
+        def _to_int_or_default(x: Any, default: int = 1) -> int:
+            try:
+                return default if x is None else int(x)
+            except Exception:
+                return default
+
+        def _add_seat_columns(df: pl.DataFrame, opener_seat: int) -> pl.DataFrame:
+            """Add Seat column (cycling 1-4 per row) and Agg_Expr_Seat from the appropriate column."""
+            n_rows = df.height
+            # Compute seat for each row: opener_seat, opener_seat+1, ... cycling 1-4
+            seats = [((opener_seat - 1 + i) % 4) + 1 for i in range(n_rows)]
+            df = df.with_columns(pl.Series("Seat", seats))
+            
+            # Build Agg_Expr_Seat by picking the right column value per row
+            agg_expr_vals = []
+            for i, seat in enumerate(seats):
+                agg_col = f"Agg_Expr_Seat_{seat}"
+                if agg_col in df.columns:
+                    agg_expr_vals.append(df[agg_col][i])
+                else:
+                    agg_expr_vals.append(None)
+            df = df.with_columns(pl.Series("Agg_Expr_Seat", agg_expr_vals))
+            
+            # Drop individual Agg_Expr_Seat_[1-4] columns
+            drop_cols = [c for c in df.columns if c.startswith("Agg_Expr_Seat_") and c[-1].isdigit()]
+            if drop_cols:
+                df = df.drop(drop_cols)
+            return df
+
         # Build combined DataFrame from all samples for comparison
         all_rows = []
         for s in samples:
+            opener_seat = _to_int_or_default(s.get("opener_seat"), 1)
             if isinstance(s.get("sequence"), list):
-                for row in s["sequence"]:
-                    all_rows.append(row)
+                for row_idx, row in enumerate(s["sequence"]):
+                    r = dict(row)
+                    # Seat cycles: opener_seat, opener_seat+1, ... (1-4)
+                    seat = ((opener_seat - 1 + row_idx) % 4) + 1
+                    r["Seat"] = seat
+                    # Pick the right Agg_Expr_Seat column value
+                    r["Agg_Expr_Seat"] = r.get(f"Agg_Expr_Seat_{seat}")
+                    all_rows.append(r)
         
         if all_rows:
             combined_df = pl.DataFrame(all_rows)
+            # Drop individual Agg_Expr_Seat_[1-4] columns
+            drop_cols = [c for c in combined_df.columns if c.startswith("Agg_Expr_Seat_") and c[-1].isdigit()]
+            if drop_cols:
+                combined_df = combined_df.drop(drop_cols)
             combined_df = order_columns(combined_df, priority_cols=[
-                "index", "Auction", "Expr",
-                "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
+                "index", "Auction", "Seat", "Expr", "Agg_Expr_Seat",
             ])
         else:
             combined_df = pl.DataFrame()
         
         # Display individual samples
         for i, s in enumerate(samples, start=1):
-            st.subheader(f"Sample {i}: {s['auction']}")
+            opener_seat = _to_int_or_default(s.get("opener_seat"), 1)
+            st.subheader(f"Sample {i}: {s['auction']} (Opener Seat {opener_seat})")
             seq_df = pl.DataFrame(s["sequence"]) if isinstance(s["sequence"], list) else s["sequence"]
+            seq_df = _add_seat_columns(seq_df, opener_seat)
             seq_df = order_columns(seq_df, priority_cols=[
-                "index", "Auction", "Expr",
-                "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
+                "index", "Auction", "Seat", "Expr", "Agg_Expr_Seat",
             ])
             render_aggrid(seq_df, key=f"seq_pattern_{i}", table_name="auction_sequences")
             st.divider()
@@ -1372,7 +1416,7 @@ def render_deals_by_auction_pattern(pattern: str | None):
                 deals_df = pl.DataFrame(deals)
                 deals_df = order_columns(deals_df, priority_cols=[
                     "index", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
-                    "Contract", "Result", "Tricks", "Score", "ParScore", "DD_Score_Declarer",
+                    "Contract", "Result", "Tricks", "Score", "DD_Score_Declarer", "ParScore",
                     "HCP_N", "HCP_E", "HCP_S", "HCP_W",
                 ])
                 st.write(f"**Matching Deals:** (showing {len(deals_df)})")
@@ -1805,7 +1849,7 @@ def render_pbn_database_lookup():
         if deal_info:
             st.write("**Deal Information:**")
             
-            key_cols = ["PBN", "Vul", "Dealer", "Actual_Auction", "Contract", "Result", "Tricks", "Score", "ParScore", "DD_Score_Declarer"]
+            key_cols = ["PBN", "Vul", "Dealer", "Actual_Auction", "Contract", "Result", "Tricks", "Score", "DD_Score_Declarer", "ParScore"]
             key_info = {k: v for k, v in deal_info.items() if k in key_cols and v is not None}
             if key_info:
                 render_aggrid(pl.DataFrame([key_info]), key="pbn_lookup_key", height=80, table_name="deal_key_info")
@@ -2019,7 +2063,7 @@ def render_analyze_actual_auctions():
                 "PBN",
                 "index", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
                 "Contract", "Result", "Score", "Score_MP", "Score_MP_Pct",
-                "ParScore", "DD_Score_Declarer",
+                "DD_Score_Declarer", "ParScore",
                 "HCP_N", "HCP_E", "HCP_S", "HCP_W",
                 "Total_Points_N", "Total_Points_E", "Total_Points_S", "Total_Points_W",
             ], drop_cols=["Auction", "Board_ID"])
@@ -3031,7 +3075,10 @@ def render_rank_by_ev():
         # DD_Score and EV_Score show the score/EV for the matching BT bid specifically
         priority_cols = ["index", "Dealer", "Vul"]
         hand_cols = ["Hand_N", "Hand_E", "Hand_S", "Hand_W"] if include_hands else []
-        score_cols = ["DD_Score", "EV_Score", "ParScore", "ParContracts"]
+        # Keep key score columns near the front for readability
+        # - DD_Score_Declarer: deal's actual contract score (if present)
+        # - ParScore: par result for the deal
+        score_cols = ["DD_Score", "EV_Score", "DD_Score_Declarer", "ParScore", "ParContracts"]
         
         dd_cols = data.get("dd_columns", []) if include_scores else []
         ordered_dd = []
@@ -3059,19 +3106,22 @@ def render_rank_by_ev():
                 if col not in ordered_dd:
                     ordered_dd.append(col)
         
-        # Build final column order
-        final_cols = []
-        for c in priority_cols + hand_cols + score_cols:
-            if c in dd_df.columns:
+        # Build final column order (deduplicated while preserving priority)
+        final_cols: list[str] = []
+        seen: set[str] = set()
+
+        for c in priority_cols + hand_cols + score_cols + ordered_dd:
+            if c in dd_df.columns and c not in seen:
                 final_cols.append(c)
-        final_cols.extend(ordered_dd)
-        
-        # Add any remaining columns (like DD_Score columns)
+                seen.add(c)
+
+        # Add any remaining columns
         for c in dd_df.columns:
-            if c not in final_cols:
+            if c not in seen:
                 final_cols.append(c)
-        
-        dd_df = dd_df.select([c for c in final_cols if c in dd_df.columns])
+                seen.add(c)
+
+        dd_df = dd_df.select(final_cols)
 
         # Ensure stable ordering: sort by global deal index ascending.
         if "index" in dd_df.columns:

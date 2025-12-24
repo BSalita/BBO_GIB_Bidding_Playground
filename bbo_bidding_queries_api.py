@@ -843,7 +843,7 @@ def _heavy_init() -> None:
         # DD_Score_Declarer = double-dummy score for the actual contract played
         # Contract = actual contract played (e.g., "4SN" = 4S by North)
         additional_cols = ['PBN', 'Vul', 'Declarer', 'bid', 'Contract', 'Result', 'Tricks', 'Score', 
-                           'ParScore', 'DD_Score_Declarer', 'ParContracts']
+                           'ParScore', 'DD_Score_Declarer', 'EV_Score_Declarer', 'ParContracts']
         
         # Add DD_Score columns for all contracts (for DD_Score_AI computation)
         # Format: DD_Score_{level}{strain}_{direction} e.g. DD_Score_3N_N
@@ -851,10 +851,6 @@ def _heavy_init() -> None:
             for strain in ['C', 'D', 'H', 'S', 'N']:
                 for direction in ['N', 'E', 'S', 'W']:
                     additional_cols.append(f"DD_Score_{level}{strain}_{direction}")
-        
-        # Add EV (Expected Value) columns for the actual contract played
-        # EV_Score_Declarer = EV for the actual contract (analogous to DD_Score_Declarer)
-        additional_cols.append('EV_Score_Declarer')
         
         # Add EV columns for all contracts (for EV_AI computation)
         # Format: EV_{pair}_{declarer}_{strain}_{level}_{vul}
@@ -938,12 +934,13 @@ def _heavy_init() -> None:
         # - Auction: pattern matching
         # - is_opening_bid, is_completed_auction: filtering
         # - seat: seat identification
+        # - Expr: criteria expression for the bid
         # - Agg_Expr_Seat_1-4: opening bid criteria matching
         # - previous_bid_indices, next_bid_indices: auction sequence queries
-        # Exclude: Expr, Agg_Expr, *_right columns
+        # Exclude: Agg_Expr, *_right columns
         required_cols = [
             "bt_index", "Auction", "is_opening_bid", "is_completed_auction", 
-            "seat", "candidate_bid", "npasses", "auction_len",
+            "seat", "candidate_bid", "npasses", "auction_len", "Expr",
             "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
             "previous_bid_indices", "next_bid_indices",
         ]
