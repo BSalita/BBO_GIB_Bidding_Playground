@@ -203,6 +203,101 @@ def order_columns(df: pl.DataFrame, priority_cols: list[str], drop_cols: list[st
     return df
 
 
+def _to_list_utf8_cell(x: Any) -> list[str] | None:
+    """Normalize a cell value into list[str] (or None) for strongly-typed List(Utf8) Series.
+
+    We see Agg_Expr_Seat_* cells as lists, None, and occasionally other list-like wrappers.
+    """
+    if x is None:
+        return None
+    if isinstance(x, pl.Series):
+        x = x.to_list()
+    elif hasattr(x, "tolist") and not isinstance(x, (str, bytes)):
+        try:
+            x = x.tolist()
+        except Exception:
+            pass
+    if isinstance(x, (list, tuple)):
+        out = ["" if v is None else str(v) for v in x]
+        out = [s for s in out if s != ""]
+        return out or None
+    if isinstance(x, (str, bytes)):
+        s = x.decode() if isinstance(x, bytes) else x
+        s = s.strip()
+        return [s] if s else None
+    s = str(x).strip()
+    return [s] if s else None
+
+
+def _expr_to_criteria_list(expr: Any) -> list[str]:
+    """Best-effort split of a BT `Expr` cell into atomic criterion strings.
+
+    Notes:
+    - BT rows may have criteria in `Agg_Expr_Seat_*` (preferred) OR only in `Expr`.
+    - This splitter is intentionally conservative; unknown tokens will be passed through and
+      the server will classify them as failed/untracked as appropriate.
+    """
+    if expr is None:
+        return []
+
+    # If Expr is already a list (common), handle it directly.
+    # Important: an empty list should mean "no criteria", not the literal string "[]".
+    if isinstance(expr, (list, tuple)):
+        if len(expr) == 0:
+            return []
+
+    # Most commonly Expr is already a list[str] (bt_seat1 schema uses List(String)).
+    direct = _to_list_utf8_cell(expr)
+    if direct is not None and not (len(direct) == 1 and ("&" in direct[0] or " and " in direct[0].lower())):
+        return direct
+
+    # Normalize common boolean separators to '&', then split.
+    # Examples seen: "A & B", "A and B", "A && B"
+    s = str(expr).strip()
+    if not s:
+        return []
+    if s in ("[]", "[ ]"):
+        return []
+    s = re.sub(r"(?i)\s+and\s+", " & ", s)
+    s = s.replace("&&", "&")
+    parts = re.split(r"\s*&\s*|\s*;\s*|\s*,\s*|\n+", s)
+    out = []
+    for p in parts:
+        p2 = str(p).strip()
+        if not p2:
+            continue
+        # Drop outer parentheses to better match bitmap column names.
+        while p2.startswith("(") and p2.endswith(")") and len(p2) >= 2:
+            p2 = p2[1:-1].strip()
+        if p2:
+            out.append(p2)
+    return out
+
+
+def _to_scalar_auction_text(x: Any) -> str | None:
+    """Best-effort: turn a grid cell into a single auction string (or None).
+
+    In Bidding Arena we sometimes display a list of matching Rules auctions in the Auction column.
+    Drilldowns must not treat that list as a regex pattern.
+    """
+    if x is None:
+        return None
+    if isinstance(x, str):
+        s = x.strip()
+        # Common case: stringified Python list from AgGrid selection like "['1S-p-p-p', '1S-4N-p-p-p']"
+        if s.startswith("[") and s.endswith("]") and ("'" in s or "\"" in s):
+            return None
+        return s or None
+    if isinstance(x, (list, tuple)):
+        # Ambiguous: caller should use bt_index list or Auction_Rules_Selected instead.
+        return None
+    try:
+        s = str(x).strip()
+        return s or None
+    except Exception:
+        return None
+
+
 def parse_distribution_pattern(pattern: str) -> dict | None:
     """
     Parse a suit distribution pattern into filter criteria.
@@ -467,6 +562,9 @@ def filter_by_distribution_duckdb(
     # Execute with DuckDB
     try:
         result = duckdb.sql(sql_query).pl()
+        # duckdb's `.pl()` can be typed as DataFrame | LazyFrame; force eager for downstream display.
+        if isinstance(result, pl.LazyFrame):
+            result = result.collect()
         return result, sql_query
     except Exception as e:
         # Return original df if query fails
@@ -639,6 +737,9 @@ def filter_deals_by_distribution_duckdb(
     
     try:
         result = duckdb.sql(sql_query).pl()
+        # duckdb's `.pl()` can be typed as DataFrame | LazyFrame; force eager for downstream display.
+        if isinstance(result, pl.LazyFrame):
+            result = result.collect()
         # Remove the added SL columns for cleaner display
         sl_cols = [f"SL_{s}_{direction}" for s in ['S', 'H', 'D', 'C']]
         result = result.drop([c for c in sl_cols if c in result.columns])
@@ -697,6 +798,8 @@ def render_aggrid(
     update_mode: GridUpdateMode = GridUpdateMode.NO_UPDATE,
     sort_model: list[dict[str, Any]] | None = None,
     hide_cols: list[str] | None = None,
+    show_copy_panel: bool = False,
+    copy_panel_default_col: str | None = None,
 ) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
     
@@ -814,8 +917,12 @@ def render_aggrid(
     # Enable row selection - clicking anywhere on a row highlights the entire row
     gb.configure_selection(selection_mode="single", use_checkbox=False, suppressRowClickSelection=False)
     # Explicitly set row/header heights to ensure consistent sizing
-    # suppressCellFocus prevents cell-level focus (keeps row selection clean)
-    gb.configure_grid_options(rowHeight=28, headerHeight=32, suppressCellFocus=True)
+    # suppressCellFocus prevents cell-level focus (keeps row selection clean) but can interfere with copy UX.
+    gb.configure_grid_options(
+        rowHeight=28,
+        headerHeight=32,
+        suppressCellFocus=True,
+    )
     grid_options = gb.build()
 
     # If provided, set an initial sort. (AgGrid can persist user sorts per-key; this
@@ -857,8 +964,50 @@ def render_aggrid(
     selected_rows: Any = response.get("selected_rows", [])
     # AgGrid returns a list of dicts or a list of dataframes depending on version
     if selected_rows is not None and hasattr(selected_rows, "to_dict"):
-        return selected_rows.to_dict("records")
-    return list(selected_rows) if selected_rows is not None else []
+        selected_records = selected_rows.to_dict("records")
+    else:
+        selected_records = list(selected_rows) if selected_rows is not None else []
+
+    # Option B: Copy panel (best-effort, works regardless of AgGrid clipboard support)
+    if show_copy_panel and selected_records:
+        row0 = selected_records[0] or {}
+        cols = list(df.columns)
+        default_col = copy_panel_default_col if (copy_panel_default_col in cols) else (cols[0] if cols else "")
+        if default_col:
+            # If the widget keys don't change when the *selected row* changes, Streamlit will
+            # preserve the previous text_area state and the displayed value won't update.
+            # Compute a best-effort fingerprint for the selected row to include in widget keys.
+            def _row_fingerprint(r: dict[str, Any]) -> str:
+                try:
+                    for k in ("_row_idx", "index", "bt_index", "Auction"):
+                        if k in r and r.get(k) is not None:
+                            return str(r.get(k))
+                    # Fall back to a stable hash of the row dict content.
+                    import json
+                    payload = json.dumps(r, sort_keys=True, default=str)
+                    return str(abs(hash(payload)))
+                except Exception:
+                    return "row"
+
+            row_fp = _row_fingerprint(row0)
+            sel_col = st.selectbox(
+                "Copy field from selected row",
+                cols,
+                index=cols.index(default_col),
+                key=f"{key}__copy_col",
+                help="Select a column, then Ctrl+A / Ctrl+C the value below.",
+            )
+            val = row0.get(sel_col)
+            st.text_area(
+                "Value (Ctrl+A, Ctrl+C)",
+                value="" if val is None else str(val),
+                height=80,
+                # Key must vary with selected column *and selected row*, otherwise Streamlit
+                # will preserve stale state and the displayed value won't update.
+                key=f"{key}__copy_val__{sel_col}__{row_fp}",
+            )
+
+    return selected_records
 
 if st.session_state.get("first_run", True):
     st.session_state.app_datetime = datetime.fromtimestamp(pathlib.Path(__file__).stat().st_mtime, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
@@ -1101,12 +1250,12 @@ def render_random_auction_samples():
             st.divider()
 
 
-def render_find_auction_sequences(pattern: str | None):
-    """Search for auction sequences matching a regex pattern."""
+def render_find_auction_sequences(pattern: str | None, indices: list[int] | None = None):
+    """Search for auction sequences by regex pattern OR by bt_index list (mutually exclusive)."""
     n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
     allow_initial_passes = st.sidebar.checkbox(
         "Match all 4 dealer positions",
-        value=True,
+        value=False,
         help=MATCH_ALL_DEALERS_HELP,
         key="allow_initial_passes_find",
     )
@@ -1115,13 +1264,29 @@ def render_find_auction_sequences(pattern: str | None):
     st.sidebar.divider()
     seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_find"))
 
+    if indices:
+        if pattern:
+            st.error("Please use either Auction Regex or bt_index list (not both).")
+            return
+        payload = {"indices": [int(x) for x in indices], "allow_initial_passes": bool(allow_initial_passes)}
+        with st.spinner("Fetching auctions by bt_index from server. Takes about 10-60 seconds."):
+            data = api_post("/auction-sequences-by-index", payload)
+        missing = data.get("missing_indices") or []
+        if missing:
+            st.warning(f"{len(missing)} bt_index values were not found (or not completed auctions).")
+    else:
+        if not pattern:
+            st.info("Enter an Auction Regex or provide a bt_index list in the sidebar.")
+            return
     payload = {"pattern": pattern, "allow_initial_passes": bool(allow_initial_passes), "n_samples": int(n_samples), "seed": seed}
     with st.spinner("Fetching auctions from server. Takes about 10-60 seconds."):
         data = api_post("/auction-sequences-matching", payload)
 
     # Show the effective pattern including (p-)* prefix when matching all seats
     effective_pattern = data.get('pattern', pattern)
-    if allow_initial_passes and effective_pattern:
+    if indices:
+        st.caption(f"Using bt_index list ({len(indices)} provided)")
+    elif allow_initial_passes and effective_pattern:
         display_pattern = prepend_all_seats_prefix(effective_pattern)
         st.caption(f"Effective pattern: {display_pattern} (4 seat variants)")
     else:
@@ -1151,10 +1316,11 @@ def render_find_auction_sequences(pattern: str | None):
             for i, seat in enumerate(seats):
                 agg_col = f"Agg_Expr_Seat_{seat}"
                 if agg_col in df.columns:
-                    agg_expr_vals.append(df[agg_col][i])
+                    agg_expr_vals.append(_to_list_utf8_cell(df[agg_col][i]))
                 else:
                     agg_expr_vals.append(None)
-            df = df.with_columns(pl.Series("Agg_Expr_Seat", agg_expr_vals))
+            # Force a strongly-typed list-of-strings column (prevents Polars panic on all-None).
+            df = df.with_columns(pl.Series("Agg_Expr_Seat", agg_expr_vals, dtype=pl.List(pl.Utf8)))
             
             # Drop individual Agg_Expr_Seat_[1-4] columns
             drop_cols = [c for c in df.columns if c.startswith("Agg_Expr_Seat_") and c[-1].isdigit()]
@@ -1203,7 +1369,7 @@ def render_find_auction_sequences(pattern: str | None):
     criteria_rejected = data.get("criteria_rejected", [])
     if criteria_rejected:
         st.markdown(f"🚫 **Rejected auctions due to custom criteria** ({len(criteria_rejected)} shown)")
-        st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
+        st.caption("Rows filtered out by `bbo_custom_auction_criteria.csv` rules (hot-reloadable overlay).")
         try:
             rejected_df = pl.DataFrame(criteria_rejected)
             render_aggrid(rejected_df, key="rejected_find_auction", height=calc_grid_height(len(criteria_rejected), max_height=300), table_name="rejected_auctions")
@@ -1215,10 +1381,10 @@ def render_find_auction_sequences(pattern: str | None):
 def render_deals_by_auction_pattern(pattern: str | None):
     """Find deals matching an auction pattern's criteria."""
     n_auction_samples = st.sidebar.number_input("Auction Samples", value=2, min_value=1, max_value=10)
-    n_deal_samples = st.sidebar.number_input("Deal Samples per Auction", value=100, min_value=1, max_value=10000)
+    n_deal_samples = st.sidebar.number_input("Deal Samples per Auction", value=100, min_value=1, max_value=10_000_000)
     allow_initial_passes = st.sidebar.checkbox(
         "Match all 4 dealer positions",
-        value=True,
+        value=False,
         help=MATCH_ALL_DEALERS_HELP,
         key="allow_initial_passes_deals",
     )
@@ -1308,7 +1474,9 @@ def render_deals_by_auction_pattern(pattern: str | None):
     else:
         st.success(f"Found {len(auctions)} matching auction(s) in {elapsed_ms/1000:.1f}s")
         for i, a in enumerate(auctions, start=1):
-            st.subheader(f"Auction {i}: {a['auction']}")
+            bt_idx = a.get("bt_index")
+            bt_suffix = f" (bt_index={bt_idx})" if bt_idx is not None else ""
+            st.subheader(f"Auction {i}: {a['auction']}{bt_suffix}")
             
             # Show sample count vs total matching deals
             total_matching = a.get("total_matching_deals", 0)
@@ -1419,6 +1587,8 @@ def render_deals_by_auction_pattern(pattern: str | None):
                     "Contract", "Result", "Tricks", "Score", "DD_Score_Declarer", "ParScore",
                     "HCP_N", "HCP_E", "HCP_S", "HCP_W",
                 ])
+                if "index" in deals_df.columns:
+                    deals_df = deals_df.sort("index")
                 st.write(f"**Matching Deals:** (showing {len(deals_df)})")
                 render_aggrid(deals_df, key=f"deals_{i}", table_name="deals")
             else:
@@ -1429,7 +1599,7 @@ def render_deals_by_auction_pattern(pattern: str | None):
     criteria_rejected = data.get("criteria_rejected", [])
     if criteria_rejected:
         st.markdown(f"🚫 **Rejected auctions due to custom criteria** ({len(criteria_rejected)} shown)")
-        st.caption("Rows filtered out by bbo_custom_auction_criteria.csv rules.")
+        st.caption("Rows filtered out by `bbo_custom_auction_criteria.csv` rules (hot-reloadable overlay).")
         try:
             rejected_df = pl.DataFrame(criteria_rejected)
             render_aggrid(rejected_df, key="rejected_deals_by_auction", height=calc_grid_height(len(criteria_rejected), max_height=300), table_name="rejected_auctions")
@@ -1450,7 +1620,7 @@ def render_bidding_table_explorer():
         key="bt_explorer_auction_pattern")
     allow_initial_passes = st.sidebar.checkbox(
         "Match all 4 dealer positions",
-        value=True,
+        value=False,
         help=MATCH_ALL_DEALERS_HELP,
         key="allow_initial_passes_bt",
     )
@@ -1888,7 +2058,7 @@ def render_analyze_actual_auctions():
     )
     match_all_dealers = st.sidebar.checkbox(
         "Match all 4 dealer positions",
-        value=True,
+        value=False,
         help=MATCH_ALL_DEALERS_HELP,
         key="match_all_dealers_group",
     )
@@ -1902,6 +2072,12 @@ def render_analyze_actual_auctions():
     
     max_groups = st.sidebar.number_input("Max Auction Groups", value=10, min_value=1, max_value=100)
     deals_per_group = st.sidebar.number_input("Deals per Group", value=100, min_value=1, max_value=1000)
+    
+    show_blocking_criteria = st.sidebar.checkbox(
+        "🔍 Show Blocking Criteria",
+        value=False,
+        help="For each deal, evaluate which criteria from the BT row are blocking. Adds columns showing failed/untracked criteria per deal."
+    )
     
     # Random seed at bottom of sidebar
     st.sidebar.divider()
@@ -2059,9 +2235,75 @@ def render_analyze_actual_auctions():
         if deals:
             st.write(f"**Sample Deals** ({len(deals)} shown):")
             deals_df = pl.DataFrame(deals)
+            
+            # Add blocking criteria columns if enabled
+            if show_blocking_criteria and bt_info:
+                # Build checks from bt_info criteria
+                checks = []
+                for seat in [1, 2, 3, 4]:
+                    crits = bt_info.get(f"Agg_Expr_Seat_{seat}", [])
+                    if crits:
+                        checks.append({"seat": seat, "criteria": crits})
+                
+                if checks:
+                    blocking_data = []
+                    with st.spinner("Evaluating criteria..."):
+                        for deal in deals:
+                            deal_row_idx = deal.get("_row_idx", deal.get("index", 0))
+                            dealer = deal.get("Dealer", "N")
+                            
+                            try:
+                                eval_resp = requests.post(
+                                    f"{API_BASE}/deal-criteria-eval-batch",
+                                    json={
+                                        "deal_row_idx": int(deal_row_idx),
+                                        "dealer": str(dealer),
+                                        "checks": checks
+                                    },
+                                    timeout=30
+                                )
+                                
+                                failed_list = []
+                                untracked_list = []
+                                if eval_resp.status_code == 200:
+                                    eval_data = eval_resp.json()
+                                    for result in eval_data.get("results", []):
+                                        seat = result.get("seat")
+                                        for f in result.get("failed", []):
+                                            failed_list.append(f"S{seat}:{f}")
+                                        for u in result.get("untracked", []):
+                                            untracked_list.append(f"S{seat}:{u}")
+                                
+                                blocking_data.append({
+                                    "_idx": deal.get("index", deal_row_idx),
+                                    "Failed_Criteria": ", ".join(failed_list[:5]) + ("..." if len(failed_list) > 5 else "") if failed_list else "",
+                                    "Untracked_Criteria": ", ".join(untracked_list[:3]) + ("..." if len(untracked_list) > 3 else "") if untracked_list else "",
+                                    "Fail_Count": len(failed_list),
+                                    "Untracked_Count": len(untracked_list),
+                                })
+                            except Exception:
+                                blocking_data.append({
+                                    "_idx": deal.get("index", deal_row_idx),
+                                    "Failed_Criteria": "(error)",
+                                    "Untracked_Criteria": "",
+                                    "Fail_Count": -1,
+                                    "Untracked_Count": 0,
+                                })
+                    
+                    # Merge blocking data into deals_df
+                    if blocking_data:
+                        blocking_df = pl.DataFrame(blocking_data)
+                        if "_idx" in blocking_df.columns and "index" in deals_df.columns:
+                            deals_df = deals_df.join(
+                                blocking_df.rename({"_idx": "index"}),
+                                on="index",
+                                how="left"
+                            )
+            
             deals_df = order_columns(deals_df, priority_cols=[
                 "PBN",
                 "index", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                "Failed_Criteria", "Untracked_Criteria", "Fail_Count", "Untracked_Count",
                 "Contract", "Result", "Score", "Score_MP", "Score_MP_Pct",
                 "DD_Score_Declarer", "ParScore",
                 "HCP_N", "HCP_E", "HCP_S", "HCP_W",
@@ -2231,6 +2473,297 @@ def render_bt_seat_stats_tool():
 
 
 # ---------------------------------------------------------------------------
+# Auction Criteria Debugger – Why is a specific auction being rejected?
+# ---------------------------------------------------------------------------
+
+def render_auction_criteria_debugger():
+    """Debug why a specific auction is being rejected as a Rules candidate.
+    
+    Shows deals matching an auction pattern, the Rules auction, and which criteria
+    from the target auction's BT row are blocking it from being selected.
+    """
+    st.header("🔍 Auction Criteria Debugger")
+    st.markdown("""
+    Enter an auction pattern (e.g., `1S-p-p-p`) to see why that auction isn't being selected 
+    by the Rules model for deals where it's the actual auction.
+    """)
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        auction_pattern = st.text_input(
+            "Target Auction Pattern",
+            value="1S-p-p-p",
+            help="The auction you want to debug (e.g., 1S-p-p-p, 2H-p-p-p, 5N-p-p-p)"
+        )
+    with col2:
+        sample_size = st.number_input(
+            "Sample Size",
+            min_value=1,
+            max_value=10000,
+            value=100,
+            help="Number of deals to analyze"
+        )
+    
+    seed = st.number_input("Random Seed", min_value=0, value=42, help="For reproducibility")
+    
+    if not auction_pattern:
+        st.info("Enter an auction pattern to begin.")
+        return
+    
+    if st.button("🔎 Analyze Auction", type="primary"):
+        with st.spinner(f"Analyzing why '{auction_pattern}' is rejected..."):
+            try:
+                import time
+                
+                # Step 1: Get the BT row for this auction pattern
+                st.subheader(f"1️⃣ BT Row for '{auction_pattern}'")
+                
+                t0 = time.perf_counter()
+                # Normalize pattern for exact match
+                pattern_exact = f"^{auction_pattern.upper()}$"
+                bt_response = requests.post(
+                    f"{API_BASE}/auction-sequences-matching",
+                    json={"pattern": pattern_exact, "n_samples": 1, "seed": int(seed)},
+                    timeout=30
+                )
+                bt_response.raise_for_status()
+                bt_data = bt_response.json()
+                elapsed_bt = time.perf_counter() - t0
+                if elapsed_bt > 1.0:
+                    st.caption(f"⏱️ BT lookup: {elapsed_bt:.1f}s")
+                
+                bt_samples = bt_data.get("samples", [])
+                if not bt_samples:
+                    st.warning(f"No BT row found for auction '{auction_pattern}'. Check the pattern.")
+                    return
+                
+                bt_sample = bt_samples[0]
+                sequence = bt_sample.get("sequence", [])
+                
+                # Find the target row (the final auction row)
+                target_row = None
+                for row in sequence:
+                    if row.get("Auction", "").upper() == auction_pattern.upper():
+                        target_row = row
+                        break
+                if not target_row and sequence:
+                    target_row = sequence[0]  # Use first row with aggregated criteria
+                
+                if not target_row:
+                    st.warning("Could not find target BT row in sequence.")
+                    return
+                
+                bt_index = target_row.get("index")
+                st.success(f"Found BT row: **bt_index={bt_index}**, Auction=**{target_row.get('Auction')}**")
+                
+                # Show criteria per seat (BT row: raw/overlay)
+                criteria_by_seat = {}
+                for seat in [1, 2, 3, 4]:
+                    criteria = target_row.get(f"Agg_Expr_Seat_{seat}", [])
+                    if criteria:
+                        criteria_by_seat[seat] = criteria
+                        st.write(f"**Seat {seat}** ({len(criteria)} criteria): `{criteria[:5]}{'...' if len(criteria) > 5 else ''}`")
+                    else:
+                        st.write(f"**Seat {seat}** (no criteria)")
+
+                # If present, show the Rules model’s seat-1 criteria (merged+overlay) for this bt_index.
+                rules_s1 = target_row.get("Agg_Expr_Seat_1_Rules")
+                if rules_s1 is not None:
+                    st.markdown("**Rules (merged+overlay) Seat 1 criteria**")
+                    if rules_s1:
+                        st.write(f"Seat 1 Rules criteria ({len(rules_s1)}): `{rules_s1[:8]}{'...' if len(rules_s1) > 8 else ''}`")
+                    else:
+                        st.write("Seat 1 Rules criteria: (none)")
+                
+                if not criteria_by_seat:
+                    st.info("No criteria on any seat for this BT row.")
+                
+                st.divider()
+                
+                # Step 2: Get deals where actual auction matches this pattern
+                st.subheader(f"2️⃣ Deals with Actual Auction Matching '{auction_pattern}'")
+                
+                t0 = time.perf_counter()
+                arena_response = requests.post(
+                    f"{API_BASE}/bidding-arena",
+                    json={
+                        "model_a": "Actual",
+                        "model_b": "Rules",
+                        "sample_size": int(sample_size),
+                        "seed": int(seed),
+                        "auction_pattern": f"^{auction_pattern.upper()}"
+                    },
+                    timeout=120
+                )
+                arena_response.raise_for_status()
+                arena_data = arena_response.json()
+                elapsed_arena = time.perf_counter() - t0
+                if elapsed_arena > 1.0:
+                    st.caption(f"⏱️ Bidding arena: {elapsed_arena:.1f}s")
+                
+                sample_deals = arena_data.get("sample_deals", [])
+                if not sample_deals:
+                    st.warning(f"No deals found with actual auction matching '{auction_pattern}'")
+                    return
+                
+                st.success(f"Found **{len(sample_deals)}** sample deals")
+                
+                st.divider()
+                
+                # Step 3: Evaluate criteria for each deal
+                st.subheader("3️⃣ Criteria Failures Analysis")
+                
+                t0 = time.perf_counter()
+                results_data = []
+                checks = [{"seat": seat, "criteria": crits} for seat, crits in criteria_by_seat.items()]
+                
+                progress_bar = st.progress(0)
+                for i, deal in enumerate(sample_deals):
+                    progress_bar.progress((i + 1) / len(sample_deals))
+                    
+                    deal_row_idx = deal.get("_row_idx")
+                    if deal_row_idx is None:
+                        deal_row_idx = deal.get("index", 0)
+                    dealer = deal.get("Dealer", "N")
+                    actual_auction = deal.get("Auction_Actual", "")
+                    rules_auction = deal.get("Auction_Rules", "")
+                    
+                    # Evaluate criteria
+                    eval_response = requests.post(
+                        f"{API_BASE}/deal-criteria-eval-batch",
+                        json={
+                            "deal_row_idx": int(deal_row_idx),
+                            "dealer": str(dealer),
+                            "checks": checks
+                        },
+                        timeout=30
+                    )
+                    
+                    failed_criteria = []
+                    untracked_criteria = []
+                    
+                    if eval_response.status_code == 200:
+                        eval_data = eval_response.json()
+                        for result in eval_data.get("results", []):
+                            seat = result.get("seat")
+                            seat_dir = result.get("seat_dir", "?")
+                            failed = result.get("failed", [])
+                            untracked = result.get("untracked", [])
+                            if failed:
+                                failed_criteria.extend([f"S{seat}({seat_dir}):{c}" for c in failed])
+                            if untracked:
+                                untracked_criteria.extend([f"S{seat}({seat_dir}):{c}" for c in untracked])
+                    
+                    # Combine failures
+                    all_blocking = failed_criteria + [f"{c} (CSV)" for c in untracked_criteria]
+                    
+                    results_data.append({
+                        "Dealer": dealer,
+                        "Vul": deal.get("Vul", ""),
+                        "Hand_N": deal.get("Hand_N", ""),
+                        "Hand_E": deal.get("Hand_E", ""),
+                        "Hand_S": deal.get("Hand_S", ""),
+                        "Hand_W": deal.get("Hand_W", ""),
+                        "Actual_Auction": actual_auction,
+                        # If no blocking criteria and rules_auction is empty, rules agrees with actual
+                        "Rules_Auction": rules_auction if rules_auction else (actual_auction if not all_blocking else "no match"),
+                        "Blocking_Criteria": ", ".join(all_blocking[:5]) + ("..." if len(all_blocking) > 5 else "") if all_blocking else "",
+                        "Failed_Count": len(failed_criteria),
+                        "Untracked_Count": len(untracked_criteria),
+                        "Result": deal.get("Result", ""),
+                        "Score": deal.get("Score", ""),
+                        "ParScore": deal.get("ParScore", ""),
+                    })
+                
+                progress_bar.empty()
+                elapsed_eval = time.perf_counter() - t0
+                if elapsed_eval > 1.0:
+                    st.caption(f"⏱️ Criteria evaluation: {elapsed_eval:.1f}s")
+                
+                # Display results table
+                if results_data:
+                    import polars as pl
+                    results_df = pl.DataFrame(results_data)
+                    
+                    # Show SQL query equivalent
+                    criteria_list = []
+                    for seat, crits in criteria_by_seat.items():
+                        for c in crits[:3]:
+                            criteria_list.append(f"S{seat}:{c}")
+                    criteria_preview = ", ".join(criteria_list[:5]) + ("..." if len(criteria_list) > 5 else "")
+                    
+                    sql_query = f"""-- Conceptual SQL for Auction Criteria Debugger
+-- Target auction: {auction_pattern}
+-- Criteria checked: {criteria_preview}
+
+SELECT 
+    d.Dealer,
+    d.Vul,
+    d.Hand_N, d.Hand_E, d.Hand_S, d.Hand_W,
+    d.bid AS Actual_Auction,
+    rules.matched_auction AS Rules_Auction,
+    CASE 
+        WHEN NOT check_criteria(d, bt.criteria) THEN get_failed_criteria(d, bt.criteria)
+        ELSE NULL 
+    END AS Blocking_Criteria
+FROM deals d
+CROSS JOIN bt_rows bt
+LEFT JOIN rules_matches rules ON d.id = rules.deal_id
+WHERE d.bid = '{auction_pattern}'
+  AND bt.auction = '{auction_pattern}'
+ORDER BY d.id
+LIMIT {sample_size};"""
+                    
+                    with st.expander("📝 SQL Query (Conceptual)", expanded=False):
+                        st.code(sql_query, language="sql")
+                    
+                    st.markdown(f"""
+                    **Legend:**
+                    - `S1:`, `S2:`, etc. = Seat number where criterion failed
+                    - `(CSV)` = Criterion from CSV overlay (untracked in bitmap)
+                    - `no match` = Rules model found no matching auction
+                    - Empty = All criteria passed (target auction should match)
+                    """)
+                    
+                    render_aggrid(results_df, key="criteria_debug_results", height=calc_grid_height(len(results_df)))
+                    
+                    # Summary statistics
+                    st.subheader("📊 Summary")
+                    total = len(results_data)
+                    rules_none = sum(1 for r in results_data if r["Rules_Auction"] == "no match")
+                    rules_match = sum(1 for r in results_data if r["Rules_Auction"].upper() == auction_pattern.upper())
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Deals", total)
+                    col2.metric("Rules = None", rules_none, help="Deals where Rules model found no match")
+                    col3.metric(f"Rules = {auction_pattern}", rules_match, help="Deals where Rules returned the target auction")
+                    
+                    # Most common blocking criteria
+                    from collections import Counter
+                    all_failed = []
+                    for r in results_data:
+                        blocking = r["Blocking_Criteria"]
+                        if blocking:
+                            for c in blocking.replace("...", "").split(", "):
+                                if c.strip():
+                                    all_failed.append(c.strip())
+                    
+                    if all_failed:
+                        st.subheader("🚫 Most Common Blocking Criteria")
+                        counter = Counter(all_failed)
+                        common_df = pl.DataFrame([
+                            {"Criterion": k, "Count": v, "Pct": f"{v/total*100:.1f}%"} 
+                            for k, v in counter.most_common(10)
+                        ])
+                        render_aggrid(common_df, key="common_blocking", height=calc_grid_height(len(common_df), max_height=300))
+                
+            except Exception as e:
+                st.error(f"Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
 # Bidding Arena – Head-to-head model comparison
 # ---------------------------------------------------------------------------
 
@@ -2247,7 +2780,27 @@ def render_bidding_arena():
         model_names = [m["name"] for m in models_data.get("models", [])]
     except Exception as e:
         st.error(f"Failed to get models: {e}")
-        model_names = ["Rules", "Actual"]
+        model_names = ["Raw_Rules", "Actual"]
+
+    # Ensure baseline models are always present (even if /bidding-models omits them)
+    for base_model in ("Raw_Rules", "Actual"):
+        if base_model not in model_names:
+            model_names.append(base_model)
+
+    # Add Rules (learned criteria) only if the server reports merged_rules loaded
+    try:
+        status_resp = requests.get(f"{API_BASE}/status", timeout=10).json()
+        loaded_files = status_resp.get("loaded_files") or {}
+        merged_ok = ("merged_rules" in loaded_files) and (loaded_files.get("merged_rules") not in (None, 0, "0"))
+        if merged_ok and "Rules" not in model_names:
+            model_names.append("Rules")
+    except Exception:
+        # If status can't be fetched, don't advertise Rules (learned).
+        pass
+
+    # Stable ordering for UI
+    preferred_order = ["Actual", "Rules", "Raw_Rules"]
+    model_names = preferred_order + sorted([m for m in model_names if m not in preferred_order])
     
     # Model selection - default to Actual vs Rules
     col1, col2 = st.columns(2)
@@ -2267,6 +2820,167 @@ def render_bidding_arena():
     with col5:
         auction_pattern = st.text_input("Auction Pattern (optional)", value="", 
             help="Regex pattern to filter auctions (e.g., '^1N-p-3N')")
+
+    pinned_indexes_raw = st.sidebar.text_area(
+        "Pinned deal indexes (optional)",
+        value="",
+        help="Comma/space/newline-separated deal 'index' values to force-include in Sample Deal Comparisons.",
+    )
+    pinned_indexes: list[int] = []
+    if pinned_indexes_raw.strip():
+        tokens = re.split(r"[,\s]+", pinned_indexes_raw.strip())
+        for t in tokens:
+            if not t:
+                continue
+            try:
+                pinned_indexes.append(int(t))
+            except Exception:
+                continue
+
+    search_all_bt_rows = st.sidebar.checkbox(
+        "Search all completed BT rows (very slow)",
+        value=False,
+        help=(
+            "If enabled, the Rules model will scan *all* completed BT auctions when trying to find a matching rule for each deal. "
+            "This can take a very long time; prefer pinned-only mode or a small sample size."
+        ),
+    )
+
+    if st.sidebar.button(
+        "Clear BT drilldown caches",
+        help="Clears cached /auction-sequences-* and /deal-criteria-eval-batch results used by the drilldowns.",
+    ):
+        for k in ("_bt_seq_cache", "_bt_by_index_cache", "_deal_bt_eval_cache", "_deal_fail_cache"):
+            if k in st.session_state:
+                del st.session_state[k]
+        st.sidebar.success("Cleared. Re-run will fetch fresh sequence/eval results.")
+        st.rerun()
+
+    if st.sidebar.button(
+        "Clear Arena cache",
+        help="Clears the cached /bidding-arena response (use this after changing sidebar options).",
+    ):
+        for k in ("_arena_cache_key", "_arena_cache_data"):
+            if k in st.session_state:
+                del st.session_state[k]
+        st.sidebar.success("Cleared. Re-run will fetch a fresh /bidding-arena response.")
+        st.rerun()
+
+    debug_bt_index_raw = st.sidebar.text_input(
+        "Debug BT index (optional)",
+        value="",
+        help="If provided (and you select a deal row below), we'll evaluate this specific bt_index's criteria against the selected deal and show which criteria pass/fail per seat.",
+    )
+    debug_bt_index: int | None = None
+    if debug_bt_index_raw.strip():
+        try:
+            debug_bt_index = int(debug_bt_index_raw.strip())
+        except Exception:
+            debug_bt_index = None
+    if debug_bt_index is not None:
+        st.sidebar.caption(f"Debug BT index is set to {debug_bt_index}. Clear it to enable auto-debug-from-Actual.")
+
+    def _render_debug_bt_index(
+        bt_index: int,
+        deal_row_idx: int,
+        dealer_dir: str,
+        deal_index_label: Any,
+        key_suffix: str,
+    ) -> None:
+        """Evaluate a specific bt_index's criteria against a selected deal row."""
+        try:
+            st.markdown("**Debug BT index vs selected deal**")
+            st.caption(f"Deal index: {deal_index_label} (dealer={dealer_dir})")
+
+            bt_payload = {"indices": [int(bt_index)], "allow_initial_passes": False}
+            bt_cache = st.session_state.setdefault("_bt_by_index_cache", {})
+            bt_key = ("auction-sequences-by-index", int(bt_index))
+            if bt_key in bt_cache:
+                bt_data = bt_cache[bt_key]
+            else:
+                bt_data = api_post("/auction-sequences-by-index", bt_payload)
+                bt_cache[bt_key] = bt_data
+
+            bt_samples = bt_data.get("samples") or []
+            if not bt_samples:
+                st.info(f"bt_index {bt_index} not found (or not a completed auction).")
+                return
+
+            seq = bt_samples[0].get("sequence") or []
+            if not isinstance(seq, list) or not seq:
+                st.info(f"bt_index {bt_index}: empty sequence")
+                return
+
+            # /auction-sequences-by-index sorts by bt_index, so select the exact row for bt_index if present.
+            target_row: dict[str, Any] | None = None
+            for r in seq:
+                try:
+                    if int(r.get("index") or -1) == int(bt_index):
+                        target_row = r
+                        break
+                except Exception:
+                    continue
+            if target_row is None:
+                for r in seq:
+                    if r.get("is_match_row") is True:
+                        target_row = r
+                        break
+            if target_row is None:
+                target_row = seq[-1]
+
+            # For type-checkers: target_row is always bound at this point.
+            assert target_row is not None
+
+            auction_val = target_row.get("Auction")
+            st.caption(f"[{key_suffix}] bt_index={bt_index} auction={auction_val}")
+
+            checks = []
+            for seat in (1, 2, 3, 4):
+                crits = target_row.get(f"Agg_Expr_Seat_{seat}") or []
+                crits = _to_list_utf8_cell(crits) or []
+                checks.append({"seat": seat, "criteria": crits})
+
+            eval_payload = {
+                "deal_row_idx": int(deal_row_idx),
+                "dealer": str(dealer_dir or "N").upper(),
+                "checks": checks,
+            }
+            eval_cache = st.session_state.setdefault("_deal_bt_eval_cache", {})
+            eval_key = ("deal-criteria-eval-batch", int(deal_row_idx), str(dealer_dir or "N").upper(), int(bt_index))
+            if eval_key in eval_cache:
+                eval_data = eval_cache[eval_key]
+            else:
+                eval_data = api_post("/deal-criteria-eval-batch", eval_payload)
+                eval_cache[eval_key] = eval_data
+
+            res = eval_data.get("results") or []
+            rows = []
+            for rr in res:
+                rows.append(
+                    {
+                        "seat": rr.get("seat"),
+                        "passed_n": len(rr.get("passed") or []),
+                        "failed": rr.get("failed") or [],
+                        "untracked": rr.get("untracked") or [],
+                    }
+                )
+            dbg_df = pl.DataFrame(rows) if rows else pl.DataFrame()
+            if not dbg_df.is_empty():
+                render_aggrid(
+                    dbg_df,
+                    key=f"arena_debug_bt_{bt_index}_{deal_index_label}_{key_suffix}",
+                    height=calc_grid_height(len(dbg_df), max_height=220),
+                )
+        except Exception as e:
+            st.warning(f"Debug BT index failed: {e}")
+
+    effective_sample_size = int(sample_size)
+    if pinned_indexes:
+        # If the user pins specific deal indexes, only show those deals (no padding with random samples).
+        # The API handler includes pinned deals and then pads up to sample_size; setting sample_size=len(pins)
+        # makes it return exactly the pinned set.
+        effective_sample_size = max(1, len(pinned_indexes))
+        st.sidebar.caption(f"Using pinned-only mode: {len(pinned_indexes)} deal(s).")
     
     # Optional: Custom deals URI
     deals_uri = st.text_input(
@@ -2289,21 +3003,54 @@ def render_bidding_arena():
             payload = {
                 "model_a": model_a,
                 "model_b": model_b,
-                "sample_size": sample_size,
+                "sample_size": effective_sample_size,
                 "seed": seed,
                 "auction_pattern": auction_pattern if auction_pattern else None,
                 "deals_uri": deals_uri if deals_uri else None,
+                "deal_indices": pinned_indexes if pinned_indexes else None,
+                "search_all_bt_rows": bool(search_all_bt_rows),
             }
-            response = requests.post(f"{API_BASE}/bidding-arena", json=payload, timeout=120)
-            response.raise_for_status()
-            data = response.json()
+            # Cache the expensive arena response across Streamlit reruns (e.g., AgGrid selection changes).
+            cache_key = ("bidding-arena", tuple(sorted(payload.items())))
+            if st.session_state.get("_arena_cache_key") == cache_key and st.session_state.get("_arena_cache_data") is not None:
+                data = st.session_state["_arena_cache_data"]
+            else:
+                timeout_s = 600 if search_all_bt_rows else 120
+                if search_all_bt_rows:
+                    st.warning("Searching all completed BT rows is enabled; this request may take minutes.")
+                response = requests.post(f"{API_BASE}/bidding-arena", json=payload, timeout=timeout_s)
+                response.raise_for_status()
+                data = response.json()
+                st.session_state["_arena_cache_key"] = cache_key
+                st.session_state["_arena_cache_data"] = data
+            
+            elapsed_ms = data.get("elapsed_ms", 0)
+            st.caption(f"Completed in {elapsed_ms:.0f}ms")
+            rules_search = data.get("rules_search") or {}
+            if rules_search:
+                st.caption(
+                    f"Rules search: mode={rules_search.get('mode')}, "
+                    f"search_all_bt_rows={rules_search.get('search_all_bt_rows')}, "
+                    f"candidate_count={rules_search.get('candidate_count')}, "
+                    f"fallback_candidate_count={rules_search.get('fallback_candidate_count')}"
+                )
 
             # Display summary
             st.subheader("📊 Summary")
             summary = data.get("summary", {})
+            
+            # Extract key counts for clarity
+            total_deals = data.get("total_deals", 0)  # After pattern filter
+            analyzed_deals = data.get("analyzed_deals", 0)  # After sampling
+            deals_compared = data.get("deals_compared", summary.get("total_deals", 0))  # Successfully processed
+            
+            # Show diagnostic info if there's a problem
+            if analyzed_deals == 0:
+                st.warning(f"No deals to analyze (total matching: {total_deals})")
+            
             summary_cols = st.columns(4)
             with summary_cols[0]:
-                st.metric("Deals Compared", summary.get("total_deals", 0))
+                st.metric("Deals Compared", deals_compared, delta=f"of {analyzed_deals} sampled")
             with summary_cols[1]:
                 st.metric(f"{model_a} Avg Score", f"{summary.get(f'avg_dd_score_{model_a.lower()}', 0):.1f}")
             with summary_cols[2]:
@@ -2339,35 +3086,841 @@ def render_bidding_arena():
             if "segmentation" in data:
                 st.subheader("📊 Segmentation Analysis")
                 for seg_idx, (seg_name, seg_data) in enumerate(data["segmentation"].items()):
-                    with st.expander(f"By {seg_name.replace('_', ' ').title()}"):
-                        if seg_data:
-                            seg_df = pl.DataFrame(seg_data)
-                            render_aggrid(seg_df, key=f"arena_seg_{seg_idx}", height=calc_grid_height(len(seg_df)))
-                        else:
-                            st.info("No segmentation data available.")
+                    # seg_name is like "by_vulnerability" -> "Vulnerability"
+                    display_name = seg_name.replace("by_", "").replace("_", " ").title()
+                    st.markdown(f"**By {display_name}**")
+                    if seg_data:
+                        seg_df = pl.DataFrame(seg_data)
+                        render_aggrid(seg_df, key=f"arena_seg_{seg_idx}", height=calc_grid_height(len(seg_df)))
+                    else:
+                        st.info("No segmentation data available.")
 
             # Sample deals
             if "sample_deals" in data and data["sample_deals"]:
                 st.subheader("🎯 Sample Deal Comparisons")
                 sample_df = pl.DataFrame(data["sample_deals"])
+                # Avoid mixing list-typed "Rules_Matches_Auctions" into Auction_* columns (breaks Polars casting).
+                # Instead, render an optional string column for debugging/visibility.
+                if "Rules_Matches_Auctions_Str" in sample_df.columns:
+                    pass
+                elif "Rules_Matches_Auctions" in sample_df.columns:
+                    try:
+                        sample_df = sample_df.with_columns(
+                            pl.when(pl.col("Rules_Matches_Auctions").is_null())
+                            .then(pl.lit(""))
+                            .otherwise(
+                                pl.col("Rules_Matches_Auctions")
+                                .list.eval(pl.element().fill_null("").cast(pl.Utf8))
+                                .list.join(", ")
+                            )
+                            .alias("Rules_Matches_Auctions_Str")
+                        )
+                    except Exception:
+                        # If list casting fails (e.g., List[Null] everywhere), just skip this derived column.
+                        pass
                 # Order columns sensibly - Hand_[NESW] in NESW order
                 priority_cols = [
+                    "index",
                     "Dealer",
                     "Vul",
                     "Hand_N", "Hand_E", "Hand_S", "Hand_W",
                     f"Auction_{model_a}",
                     f"Auction_{model_b}",
+                    "Rules_Actual_BT_Lookup",
+                    "Rules_Actual_BT_Index",
+                    "Rules_Actual_Criteria_OK",
+                    "Rules_Actual_First_Failure",
+                    "Rules_Actual_Seat1_Criteria",
+                    "Rules_Actual_BT_Base_Criteria_By_Seat",
+                    "Rules_Actual_BT_MergedOnly_Criteria_By_Seat",
+                    "Rules_Actual_BT_Merged_Criteria_By_Seat",
+                    "Rules_Matches_Count",
+                    "Rules_Matches_Truncated",
+                    "Rules_Matches_Auctions_Str",
                     f"DD_Score_{model_a}",
                     f"DD_Score_{model_b}",
+                    "Rejection_Reason",
                     "IMP_Diff",
                 ]
                 existing = [c for c in priority_cols if c in sample_df.columns]
                 remaining = [c for c in sample_df.columns if c not in existing]
                 sample_df = sample_df.select(existing + remaining)
-                render_aggrid(sample_df, key="arena_sample_deals", height=calc_grid_height(len(sample_df)), table_name="arena_samples")
+                selected_rows = render_aggrid(
+                    sample_df,
+                    key="arena_sample_deals",
+                    height=calc_grid_height(len(sample_df)),
+                    table_name="arena_samples",
+                    update_mode=GridUpdateMode.SELECTION_CHANGED,
+                    show_copy_panel=True,
+                    copy_panel_default_col="index",
+                    hide_cols=["_row_idx", "Rules_Matches", "Rules_Matches_Auctions", "Auction_Rules_Selected"],
+                )
+
+                # Convenience: if we're pinned-only (single row) and Debug BT index is set,
+                # auto-run the debug without requiring a grid click.
+                if debug_bt_index is not None and pinned_indexes and len(pinned_indexes) == 1 and len(sample_df) == 1 and not selected_rows:
+                    try:
+                        only = sample_df.to_dicts()[0] if sample_df.height == 1 else {}
+                        only_row_idx = only.get("_row_idx")
+                        only_dealer = str(only.get("Dealer") or "N").upper()
+                        if only_row_idx is not None:
+                            st.subheader("🔎 Selected Deal: BT Auction Sequence (Step-by-step)")
+                            st.caption(f"Selected deal index: {only.get('index')}")
+                            _render_debug_bt_index(
+                                int(debug_bt_index),
+                                int(only_row_idx),
+                                only_dealer,
+                                only.get("index"),
+                                "auto",
+                            )
+                    except Exception as e:
+                        st.warning(f"Auto debug failed: {e}")
+
+                # Copy-friendly index list
+                if "index" in sample_df.columns and len(sample_df) > 0:
+                    try:
+                        idx_vals = [int(x) for x in sample_df.get_column("index").drop_nulls().to_list()]
+                    except Exception:
+                        idx_vals = [str(x) for x in sample_df.get_column("index").drop_nulls().to_list()]
+                    idx_csv = ", ".join(str(x) for x in idx_vals)
+                    st.text_area(
+                        "Copy indexes (comma-separated)",
+                        value=idx_csv,
+                        height=80,
+                    )
+
+                # Click-to-drill into BT auction sequence (previous_bid_indices chain)
+                if selected_rows:
+                    sel = selected_rows[0] or {}
+                    sel_idx = sel.get("index")
+                    sel_row_idx = sel.get("_row_idx")
+                    sel_dealer = str(sel.get("Dealer") or "").upper()
+                    dealer_to_seat = {"N": 1, "E": 2, "S": 3, "W": 4}
+                    dealer_seat = dealer_to_seat.get(sel_dealer, 1)
+                    rules_like_models = {"Rules", "Raw_Rules"}
+                    rules_missing_for_row = (
+                        (model_a in rules_like_models and not sel.get(f"Auction_{model_a}"))
+                        or (model_b in rules_like_models and not sel.get(f"Auction_{model_b}"))
+                    )
+
+                    st.subheader("🔎 Selected Deal: BT Auction Sequence (Step-by-step)")
+                    if sel_idx is not None:
+                        st.caption(f"Selected deal index: {sel_idx}")
+                    if sel_row_idx is None:
+                        st.warning("Missing internal deal row index (_row_idx); cannot compute 'Failed Exprs' via bitmap lookups.")
+                    rejection_reason = str(sel.get("Rejection_Reason") or "").strip()
+                    rejected_model: str | None = None
+                    for m in ("Rules", "Raw_Rules"):
+                        if rejection_reason.startswith(f"{m}: no matching auction"):
+                            rejected_model = m
+                            break
+                    if rejected_model is not None:
+                        st.caption(
+                            f"Note: this rejection reason is about the **{rejected_model} model** failing to find any BT completed auction whose criteria match this deal. "
+                            "The 'Failed Exprs' column below evaluates the criteria for the specific BT auction sequence shown (if any)."
+                        )
+
+                    # Show all matching Rules BT rows for this deal (if present)
+                    rules_matches = sel.get("Rules_Matches") or []
+                    selected_rules_bt_index: int | None = None
+                    if rules_matches:
+                        st.markdown("**Rules matches for this deal (all matching BT rows)**")
+                        try:
+                            rm_df = pl.DataFrame(rules_matches)
+                            if "bt_index" in rm_df.columns:
+                                rm_df = rm_df.sort("bt_index")
+                            st.caption("Tip: click a row to show that BT sequence immediately below.")
+                            selected_rules_rows = render_aggrid(
+                                rm_df,
+                                key=f"arena_rules_matches_{sel_idx}",
+                                height=calc_grid_height(len(rm_df), max_height=260),
+                                table_name="rules_matches",
+                                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                                show_copy_panel=True,
+                                copy_panel_default_col="bt_index" if "bt_index" in rm_df.columns else None,
+                            )
+                            if selected_rules_rows:
+                                try:
+                                    v = (selected_rules_rows[0] or {}).get("bt_index")
+                                    selected_rules_bt_index = int(v) if v is not None else None
+                                except Exception:
+                                    selected_rules_bt_index = None
+                        except Exception as e:
+                            st.warning(f"Could not render Rules matches table: {e}")
+                            st.json(rules_matches)
+                            selected_rules_bt_index = None
+
+                    # Optional: debug a specific bt_index against this selected deal.
+                    if debug_bt_index is not None and sel_row_idx is not None:
+                        _render_debug_bt_index(int(debug_bt_index), int(sel_row_idx), sel_dealer or "N", sel_idx, "selected")
+
+                    # If there are many Rules matches, show a few of their BT sequences below for visibility.
+                    if rules_matches and sel_row_idx is not None:
+                        try:
+                            max_show = st.sidebar.number_input(
+                                "Max Rules matches to expand in Selected Deal",
+                                min_value=0,
+                                max_value=25,
+                                value=5,
+                                step=1,
+                                help="How many matching Rules BT rows to render as step-by-step sequences below.",
+                                key="arena_rules_matches_max_show",
+                            )
+                        except Exception:
+                            max_show = 5
+
+                        try:
+                            bt_idxs = []
+                            for m in rules_matches:
+                                try:
+                                    bt_idxs.append(int(m.get("bt_index")))
+                                except Exception:
+                                    continue
+                            bt_idxs = [x for x in bt_idxs if x is not None]
+                            if max_show and bt_idxs:
+                                # If the user clicked a Rules match row, "jump" to it by rendering it first.
+                                bt_idxs_to_show: list[int] = []
+                                if selected_rules_bt_index is not None:
+                                    bt_idxs_to_show.append(int(selected_rules_bt_index))
+                                for x in bt_idxs:
+                                    if len(bt_idxs_to_show) >= int(max_show):
+                                        break
+                                    if selected_rules_bt_index is not None and int(x) == int(selected_rules_bt_index):
+                                        continue
+                                    bt_idxs_to_show.append(int(x))
+
+                                st.markdown(f"**Rules match sequences (showing {len(bt_idxs_to_show)} of {len(bt_idxs)})**")
+                                seq_payload = {"indices": bt_idxs_to_show, "allow_initial_passes": False}
+                                bt_cache = st.session_state.setdefault("_bt_by_index_cache", {})
+                                bt_key = ("auction-sequences-by-index", tuple(bt_idxs_to_show))
+                                if bt_key in bt_cache:
+                                    bt_data = bt_cache[bt_key]
+                                else:
+                                    bt_data = api_post("/auction-sequences-by-index", seq_payload)
+                                    bt_cache[bt_key] = bt_data
+                                for s in (bt_data.get("samples") or []):
+                                    seq_rows = s.get("sequence") or []
+                                    if not isinstance(seq_rows, list) or not seq_rows:
+                                        continue
+                                    # Take the matched row itself for a quick header
+                                    bt_idx = None
+                                    auc = None
+                                    try:
+                                        for rr in seq_rows:
+                                            if int(rr.get("index") or -1) in bt_idxs_to_show and rr.get("is_match_row") is True:
+                                                bt_idx = rr.get("index")
+                                                auc = rr.get("Auction")
+                                                break
+                                    except Exception:
+                                        bt_idx = None
+                                        auc = None
+                                    if bt_idx is None:
+                                        last = seq_rows[-1]
+                                        bt_idx = last.get("index")
+                                        auc = last.get("Auction")
+
+                                    st.markdown(f"**Rules BT {bt_idx}: {auc}**")
+                                    # Reuse the existing renderer by pattern (cheap) would requery;
+                                    # instead, just show the raw sequence table.
+                                    try:
+                                        seq_df2 = pl.DataFrame(seq_rows)
+                                        if "index" in seq_df2.columns:
+                                            seq_df2 = seq_df2.sort("index")
+                                        render_aggrid(
+                                            seq_df2,
+                                            key=f"arena_rules_seq_{sel_idx}_{bt_idx}",
+                                            height=calc_grid_height(len(seq_df2), max_height=260),
+                                            table_name="auction_sequences",
+                                            show_copy_panel=True,
+                                            copy_panel_default_col="index",
+                                        )
+                                    except Exception as e:
+                                        st.warning(f"Failed to render rules sequence for bt_index={bt_idx}: {e}")
+                        except Exception as e:
+                            st.warning(f"Failed to render Rules match sequences: {e}")
+
+                    def _render_bt_sequence_for_auction(auction_text: str, label: str) -> bool:
+                        # Guard: some grid cells may contain lists of auctions (e.g. all Rules matches).
+                        if not isinstance(auction_text, str):
+                            return False
+                        if not auction_text or auction_text.strip() == "":
+                            return False
+                        try:
+                            # Determine how many leading passes the *selected auction text* has.
+                            # This is necessary to map seat-1 canonical BT seats back to deal-relative seats
+                            # (seat 1 = dealer, 2 = LHO, 3 = partner, 4 = RHO).
+                            raw_for_passes = str(auction_text).strip()
+                            raw_for_passes = raw_for_passes.lstrip("^").rstrip("$").strip()
+                            m_pass = re.match(r"(?i)^((p-)+)", raw_for_passes)
+                            leading_passes = (m_pass.group(1).lower().count("p-")) if m_pass else 0
+
+                            # For drilldown we want the BT seat-1 canonical auction (no leading p- padding),
+                            # so the sequence we show matches the actual bt_seat1 row (e.g. "1s-p-p-p"),
+                            # not a seat-expanded display variant (e.g. "p-p-1s-p-p-p").
+                            normalized = normalize_auction_user_text(str(auction_text))
+                            base_auction = re.sub(r"(?i)^(p-)+", "", normalized)
+
+                            # Try exact match first, then fall back to a plain (substring/regex) match.
+                            patterns_to_try: list[str] = []
+                            exact_pattern = base_auction
+                            if not (exact_pattern.startswith("^") or exact_pattern.endswith("$")):
+                                exact_pattern = f"^{exact_pattern}$"
+                            patterns_to_try.append(exact_pattern)
+                            if base_auction != exact_pattern:
+                                patterns_to_try.append(base_auction)
+
+                            samples: list[dict[str, Any]] = []
+                            for patt in patterns_to_try:
+                                payload = {
+                                    "pattern": patt,
+                                    # We already canonicalized to seat-1, so don't expand into dealer/seat variants.
+                                    "allow_initial_passes": False,
+                                    "n_samples": 1,
+                                    "seed": 0,
+                                }
+                                # Cache drilldown lookups per (pattern, allow_initial_passes) to avoid repeated API calls on reruns.
+                                seq_cache = st.session_state.setdefault("_bt_seq_cache", {})
+                                seq_cache_key = ("auction-sequences-matching", payload["pattern"], payload["allow_initial_passes"])
+                                if seq_cache_key in seq_cache:
+                                    seq_data = seq_cache[seq_cache_key]
+                                else:
+                                    seq_data = api_post("/auction-sequences-matching", payload)
+                                    seq_cache[seq_cache_key] = seq_data
+                                samples = seq_data.get("samples", []) or []
+                                if samples:
+                                    break
+                            chosen = samples[0] if samples else None
+                            if not chosen:
+                                st.info(f"{label}: no BT auction sequence found for {base_auction}")
+                                return False
+
+                            opener_seat = 1  # seat-1 canonical sequence
+                            seq_rows = chosen.get("sequence") or []
+                            seq_df = pl.DataFrame(seq_rows) if isinstance(seq_rows, list) else pl.DataFrame()
+                            if seq_df.is_empty():
+                                st.info(f"{label}: empty sequence")
+                                return False
+
+                            # Add Seat columns and Agg_Expr_Seat.
+                            # Seat mapping:
+                            # - BT_Seat: seat-1 canonical (opener = 1, next = 2, ...)
+                            # - Seat: deal-relative (dealer = 1, LHO = 2, partner = 3, RHO = 4)
+                            # We map BT_Seat -> Seat by rotating by the number of leading passes in the selected auction text.
+                            n_rows = seq_df.height
+                            bt_seats: list[int] = []
+                            deal_seats: list[int] = []
+                            agg_expr_vals: list[list[str] | None] = []
+
+                            for i in range(n_rows):
+                                inferred_bt_seat: int | None = None
+                                if "Expr" in seq_df.columns:
+                                    expr_list = _to_list_utf8_cell(seq_df["Expr"][i]) or []
+                                    if expr_list:
+                                        for s in (1, 2, 3, 4):
+                                            col = f"Agg_Expr_Seat_{s}"
+                                            if col not in seq_df.columns:
+                                                continue
+                                            cand = _to_list_utf8_cell(seq_df[col][i]) or []
+                                            if cand and all(e in cand for e in expr_list):
+                                                inferred_bt_seat = s
+                                                break
+
+                                bt_seat = inferred_bt_seat or (((opener_seat - 1 + i) % 4) + 1)
+                                bt_seats.append(bt_seat)
+
+                                # Rotate canonical BT seats into deal-relative seats using leading passes.
+                                deal_seat = ((bt_seat - 1 + (leading_passes % 4)) % 4) + 1
+                                deal_seats.append(deal_seat)
+
+                                agg_col = f"Agg_Expr_Seat_{bt_seat}"
+                                if agg_col in seq_df.columns:
+                                    agg_expr_vals.append(_to_list_utf8_cell(seq_df[agg_col][i]))
+                                else:
+                                    agg_expr_vals.append(None)
+
+                            seq_df = seq_df.with_columns(
+                                pl.Series("BT_Seat", bt_seats),
+                                pl.Series("Seat", deal_seats),
+                            )
+                            # Force strongly-typed list-of-strings column (prevents Polars panic on all-None).
+                            seq_df = seq_df.with_columns(pl.Series("Agg_Expr_Seat", agg_expr_vals, dtype=pl.List(pl.Utf8)))
+                            drop_cols = [c for c in seq_df.columns if c.startswith("Agg_Expr_Seat_") and c[-1].isdigit()]
+                            if drop_cols:
+                                seq_df = seq_df.drop(drop_cols)
+
+                            # Compute Failed Exprs for each step (server-side bitmap evaluation)
+                            if sel_row_idx is not None and "Agg_Expr_Seat" in seq_df.columns and "Seat" in seq_df.columns:
+                                try:
+                                    checks = []
+                                    needed_cols = ["Seat", "Agg_Expr_Seat"]
+                                    if "Expr" in seq_df.columns:
+                                        needed_cols.append("Expr")
+                                    for rr in seq_df.select(needed_cols).to_dicts():
+                                        crits = rr.get("Agg_Expr_Seat") or []
+                                        # Fallback: if Agg_Expr_Seat is empty, derive criteria from Expr.
+                                        # This matches the original intent of "Failed Exprs" being based on Expr evaluation.
+                                        if not crits:
+                                            crits = _expr_to_criteria_list(rr.get("Expr"))
+                                        checks.append(
+                                            {
+                                                "seat": int(rr.get("Seat") or 0),
+                                                "criteria": crits,
+                                            }
+                                        )
+                                    payload_fail = {
+                                        "deal_row_idx": int(sel_row_idx),
+                                        "dealer": sel_dealer or "N",
+                                        "checks": checks,
+                                    }
+                                    fail_cache = st.session_state.setdefault("_deal_fail_cache", {})
+                                    fail_key = (
+                                        "deal-criteria-eval-batch",
+                                        payload_fail["deal_row_idx"],
+                                        payload_fail["dealer"],
+                                        tuple((c["seat"], tuple(c["criteria"])) for c in checks),
+                                    )
+                                    if fail_key in fail_cache:
+                                        fail_data = fail_cache[fail_key]
+                                    else:
+                                        fail_data = api_post("/deal-criteria-eval-batch", payload_fail)
+                                        fail_cache[fail_key] = fail_data
+                                    res_list = fail_data.get("results") or []
+                                    failed_col = []
+                                    for r in res_list:
+                                        f = r.get("failed") or []
+                                        u = r.get("untracked") or []
+                                        parts = []
+                                        if f:
+                                            parts.extend([str(x) for x in f])
+                                        if u:
+                                            parts.extend([f"UNTRACKED: {x}" for x in u])
+                                        failed_col.append(parts)
+                                    if len(failed_col) == seq_df.height:
+                                        seq_df = seq_df.with_columns(
+                                            pl.Series("Failed Exprs", failed_col, dtype=pl.List(pl.Utf8))
+                                        )
+                                except Exception as e:
+                                    st.warning(f"Failed to compute Failed Exprs: {e}")
+
+                            seq_df = order_columns(seq_df, priority_cols=["index", "Auction", "Seat", "BT_Seat", "is_match_row", "Expr", "Agg_Expr_Seat", "Failed Exprs"])
+                            if "index" in seq_df.columns:
+                                seq_df = seq_df.sort("index")
+
+                            # Show what BT row actually matched (from server), not just the requested text.
+                            matched_bt_idx = None
+                            matched_bt_auc = None
+                            try:
+                                if "is_match_row" in seq_df.columns and "index" in seq_df.columns and "Auction" in seq_df.columns:
+                                    mdf = seq_df.filter(pl.col("is_match_row") == True).select(["index", "Auction"])
+                                    if mdf.height == 1:
+                                        matched_bt_idx = mdf["index"][0]
+                                        matched_bt_auc = mdf["Auction"][0]
+                            except Exception:
+                                matched_bt_idx = None
+                                matched_bt_auc = None
+
+                            title_auction = matched_bt_auc or base_auction
+                            st.markdown(f"**{label} (BT seat-1): {title_auction}**")
+                            if matched_bt_idx is not None and matched_bt_auc is not None:
+                                st.caption(f"Matched BT row: bt_index={matched_bt_idx}, auction={matched_bt_auc}")
+                            render_aggrid(
+                                seq_df,
+                                key=f"arena_bt_seq_{label}_{sel_idx}",
+                                table_name="auction_sequences",
+                                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                                show_copy_panel=True,
+                                copy_panel_default_col="index",
+                            )
+
+                            # If Rules had no match for this deal, auto-debug the BT row corresponding to the
+                            # *Actual* auction sequence shown here. This answers: "does this deal satisfy the
+                            # criteria of the BT row that shares its auction string?"
+                            if (
+                                debug_bt_index is None
+                                and rules_missing_for_row
+                                and sel_row_idx is not None
+                                and "Actual" in label
+                                and "index" in seq_df.columns
+                            ):
+                                try:
+                                    bt_idx_val = None
+                                    if "is_match_row" in seq_df.columns:
+                                        mdf = seq_df.filter(pl.col("is_match_row") == True).select("index")
+                                        if mdf.height == 1:
+                                            bt_idx_val = mdf.item()
+                                    if bt_idx_val is None and seq_df.height > 0:
+                                        bt_idx_val = seq_df.select("index").tail(1).item()
+                                    if bt_idx_val is not None:
+                                        _render_debug_bt_index(
+                                            int(bt_idx_val),
+                                            int(sel_row_idx),
+                                            sel_dealer or "N",
+                                            sel_idx,
+                                            "auto_from_actual",
+                                        )
+                                except Exception as e:
+                                    st.warning(f"Auto debug (from Actual BT row) failed: {e}")
+                            return True
+                        except Exception as e:
+                            st.warning(f"{label}: failed to fetch/render BT sequence: {e}")
+                            return False
+
+                    # Show sequences for both model auctions (if present)
+                    auct_a = sel.get(f"Auction_{model_a}")
+                    auct_b = sel.get(f"Auction_{model_b}")
+
+                    # If a model is Rules, the displayed Auction cell may be a list (all matches).
+                    # For drilldown-by-auction-string, use the single selected Rules auction instead.
+                    if model_a == "Rules":
+                        auct_a = sel.get("Auction_Rules_Selected") or auct_a
+                    if model_b == "Rules":
+                        auct_b = sel.get("Auction_Rules_Selected") or auct_b
+
+                    auct_a_s = _to_scalar_auction_text(auct_a)
+                    auct_b_s = _to_scalar_auction_text(auct_b)
+                    st.caption(
+                        f"Selected row auctions: {model_a}={auct_a if auct_a else '(none)'}; {model_b}={auct_b if auct_b else '(none)'}"
+                    )
+                    if auct_a_s:
+                        _render_bt_sequence_for_auction(auct_a_s, f"Auction_{model_a}")
+                    elif auct_a:
+                        if model_a == "Rules":
+                            st.info(
+                                f"Auction_{model_a}: multiple auctions shown in grid; "
+                                "use Rules matches table below to drill into specific bt_index rows."
+                            )
+                        else:
+                            st.info(f"Auction_{model_a}: value is not a single auction string; cannot drill down by auction.")
+                    if auct_b_s and auct_b_s != auct_a_s:
+                        _render_bt_sequence_for_auction(auct_b_s, f"Auction_{model_b}")
+                    elif auct_b and auct_b != auct_a:
+                        if model_b == "Rules":
+                            st.info(
+                                f"Auction_{model_b}: multiple auctions shown in grid; "
+                                "use Rules matches table below to drill into specific bt_index rows."
+                            )
+                        else:
+                            st.info(f"Auction_{model_b}: value is not a single auction string; cannot drill down by auction.")
+                    if not auct_a and not auct_b:
+                        st.info("This row has no auction values (likely rejected / missing Rules match), so no BT sequence can be shown.")
 
         except Exception as e:
             st.error(f"Arena comparison failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Custom Criteria Editor – Manage bbo_custom_auction_criteria.csv
+# ---------------------------------------------------------------------------
+
+def render_custom_criteria_editor():
+    """Render the Custom Criteria Editor for managing auction criteria rules."""
+    st.header("📝 Custom Criteria Editor")
+    st.markdown("Manage custom auction criteria applied as a **hot-reloadable overlay** (no server restart).")
+    
+    # Action buttons row
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        if st.button("↻ Reload from Server", help="Hot-reload criteria overlay from CSV (no server restart)"):
+            with st.spinner("Reloading..."):
+                try:
+                    resp = requests.post(f"{API_BASE}/custom-criteria-reload", timeout=30)
+                    if resp.ok:
+                        data = resp.json()
+                        if data.get("success"):
+                            st.success(f"Reloaded! {data.get('stats', {}).get('rules_applied', 0)} rules applied.")
+                            st.rerun()
+                        else:
+                            st.error("Reload failed")
+                    else:
+                        st.error(f"Reload failed: {resp.text}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    
+    # Load current rules (single API call, reused for file path display)
+    try:
+        rules_resp = requests.get(f"{API_BASE}/custom-criteria-rules", timeout=10)
+        rules_resp.raise_for_status()
+        rules_data = rules_resp.json()
+        current_rules = rules_data.get("rules", [])
+        file_path = rules_data.get("file_path", "N/A")
+    except Exception as e:
+        st.error(f"Failed to load rules: {e}")
+        current_rules = []
+        file_path = "N/A"
+    
+    with col2:
+        st.caption(f"📁 `{file_path}`")
+    
+    # Initialize session state for rules if not present (only on first load)
+    if "criteria_rules" not in st.session_state:
+        st.session_state.criteria_rules = current_rules
+    
+    st.divider()
+    
+    # Current rules display with edit/delete
+    st.subheader(f"📋 Current Rules ({len(st.session_state.criteria_rules)})")
+    
+    if not st.session_state.criteria_rules:
+        st.info("No rules defined. Add one below.")
+    else:
+        # Display rules in a table with actions
+        rules_to_delete = []
+        
+        for idx, rule in enumerate(st.session_state.criteria_rules):
+            with st.container():
+                cols = st.columns([2, 4, 1, 1, 1])
+                
+                with cols[0]:
+                    new_partial = st.text_input(
+                        "Partial",
+                        value=rule["partial_auction"],
+                        key=f"partial_{idx}",
+                        label_visibility="collapsed",
+                    )
+                    if new_partial != rule["partial_auction"]:
+                        st.session_state.criteria_rules[idx]["partial_auction"] = new_partial
+                
+                with cols[1]:
+                    criteria_str = ", ".join(rule["criteria"])
+                    new_criteria_str = st.text_input(
+                        "Criteria",
+                        value=criteria_str,
+                        key=f"criteria_{idx}",
+                        label_visibility="collapsed",
+                        help="Comma-separated: HCP >= 12, SL_C >= 3",
+                    )
+                    if new_criteria_str != criteria_str:
+                        new_criteria = [c.strip() for c in new_criteria_str.split(",") if c.strip()]
+                        st.session_state.criteria_rules[idx]["criteria"] = new_criteria
+                
+                with cols[2]:
+                    # Preview button
+                    if st.button("👁", key=f"preview_{idx}", help="Preview impact"):
+                        try:
+                            preview_resp = requests.post(
+                                f"{API_BASE}/custom-criteria-preview",
+                                json={"partial_auction": rule["partial_auction"]},
+                                timeout=10,
+                            )
+                            if preview_resp.ok:
+                                preview = preview_resp.json()
+                                st.info(f"Seat {preview['seat_affected']}: {preview['auctions_affected']:,} auctions")
+                        except Exception:
+                            pass
+                
+                with cols[3]:
+                    # Validate button
+                    if st.button("✓", key=f"validate_{idx}", help="Validate syntax"):
+                        all_valid = True
+                        for criterion in rule["criteria"]:
+                            try:
+                                val_resp = requests.post(
+                                    f"{API_BASE}/custom-criteria-validate",
+                                    json={"expression": criterion},
+                                    timeout=5,
+                                )
+                                if val_resp.ok:
+                                    val_data = val_resp.json()
+                                    if not val_data.get("valid"):
+                                        st.warning(f"'{criterion}': {val_data.get('error')}")
+                                        all_valid = False
+                            except Exception:
+                                pass
+                        if all_valid:
+                            st.success("All valid!")
+                
+                with cols[4]:
+                    if st.button("🗑", key=f"delete_{idx}", help="Delete rule"):
+                        rules_to_delete.append(idx)
+        
+        # Process deletions
+        if rules_to_delete:
+            for idx in sorted(rules_to_delete, reverse=True):
+                st.session_state.criteria_rules.pop(idx)
+            st.rerun()
+    
+    st.divider()
+    
+    # Add new rule section
+    st.subheader("➕ Add New Rule")
+    
+    col_add1, col_add2 = st.columns([1, 3])
+    
+    with col_add1:
+        new_partial = st.text_input(
+            "Partial Auction",
+            value="",
+            placeholder="e.g., 1c, 1n-p-3n",
+            key="new_partial",
+        )
+    
+    with col_add2:
+        new_criteria_input = st.text_input(
+            "Criteria (comma-separated)",
+            value="",
+            placeholder="e.g., HCP >= 12, SL_C >= 3",
+            key="new_criteria",
+        )
+    
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+    
+    with col_btn1:
+        if st.button("Preview Impact"):
+            if new_partial:
+                try:
+                    preview_resp = requests.post(
+                        f"{API_BASE}/custom-criteria-preview",
+                        json={"partial_auction": new_partial},
+                        timeout=10,
+                    )
+                    if preview_resp.ok:
+                        preview = preview_resp.json()
+                        st.info(
+                            f"Would affect **{preview['auctions_affected']:,}** auctions "
+                            f"(Seat {preview['seat_affected']})"
+                        )
+                        if preview.get("sample_auctions"):
+                            st.caption(f"Samples: {', '.join(preview['sample_auctions'][:5])}")
+                except Exception as e:
+                    st.error(f"Preview failed: {e}")
+            else:
+                st.warning("Enter a partial auction first")
+    
+    with col_btn2:
+        if st.button("Validate Syntax"):
+            if new_criteria_input:
+                criteria_list = [c.strip() for c in new_criteria_input.split(",") if c.strip()]
+                all_valid = True
+                for criterion in criteria_list:
+                    try:
+                        val_resp = requests.post(
+                            f"{API_BASE}/custom-criteria-validate",
+                            json={"expression": criterion},
+                            timeout=5,
+                        )
+                        if val_resp.ok:
+                            val_data = val_resp.json()
+                            if val_data.get("valid"):
+                                st.success(f"✓ `{criterion}`")
+                            else:
+                                st.warning(f"⚠ `{criterion}`: {val_data.get('error')}")
+                                all_valid = False
+                    except Exception as e:
+                        st.error(f"Validation error: {e}")
+                        all_valid = False
+            else:
+                st.warning("Enter criteria first")
+    
+    with col_btn3:
+        if st.button("➕ Add Rule", type="primary"):
+            if new_partial and new_criteria_input:
+                new_criteria = [c.strip() for c in new_criteria_input.split(",") if c.strip()]
+                st.session_state.criteria_rules.append({
+                    "partial_auction": new_partial.strip().lower(),
+                    "criteria": new_criteria,
+                })
+                st.success(f"Added rule for '{new_partial}'")
+                # Clear inputs explicitly (these widgets use session_state keys)
+                st.session_state["new_partial"] = ""
+                st.session_state["new_criteria"] = ""
+                st.rerun()
+            else:
+                st.warning("Both partial auction and criteria are required")
+    
+    st.divider()
+    
+    # Save section
+    st.subheader("💾 Save Changes")
+    
+    # Show if there are unsaved changes
+    if st.session_state.criteria_rules != current_rules:
+        st.warning("⚠️ You have unsaved changes!")
+    
+    col_save1, col_save2 = st.columns([1, 3])
+    
+    with col_save1:
+        if st.button("💾 Save to File", type="primary"):
+            try:
+                # Convert to API format
+                rules_to_save = [
+                    {"partial_auction": r["partial_auction"], "criteria": r["criteria"]}
+                    for r in st.session_state.criteria_rules
+                ]
+                
+                save_resp = requests.post(
+                    f"{API_BASE}/custom-criteria-rules",
+                    json={"rules": rules_to_save},
+                    timeout=10,
+                )
+                
+                if save_resp.ok:
+                    save_data = save_resp.json()
+                    if save_data.get("success"):
+                        st.success(f"Saved {save_data.get('rules_saved', 0)} rules!")
+                        st.session_state._needs_reload = True
+                    else:
+                        st.error("Save failed")
+                else:
+                    st.error(f"Save failed: {save_resp.text}")
+            except Exception as e:
+                st.error(f"Error saving: {e}")
+    
+    with col_save2:
+        if st.button("🔄 Discard Changes"):
+            st.session_state.criteria_rules = current_rules
+            st.rerun()
+    
+    # Hot reload button (shown after save)
+    if st.session_state.get("_needs_reload"):
+        st.info("💡 Rules saved to file. Click below to apply changes to the running server.")
+        if st.button("↻ Apply Changes (Hot Reload)", type="secondary"):
+            try:
+                reload_resp = requests.post(f"{API_BASE}/custom-criteria-reload", timeout=60)
+                if reload_resp.ok:
+                    reload_data = reload_resp.json()
+                    if reload_data.get("success"):
+                        st.success("Changes applied to server!")
+                        st.session_state._needs_reload = False
+                        st.rerun()
+                else:
+                    st.error(f"Reload failed: {reload_resp.text}")
+            except Exception as e:
+                st.error(f"Reload error: {e}")
+    
+    # Refresh from server button
+    if st.button("🔃 Refresh from Server"):
+        if "criteria_rules" in st.session_state:
+            del st.session_state["criteria_rules"]
+        st.rerun()
+    
+    # Analytics section
+    st.divider()
+    with st.expander("📊 Analytics"):
+        # Show current merged stats
+        try:
+            info_resp = requests.get(f"{API_BASE}/custom-criteria-info", timeout=10)
+            if info_resp.ok:
+                info_data = info_resp.json()
+                stats = info_data.get("stats", {})
+                
+                if stats.get("rules_applied"):
+                    st.metric("Rules Applied", stats.get("rules_applied", 0))
+                    st.metric("Auctions Modified", f"{stats.get('auctions_modified', 0):,}")
+                    
+                    # Distribution by seat
+                    if stats.get("rules"):
+                        seat_counts = {}
+                        for rule in stats["rules"]:
+                            seat = rule.get("seat", 0)
+                            seat_counts[seat] = seat_counts.get(seat, 0) + 1
+                        
+                        st.markdown("**Rules by Seat:**")
+                        for seat in sorted(seat_counts.keys()):
+                            st.write(f"- Seat {seat}: {seat_counts[seat]} rules")
+                else:
+                    st.info("No rules currently applied on server. Save and reload to apply.")
+        except Exception:
+            st.info("Could not fetch analytics.")
 
 
 # ---------------------------------------------------------------------------
@@ -3183,9 +4736,11 @@ func_choice = st.sidebar.selectbox(
     [
         "Deals by Auction Pattern",      # Primary: find deals matching auction criteria
         "Analyze Actual Auctions",       # Group deals by bid column, analyze outcomes
-        "Bidding Arena",                 # NEW: Head-to-head model comparison
-        "Wrong Bid Analysis",            # NEW: Wrong bid statistics and leaderboard
-        "Rank Next Bids by EV",               # Rank next bids after an auction by EV
+        "Bidding Arena",                 # Head-to-head model comparison
+        "Auction Criteria Debugger",     # Debug why an auction is rejected
+        "Wrong Bid Analysis",            # Wrong bid statistics and leaderboard
+        "Custom Criteria Editor",        # Manage bbo_custom_auction_criteria.csv
+        "Rank Next Bids by EV",          # Rank next bids after an auction by EV
         "Analyze Deal (PBN/LIN)",        # Input a deal, find matching auctions
         "Bidding Table Explorer",        # Browse bt_df with statistics
         "Find Auction Sequences",        # Regex search bt_df
@@ -3196,12 +4751,21 @@ func_choice = st.sidebar.selectbox(
     ],
 )
 
+# Global settings
+st.sidebar.divider()
+show_custom_criteria = st.sidebar.checkbox(
+    "Show custom criteria info",
+    value=False,
+    help="Show info about custom auction criteria loaded from bbo_custom_auction_criteria.csv (hot-reloadable overlay)",
+)
+
 # Function descriptions (WIP)
 FUNC_DESCRIPTIONS = {
     "Deals by Auction Pattern": "Find deals matching an auction pattern's criteria. Compare Rules contracts vs actual using DD scores and EV.",
     "Analyze Actual Auctions": "Group deals by their actual auction (bid column). Analyze criteria compliance, score deltas, and outcomes.",
     "Bidding Arena": "Head-to-head model comparison. Compare bidding models (Rules, Actual, NN, etc.) with DD scores, EV, and IMP differentials.",
     "Wrong Bid Analysis": "Analyze wrong bids: statistics, failed criteria summary, and leaderboard of auctions with highest wrong bid rates.",
+    "Custom Criteria Editor": "Manage custom auction criteria applied as a hot-reloadable overlay. Add/edit/delete rules and apply without restarting the server.",
     "Rank Next Bids by EV": "Rank all possible next bids after an auction by EV. Empty input shows opening bids.",
     "Analyze Deal (PBN/LIN)": "Input a PBN/LIN deal and find which bidding table auctions match the hand characteristics.",
     "Bidding Table Explorer": "Browse bidding table entries with aggregate statistics (min/max ranges) for hand criteria per auction.",
@@ -3215,14 +4779,100 @@ FUNC_DESCRIPTIONS = {
 # Display function description
 st.info(f"**{func_choice}:** {FUNC_DESCRIPTIONS.get(func_choice, 'No description available.')}")
 
-# Auction Regex input - shown for pattern-based functions
+# Show custom criteria info if checkbox is checked
+if show_custom_criteria:
+    try:
+        criteria_resp = requests.get(f"{API_BASE}/custom-criteria-info", timeout=10)
+        if criteria_resp.ok:
+            criteria_data = criteria_resp.json()
+            stats = criteria_data.get("stats", {})
+            if stats.get("criteria_file_exists"):
+                with st.expander("📋 Custom Auction Criteria (from CSV)", expanded=True):
+                    st.caption(f"File: `{criteria_data.get('criteria_file', 'N/A')}`")
+                    rules = stats.get("rules", [])
+                    if rules:
+                        st.markdown(f"**{len(rules)} rules applied** affecting {stats.get('auctions_modified', 0):,} auctions")
+                        rules_df = pl.DataFrame(rules)
+                        st.dataframe(rules_df.to_pandas(), use_container_width=True)
+                    else:
+                        st.info("No rules defined in the CSV file.")
+            else:
+                st.caption("No custom criteria file found.")
+    except Exception:
+        pass  # Silently ignore errors fetching criteria info
+
+# Auction inputs for pattern-based functions
 pattern = None
+auction_sequence_indices: list[int] | None = None
 if func_choice in ["Find Auction Sequences", "Deals by Auction Pattern"]:
-    raw_pattern = st.sidebar.text_input("Auction Regex", value="^1N-p-3N$",
-        help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')")
-    pattern = normalize_auction_user_text(raw_pattern)
-    if pattern != raw_pattern:
-        st.sidebar.caption(f"→ {pattern}")
+    def _has_regex_metacharacters(s: str) -> bool:
+        """Return True if the string contains common regex metacharacters."""
+        # Note: '-' is not treated as a metacharacter here because auction strings are dash-separated.
+        return any(ch in s for ch in r".^$*+?{}[]\|()")
+
+    def _auto_anchor_if_plain(s: str) -> str:
+        """If user input looks like a plain auction string, auto-anchor it as ^...$."""
+        s = (s or "").strip()
+        if not s:
+            return s
+        # If user already provided anchors, respect them.
+        if s.startswith("^") or s.endswith("$"):
+            return s
+        # If it contains regex metacharacters, assume the user intends regex.
+        if _has_regex_metacharacters(s):
+            return s
+        return f"^{s}$"
+
+    if func_choice == "Find Auction Sequences":
+        seq_input_mode = st.sidebar.radio(
+            "Find Auction Sequences Input",
+            ["Auction Regex", "bt_index list"],
+            index=0,
+            help="Choose ONE input method. Regex and bt_index list are mutually exclusive.",
+        )
+        if seq_input_mode == "Auction Regex":
+            raw_pattern = st.sidebar.text_input(
+                "Auction Regex",
+                value="^1N-p-3N$",
+                help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')",
+                key="find_seq_regex",
+            )
+            normalized = normalize_auction_user_text(raw_pattern)
+            pattern = _auto_anchor_if_plain(normalized)
+            if pattern != raw_pattern:
+                st.sidebar.caption(f"→ {pattern}")
+        else:
+            raw_idxs = st.sidebar.text_area(
+                "bt_index list",
+                value="",
+                help="Comma/space/newline-separated bt_index values. Example: 123, 456 789",
+                key="find_seq_bt_indices",
+            )
+            toks = re.split(r"[,\s]+", (raw_idxs or "").strip())
+            parsed: list[int] = []
+            for t in toks:
+                if not t:
+                    continue
+                try:
+                    parsed.append(int(t))
+                except Exception:
+                    continue
+            auction_sequence_indices = parsed if parsed else []
+            if auction_sequence_indices:
+                st.sidebar.caption(f"{len(auction_sequence_indices)} index(es) provided")
+    else:
+        # Deals by Auction Pattern always uses regex.
+        raw_pattern = st.sidebar.text_input(
+            "Auction Regex",
+            value="^1N-p-3N$",
+            help="Trailing '-p-p-p' is assumed if not present (e.g., '1N-p-3N' → '1N-p-3N-p-p-p')",
+            key="deals_by_auction_regex",
+        )
+        normalized = normalize_auction_user_text(raw_pattern)
+        pattern = _auto_anchor_if_plain(normalized)
+        if pattern != raw_pattern:
+            st.sidebar.caption(f"→ {pattern}")
+
     st.sidebar.divider()
 else:
     st.sidebar.divider()
@@ -3238,8 +4888,12 @@ match func_choice:
         render_analyze_actual_auctions()
     case "Bidding Arena":
         render_bidding_arena()
+    case "Auction Criteria Debugger":
+        render_auction_criteria_debugger()
     case "Wrong Bid Analysis":
         render_wrong_bid_analysis()
+    case "Custom Criteria Editor":
+        render_custom_criteria_editor()
     case "Rank Next Bids by EV":
         render_rank_by_ev()
     case "Analyze Deal (PBN/LIN)":
@@ -3247,7 +4901,7 @@ match func_choice:
     case "Bidding Table Explorer":
         render_bidding_table_explorer()
     case "Find Auction Sequences":
-        render_find_auction_sequences(pattern)
+        render_find_auction_sequences(pattern, auction_sequence_indices)
     case "BT Seat Stats (On-the-fly)":
         render_bt_seat_stats_tool()
     case "PBN Database Lookup":

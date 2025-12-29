@@ -13,16 +13,21 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import gc
+import operator
 import os
-import random
 import re
 import signal
 import sys
 import threading
 import time
-from typing import Any, Dict, List, NoReturn, Optional, Tuple
+import traceback
+from functools import wraps
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple, TypeVar
 import pathlib
+
+import pyarrow.parquet as pq
 
 # Add mlBridgeLib to path so its internal imports work (append, not insert, to avoid shadowing the package)
 sys.path.append(os.path.join(os.path.dirname(__file__), "mlBridgeLib"))
@@ -80,7 +85,6 @@ from bbo_bidding_queries_lib import (
 # ---------------------------------------------------------------------------
 
 import importlib
-import sys
 
 # Track mtime of plugins directory for hot-reload
 _PLUGINS_DIR = pathlib.Path(__file__).parent / "plugins"
@@ -185,10 +189,35 @@ def _attach_hot_reload_info(resp: Dict[str, Any], reload_info: dict[str, object]
 
 def _log_and_raise(endpoint: str, e: Exception) -> NoReturn:
     """Log exception with traceback and raise HTTPException with details."""
-    import traceback
     tb = traceback.format_exc()
     print(f"[{endpoint}] ERROR: {e}\n{tb}")
     raise HTTPException(status_code=500, detail=tb)
+
+
+def _get_handler_module():
+    """Get the handler module, raising ImportError if not found."""
+    handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+    if not handler_module:
+        raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+    return handler_module
+
+
+def _prepare_handler_call() -> Tuple[Dict[str, Any], dict, Any]:
+    """Common setup for endpoint handlers.
+    
+    Returns:
+        (state_copy, reload_info, handler_module)
+    
+    Raises:
+        HTTPException: If service not ready
+        ImportError: If handler plugin not loaded
+    """
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    handler_module = _get_handler_module()
+    return state, reload_info, handler_module
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +226,6 @@ def _log_and_raise(endpoint: str, e: Exception) -> NoReturn:
 
 def _parse_data_dir_arg() -> pathlib.Path | None:
     """Parse --data-dir from sys.argv early (before full argparse)."""
-    import sys
     for i, arg in enumerate(sys.argv):
         if arg == "--data-dir" and i + 1 < len(sys.argv):
             return pathlib.Path(sys.argv[i + 1])
@@ -211,7 +239,6 @@ def _parse_deal_rows_arg() -> int | None:
     
     0 or None means 'all rows'.
     """
-    import sys
     for i, arg in enumerate(sys.argv):
         if arg == "--deal-rows" and i + 1 < len(sys.argv):
             val = int(sys.argv[i + 1])
@@ -231,7 +258,6 @@ def _parse_prewarm_arg() -> bool:
     
     Default: True (on) so endpoints are pre-warmed unless explicitly disabled.
     """
-    import sys
     prewarm = True
     for arg in sys.argv:
         if arg == "--prewarm":
@@ -273,11 +299,64 @@ bt_seat1_file = dataPath.joinpath("bbo_bt_seat1.parquet")  # Clean seat-1-only t
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
+# Merged rules file: learned criteria with deduplication (for Rules model)
+merged_rules_file = dataPath.joinpath("bbo_bt_merged_rules.parquet")
+
+# ---------------------------------------------------------------------------
+# Constants for hand criteria
+# ---------------------------------------------------------------------------
+
+# Valid column names for hand criteria expressions (base names; direction suffix appended where applicable)
+# NOTE: Keep this list aligned with what actually exists in the precomputed deal_df.
+HAND_CRITERIA_COLUMNS = frozenset(['HCP', 'SL_S', 'SL_H', 'SL_D', 'SL_C', 'Total_Points'])
+
+# Bridge directions
+DIRECTIONS_LIST = ['N', 'E', 'S', 'W']
+
+# Valid seat numbers (1-based)
+VALID_SEATS = range(1, 5)
+
+# Comparison operators and their implementations (works with Polars expressions via __ge__ etc.)
+_COMPARISON_OPS = {
+    '>=': operator.ge,
+    '<=': operator.le,
+    '>': operator.gt,
+    '<': operator.lt,
+    '==': operator.eq,
+    '!=': operator.ne,
+}
+
+# Vulnerability enum mapping (endplay library convention)
+VUL_MAP = {0: 'None', 1: 'NS', 2: 'EW', 3: 'Both'}
+
+# DD Score column generation constants
+DD_SCORE_LEVELS = range(1, 8)  # Bridge levels 1-7
+DD_SCORE_STRAINS = ('C', 'D', 'H', 'S', 'N')
+DD_SCORE_VULS = ('NV', 'V')
+
+# Initialization step counts (for loading progress display)
+INIT_STEPS_WITH_PREWARM = 7
+INIT_STEPS_WITHOUT_PREWARM = 6
+
+
+def _normalize_auction_expr(col_name: str = "Auction") -> pl.Expr:
+    """Create a Polars expression that normalizes auction strings.
+    
+    Normalizes by: lowercase, strip leading passes (p-).
+    This is used consistently across all auction matching code.
+    """
+    return (
+        pl.col(col_name)
+        .cast(pl.Utf8)
+        .str.to_lowercase()
+        .str.replace(r"^(p-)+", "")
+    )
 
 
 # ---------------------------------------------------------------------------
 # Dynamic auction criteria filtering (from criteria.csv)
 # ---------------------------------------------------------------------------
+
 
 def _load_auction_criteria() -> list[tuple[str, list[str]]]:
     """Load criteria.csv and return list of (partial_auction, [criteria...]).
@@ -288,7 +367,6 @@ def _load_auction_criteria() -> list[tuple[str, list[str]]]:
     if not auction_criteria_file.exists():
         return []
     
-    import csv
     criteria_list = []
     try:
         with open(auction_criteria_file, 'r', encoding='utf-8') as f:
@@ -306,18 +384,93 @@ def _load_auction_criteria() -> list[tuple[str, list[str]]]:
     return criteria_list
 
 
+def _normalize_criterion_string(s: str) -> str:
+    """Normalize a criterion expression for matching against bitmap column names.
+    
+    The execution-plan expressions sometimes differ only by whitespace around operators.
+    We normalize by stripping and removing whitespace around comparison operators.
+    """
+    s = (s or "").strip()
+    # Remove whitespace around comparison operators
+    s = re.sub(r"\s*(>=|<=|==|!=|>|<)\s*", r"\1", s)
+    # Collapse internal whitespace (e.g. between tokens like 'and', though uncommon here)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _build_custom_criteria_overlay(available_criteria_names: set[str] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build an in-memory overlay from bbo_custom_auction_criteria.csv.
+    
+    Overlay row format:
+        {"partial": str, "seat": int, "criteria": list[str]}
+    
+    Notes:
+    - `partial` is expected to be in seat-1 view (no leading 'p-').
+    - We compute `seat` as (num_dashes + 1), consistent with existing logic.
+    - This overlay is applied *on-the-fly* in handlers; we do NOT mutate bt_seat1_df.
+    """
+    criteria_list = _load_auction_criteria()
+    overlay: list[dict[str, Any]] = []
+    unknown_criteria: list[str] = []
+    for partial_auction, criteria in criteria_list:
+        seat = partial_auction.count("-") + 1
+        if seat not in VALID_SEATS:
+            continue
+        normalized_criteria: list[str] = []
+        for c in criteria:
+            c0 = (c or "").strip()
+            if not c0:
+                continue
+            if available_criteria_names is None:
+                # No reference set available; keep as-is
+                normalized_criteria.append(c0)
+                continue
+            if c0 in available_criteria_names:
+                normalized_criteria.append(c0)
+                continue
+            c_norm = _normalize_criterion_string(c0)
+            if c_norm in available_criteria_names:
+                normalized_criteria.append(c_norm)
+                continue
+            # Keep original but track as unknown (will likely be ignored by bitmap checks)
+            normalized_criteria.append(c0)
+            unknown_criteria.append(c0)
+
+        overlay.append(
+            {"partial": partial_auction.strip().lower(), "seat": int(seat), "criteria": normalized_criteria}
+        )
+
+    # Provide a UI-friendly "rules" list for `/custom-criteria-info`.
+    # (Older UI expects stats["rules"] and stats["rules_applied"].)
+    rules_for_ui = [
+        {"partial": r["partial"], "seat": r["seat"], "criteria": r["criteria"]}
+        for r in overlay
+    ]
+
+    stats: dict[str, Any] = {
+        "criteria_file": str(auction_criteria_file),
+        "criteria_file_exists": auction_criteria_file.exists(),
+        "rule_count": len(overlay),
+        "rules_applied": len(overlay),  # backward compatibility with older UI wording
+        "overlay_enabled": True,
+        "unknown_criteria_count": len(set(unknown_criteria)),
+        "rules": rules_for_ui,
+    }
+    return overlay, stats
+
+
 def _get_direction_for_partial_auction(partial_auction: str, dealer: str) -> str:
     """Get the direction (N/E/S/W) for the bidder of the last bid in partial_auction.
     
     The seat number = number of dashes + 1
-    Direction = ['N', 'E', 'S', 'W'][(dealer_index + seat - 1) % 4]
+    Direction = DIRECTIONS_LIST[(dealer_index + seat - 1) % 4]
     """
-    directions = ['N', 'E', 'S', 'W']
-    dealer_idx = directions.index(dealer.upper()) if dealer.upper() in directions else 0
+    dealer_upper = dealer.upper()
+    dealer_idx = DIRECTIONS_LIST.index(dealer_upper) if dealer_upper in DIRECTIONS_LIST else 0
     num_dashes = partial_auction.count('-')
     seat = num_dashes + 1  # 1-based seat number
     direction_idx = (dealer_idx + seat - 1) % 4
-    return directions[direction_idx]
+    return DIRECTIONS_LIST[direction_idx]
 
 
 def _parse_criterion_to_polars(criterion: str, direction: str) -> pl.Expr | None:
@@ -328,61 +481,69 @@ def _parse_criterion_to_polars(criterion: str, direction: str) -> pl.Expr | None
     - Value comparisons: HCP >= 12, SL_S <= 5
     - Operators: >=, <=, >, <, ==, !=
     """
-    
-    # Match: COL OP COL or COL OP VALUE
-    pattern = r'(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+)'
+    # Match: COL OP COL or COL OP VALUE (allow floats like 12.5)
+    pattern = r'(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+\.?\d*)'
     match = re.match(pattern, criterion.strip())
-    if not match:
+    if match is None:
         print(f"[auction-criteria] Could not parse criterion: {criterion}")
         return None
     
     left, op, right = match.groups()
     
-    # Append direction to column names if they're bridge columns
-    bridge_cols = ['SL_S', 'SL_H', 'SL_D', 'SL_C', 'HCP', 'Total_Points']
+    if op not in _COMPARISON_OPS:
+        print(f"[auction-criteria] Unknown operator '{op}' in criterion: {criterion}")
+        return None
     
-    left_col = f"{left}_{direction}" if left in bridge_cols else left
+    # Append direction to column names if they're bridge columns
+    left_col = f"{left}_{direction}" if left in HAND_CRITERIA_COLUMNS else left
     left_expr = pl.col(left_col)
     
     # Check if right is a number or column name
-    right_val: float | None = None
     try:
         right_val = float(right)
+        return _COMPARISON_OPS[op](left_expr, right_val)
     except ValueError:
-        pass
-    
-    if right_val is not None:
-        # Compare against a numeric value
-        if op == '>=':
-            return left_expr >= right_val
-        elif op == '<=':
-            return left_expr <= right_val
-        elif op == '>':
-            return left_expr > right_val
-        elif op == '<':
-            return left_expr < right_val
-        elif op == '==':
-            return left_expr == right_val
-        elif op == '!=':
-            return left_expr != right_val
-    else:
         # Compare against another column
-        right_col = f"{right}_{direction}" if right in bridge_cols else right
+        right_col = f"{right}_{direction}" if right in HAND_CRITERIA_COLUMNS else right
         right_expr = pl.col(right_col)
-        if op == '>=':
-            return left_expr >= right_expr
-        elif op == '<=':
-            return left_expr <= right_expr
-        elif op == '>':
-            return left_expr > right_expr
-        elif op == '<':
-            return left_expr < right_expr
-        elif op == '==':
-            return left_expr == right_expr
-        elif op == '!=':
-            return left_expr != right_expr
-    
-    return None
+        return _COMPARISON_OPS[op](left_expr, right_expr)
+
+
+def _build_criteria_expressions(
+    criteria: list[str], 
+    direction: str
+) -> list[tuple[str, pl.Expr]]:
+    """Parse a list of criterion strings into (name, expression) pairs."""
+    result = []
+    for criterion in criteria:
+        expr = _parse_criterion_to_polars(criterion, direction)
+        if expr is not None:
+            result.append((criterion, expr))
+    return result
+
+
+def _combine_criteria_expressions(exprs: list[tuple[str, pl.Expr]]) -> pl.Expr:
+    """Combine multiple criteria expressions with AND logic."""
+    combined = exprs[0][1]
+    for _, expr in exprs[1:]:
+        combined = combined & expr
+    return combined
+
+
+def _check_row_criteria(
+    row_df: pl.DataFrame,
+    criteria_exprs: list[tuple[str, pl.Expr]]
+) -> list[str]:
+    """Check which criteria fail for a single row. Returns list of failed criterion names."""
+    failed = []
+    for criterion_str, criterion_expr in criteria_exprs:
+        try:
+            passes = row_df.filter(criterion_expr).height > 0
+            if not passes:
+                failed.append(criterion_str)
+        except (pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError) as e:
+            failed.append(f"{criterion_str} (error: {type(e).__name__})")
+    return failed
 
 
 def _apply_auction_criteria(
@@ -401,87 +562,61 @@ def _apply_auction_criteria(
         rejected_df has columns: Auction, Partial_Auction, Failed_Criteria, Dealer, Seat, Direction
     """
     criteria_list = _load_auction_criteria()
-    if not criteria_list:
+    if len(criteria_list) == 0:
         return df, None
     
     if auction_col not in df.columns or dealer_col not in df.columns:
         return df, None
     
-    # Track rejected rows for debugging
     rejected_rows: list[dict] = []
     
-    # For each criterion set, filter out rows that match the partial
-    # auction but don't satisfy the criteria
     for partial_auction, criteria in criteria_list:
-        # Criteria matching is defined in "seat-1 view" (no leading p-), so strip for matching.
-        auction_lower = (
-            pl.col(auction_col)
-            .cast(pl.Utf8)
-            .str.to_lowercase()
-            .str.replace(r"^(p-)+", "")
-        )
-        matches_partial = auction_lower.str.starts_with(partial_auction)
-        
-        # For each dealer, build the criteria check
-        for dealer in ['N', 'E', 'S', 'W']:
+        # Use consistent auction normalization
+        matches_partial = _normalize_auction_expr(auction_col).str.starts_with(partial_auction)
+        num_dashes = partial_auction.count('-')
+        seat = num_dashes + 1
+            
+        for dealer in DIRECTIONS_LIST:
             direction = _get_direction_for_partial_auction(partial_auction, dealer)
-            num_dashes = partial_auction.count('-')
-            seat = num_dashes + 1
+            criteria_exprs = _build_criteria_expressions(criteria, direction)
             
-            criteria_exprs = []
-            criteria_strs = []
-            for criterion in criteria:
-                criterion_expr = _parse_criterion_to_polars(criterion, direction)
-                if criterion_expr is not None:
-                    criteria_exprs.append((criterion, criterion_expr))
-                    criteria_strs.append(criterion)
+            if len(criteria_exprs) == 0:
+                continue
             
-            if criteria_exprs:
-                # Find rows that match partial auction and dealer
-                matching_mask = matches_partial & (pl.col(dealer_col) == dealer)
-                matching_rows = df.filter(matching_mask)
+            matching_mask = matches_partial & (pl.col(dealer_col) == dealer)
+            matching_rows = df.filter(matching_mask)
                 
-                if track_rejected and matching_rows.height > 0:
-                    # For each matching row, check which criteria fail
-                    for row_idx in range(matching_rows.height):
-                        row = matching_rows.row(row_idx, named=True)
-                        failed_criteria = []
-                        
-                        for criterion_str, criterion_expr in criteria_exprs:
-                            # Check if this single row passes the criterion
-                            try:
-                                single_row_df = matching_rows.slice(row_idx, 1)
-                                passes = single_row_df.filter(criterion_expr).height > 0
-                                if not passes:
-                                    failed_criteria.append(criterion_str)
-                            except Exception:
-                                failed_criteria.append(f"{criterion_str} (eval error)")
-                        
-                        if failed_criteria:
-                            rejected_rows.append({
-                                'Auction': str(row.get(auction_col, '')),
-                                'Partial_Auction': str(partial_auction),
-                                'Failed_Criteria': ', '.join(failed_criteria),  # Convert list to string for display
-                                'Dealer': str(dealer),
-                                'Seat': int(seat),
-                                'Direction': str(direction),
-                            })
+            # Track rejected rows if requested
+            if track_rejected and matching_rows.height > 0:
+                for row_idx in range(matching_rows.height):
+                    row = matching_rows.row(row_idx, named=True)
+                    single_row_df = matching_rows.slice(row_idx, 1)
+                    failed_criteria = _check_row_criteria(single_row_df, criteria_exprs)
+                    
+                    if len(failed_criteria) > 0:
+                        rejected_rows.append({
+                            'Auction': str(row.get(auction_col, '')),
+                            'Partial_Auction': str(partial_auction),
+                            'Failed_Criteria': ', '.join(failed_criteria),
+                            'Dealer': str(dealer),
+                            'Seat': int(seat),
+                            'Direction': str(direction),
+                        })
                 
-                # Build combined filter
-                combined_criteria = criteria_exprs[0][1]
-                for _, expr in criteria_exprs[1:]:
-                    combined_criteria = combined_criteria & expr
-                
-                # Keep row if: not (matches_partial AND dealer matches AND NOT criteria_satisfied)
-                df = df.filter(
-                    ~(matches_partial & (pl.col(dealer_col) == dealer)) | combined_criteria
+            # Apply filter: keep rows that don't match OR satisfy criteria
+            combined_criteria = _combine_criteria_expressions(criteria_exprs)
+            try:
+                df = df.filter(~matching_mask | combined_criteria)
+            except (pl.exceptions.ColumnNotFoundError, pl.exceptions.ComputeError) as e:
+                # Defensive: a criterion may reference a column not present in df.
+                # Skip applying this criterion set rather than crashing the endpoint.
+                print(
+                    "[auction-criteria] WARNING: skipping criteria due to filter error: "
+                    f"partial={partial_auction}, dealer={dealer}, err={type(e).__name__}: {e}"
                 )
+                continue
     
-    # Build rejected DataFrame
-    rejected_df = None
-    if track_rejected and rejected_rows:
-        rejected_df = pl.DataFrame(rejected_rows)
-    
+    rejected_df = pl.DataFrame(rejected_rows) if track_rejected and len(rejected_rows) > 0 else None
     return df, rejected_df
 
 
@@ -570,6 +705,28 @@ class AuctionSequencesMatchingRequest(BaseModel):
     # If True, treat the pattern as applying to all seats (ignore leading initial passes in stored auctions).
     # If False, treat the pattern as a literal regex against the raw Auction string.
     allow_initial_passes: bool = True
+
+
+class AuctionSequencesByIndexRequest(BaseModel):
+    """Request for fetching auction sequences by bt_index values."""
+    indices: List[int]
+    # If True, expand each result into 4 dealer positions (p- prefix variants), matching Find Auction Sequences behavior.
+    allow_initial_passes: bool = True
+
+
+class DealCriteriaCheck(BaseModel):
+    seat: int
+    criteria: List[str] = []
+
+
+class DealCriteriaEvalBatchRequest(BaseModel):
+    """Request to evaluate criteria for a given deal row index (batch).
+
+    Returns per-seat: passed, failed, untracked.
+    """
+    deal_row_idx: int
+    dealer: str  # N/E/S/W
+    checks: List[DealCriteriaCheck]
 
 
 class DealsMatchingAuctionRequest(BaseModel):
@@ -663,6 +820,27 @@ class WrongBidLeaderboardRequest(BaseModel):
     seat: Optional[int] = None  # Filter by specific seat (1-4), None = all seats
 
 
+class CustomCriteriaRule(BaseModel):
+    """A single custom criteria rule."""
+    partial_auction: str  # e.g., "1c", "1n-p-3n"
+    criteria: List[str]  # e.g., ["HCP >= 12", "SL_C >= 3"]
+
+
+class CustomCriteriaSaveRequest(BaseModel):
+    """Request to save all custom criteria rules."""
+    rules: List[CustomCriteriaRule]
+
+
+class CustomCriteriaValidateRequest(BaseModel):
+    """Request to validate a criteria expression."""
+    expression: str  # e.g., "HCP >= 12"
+
+
+class CustomCriteriaPreviewRequest(BaseModel):
+    """Request to preview impact of a rule."""
+    partial_auction: str
+
+
 class BiddingArenaRequest(BaseModel):
     """Request for Bidding Arena: head-to-head model comparison."""
     model_a: str = "Rules"  # First model to compare
@@ -673,6 +851,11 @@ class BiddingArenaRequest(BaseModel):
     # Custom deals source: file path or URL to parquet/csv file
     # If None, uses the default deal_df loaded at startup
     deals_uri: Optional[str] = None
+    # Optional pinned deal indexes to force-include in the sample (shown in Sample Deal Comparisons)
+    deal_indices: Optional[List[int]] = None
+    # If True, the Rules model will search all completed BT rows (can be extremely slow).
+    # Only relevant when the deal rows do not contain precomputed Matched_BT_Indices.
+    search_all_bt_rows: bool = False
 
 
 class AuctionDDAnalysisRequest(BaseModel):
@@ -738,11 +921,19 @@ STATE: Dict[str, Any] = {
     # Built from bbo_bt_criteria.parquet + bbo_bt_aggregate.parquet and keyed by bt_index.
     "bt_stats_df": None,
     "duckdb_conn": None,
+    # Hot-reloadable overlay rules loaded from bbo_custom_auction_criteria.csv.
+    # These rules are applied on-the-fly to BT rows when serving responses and when building criteria masks.
+    "custom_criteria_overlay": [],
+    # Merged rules lookup: bt_index -> Merged_Rules list (for Rules model in Bidding Arena)
+    # Loaded from bbo_bt_merged_rules.parquet (optional - if missing, Rules model is disabled)
+    "merged_rules_lookup": None,
+    "custom_criteria_stats": {},
+    # Set of available criterion names (from deal_criteria_by_direction_dfs) for normalizing CSV criteria strings.
+    "available_criteria_names": None,
 }
 
 # Additional optional data file paths
 bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
-bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 # Pre-joined completed-auction criteria/aggregate table (preferred at runtime).
 bt_criteria_seat1_file = dataPath.joinpath("bbo_bt_criteria_seat1_df.parquet")
 
@@ -791,7 +982,185 @@ def _register_duckdb_tables(
 
 
 # ---------------------------------------------------------------------------
-# Heavy initialization
+# Heavy initialization helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_additional_deal_columns() -> List[str]:
+    """Build list of additional columns needed for PBN Lookup and DD/EV computation."""
+    additional_cols = [
+        'PBN', 'Vul', 'Declarer', 'bid', 'Contract', 'Result', 'Tricks', 'Score',
+        'ParScore', 'DD_Score_Declarer', 'EV_Score_Declarer', 'ParContracts'
+    ]
+    
+    # Add DD_Score columns for all contracts (for DD_Score_AI computation)
+    # Format: DD_Score_{level}{strain}_{direction} e.g. DD_Score_3N_N
+    for level in DD_SCORE_LEVELS:
+        for strain in DD_SCORE_STRAINS:
+            for direction in DIRECTIONS_LIST:
+                additional_cols.append(f"DD_Score_{level}{strain}_{direction}")
+    
+    # Add EV columns for all contracts (for EV_AI computation)
+    # Format: EV_{pair}_{declarer}_{strain}_{level}_{vul}
+    for pair in ['NS', 'EW']:
+        declarers = ['N', 'S'] if pair == 'NS' else ['E', 'W']
+        for declarer in declarers:
+            for strain in DD_SCORE_STRAINS:
+                for level in DD_SCORE_LEVELS:
+                    for vul in DD_SCORE_VULS:
+                        additional_cols.append(f"EV_{pair}_{declarer}_{strain}_{level}_{vul}")
+    
+    return additional_cols
+
+
+def _load_bt_seat1_df() -> pl.DataFrame:
+    """Load bt_seat1_df with only the columns needed at runtime."""
+    print(f"[init] Loading bt_seat1_df from {bt_seat1_file} (selective columns)...")
+    bt_seat1_scan = pl.scan_parquet(bt_seat1_file)
+    available_cols = bt_seat1_scan.collect_schema().names()
+    
+    # Hard fail if 'bt_index' is missing
+    if "bt_index" not in available_cols:
+        raise ValueError(f"REQUIRED column 'bt_index' missing from {bt_seat1_file}. Pipeline error.")
+    
+    # Columns required for API operations
+    required_cols = [
+        "bt_index", "Auction", "is_opening_bid", "is_completed_auction",
+        "seat", "candidate_bid", "npasses", "auction_len", "Expr",
+        "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
+        "previous_bid_indices", "next_bid_indices",
+        "matching_deal_count",
+    ]
+    cols_to_load = [c for c in required_cols if c in available_cols]
+    print(f"[init] Loading {len(cols_to_load)} of {len(available_cols)} columns...")
+    
+    return bt_seat1_scan.select(cols_to_load).collect()
+
+
+def _load_merged_rules() -> Dict[int, List[str]] | None:
+    """Load merged rules for Rules model (optional).
+    
+    IMPORTANT: We key this lookup by `bt_index` (int) to avoid fragile auction-string
+    normalization/matching issues.
+    """
+    if not merged_rules_file.exists():
+        print(f"[init] Merged rules file not found: {merged_rules_file}")
+        print("[init] Rules model will be disabled in Bidding Arena (only Raw_Rules available)")
+        return None
+    
+    try:
+        print(f"[init] Loading merged rules from {merged_rules_file}...")
+        merged_rules_df = pl.read_parquet(merged_rules_file)
+        if "bt_index" not in merged_rules_df.columns:
+            raise ValueError("Merged rules parquet missing required column: bt_index")
+        if "Merged_Rules" not in merged_rules_df.columns:
+            raise ValueError("Merged rules parquet missing required column: Merged_Rules")
+
+        lookup: dict[int, list[str]] = {}
+        for bt_index, merged_rules in (
+            merged_rules_df
+            .select(["bt_index", "Merged_Rules"])
+            .drop_nulls(["bt_index", "Merged_Rules"])
+            .iter_rows()
+        ):
+            try:
+                bt_idx_i = int(bt_index)
+            except Exception:
+                continue
+            if not merged_rules:
+                continue
+            lookup[bt_idx_i] = list(merged_rules)
+
+        print(f"[init] Loaded {len(lookup):,} merged rules entries (Rules model enabled)")
+        return lookup
+    except Exception as e:
+        print(f"[init] WARNING: Failed to load merged rules from {merged_rules_file}: {e}")
+        print("[init] Rules model will be disabled in Bidding Arena (only Raw_Rules available)")
+        return None
+
+
+def _prewarm_all_endpoints(bt_seat1_df: pl.DataFrame) -> None:
+    """Pre-warm all endpoints to speed up first user request."""
+    
+    def _prewarm_endpoint(name: str, fn, *args, **kwargs):
+        """Run a prewarm call and log its duration."""
+        t0 = time.perf_counter()
+        try:
+            result = fn(*args, **kwargs)
+            elapsed_s = time.perf_counter() - t0
+            print(f"[init] Pre-warmed {name}: {elapsed_s:.2f}s")
+            return result
+        except Exception as e:
+            elapsed_s = time.perf_counter() - t0
+            print(f"[init] Pre-warm {name} FAILED ({elapsed_s:.2f}s): {e}")
+            return None
+    
+    prewarm_t0 = time.perf_counter()
+    
+    _prewarm_endpoint("openings-by-deal-index",
+        openings_by_deal_index, OpeningsByDealIndexRequest(sample_size=1))
+
+    _prewarm_endpoint("random-auction-sequences",
+        random_auction_sequences, RandomAuctionSequencesRequest(n_samples=1, seed=42))
+
+    _prewarm_endpoint("auction-sequences-matching",
+        auction_sequences_matching,
+        AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))
+
+    _prewarm_endpoint("deals-matching-auction",
+        deals_matching_auction,
+        DealsMatchingAuctionRequest(pattern="^1N-p-3N$", n_auction_samples=1, n_deal_samples=3, seed=0))
+
+    _prewarm_endpoint("bidding-table-statistics",
+        bidding_table_statistics,
+        BiddingTableStatisticsRequest(auction_pattern="^1N-p-3N$", sample_size=1, seed=42))
+
+    _prewarm_endpoint("process-pbn",
+        process_pbn,
+        ProcessPBNRequest(
+            pbn="N:AKQ2.KQ2.AK2.AK2 T987.987.987.987 J654.654.654.654 3.JT53.QJT53.QJT5",
+            include_par=True, vul="None"))
+
+    _prewarm_endpoint("find-matching-auctions",
+        find_matching_auctions,
+        FindMatchingAuctionsRequest(hcp=15, sl_s=4, sl_h=3, sl_d=3, sl_c=3, total_points=17, seat=1, max_results=1))
+
+    _prewarm_endpoint("group-by-bid",
+        group_by_bid,
+        GroupByBidRequest(auction_pattern="^1N-p-3N$", n_auction_groups=1, n_deals_per_group=1, seed=42))
+
+    sample_resp = _prewarm_endpoint("pbn-sample", get_pbn_sample)
+    _prewarm_endpoint("pbn-random", get_pbn_random)
+
+    sample_pbn = getattr(sample_resp, "pbn", None) or (sample_resp.get("pbn", "") if sample_resp else "")
+    if sample_pbn:
+        _prewarm_endpoint("pbn-lookup", pbn_lookup, PBNLookupRequest(pbn=sample_pbn, max_results=1))
+
+    _prewarm_endpoint("execute-sql", execute_sql, ExecuteSQLRequest(sql="SELECT 1 AS x", max_rows=1))
+
+    # Pre-warm bt-seat-stats endpoint
+    first_bt_index = None
+    if bt_seat1_df.height > 0:
+        try:
+            first_bt_index = int(bt_seat1_df.select("bt_index").head(1).item())
+        except Exception:
+            pass
+    if first_bt_index is not None:
+        _prewarm_endpoint("bt-seat-stats", bt_seat_stats, BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))
+
+    _prewarm_endpoint("wrong-bid-stats", wrong_bid_stats, WrongBidStatsRequest(auction_pattern=None, seat=None))
+    _prewarm_endpoint("failed-criteria-summary", failed_criteria_summary, FailedCriteriaSummaryRequest(auction_pattern=None, top_n=5, seat=None))
+    _prewarm_endpoint("wrong-bid-leaderboard", wrong_bid_leaderboard, WrongBidLeaderboardRequest(top_n=5, seat=None))
+    _prewarm_endpoint("bidding-models", list_bidding_models)
+    _prewarm_endpoint("bidding-arena", bidding_arena, BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
+    _prewarm_endpoint("rank-bids-by-ev", rank_bids_by_ev, RankBidsByEVRequest(auction="", max_deals=10, seed=42))
+
+    total_prewarm_s = time.perf_counter() - prewarm_t0
+    print(f"[init] All endpoints pre-warmed in {total_prewarm_s:.2f}s")
+
+
+# ---------------------------------------------------------------------------
+# Heavy initialization (main)
 # ---------------------------------------------------------------------------
 
 
@@ -820,12 +1189,12 @@ def _heavy_init() -> None:
     _log_memory("start")
     
     # Keep this in sync with the _update_loading_status() calls below.
-    TOTAL_STEPS = 7 if _cli_prewarm else 6  # +1 only if prewarm is enabled
+    total_steps = INIT_STEPS_WITH_PREWARM if _cli_prewarm else INIT_STEPS_WITHOUT_PREWARM
     
     def _update_loading_status(step_num: int, step: str, file_name: str | None = None, row_count: int | str | None = None):
         """Update loading progress in STATE (thread-safe)."""
         with _STATE_LOCK:
-            STATE["loading_step"] = f"[{step_num}/{TOTAL_STEPS}] {step}"
+            STATE["loading_step"] = f"[{step_num}/{total_steps}] {step}"
             if file_name and row_count is not None:
                 STATE["loaded_files"][file_name] = row_count
     
@@ -839,31 +1208,8 @@ def _heavy_init() -> None:
         ) = load_execution_plan_data(exec_plan_file)
         _log_memory("after load_execution_plan_data")
 
-        # Add additional columns needed for PBN Lookup (game results)
-        # DD_Score_Declarer = double-dummy score for the actual contract played
-        # Contract = actual contract played (e.g., "4SN" = 4S by North)
-        additional_cols = ['PBN', 'Vul', 'Declarer', 'bid', 'Contract', 'Result', 'Tricks', 'Score', 
-                           'ParScore', 'DD_Score_Declarer', 'EV_Score_Declarer', 'ParContracts']
-        
-        # Add DD_Score columns for all contracts (for DD_Score_AI computation)
-        # Format: DD_Score_{level}{strain}_{direction} e.g. DD_Score_3N_N
-        for level in range(1, 8):
-            for strain in ['C', 'D', 'H', 'S', 'N']:
-                for direction in ['N', 'E', 'S', 'W']:
-                    additional_cols.append(f"DD_Score_{level}{strain}_{direction}")
-        
-        # Add EV columns for all contracts (for EV_AI computation)
-        # Format: EV_{pair}_{declarer}_{strain}_{level}_{vul}
-        # e.g. EV_NS_N_S_3_NV = EV for 3S by North, NS pair, Not Vulnerable
-        for pair in ['NS', 'EW']:
-            # Declarers for each pair
-            declarers = ['N', 'S'] if pair == 'NS' else ['E', 'W']
-            for declarer in declarers:
-                for strain in ['C', 'D', 'H', 'S', 'N']:
-                    for level in range(1, 8):
-                        for vul in ['NV', 'V']:
-                            additional_cols.append(f"EV_{pair}_{declarer}_{strain}_{level}_{vul}")
-        
+        # Add additional columns needed for PBN Lookup and DD/EV computation
+        additional_cols = _build_additional_deal_columns()
         for col in additional_cols:
             if col not in valid_deal_columns:
                 valid_deal_columns.append(col)
@@ -875,7 +1221,6 @@ def _heavy_init() -> None:
         
         # Get total row count for display (when using --deal-rows)
         if _cli_deal_rows:
-            import pyarrow.parquet as pq
             total_rows = pq.read_metadata(bbo_mldf_augmented_file).num_rows
             row_info = f"{deal_df.height:,} of {total_rows:,}"
         else:
@@ -885,7 +1230,8 @@ def _heavy_init() -> None:
 
         # todo: do this earlier in the pipeline?
         # Convert 'bid' from pl.List(pl.Utf8) to pl.Utf8 by joining with '-'
-        if 'bid' in deal_df.columns and deal_df['bid'].dtype == pl.List(pl.Utf8):
+        bid_dtype = deal_df.schema.get("bid")
+        if bid_dtype == pl.List(pl.Utf8):
             deal_df = deal_df.with_columns(pl.col('bid').list.join('-'))
         
         # Load criteria bitmaps (must be pre-built by pipeline)
@@ -913,50 +1259,33 @@ def _heavy_init() -> None:
         )
         _log_memory("after directional_to_directionless")
 
+        # Capture the canonical set of criterion names (as used by the bitmap DataFrames).
+        # These are "original expressions" (directionless) after directional_to_directionless renaming.
+        # We'll use this set to normalize CSV criteria strings on reload (mainly whitespace differences).
+        try:
+            ref_dir = "N" if "N" in deal_criteria_by_direction_dfs else next(iter(deal_criteria_by_direction_dfs.keys()))
+            available_criteria_names = set(deal_criteria_by_direction_dfs[ref_dir].columns)
+        except Exception:
+            available_criteria_names = None
+
         # We no longer need these large helper objects
         del criteria_deal_dfs_directional, pythonized_exprs_by_direction, directionless_criteria_cols
         gc.collect()
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load clean seat-1-only table (used for pattern matching - no p- prefix issues)
-        # NOTE: We load only the columns needed at runtime to minimize memory usage.
-        # The full file has 122 columns including many List(String) types that explode in RAM.
-        print(f"[init] Loading bt_seat1_df from {bt_seat1_file} (selective columns)...")
-        bt_seat1_scan = pl.scan_parquet(bt_seat1_file)
-        available_cols = bt_seat1_scan.collect_schema().names()
-        
-        # Hard fail if 'bt_index' is missing
-        if "bt_index" not in available_cols:
-            raise ValueError(f"REQUIRED column 'bt_index' missing from {bt_seat1_file}. Pipeline error.")
-        
-        # Columns required for API operations:
-        # - bt_index: primary key
-        # - Auction: pattern matching
-        # - is_opening_bid, is_completed_auction: filtering
-        # - seat: seat identification
-        # - Expr: criteria expression for the bid
-        # - Agg_Expr_Seat_1-4: opening bid criteria matching
-        # - previous_bid_indices, next_bid_indices: auction sequence queries
-        # Exclude: Agg_Expr, *_right columns
-        required_cols = [
-            "bt_index", "Auction", "is_opening_bid", "is_completed_auction", 
-            "seat", "candidate_bid", "npasses", "auction_len", "Expr",
-            "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
-            "previous_bid_indices", "next_bid_indices",
-        ]
-        # Only select columns that exist in the file
-        cols_to_load = [c for c in required_cols if c in available_cols]
-        print(f"[init] Loading {len(cols_to_load)} of {len(available_cols)} columns...")
-        
-        bt_seat1_df = bt_seat1_scan.select(cols_to_load).collect()
+        bt_seat1_df = _load_bt_seat1_df()
         
         # IMPORTANT:
         # Do NOT strip leading 'p-' prefixes here.
         # Those prefixes encode seat/turn order and are required for correct declarer/contract logic
         # (AI/DD/IMP computations). Matching code strips prefixes at query time instead.
         _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_df.height)
-        print(f"[init] bt_seat1_df: {bt_seat1_df.height:,} rows (clean seat-1 data with all stats)")
-        _log_memory("after load bt_seat1_df")
+        print(f"[init] bt_seat1_df: {bt_seat1_df.height:,} rows (clean seat-1 data)")
+        
+        # Load hot-reloadable criteria overlay (does NOT mutate bt_seat1_df)
+        overlay, custom_criteria_stats = _build_custom_criteria_overlay(available_criteria_names)
+        _log_memory("after load custom criteria overlay")
 
         # Load completed-auction stats table (criteria + aggregates) keyed by bt_index.
         # This file is REQUIRED for the Bidding Table Explorer and other tools.
@@ -973,6 +1302,12 @@ def _heavy_init() -> None:
             print(f"[init] ERROR: Failed to load bt_stats_df from {bt_criteria_seat1_file}: {e}")
             raise
         _log_memory("after load bt_stats_df")
+
+        # Load merged rules for Rules model (optional - not required for startup)
+        merged_rules_lookup = _load_merged_rules()
+        if merged_rules_lookup:
+            _update_loading_status(5, "Loading merged rules...", "merged_rules", len(merged_rules_lookup))
+        _log_memory("after load merged_rules")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
         _update_loading_status(6, "Processing opening bids (seat1-only)...", "bt_seat1_df", bt_seat1_df.height)
@@ -992,6 +1327,10 @@ def _heavy_init() -> None:
             STATE["deal_criteria_by_direction_dfs"] = deal_criteria_by_direction_dfs
             STATE["results"] = results
             STATE["bt_stats_df"] = bt_stats_df
+            STATE["custom_criteria_overlay"] = overlay
+            STATE["custom_criteria_stats"] = custom_criteria_stats
+            STATE["available_criteria_names"] = available_criteria_names
+            STATE["merged_rules_lookup"] = merged_rules_lookup
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
@@ -1012,128 +1351,10 @@ def _heavy_init() -> None:
             print(f"[init] Completed heavy initialization (pre-warm disabled) in {elapsed:.1f}s")
             return
 
-        # ------------------------------------------------------------------
-        # Pre-warm selected query paths so the first user request is faster.
-        # This does a tiny sample query on each endpoint's core logic.
-        # ------------------------------------------------------------------
+        # Pre-warm selected query paths so the first user request is faster
         _update_loading_status(7, "Pre-warming endpoints...")
-        
-        def _prewarm_endpoint(name: str, fn, *args, **kwargs):
-            """Run a prewarm call and log its duration."""
-            t0 = time.perf_counter()
-            try:
-                result = fn(*args, **kwargs)
-                elapsed_s = time.perf_counter() - t0
-                print(f"[init] Pre-warmed {name}: {elapsed_s:.2f}s")
-                return result
-            except Exception as e:
-                elapsed_s = time.perf_counter() - t0
-                print(f"[init] Pre-warm {name} FAILED ({elapsed_s:.2f}s): {e}")
-                return None
-        
-        prewarm_t0 = time.perf_counter()
         try:
-            _prewarm_endpoint("openings-by-deal-index",
-                openings_by_deal_index, OpeningsByDealIndexRequest(sample_size=1))
-
-            _prewarm_endpoint("random-auction-sequences",
-                random_auction_sequences, RandomAuctionSequencesRequest(n_samples=1, seed=42))
-
-            _prewarm_endpoint("auction-sequences-matching",
-                auction_sequences_matching,
-                AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))
-
-            _prewarm_endpoint("deals-matching-auction",
-                deals_matching_auction,
-                DealsMatchingAuctionRequest(
-                    pattern="^1N-p-3N$",
-                    n_auction_samples=1,
-                    n_deal_samples=3,
-                    seed=0,
-                ))
-
-            _prewarm_endpoint("bidding-table-statistics",
-                bidding_table_statistics,
-                BiddingTableStatisticsRequest(
-                    auction_pattern="^1N-p-3N$",
-                    sample_size=1,
-                    seed=42,
-                ))
-
-            _prewarm_endpoint("process-pbn",
-                process_pbn,
-                ProcessPBNRequest(
-                    pbn="N:AKQ2.KQ2.AK2.AK2 T987.987.987.987 J654.654.654.654 3.JT53.QJT53.QJT5",
-                    include_par=True,
-                    vul="None",
-                ))
-
-            _prewarm_endpoint("find-matching-auctions",
-                find_matching_auctions,
-                FindMatchingAuctionsRequest(
-                    hcp=15,
-                    sl_s=4,
-                    sl_h=3,
-                    sl_d=3,
-                    sl_c=3,
-                    total_points=17,
-                    seat=1,
-                    max_results=1,
-                ))
-
-            _prewarm_endpoint("group-by-bid",
-                group_by_bid,
-                GroupByBidRequest(
-                    auction_pattern="^1N-p-3N$",
-                    n_auction_groups=1,
-                    n_deals_per_group=1,
-                    seed=42,
-                ))
-
-            # Pre-warm PBN sample / random / lookup endpoints
-            sample_resp = _prewarm_endpoint("pbn-sample", get_pbn_sample)
-
-            _prewarm_endpoint("pbn-random", get_pbn_random)
-
-            sample_pbn = getattr(sample_resp, "pbn", None) or (sample_resp.get("pbn", "") if sample_resp else "")
-            if sample_pbn:
-                _prewarm_endpoint("pbn-lookup",
-                    pbn_lookup, PBNLookupRequest(pbn=sample_pbn, max_results=1))
-
-            _prewarm_endpoint("execute-sql",
-                execute_sql, ExecuteSQLRequest(sql="SELECT 1 AS x", max_rows=1))
-
-            # Pre-warm bt-seat-stats endpoint (on-the-fly stats)
-            first_bt_index = None
-            if bt_seat1_df.height > 0:
-                try:
-                    first_bt_index = int(bt_seat1_df["bt_index"][0])
-                except Exception:
-                    first_bt_index = None
-            if first_bt_index is not None:
-                _prewarm_endpoint("bt-seat-stats",
-                    bt_seat_stats, BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))
-
-            _prewarm_endpoint("wrong-bid-stats",
-                wrong_bid_stats, WrongBidStatsRequest(auction_pattern=None, seat=None))
-
-            _prewarm_endpoint("failed-criteria-summary",
-                failed_criteria_summary, FailedCriteriaSummaryRequest(auction_pattern=None, top_n=5, seat=None))
-
-            _prewarm_endpoint("wrong-bid-leaderboard",
-                wrong_bid_leaderboard, WrongBidLeaderboardRequest(top_n=5, seat=None))
-
-            _prewarm_endpoint("bidding-models", list_bidding_models)
-
-            _prewarm_endpoint("bidding-arena",
-                bidding_arena, BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
-
-            _prewarm_endpoint("rank-bids-by-ev",
-                rank_bids_by_ev, RankBidsByEVRequest(auction="", max_deals=10, seed=42))
-
-            total_prewarm_s = time.perf_counter() - prewarm_t0
-            print(f"[init] All endpoints pre-warmed in {total_prewarm_s:.2f}s")
-
+            _prewarm_all_endpoints(bt_seat1_df)
         except Exception as warm_exc:  # pragma: no cover - best-effort prewarm
             print("[init] WARNING: pre-warm step failed:", warm_exc)
 
@@ -1195,6 +1416,150 @@ def start_init(background_tasks: BackgroundTasks) -> InitResponse:
 
     background_tasks.add_task(_heavy_init)
     return InitResponse(status="started")
+
+
+@app.get("/custom-criteria-info")
+def get_custom_criteria_info() -> Dict[str, Any]:
+    """Get info about custom auction criteria loaded from CSV (hot-reloadable overlay)."""
+    with _STATE_LOCK:
+        if not STATE["initialized"]:
+            return {"initialized": False, "stats": None}
+        stats = STATE.get("custom_criteria_stats", {})
+    return {
+        "initialized": True,
+        "criteria_file": str(auction_criteria_file),
+        "stats": stats,
+    }
+
+
+@app.get("/custom-criteria-rules")
+def get_custom_criteria_rules() -> Dict[str, Any]:
+    """Get all custom criteria rules from the CSV file."""
+    criteria_list = _load_auction_criteria()
+    rules = [
+        {"partial_auction": partial, "criteria": criteria}
+        for partial, criteria in criteria_list
+    ]
+    return {
+        "file_path": str(auction_criteria_file),
+        "file_exists": auction_criteria_file.exists(),
+        "rules": rules,
+        "rule_count": len(rules),
+    }
+
+
+@app.post("/custom-criteria-rules")
+def save_custom_criteria_rules(req: CustomCriteriaSaveRequest) -> Dict[str, Any]:
+    """Save all custom criteria rules to the CSV file."""
+    try:
+        with open(auction_criteria_file, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            # Write header comment
+            writer.writerow(["# Custom auction criteria - format: partial_auction,criterion1,criterion2,..."])
+            for rule in req.rules:
+                row = [rule.partial_auction.strip().lower()] + [c.strip() for c in rule.criteria]
+                writer.writerow(row)
+        
+        return {
+            "success": True,
+            "file_path": str(auction_criteria_file),
+            "rules_saved": len(req.rules),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save: {e}")
+
+
+@app.post("/custom-criteria-validate")
+def validate_custom_criteria(req: CustomCriteriaValidateRequest) -> Dict[str, Any]:
+    """Validate a criteria expression syntax."""
+    expression = req.expression.strip()
+    
+    # Check basic format: COL OP VALUE or COL OP COL
+    pattern = r'^(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+\.?\d*)$'
+    match = re.match(pattern, expression)
+    
+    if not match:
+        return {
+            "valid": False,
+            "expression": expression,
+            "error": "Invalid format. Expected: COLUMN OPERATOR VALUE (e.g., 'HCP >= 12', 'SL_S > SL_H')",
+        }
+    
+    left, op, right = match.groups()
+    
+    # Check if left is a known column
+    if left not in HAND_CRITERIA_COLUMNS:
+        return {
+            "valid": False,
+            "expression": expression,
+            "error": f"Unknown column '{left}'. Valid columns: {sorted(HAND_CRITERIA_COLUMNS)}",
+            "warning": True,  # Warning, not error - might be valid for advanced use
+        }
+    
+    # Check if right is a number or valid column
+    try:
+        float(right)
+        is_number = True
+    except ValueError:
+        is_number = False
+    
+    if not is_number and right not in HAND_CRITERIA_COLUMNS:
+        return {
+            "valid": False,
+            "expression": expression,
+            "error": f"Right side '{right}' is neither a number nor a known column",
+            "warning": True,
+        }
+    
+    return {
+        "valid": True,
+        "expression": expression,
+        "parsed": {"left": left, "operator": op, "right": right},
+    }
+
+
+@app.post("/custom-criteria-preview")
+def preview_custom_criteria(req: CustomCriteriaPreviewRequest) -> Dict[str, Any]:
+    """Preview how many auctions would be affected by a rule."""
+    _ensure_ready()
+    
+    partial = req.partial_auction.strip().lower()
+    
+    with _STATE_LOCK:
+        bt_seat1_df = STATE["bt_seat1_df"]
+    
+    # Find auctions that start with this partial (case-insensitive, ignore leading passes)
+    matches = bt_seat1_df.filter(_normalize_auction_expr().str.starts_with(partial))
+    
+    # Determine which seat this affects
+    num_dashes = partial.count('-')
+    seat = num_dashes + 1
+    
+    # Get sample auctions
+    sample_auctions = matches.head(10).select("Auction").to_series().to_list()
+    
+    return {
+        "partial_auction": partial,
+        "seat_affected": seat,
+        "auctions_affected": matches.height,
+        "sample_auctions": sample_auctions,
+    }
+
+
+@app.post("/custom-criteria-reload")
+def reload_custom_criteria() -> Dict[str, Any]:
+    """Hot-reload custom criteria overlay from CSV (no bt/deal reload)."""
+    _ensure_ready()
+    try:
+        with _STATE_LOCK:
+            available_criteria_names = STATE.get("available_criteria_names")
+        overlay, stats = _build_custom_criteria_overlay(available_criteria_names)
+        with _STATE_LOCK:
+            STATE["custom_criteria_overlay"] = overlay
+            STATE["custom_criteria_stats"] = stats
+        return {"success": True, "message": "Custom criteria overlay reloaded successfully", "stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
 
 
 def _ensure_ready() -> Tuple[
@@ -1322,6 +1687,59 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
         _log_and_raise("auction-sequences-matching", e)
 
 
+@app.post("/auction-sequences-by-index")
+def auction_sequences_by_index(req: AuctionSequencesByIndexRequest) -> Dict[str, Any]:
+    """Auction sequences by bt_index list - delegated to hot-reloadable handler."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+
+    with _STATE_LOCK:
+        state = dict(STATE)
+
+    if state.get("bt_seat1_df") is None or "previous_bid_indices" not in state["bt_seat1_df"].columns:
+        raise HTTPException(status_code=500, detail="Column 'previous_bid_indices' not found in bt_seat1_df")
+
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_auction_sequences_by_index(
+            state=state,
+            indices=req.indices,
+            allow_initial_passes=req.allow_initial_passes,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("auction-sequences-by-index", e)
+
+
+@app.post("/deal-criteria-eval-batch")
+def deal_criteria_eval_batch(req: DealCriteriaEvalBatchRequest) -> Dict[str, Any]:
+    """Evaluate criteria for a specific deal row index, for multiple (seat, criteria) checks.
+
+    Returns per-seat: passed, failed, untracked.
+    """
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_deal_criteria_failures_batch(
+            state=state,
+            deal_row_idx=int(req.deal_row_idx),
+            dealer=str(req.dealer),
+            checks=[c.model_dump() for c in req.checks],
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("deal-criteria-eval-batch", e)
+
+
 # ---------------------------------------------------------------------------
 # API: deals for auction pattern
 # ---------------------------------------------------------------------------
@@ -1426,9 +1844,8 @@ def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[s
             pbn_str = board.deal.to_pbn()
             
             # Get vulnerability
-            vul_map = {0: 'None', 1: 'NS', 2: 'EW', 3: 'Both'}  # endplay Vul enum values
             try:
-                vul = vul_map.get(int(board.vul), 'None') if board.vul is not None else 'None'
+                vul = VUL_MAP.get(int(board.vul), 'None') if board.vul is not None else 'None'
             except Exception:
                 vul = 'None'
             
@@ -1501,16 +1918,20 @@ def _filter_auctions_by_hand_criteria(
     rejected_info = []
     rows_to_keep = []
     
+    # Criteria matching is defined in "seat-1 view" (no leading p-), so strip leading passes for matching.
+    _pass_prefix_re = re.compile(r"^(p-)+")
+    
     for row_idx in range(df.height):
         row = df.row(row_idx, named=True)
         auction = str(row.get(auction_col, '')).lower()
+        auction_norm = _pass_prefix_re.sub("", auction)
         keep_row = True
         failed_criteria = []
         matched_partial = None
         
         # Check each criterion set
         for partial_auction, criteria in criteria_list:
-            if auction.startswith(partial_auction):
+            if auction_norm.startswith(partial_auction):
                 # This auction matches this partial - check criteria
                 # Determine which seat made the last bid of the partial auction
                 num_dashes = partial_auction.count('-')
@@ -1540,7 +1961,14 @@ def _filter_auctions_by_hand_criteria(
     if len(rows_to_keep) == df.height:
         return df, rejected_info  # No filtering needed
     
-    filtered_df = df[rows_to_keep]
+    # Select rows in a type-checker-friendly way (and preserve order).
+    idx_df = pl.DataFrame({"_i": rows_to_keep, "_pos": list(range(len(rows_to_keep)))})
+    filtered_df = (
+        df.with_row_index("_i")
+        .join(idx_df, on="_i", how="inner")
+        .sort("_pos")
+        .drop(["_i", "_pos"])
+    )
     return filtered_df, rejected_info
 
 
@@ -1583,17 +2011,9 @@ def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
 @app.get("/pbn-sample")
 def get_pbn_sample() -> Dict[str, Any]:
     """Get a sample PBN from the first row of deal_df for testing."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler = _prepare_handler_call()
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
-        resp = handler_module.handle_pbn_sample(state)
+        resp = handler.handle_pbn_sample(state)
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1604,17 +2024,9 @@ def get_pbn_sample() -> Dict[str, Any]:
 @app.get("/pbn-random")
 def get_pbn_random() -> Dict[str, Any]:
     """Get a random PBN from deal_df (YOLO mode)."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler = _prepare_handler_call()
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
-        resp = handler_module.handle_pbn_random(state)
+        resp = handler.handle_pbn_random(state)
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1779,16 +2191,9 @@ def execute_sql(req: ExecuteSQLRequest) -> Dict[str, Any]:
 @app.post("/wrong-bid-stats")
 def wrong_bid_stats(req: WrongBidStatsRequest) -> Dict[str, Any]:
     """Aggregate statistics about wrong bids across the dataset."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
-        resp = handler_module.handle_wrong_bid_stats(
+        resp = handler.handle_wrong_bid_stats(
             state=state,
             auction_pattern=req.auction_pattern,
             seat=req.seat,
@@ -1801,16 +2206,9 @@ def wrong_bid_stats(req: WrongBidStatsRequest) -> Dict[str, Any]:
 @app.post("/failed-criteria-summary")
 def failed_criteria_summary(req: FailedCriteriaSummaryRequest) -> Dict[str, Any]:
     """Analysis of which criteria fail most often."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
-        resp = handler_module.handle_failed_criteria_summary(
+        resp = handler.handle_failed_criteria_summary(
             state=state,
             auction_pattern=req.auction_pattern,
             top_n=req.top_n,
@@ -1824,16 +2222,9 @@ def failed_criteria_summary(req: FailedCriteriaSummaryRequest) -> Dict[str, Any]
 @app.post("/wrong-bid-leaderboard")
 def wrong_bid_leaderboard(req: WrongBidLeaderboardRequest) -> Dict[str, Any]:
     """Leaderboard of bids with highest error rates."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
-        resp = handler_module.handle_wrong_bid_leaderboard(
+        resp = handler.handle_wrong_bid_leaderboard(
             state=state,
             top_n=req.top_n,
             seat=req.seat,
@@ -1919,6 +2310,8 @@ def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
             sample_size=req.sample_size,
             seed=req.seed,
             deals_uri=req.deals_uri,
+            deal_indices=req.deal_indices,
+            search_all_bt_rows=bool(req.search_all_bt_rows),
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:

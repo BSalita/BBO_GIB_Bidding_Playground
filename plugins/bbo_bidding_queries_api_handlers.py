@@ -55,6 +55,8 @@ from plugins.bbo_handlers_common import (
     SEAT_RANGE,
     MAX_SAMPLE_SIZE,
     DEFAULT_SEED,
+    SUIT_IDX,
+    DIRECTIONS_LIST,
     agg_expr_col,
     wrong_bid_col,
     invalid_criteria_col,
@@ -83,22 +85,24 @@ from plugins.bbo_handlers_common import (
     get_bt_info_from_match as _get_bt_info_from_match,
     # Wrong bid checking
     check_deal_criteria_conformance_bitmap as _check_deal_criteria_conformance_bitmap,
+    # Suit Length evaluation
+    evaluate_sl_criterion,
     # Vectorized join helpers (performance optimization)
     prepare_deals_with_bid_str,
     prepare_bt_for_join,
     join_deals_with_bt,
     batch_check_wrong_bids,
+    # SL (Suit Length) evaluation helpers
+    seat_to_direction,
+    hand_suit_length,
+    parse_sl_comparison_relative,
+    parse_sl_comparison_numeric,
+    eval_comparison,
+    evaluate_sl_criterion,
 )
 
 
-# ===========================================================================
-# Note: Common helpers (_display_auction_with_seat_prefix, _expand_row_to_all_seats,
-# _normalize_to_seat1, _take_rows_by_index, _safe_float, _bid_value_to_str,
-# _par_contract_signature, _dedup_par_contracts, _format_par_contracts,
-# _ev_list_for_par_contracts, _effective_seed, _seat_direction_map,
-# _extract_bid_at_seat, _check_deal_criteria_conformance_bitmap, _lookup_bt_row)
-# are imported from handlers_common.py to eliminate code duplication.
-# ===========================================================================
+from plugins.custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_custom_criteria_overlay_to_bt_row
 
 
 def _compute_seat_stats_for_bt_row(
@@ -575,18 +579,47 @@ LIMIT {sample_n}"""
         prev_rows_lookup = {}
 
     out_samples: List[Dict[str, Any]] = []
+    overlay = state.get("custom_criteria_overlay") or []
+    merged_rules_lookup = state.get("merged_rules_lookup")
+
+    def _with_rules_seat1_cols(raw_row: dict[str, Any]) -> dict[str, Any]:
+        """Return the overlay-applied BT row plus extra columns showing Rules (merged+overlay) seat-1 criteria."""
+        base_row = _apply_custom_criteria_overlay_to_bt_row(dict(raw_row), overlay)
+        try:
+            bt_idx_val = base_row.get(index_col)
+            bt_idx_i = int(bt_idx_val) if bt_idx_val is not None else None
+        except Exception:
+            bt_idx_i = None
+        merged = None
+        if merged_rules_lookup is not None and bt_idx_i is not None:
+            try:
+                merged = merged_rules_lookup.get(bt_idx_i)
+            except Exception:
+                merged = None
+        if merged:
+            rules_row = dict(raw_row)
+            rules_row[agg_expr_col(1)] = list(merged)
+            rules_row = _apply_custom_criteria_overlay_to_bt_row(rules_row, overlay)
+            base_row["Merged_Rules_Seat_1"] = list(merged)
+            base_row["Agg_Expr_Seat_1_Rules"] = rules_row.get(agg_expr_col(1)) or []
+        else:
+            base_row["Merged_Rules_Seat_1"] = []
+            base_row["Agg_Expr_Seat_1_Rules"] = base_row.get(agg_expr_col(1)) or []
+        return base_row
 
     for row in sampled_df.iter_rows(named=True):
         prev_indices = row.get(prev_idx_col, [])
 
         sequence_data: List[Dict[str, Any]] = []
         if prev_indices:
-            sequence_data.extend(prev_rows_lookup[idx] for idx in prev_indices if idx in prev_rows_lookup)
-        sequence_data.append({c: row[c] for c in available_display_cols if c in row})
+            for idx in prev_indices:
+                if idx in prev_rows_lookup:
+                    sequence_data.append(_with_rules_seat1_cols(dict(prev_rows_lookup[idx])))
+        sequence_data.append(_with_rules_seat1_cols({c: row[c] for c in available_display_cols if c in row}))
 
+        # IMPORTANT: keep the sequence in chronological order (previous_bid_indices chain + final row).
+        # Do NOT sort by bt_index here; bt_index is not a time/sequence key and sorting breaks is_match_row.
         seq_df = pl.DataFrame(sequence_data)
-        if index_col in seq_df.columns:
-            seq_df = seq_df.sort(index_col)
         
         # Mark the final row explicitly and use it as the sample title.
         if seq_df.height > 0:
@@ -604,6 +637,9 @@ LIMIT {sample_n}"""
             out_cols.append("Expr")
         # Include all Agg_Expr_Seat columns
         for col in agg_expr_cols:
+            if col in seq_df.columns:
+                out_cols.append(col)
+        for col in ("Merged_Rules_Seat_1", "Agg_Expr_Seat_1_Rules"):
             if col in seq_df.columns:
                 out_cols.append(col)
         seq_df = seq_df.select([c for c in out_cols if c in seq_df.columns])
@@ -742,7 +778,9 @@ def handle_auction_sequences_matching(
     regex_pattern = f"(?i){pattern}"
     filtered_df = base_df.filter(auction_expr.str.contains(regex_pattern))
 
-    filtered_df, rejected_df = apply_auction_criteria_fn(filtered_df, track_rejected=True)
+    # NOTE: Auction-sequence filtering here is BT-only (no dealer/hand context), so we do not
+    # apply CSV rules as a filter. Instead, CSV rules are applied as an overlay onto Agg_Expr_Seat_*.
+    rejected_df = None
 
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -750,7 +788,7 @@ def handle_auction_sequences_matching(
             "pattern": pattern,
             "samples": [],
             "total_matching": 0,
-            "rejected_count": rejected_df.height if rejected_df is not None else 0,
+            "rejected_count": 0,
             "elapsed_ms": round(elapsed_ms, 1),
         }
 
@@ -788,18 +826,48 @@ def handle_auction_sequences_matching(
         prev_rows_lookup = {}
 
     out_samples: List[Dict[str, Any]] = []
+    overlay = state.get("custom_criteria_overlay") or []
+    merged_rules_lookup = state.get("merged_rules_lookup")
+
+    def _with_rules_seat1_cols(raw_row: dict[str, Any]) -> dict[str, Any]:
+        """Return the overlay-applied BT row plus extra columns showing Rules (merged+overlay) seat-1 criteria."""
+        base_row = _apply_custom_criteria_overlay_to_bt_row(dict(raw_row), overlay)
+        try:
+            bt_idx_val = base_row.get(index_col)
+            bt_idx_i = int(bt_idx_val) if bt_idx_val is not None else None
+        except Exception:
+            bt_idx_i = None
+        merged = None
+        if merged_rules_lookup is not None and bt_idx_i is not None:
+            try:
+                merged = merged_rules_lookup.get(bt_idx_i)
+            except Exception:
+                merged = None
+        if merged:
+            # Apply merged rules to seat 1, then re-apply overlay so CSV can override merged rules.
+            rules_row = dict(raw_row)
+            rules_row[agg_expr_col(1)] = list(merged)
+            rules_row = _apply_custom_criteria_overlay_to_bt_row(rules_row, overlay)
+            base_row["Merged_Rules_Seat_1"] = list(merged)
+            base_row["Agg_Expr_Seat_1_Rules"] = rules_row.get(agg_expr_col(1)) or []
+        else:
+            base_row["Merged_Rules_Seat_1"] = []
+            base_row["Agg_Expr_Seat_1_Rules"] = base_row.get(agg_expr_col(1)) or []
+        return base_row
 
     for row in sampled_df.iter_rows(named=True):
         prev_indices = row.get(prev_idx_col, [])
 
         sequence_data: List[Dict[str, Any]] = []
         if prev_indices:
-            sequence_data.extend(prev_rows_lookup[idx] for idx in prev_indices if idx in prev_rows_lookup)
-        sequence_data.append({c: row[c] for c in available_display_cols if c in row})
+            for idx in prev_indices:
+                if idx in prev_rows_lookup:
+                    sequence_data.append(_with_rules_seat1_cols(dict(prev_rows_lookup[idx])))
+        sequence_data.append(_with_rules_seat1_cols({c: row[c] for c in available_display_cols if c in row}))
 
+        # IMPORTANT: keep the sequence in chronological order (previous_bid_indices chain + final row).
+        # Do NOT sort by bt_index here; bt_index is not a time/sequence key and sorting breaks is_match_row.
         seq_df = pl.DataFrame(sequence_data)
-        if index_col in seq_df.columns:
-            seq_df = seq_df.sort(index_col)
 
         # Mark the final (matched) row explicitly so UI can't confuse it with prefix rows.
         # Also use the final row's Auction as the sample title.
@@ -875,8 +943,294 @@ def handle_auction_sequences_matching(
         "pattern": pattern,
         "samples": out_samples,
         "total_matching": total_matching,
-        "rejected_count": rejected_df.height if rejected_df is not None else 0,
+        "rejected_count": 0,
         "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def handle_auction_sequences_by_index(
+    state: Dict[str, Any],
+    indices: List[int],
+    allow_initial_passes: bool = True,
+) -> Dict[str, Any]:
+    """Handle /auction-sequences-by-index endpoint.
+
+    Fetches sequences for the provided bt_index values (order-preserving) and returns
+    the same output shape as /auction-sequences-matching.
+    """
+    t0 = time.perf_counter()
+
+    bt_seat1_df = state.get("bt_seat1_df")
+    if bt_seat1_df is None:
+        raise ValueError("bt_seat1_df not loaded (pipeline error): missing bbo_bt_seat1.parquet")
+
+    # Hard fail if is_completed_auction is missing
+    if "is_completed_auction" not in bt_seat1_df.columns:
+        raise ValueError("REQUIRED column 'is_completed_auction' missing from bt_seat1_df. Pipeline error.")
+
+    if "bt_index" not in bt_seat1_df.columns:
+        raise ValueError("REQUIRED column 'bt_index' missing from bt_seat1_df. Pipeline error.")
+
+    index_col = "bt_index"
+    prev_idx_col = "previous_bid_indices"
+    if prev_idx_col not in bt_seat1_df.columns:
+        raise ValueError("REQUIRED column 'previous_bid_indices' missing from bt_seat1_df. Pipeline error.")
+
+    # Normalize/limit indices
+    requested: list[int] = []
+    seen: set[int] = set()
+    for x in (indices or []):
+        try:
+            xi = int(x)
+        except (ValueError, TypeError):
+            continue
+        if xi in seen:
+            continue
+        requested.append(xi)
+        seen.add(xi)
+    requested = requested[:200]
+
+    if not requested:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "indices": [],
+            "samples": [],
+            "total_matching": 0,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+
+    # Load matched rows and keep original order
+    order_df = pl.DataFrame({index_col: requested, "_ord": list(range(len(requested)))})
+    base_df = bt_seat1_df.filter(pl.col("is_completed_auction"))
+    sampled_df = (
+        base_df.join(order_df, on=index_col, how="inner")
+        .sort("_ord")
+        .drop("_ord")
+    )
+
+    if sampled_df.height == 0:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "indices": requested,
+            "missing_indices": requested,
+            "samples": [],
+            "total_matching": 0,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+
+    found_indices = sampled_df.get_column(index_col).to_list() if index_col in sampled_df.columns else []
+    found_set = set(int(x) for x in found_indices if x is not None)
+    missing_indices = [x for x in requested if x not in found_set]
+
+    agg_expr_cols = [f"Agg_Expr_Seat_{i}" for i in range(1, 5)]
+    extra_cols = ["Expr"] + agg_expr_cols
+    display_cols = [index_col, "Auction"]
+    lookup_cols = display_cols + [c for c in extra_cols if c in base_df.columns]
+    available_display_cols = [c for c in lookup_cols if c in base_df.columns]
+
+    # Get previous bid indices for sequence building
+    all_prev_indices = set()
+    for prev_list in sampled_df[prev_idx_col].to_list():
+        if prev_list:
+            all_prev_indices.update(prev_list)
+
+    if all_prev_indices:
+        prev_rows_df = bt_seat1_df.filter(pl.col(index_col).is_in(list(all_prev_indices))).select(
+            [c for c in available_display_cols if c in bt_seat1_df.columns]
+        )
+        prev_rows_lookup = {row[index_col]: row for row in prev_rows_df.iter_rows(named=True)}
+    else:
+        prev_rows_lookup = {}
+
+    out_samples: List[Dict[str, Any]] = []
+    overlay = state.get("custom_criteria_overlay") or []
+
+    for row in sampled_df.iter_rows(named=True):
+        prev_indices = row.get(prev_idx_col, [])
+
+        sequence_data: List[Dict[str, Any]] = []
+        if prev_indices:
+            for idx in prev_indices:
+                if idx in prev_rows_lookup:
+                    sequence_data.append(
+                        _apply_custom_criteria_overlay_to_bt_row(dict(prev_rows_lookup[idx]), overlay)
+                    )
+        sequence_data.append(
+            _apply_custom_criteria_overlay_to_bt_row(
+                {c: row[c] for c in available_display_cols if c in row},
+                overlay,
+            )
+        )
+
+        seq_df = pl.DataFrame(sequence_data)
+        if index_col in seq_df.columns:
+            seq_df = seq_df.sort(index_col)
+
+        # Mark the final (matched) row explicitly so UI can't confuse it with prefix rows.
+        if seq_df.height > 0:
+            seq_df = seq_df.with_row_index("_seq_pos").with_columns(
+                (pl.col("_seq_pos") == (pl.len() - 1)).alias("is_match_row")
+            ).drop("_seq_pos")
+            matched_auction = seq_df.select("Auction").tail(1).item()
+        else:
+            matched_auction = row.get("Auction")
+
+        out_cols = []
+        if index_col in seq_df.columns:
+            out_cols.append(index_col)
+        if "Auction" in seq_df.columns:
+            out_cols.append("Auction")
+        if "is_match_row" in seq_df.columns:
+            out_cols.append("is_match_row")
+        if "Expr" in seq_df.columns:
+            out_cols.append("Expr")
+        for col in agg_expr_cols:
+            if col in seq_df.columns:
+                out_cols.append(col)
+        for col in ("Merged_Rules_Seat_1", "Agg_Expr_Seat_1_Rules"):
+            if col in seq_df.columns:
+                out_cols.append(col)
+
+        seq_df = seq_df.select(out_cols)
+        if index_col == "bt_index":
+            seq_df = seq_df.rename({"bt_index": "index"})
+
+        out_samples.append({"auction": matched_auction, "sequence": seq_df.to_dicts()})
+
+    # Expand each sample to 4 seat variants when allow_initial_passes is True
+    total_matching = len(out_samples)
+    if allow_initial_passes:
+        expanded_samples = []
+        for sample in out_samples:
+            for num_passes in range(4):
+                prefix = "p-" * num_passes
+                opener_seat = num_passes + 1
+
+                expanded_sample = {
+                    "auction": prefix + sample["auction"] if sample["auction"] else sample["auction"],
+                    "opener_seat": opener_seat,
+                    "sequence": [],
+                }
+
+                for seq_row in sample["sequence"]:
+                    new_row = dict(seq_row)
+                    if "Auction" in new_row and new_row["Auction"]:
+                        new_row["Auction"] = prefix + str(new_row["Auction"])
+
+                    for display_seat in range(1, 5):
+                        original_seat = ((display_seat - 1 - num_passes) % 4) + 1
+                        orig_col = f"Agg_Expr_Seat_{original_seat}"
+                        display_col = f"Agg_Expr_Seat_{display_seat}"
+                        if orig_col in seq_row:
+                            new_row[display_col] = seq_row[orig_col]
+
+                    expanded_sample["sequence"].append(new_row)
+
+                expanded_samples.append(expanded_sample)
+
+        out_samples = expanded_samples
+        total_matching = total_matching * 4
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[auction-sequences-by-index] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
+    return {
+        "indices": requested,
+        "missing_indices": missing_indices,
+        "samples": out_samples,
+        "total_matching": total_matching,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def handle_deal_criteria_failures_batch(
+    state: Dict[str, Any],
+    deal_row_idx: int,
+    dealer: str,
+    checks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Handle /deal-criteria-eval-batch.
+
+    Uses bitmap DFs (deal_criteria_by_seat_dfs) to evaluate criteria per seat for a specific deal row index.
+    Also supports dynamic suit-length comparisons like 'SL_S >= SL_H' by parsing Hand_{N/E/S/W}.
+    """
+    deal_df = state.get("deal_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+    if deal_df is None:
+        raise ValueError("deal_df not loaded")
+
+    # Get deal row using positional index
+    try:
+        row = deal_df.row(int(deal_row_idx), named=True)
+    except (IndexError, ValueError) as e:
+        raise ValueError(f"Invalid deal_row_idx {deal_row_idx}: {e}")
+
+    dealer = str(dealer or "N").upper()
+
+    results: List[Dict[str, Any]] = []
+    for chk in (checks or []):
+        seat = int(chk.get("seat") or 0)
+        criteria_list = chk.get("criteria") or []
+        failed: List[str] = []
+        untracked: List[str] = []
+
+        if seat < 1 or seat > 4:
+            results.append({"seat": seat, "passed": [], "failed": failed, "untracked": untracked})
+            continue
+
+        criteria_df = deal_criteria_by_seat_dfs.get(seat, {}).get(dealer)
+        available_cols = set(criteria_df.columns) if criteria_df is not None else set()
+
+        # Evaluate each criterion
+        crit_norm: List[str] = []
+        for crit in criteria_list:
+            if crit is None:
+                continue
+            crit_s = str(crit)
+            crit_norm.append(crit_s)
+            
+            # Try dynamic SL evaluation first (uses shared helpers)
+            # Use fail_on_missing=False so "can't evaluate" becomes "untracked" for UI display
+            sl_result = evaluate_sl_criterion(crit_s, dealer, seat, row, fail_on_missing=False)
+            if sl_result is True:
+                continue  # Passed
+            elif sl_result is False:
+                failed.append(crit_s)
+                continue
+            # sl_result is None - either not an SL criterion OR can't evaluate
+            # Check if it was an SL criterion that couldn't be evaluated
+            if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
+                untracked.append(crit_s)
+                continue
+            
+            # Fall back to bitmap lookup for other criteria
+            if criteria_df is not None and crit_s in available_cols:
+                try:
+                    if not bool(criteria_df[crit_s][int(deal_row_idx)]):
+                        failed.append(crit_s)
+                except (IndexError, KeyError):
+                    untracked.append(crit_s)
+                continue
+
+            # Unknown / untracked criterion
+            untracked.append(crit_s)
+
+        # Passed = evaluated successfully and did not fail
+        failed_set = set(failed)
+        untracked_set = set(untracked)
+        passed = [c for c in crit_norm if c not in failed_set and c not in untracked_set]
+
+        results.append({
+            "seat": seat, 
+            "seat_dir": seat_to_direction(dealer, seat),
+            "passed": passed, 
+            "failed": failed, 
+            "untracked": untracked
+        })
+
+    return {
+        "deal_row_idx": int(deal_row_idx), 
+        "dealer": dealer,
+        "results": results
     }
 
 
@@ -1087,15 +1441,14 @@ def handle_deals_matching_auction(
     regex_pattern = f"(?i){pattern}"
     filtered_df = base_df.filter(auction_expr.str.contains(regex_pattern))
 
-    filtered_df, rejected_df = apply_auction_criteria_fn(filtered_df, track_rejected=True)
+    # NOTE: This step is BT-only (no dealer/hand context), so we do not apply CSV rules as a filter.
+    # CSV rules are applied as an overlay onto Agg_Expr_Seat_* and will affect criteria mask building below.
+    rejected_df = None
 
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(f"[deals-matching-auction] {elapsed_ms:.1f}ms (no matches)")
-        result: Dict[str, Any] = {"pattern": pattern, "auctions": [], "elapsed_ms": round(elapsed_ms, 1)}
-        if rejected_df is not None and rejected_df.height > 0:
-            result["criteria_rejected"] = rejected_df.to_dicts()
-        return result
+        return {"pattern": pattern, "auctions": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(n_auction_samples, filtered_df.height)
     effective_seed = _effective_seed(seed)
@@ -1108,6 +1461,7 @@ def handle_deals_matching_auction(
     ]
 
     out_auctions: List[Dict[str, Any]] = []
+    overlay = state.get("custom_criteria_overlay") or []
     
     # Initialize loop variables for type checker (they're always bound when used due to early return)
     auction: str = ""
@@ -1115,9 +1469,11 @@ def handle_deals_matching_auction(
     combined_df: pl.DataFrame = pl.DataFrame()
 
     for auction_row in sampled_auctions.iter_rows(named=True):
+        auction_row = _apply_custom_criteria_overlay_to_bt_row(dict(auction_row), overlay)
         auction = auction_row["Auction"]
 
         auction_info = {
+            "bt_index": auction_row.get("bt_index"),
             "auction": auction,
             "expr": auction_row.get("Expr"),
             "criteria_by_seat": {},
@@ -1142,13 +1498,16 @@ def handle_deals_matching_auction(
         criteria_found: Dict[str, List[str]] = {}
         criteria_missing: Dict[str, List[str]] = {}
         
-        actual_final_seat = 0
-        for s in range(1, 5):
-            agg_col = f"Agg_Expr_Seat_{s}"
-            if agg_col in auction_row and auction_row[agg_col]:
-                actual_final_seat = s
+        # Compute final seat from the auction length (not from "has criteria"), so
+        # complete auctions like "1S-p-p-p" correctly report Seat_4 in debug.
+        try:
+            bids = [b for b in str(auction).split("-") if b != ""]
+            actual_final_seat = ((len(bids) - 1) % 4) + 1 if bids else 1
+        except (ValueError, AttributeError):
+            actual_final_seat = 1
         
-        for s in range(1, actual_final_seat + 1):
+        # Build found/missing debug for all seats up to final seat (inclusive).
+        for s in range(1, int(actual_final_seat) + 1):
             agg_col = f"Agg_Expr_Seat_{s}"
             seat_key = f"Seat_{s}"
             criteria_found[seat_key] = []
@@ -1161,7 +1520,10 @@ def handle_deals_matching_auction(
                         if s in deal_criteria_by_seat_dfs and dealer in deal_criteria_by_seat_dfs[s]:
                             seat_criteria_df = deal_criteria_by_seat_dfs[s][dealer]
                             for criterion in criteria_list:
-                                if criterion in seat_criteria_df.columns:
+                                # Treat suit-length comparisons as "found" because we evaluate them dynamically.
+                                c = str(criterion).strip().replace("≥", ">=").replace("≤", "<=")
+                                is_dyn_sl = bool(re.match(r"^SL_[SHDC]\s*(>=|<=|>|<|==|!=)\s*SL_[SHDC]$", c))
+                                if is_dyn_sl or (criterion in seat_criteria_df.columns):
                                     if criterion not in criteria_found[seat_key]:
                                         criteria_found[seat_key].append(criterion)
                                 else:
@@ -1276,8 +1638,7 @@ def handle_deals_matching_auction(
                     deal_row[f"Wrong_Bid_S{seat}"] = False
                     deal_row[f"Invalid_Criteria_S{seat}"] = None
                 deal_row["first_wrong_seat"] = None
-            # Remove internal row index from output
-            deal_row.pop("_row_idx", None)
+            # Keep _row_idx in output so clients can use it for /deal-criteria-eval-batch
             
             # Add requested EV fields
             # - EV_Declarer: EV for the deal's actual declarer/contract (already precomputed in deal_df)
@@ -1398,8 +1759,6 @@ def handle_deals_matching_auction(
         response["dist_filter"] = {"dist_pattern": dist_pattern, "sorted_shape": sorted_shape, "direction": dist_direction}
     if wrong_bid_filter != "all":
         response["wrong_bid_filter"] = wrong_bid_filter
-    if rejected_df is not None and rejected_df.height > 0:
-        response["criteria_rejected"] = rejected_df.to_dicts()
     return response
 
 
@@ -1520,6 +1879,9 @@ def handle_bidding_table_statistics(
                 print(f"[bidding-table-statistics] Distribution filter error: {e}")
     
     result_rows = result_df.to_dicts()
+    overlay = state.get("custom_criteria_overlay") or []
+    if overlay:
+        result_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in result_rows]
     
     # Expand each matched row to 4 seat variants when allow_initial_passes is True
     if allow_initial_passes:
@@ -1637,6 +1999,9 @@ def handle_find_matching_auctions(
     result_cols = [c for c in result_cols if c in join_df.columns]
     result_df = join_df.select(result_cols)
     result_rows = result_df.to_dicts()
+    overlay = state.get("custom_criteria_overlay") or []
+    if overlay:
+        result_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in result_rows]
     # Display: prepend leading passes for the requested seat.
     for r in result_rows:
         if "Auction" in r:
@@ -1774,6 +2139,10 @@ def handle_bt_seat_stats(
         seat: 1-4 for specific seat, 0 for all seats.
         max_deals: Optional cap on deals to aggregate (currently unused; exact stats).
     """
+    # Apply hot-reloadable custom criteria overlay so stats reflect current CSV rules.
+    overlay = state.get("custom_criteria_overlay") or []
+    bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(bt_row), overlay)
+
     if seat == 0:
         seats = [1, 2, 3, 4]
     else:
@@ -2008,6 +2377,7 @@ LIMIT {n_auction_groups}"""
     available_deal_cols = [c for c in deal_cols if c in filtered_df.columns]
     
     bt_cols = ["Auction", "Expr", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"]
+    overlay = state.get("custom_criteria_overlay") or []
     
     bt_lookup_df = bt_seat1_df
     # Hard fail if is_completed_auction is missing
@@ -2043,7 +2413,7 @@ LIMIT {n_auction_groups}"""
                 auction_with_passes = auction_for_search + "-p-p-p"
                 bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_with_passes)
             if bt_match.height > 0:
-                bt_row = bt_match.row(0, named=True)
+                bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(bt_match.row(0, named=True)), overlay)
                 bt_info = {c: bt_row.get(c) for c in available_bt_cols if c in bt_row}
                 bt_auction = bt_row.get("Auction")
         
@@ -2107,8 +2477,7 @@ LIMIT {n_auction_groups}"""
                     deal_row[f"Wrong_Bid_S{seat}"] = False
                     deal_row[f"Invalid_Criteria_S{seat}"] = None
                 deal_row["first_wrong_seat"] = None
-            # Remove internal row index from output
-            deal_row.pop("_row_idx", None)
+            # Keep _row_idx in output so clients can use it for /deal-criteria-eval-batch
         
         auction_groups.append({
             "auction": bid_auction, "bt_auction": bt_auction, "deal_count": deal_count,
@@ -2182,9 +2551,10 @@ def handle_wrong_bid_stats(
     # Prepare BT for join and join once (instead of per-row lookups)
     bt_prepared = prepare_bt_for_join(bt_seat1_df)
     joined_df = join_deals_with_bt(sample_df, bt_prepared)
+    overlay = state.get("custom_criteria_overlay") or []
     
     # Batch check wrong bids (still loops but no per-row filter operations)
-    result_df = batch_check_wrong_bids(joined_df, deal_criteria_by_seat_dfs, seat)
+    result_df = batch_check_wrong_bids(joined_df, deal_criteria_by_seat_dfs, seat, criteria_overlay=overlay)
     
     # Aggregate statistics from result_df
     wrong_rows = result_df.filter(pl.col("first_wrong_seat").is_not_null())
@@ -2335,6 +2705,7 @@ def handle_failed_criteria_summary(
     # Prepare BT for join and join once (eliminates per-row filter operations)
     bt_prepared = prepare_bt_for_join(bt_seat1_df)
     joined_df = join_deals_with_bt(sample_df, bt_prepared)
+    overlay = state.get("custom_criteria_overlay") or []
     
     # Track criteria failures
     criteria_fail_counts: Dict[str, int] = {}
@@ -2344,6 +2715,8 @@ def handle_failed_criteria_summary(
     # Process each deal - now without per-row BT lookups (already joined)
     seats_to_check = [seat] if seat else list(range(1, 5))
     for row in joined_df.iter_rows(named=True):
+        if overlay:
+            row = _apply_custom_criteria_overlay_to_bt_row(dict(row), overlay)
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         
@@ -2459,6 +2832,7 @@ def handle_wrong_bid_leaderboard(
     # Prepare BT for join and join once (eliminates per-row filter operations)
     bt_prepared = prepare_bt_for_join(bt_seat1_df)
     joined_df = join_deals_with_bt(sample_df, bt_prepared)
+    overlay = state.get("custom_criteria_overlay") or []
     
     # Track wrong bids by (bid, seat)
     bid_seat_wrong: Dict[Tuple[str, int], int] = {}
@@ -2468,6 +2842,8 @@ def handle_wrong_bid_leaderboard(
     # Process each deal - now without per-row BT lookups (already joined)
     seats_to_check = [seat] if seat else list(range(1, 5))
     for row in joined_df.iter_rows(named=True):
+        if overlay:
+            row = _apply_custom_criteria_overlay_to_bt_row(dict(row), overlay)
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         bid_str = row.get("_bid_str", "")
@@ -2754,14 +3130,17 @@ def handle_bidding_arena(
     sample_size: int,
     seed: Optional[int],
     deals_uri: Optional[str] = None,
+    deal_indices: Optional[List[int]] = None,
+    search_all_bt_rows: bool = False,
 ) -> Dict[str, Any]:
     """Handle /bidding-arena endpoint (Bidding Arena).
     
     Provides comprehensive head-to-head comparison between two bidding models.
-    Currently supports "Rules" and "Actual" models.
+    Currently supports "Rules", "Raw_Rules", and "Actual" models.
     Future: "NN", "RF", "Fuzzy", etc.
     
-    IMPORTANT: "Rules" model finds the BT completed auction whose criteria ALL match
+    IMPORTANT: "Rules" model uses learned criteria + CSV overlay.
+    "Raw_Rules" model finds the BT completed auction whose criteria ALL match
     the deal's hand features (using bitmap lookups). This is NOT the same as looking
     up the BT row by the actual auction string.
     
@@ -2787,13 +3166,24 @@ def handle_bidding_arena(
     bt_seat1_df = state.get("bt_seat1_df")
     
     # Validate models
-    valid_models = {"Rules", "Actual"}  # Future: add "NN", "RF", "Fuzzy"
+    # "Rules" uses learned criteria from bbo_bt_merged_rules.parquet + CSV overlay (default)
+    # "Raw_Rules" uses original BT criteria + CSV overlay (no learned criteria)
+    merged_rules_lookup = state.get("merged_rules_lookup")
+    valid_models = {"Raw_Rules", "Actual"}
+    if merged_rules_lookup is not None:
+        valid_models.add("Rules")
+    
     if model_a not in valid_models:
         raise ValueError(f"Invalid model_a: {model_a}. Valid models: {valid_models}")
     if model_b not in valid_models:
         raise ValueError(f"Invalid model_b: {model_b}. Valid models: {valid_models}")
     if model_a == model_b:
         raise ValueError("model_a and model_b must be different")
+    
+    # Check if Rules model is requested but not available
+    if (model_a == "Rules" or model_b == "Rules") and merged_rules_lookup is None:
+        raise ValueError("Rules model requested but merged_rules_lookup not loaded. "
+                         "Ensure bbo_bt_merged_rules.parquet exists in data directory.")
     
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
@@ -2814,89 +3204,502 @@ def handle_bidding_arena(
     
     total_deals = deals_prepared.height
     
-    # Sample deals
+    # Sample deals (optionally force-include pinned deal indexes)
     effective_seed = _effective_seed(seed)
-    if sample_size < total_deals:
-        sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
+    pinned_df: Optional[pl.DataFrame] = None
+    pinned_set: set[int] = set()
+    if deal_indices:
+        # Normalize/validate indices
+        pinned_list: list[int] = []
+        for x in deal_indices:
+            try:
+                pinned_list.append(int(x))
+            except (ValueError, TypeError):
+                continue
+        if pinned_list and "index" in deals_prepared.columns:
+            pinned_set = set(pinned_list)
+            order_df = pl.DataFrame({"index": pinned_list, "_pin_rank": list(range(len(pinned_list)))})
+            pinned_df = (
+                deals_prepared
+                .join(order_df, on="index", how="inner")
+                .sort("_pin_rank")
+                .drop("_pin_rank")
+            )
+
+    if pinned_df is not None and pinned_df.height > 0:
+        remaining_df = deals_prepared.filter(~pl.col("index").is_in(list(pinned_set)))
+        remaining_n = max(0, int(sample_size) - int(pinned_df.height))
+        if remaining_n > 0 and remaining_df.height > 0:
+            remaining_n = min(remaining_n, remaining_df.height)
+            sampled_rest = remaining_df.sample(n=remaining_n, seed=effective_seed) if remaining_n < remaining_df.height else remaining_df
+            sample_df = pl.concat([pinned_df, sampled_rest], how="vertical")
+        else:
+            sample_df = pinned_df
     else:
-        sample_df = deals_prepared
+        if sample_size < total_deals:
+            sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
+        else:
+            sample_df = deals_prepared
     
     analyzed_deals = sample_df.height
     
     # ---------------------------------------------------------------------------
     # Rules Auction Matching Strategy
     # ---------------------------------------------------------------------------
-    # Check if pre-computed Matched_BT_Indices column exists
-    has_precomputed_matches = "Matched_BT_Indices" in sample_df.columns
-    
-    if has_precomputed_matches:
-        print("[bidding-arena] Using pre-computed Matched_BT_Indices column")
-        # Build bt_index -> Auction lookup
-        bt_idx_to_auction = {}
-        for row in bt_seat1_df.iter_rows(named=True):
-            bt_idx = row.get("bt_index")
-            auction = row.get("Auction")
-            if bt_idx is not None and auction:
-                bt_idx_to_auction[int(bt_idx)] = auction
+    # Deal-level precomputed candidates (Matched_BT_Indices) appear unreliable in this dataset,
+    # so we do NOT use them for Rules matching.
+    has_precomputed_matches = False
+
+    # Rules candidate source:
+    # - Default: restrict to BT rows that have a merged-rules entry (bt_index in merged_rules_lookup)
+    # - Backstop: fall back to generic on-the-fly candidate pool (bt_seat1 completed auctions)
+    rules_search_mode = "merged_default"
+    rules_search_limit: int | None = None
+    rules_search_limit_fallback: int | None = None
+    # Branch-specific structures (initialized for type-checkers)
+    bt_idx_to_row: dict[int, dict[str, Any]] = {}
+    bt_idx_to_row_base: dict[int, dict[str, Any]] = {}  # Without overlay (for Rules model)
+    bt_auction_to_row_base: dict[str, dict[str, Any]] = {}
+    bt_auction_to_row_full_base: dict[str, dict[str, Any]] = {}
+    bt_completed_rows: list[dict[str, Any]] = []
+    bt_completed_rows_base: list[dict[str, Any]] = []  # Backstop pool (without overlay)
+    bt_rules_default_rows_base: list[dict[str, Any]] = []  # Default pool (without overlay)
+    RULES_MATCHES_MAX_RETURNED = 200  # UI payload guardrail
+
+    def _auction_key_seat1(auction: Any) -> str:
+        """Canonical seat-1 lookup key for auctions.
         
-        def _find_rules_auction_precomputed(matched_indices: List[int] | None) -> Optional[str]:
-            """Look up Rules auction from pre-computed match indices."""
-            if not matched_indices:
-                return None
-            # Return first matching auction
-            for bt_idx in matched_indices:
-                auction = bt_idx_to_auction.get(int(bt_idx))
-                if auction:
-                    return auction
+        - Normalizes tokens via normalize_auction_input (1nt/1n -> 1N, pass -> p)
+        - Strips leading passes (seat-1 view)
+        - Lowercases for stable dict keys
+        """
+        if auction is None:
+            return ""
+        try:
+            s = normalize_auction_input(str(auction))
+        except Exception:
+            s = str(auction)
+        s = re.sub(r"(?i)^(p-)+", "", s)
+        return s.lower()
+    
+    def _first_failure_for_bt_row(
+        deal_idx: int,
+        dealer: str,
+        bt_row: Dict[str, Any],
+        deal_row: Dict[str, Any] | None = None,
+    ) -> str | None:
+        """Return a short 'first failure' string for debugging, or None if all criteria pass."""
+        try:
+            d = str(dealer or "N").upper()
+        except Exception:
+            d = "N"
+        for seat in SEAT_RANGE:
+            criteria_list = bt_row.get(agg_expr_col(seat)) or []
+            if not criteria_list:
+                continue
+            criteria_df = (deal_criteria_by_seat_dfs.get(seat, {}) or {}).get(d)
+            if criteria_df is None or criteria_df.is_empty():
+                return f"S{seat}: missing bitmap dealer={d}"
+            for criterion in criteria_list:
+                crit_s = str(criterion).strip()
+                # Dynamic SL evaluation if possible
+                if deal_row is not None:
+                    sl_result = evaluate_sl_criterion(crit_s, d, seat, deal_row, fail_on_missing=False)
+                    if sl_result is True:
+                        continue
+                    if sl_result is False:
+                        return f"S{seat}: failed {crit_s}"
+                # Bitmap evaluation
+                if criterion not in criteria_df.columns:
+                    continue
+                try:
+                    if not bool(criteria_df[criterion][deal_idx]):
+                        return f"S{seat}: failed {crit_s}"
+                except (IndexError, KeyError, TypeError):
+                    return f"S{seat}: bitmap lookup error for {crit_s}"
+        return None
+
+    def _deal_meets_all_seat_criteria(deal_idx: int, dealer: str, bt_row: Dict[str, Any], deal_row: Dict[str, Any] | None = None) -> bool:
+        """Check if a deal meets ALL seat criteria for a BT row.
+        
+        IMPORTANT: Unknown criteria (not in bitmap, typically from CSV overlay) 
+        are treated as FAIL. This ensures CSV overlay can add blocking criteria.
+        
+        If deal_row is provided, SL (suit length) criteria are evaluated dynamically
+        to ensure correct seat-direction mapping.
+        """
+        for seat in SEAT_RANGE:
+            criteria_list = bt_row.get(agg_expr_col(seat))
+            if not criteria_list:
+                continue  # No criteria for this seat = passes
+            
+            seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
+            criteria_df = seat_dfs.get(dealer)
+            if criteria_df is None or criteria_df.is_empty():
+                return False  # Can't verify = fail
+            
+            for criterion in criteria_list:
+                crit_s = str(criterion).strip()
+                
+                # Try dynamic SL evaluation first if deal_row is provided
+                if deal_row is not None:
+                    sl_result = evaluate_sl_criterion(crit_s, dealer, seat, deal_row, fail_on_missing=False)
+                    if sl_result is True:
+                        continue  # SL criterion passed, skip bitmap lookup
+                    elif sl_result is False:
+                        return False  # SL criterion failed
+                    # sl_result is None - not an SL criterion OR hand data missing, fall through to bitmap
+                
+                # Bitmap lookup for non-SL criteria
+                if criterion not in criteria_df.columns:
+                    # Unknown criterion - skip it (can't verify, assume passes)
+                    # Note: This means CSV overlay criteria not in bitmap will be IGNORED
+                    # for matching purposes. Dynamic SL evaluation handles SL criteria.
+                    continue
+                try:
+                    if not bool(criteria_df[criterion][deal_idx]):
+                        return False  # Failed this criterion
+                except (IndexError, KeyError):
+                    return False
+        return True
+        
+    def _find_rules_matches_precomputed(
+        deal_idx: int,
+        dealer: str,
+        matched_indices: List[int] | None,
+        deal_row: Dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return all matching BT candidates among the precomputed list (up to max returned)."""
+        if not matched_indices:
+            return [], False
+        out: list[dict[str, Any]] = []
+        truncated = False
+        for bt_idx in matched_indices:
+            bt_idx_i = int(bt_idx)
+            bt_row = bt_idx_to_row.get(bt_idx_i)
+            if bt_row is None:
+                continue
+            if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
+                out.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction")})
+                if len(out) >= RULES_MATCHES_MAX_RETURNED:
+                    truncated = True
+                    break
+        return out, truncated
+
+    def _find_rules_matches_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], bool]:
+        """Return matching BT candidates from the on-the-fly candidate pool (up to max returned)."""
+        out: list[dict[str, Any]] = []
+        truncated = False
+        for bt_row in bt_completed_rows:
+            if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
+                out.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")})
+                if len(out) >= RULES_MATCHES_MAX_RETURNED:
+                    truncated = True
+                    break
+        return out, truncated
+
+    def _find_first_rules_match_precomputed(
+        deal_idx: int,
+        dealer: str,
+        matched_indices: List[int] | None,
+        deal_row: Dict[str, Any] | None = None,
+    ) -> str | None:
+        """Fast path: return first matching auction among the precomputed candidate list."""
+        if not matched_indices:
             return None
+        for bt_idx in matched_indices:
+            bt_idx_i = int(bt_idx)
+            bt_row = bt_idx_to_row.get(bt_idx_i)
+            if bt_row is None:
+                continue
+            if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+
+    def _find_first_rules_match_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
+        """Fast path: return first matching auction from the on-the-fly candidate pool."""
+        for bt_row in bt_completed_rows:
+            if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+
+    if has_precomputed_matches:
+        # Use precomputed candidate indices but re-check against (base + overlay) criteria so the CSV can override.
+        overlay = state.get("custom_criteria_overlay") or []
+
+        try:
+            matched_series = sample_df.get_column("Matched_BT_Indices")
+            needed_idxs = (
+                matched_series
+                .explode()
+                .drop_nulls()
+                .unique()
+                .to_list()
+            )
+        except Exception:
+            needed_idxs = []
+
+        bt_idx_to_auction: dict[int, str] = {}
+        # Keyed by a seat-1 normalized, lowercased auction string (leading passes stripped).
+        # (Initialized above for type-checkers; populated here.)
+        if needed_idxs:
+            try:
+                cols = ["bt_index", "Auction", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
+                cols = [c for c in cols if c in bt_seat1_df.columns]
+                lookup_df = bt_seat1_df.select(cols).filter(pl.col("bt_index").is_in(needed_idxs))
+                lookup_rows_base = lookup_df.to_dicts()
+                # Store base rows (without overlay) for Rules model
+                for r in lookup_rows_base:
+                    bt_idx = r.get("bt_index")
+                    if bt_idx is not None:
+                        bt_idx_to_row_base[int(bt_idx)] = r
+                    auc = r.get("Auction")
+                    if auc:
+                        # Normalize key to seat-1 view + lowercase so deal auctions with leading passes
+                        # (e.g. "p-p-p-1N-p-p-p") can be looked up reliably.
+                        k = _auction_key_seat1(auc)
+                        bt_auction_to_row_base[k] = r
+                # Apply overlay for Rules model
+                if overlay:
+                    lookup_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in lookup_rows_base]
+                else:
+                    lookup_rows = lookup_rows_base
+                for r in lookup_rows:
+                    bt_idx = r.get("bt_index")
+                    auction = r.get("Auction")
+                    if bt_idx is None:
+                        continue
+                    bt_idx_i = int(bt_idx)
+                    bt_idx_to_row[bt_idx_i] = r
+                    if auction:
+                        bt_idx_to_auction[bt_idx_i] = str(auction)
+            except Exception:
+                bt_idx_to_row = {}
+                bt_idx_to_row_base = {}
+                bt_idx_to_auction = {}
+
+        def _find_rules_auction_precomputed(deal_idx: int, dealer: str, matched_indices: List[int] | None) -> Optional[str]:
+            """Pick the first precomputed candidate that satisfies (base + overlay) criteria for this deal."""
+            return _find_first_rules_match_precomputed(deal_idx, dealer, matched_indices)
     else:
-        print("[bidding-arena] Using on-the-fly criteria matching (Matched_BT_Indices not available)")
-        # Get completed auctions with their criteria for on-the-fly matching
+        # Candidate pool(s) for criteria matching (no deal-level Matched_BT_Indices)
         if "is_completed_auction" in bt_seat1_df.columns:
             bt_completed = bt_seat1_df.filter(pl.col("is_completed_auction"))
         else:
             bt_completed = bt_seat1_df
-        
-        # Limit to most common completed auctions for performance
-        if "matching_deal_count" in bt_completed.columns:
-            bt_completed = bt_completed.sort("matching_deal_count", descending=True).head(5000)
+
+        # Default Rules candidate pool: BT rows that have a merged rules entry.
+        merged_rules_lookup = state.get("merged_rules_lookup") or {}
+        if merged_rules_lookup:
+            try:
+                merged_bt_indices = list(merged_rules_lookup.keys())
+            except Exception:
+                merged_bt_indices = []
         else:
-            bt_completed = bt_completed.head(5000)
+            merged_bt_indices = []
+
+        bt_rules_default = bt_completed
+        if merged_bt_indices and "bt_index" in bt_rules_default.columns:
+            bt_rules_default = bt_rules_default.filter(pl.col("bt_index").is_in(merged_bt_indices))
+        else:
+            # If merged rules aren't available, default pool degenerates to the generic completed pool.
+            rules_search_mode = "onthefly"
         
-        # Convert to list of dicts for iteration
-        bt_completed_rows = bt_completed.select([
-            "Auction",
-            agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4),
-        ]).to_dicts()
+        if not search_all_bt_rows:
+            # Limit pools for performance (default + fallback)
+            if "matching_deal_count" in bt_rules_default.columns:
+                bt_rules_default = bt_rules_default.sort("matching_deal_count", descending=True).head(5000)
+            elif "bt_index" in bt_rules_default.columns:
+                bt_rules_default = bt_rules_default.sort("bt_index").head(5000)
+            else:
+                bt_rules_default = bt_rules_default.head(5000)
+
+            if "matching_deal_count" in bt_completed.columns:
+                bt_completed = bt_completed.sort("matching_deal_count", descending=True).head(5000)
+            elif "bt_index" in bt_completed.columns:
+                bt_completed = bt_completed.sort("bt_index").head(5000)
+            else:
+                bt_completed = bt_completed.head(5000)
         
-        def _deal_meets_all_seat_criteria(deal_idx: int, dealer: str, bt_row: Dict[str, Any]) -> bool:
-            """Check if a deal meets ALL seat criteria for a BT row."""
-            for seat in SEAT_RANGE:
-                criteria_list = bt_row.get(agg_expr_col(seat))
-                if not criteria_list:
-                    continue  # No criteria for this seat = passes
-                
-                seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
-                criteria_df = seat_dfs.get(dealer)
-                if criteria_df is None or criteria_df.is_empty():
-                    return False  # Can't verify = fail
-                
-                for criterion in criteria_list:
-                    if criterion not in criteria_df.columns:
-                        continue  # Criterion not tracked = ignore
-                    try:
-                        if not bool(criteria_df[criterion][deal_idx]):
-                            return False  # Failed this criterion
-                    except (IndexError, KeyError):
-                        return False
-            return True
+        # Convert pools to list of dicts for iteration
+        bt_cols = ["Auction", "bt_index", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
+        bt_cols = [c for c in bt_cols if c in bt_completed.columns]
+
+        bt_rules_default_rows_base = bt_rules_default.select(bt_cols).to_dicts() if bt_rules_default is not None else []
+        bt_completed_rows_base = bt_completed.select(bt_cols).to_dicts()
+
+        # Build Auction->row caches for fast lookup.
+        # - default: merged-rules pool only (preferred when searching candidates)
+        # - full: generic completed pool (used ONLY for "is actual auction in BT?" checks)
+        #
+        # Key by seat-1 normalized, lowercased auction string for robust lookup.
+        bt_auction_to_row_base = {
+            _auction_key_seat1(r.get("Auction")): r
+            for r in bt_rules_default_rows_base
+            if r.get("Auction")
+        }
+        bt_auction_to_row_full_base = {
+            _auction_key_seat1(r.get("Auction")): r
+            for r in bt_completed_rows_base
+            if r.get("Auction")
+        }
+        rules_search_limit = len(bt_rules_default_rows_base)
+        rules_search_limit_fallback = len(bt_completed_rows_base)
+        
+        # DIAGNOSTIC: Show first few auctions from the candidates list
+        top_auctions = [r.get("Auction") for r in bt_rules_default_rows_base[:5]]
+        if rules_search_mode == "merged_default":
+            print(f"[bidding-arena] merged-default {len(bt_rules_default_rows_base)} candidates (top 5: {top_auctions})")
+        else:
+            print(f"[bidding-arena] {len(bt_completed_rows_base)} candidates (top 5: {top_auctions})")
+        overlay = state.get("custom_criteria_overlay") or []
+        if overlay:
+            bt_completed_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in bt_completed_rows_base]
+        else:
+            bt_completed_rows = bt_completed_rows_base
         
         def _find_rules_auction_onthefly(deal_idx: int, dealer: str) -> Optional[str]:
             """Find the first completed auction whose criteria ALL match this deal."""
-            for bt_row in bt_completed_rows:
-                if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row):
-                    return bt_row.get("Auction")
+            return _find_first_rules_match_onthefly(deal_idx, dealer)
+    
+    # ---------------------------------------------------------------------------
+    # Rules Model Matching Setup (Learned Criteria)
+    # ---------------------------------------------------------------------------
+    # Rules model uses learned criteria from bbo_bt_merged_rules.parquet.
+    # We key the lookup by bt_index to avoid fragile auction-string matching.
+    
+    use_rules = model_a == "Rules" or model_b == "Rules"  # Rules = learned + CSV overlay
+    
+    def _apply_merged_rules_to_bt_row(bt_row: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply Merged_Rules to seat-1, then apply CSV overlay on top.
+        
+        Flow:
+        1. Get merged rules for seat 1 from merged_rules_lookup (if available)
+        2. Apply CSV overlay on top (so CSV can disable/modify merged rules)
+        
+        IMPORTANT: CSV overlay is ALWAYS applied, even if no merged rules exist.
+        """
+        overlay = state.get("custom_criteria_overlay") or []
+        
+        # Start with a copy to avoid mutating the original
+        result = dict(bt_row)
+        
+        # Apply merged rules to seat 1 if available
+        if merged_rules_lookup is not None:
+            bt_idx = bt_row.get("bt_index")
+            if bt_idx is not None:
+                try:
+                    bt_idx_i = int(bt_idx)
+                    merged = merged_rules_lookup.get(bt_idx_i)
+                    if merged:
+                        # Rules model: seat-1 criteria is driven by merged rules (pipeline output).
+                        result[agg_expr_col(1)] = list(merged)
+                except Exception:
+                    pass
+        
+        # ALWAYS apply CSV overlay on top (so CSV can modify/disable rules)
+        if overlay:
+            result = _apply_custom_criteria_overlay_to_bt_row(result, overlay)
+        
+        return result
+    
+    def _deal_meets_merged_criteria(deal_idx: int, dealer: str, bt_row: Dict[str, Any], deal_row: Dict[str, Any] | None = None) -> bool:
+        """Check if a deal meets criteria using Merged_Rules for seat 1."""
+        merged_row = _apply_merged_rules_to_bt_row(bt_row)
+        return _deal_meets_all_seat_criteria(deal_idx, dealer, merged_row, deal_row)
+    
+    def _find_first_merged_rules_match_precomputed(
+        deal_idx: int,
+        dealer: str,
+        matched_indices: List[int] | None,
+        deal_row: Dict[str, Any] | None = None,
+    ) -> str | None:
+        """Find first matching auction using Merged_Rules criteria (precomputed path).
+        
+        Uses bt_idx_to_row_base (without overlay), then _apply_merged_rules_to_bt_row
+        applies merged rules + CSV overlay.
+        """
+        if not matched_indices:
             return None
+        for bt_idx in matched_indices:
+            # Use base rows - overlay is applied inside _apply_merged_rules_to_bt_row
+            bt_row = bt_idx_to_row_base.get(int(bt_idx))
+            if bt_row and _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+    
+    def _find_first_merged_rules_match_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
+        """Find first matching auction using Merged_Rules criteria (on-the-fly path).
+        
+        Uses bt_completed_rows_base (without overlay), then _apply_merged_rules_to_bt_row
+        applies merged rules + CSV overlay.
+        """
+        for bt_row in bt_completed_rows_base:
+            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+
+    def _find_first_merged_rules_match_default(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
+        """Default path: search the merged-rules candidate pool first, then fall back to None."""
+        for bt_row in bt_rules_default_rows_base:
+            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+    
+    def _find_merged_rules_matches_precomputed(
+        deal_idx: int,
+        dealer: str,
+        matched_indices: List[int] | None,
+        deal_row: Dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return all matching BT candidates using merged rules (up to max returned)."""
+        if not matched_indices:
+            return [], False
+        out: list[dict[str, Any]] = []
+        truncated = False
+        for bt_idx in matched_indices:
+            bt_idx_i = int(bt_idx)
+            bt_row = bt_idx_to_row_base.get(bt_idx_i)
+            if bt_row is None:
+                continue
+            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+                out.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction")})
+                if len(out) >= RULES_MATCHES_MAX_RETURNED:
+                    truncated = True
+                    break
+        return out, truncated
+
+    def _find_merged_rules_matches_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], bool]:
+        """Return matching BT candidates using merged rules, default pool first (up to max returned)."""
+        out: list[dict[str, Any]] = []
+        truncated = False
+        # Default source: merged-rules rows
+        for bt_row in bt_rules_default_rows_base:
+            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+                out.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")})
+                if len(out) >= RULES_MATCHES_MAX_RETURNED:
+                    truncated = True
+                    break
+        # Backstop: generic completed rows (avoid duplicates)
+        if not truncated and len(out) < RULES_MATCHES_MAX_RETURNED:
+            seen = set((m.get("bt_index"), m.get("auction")) for m in out)
+            for bt_row in bt_completed_rows_base:
+                if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+                    item = {"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")}
+                    key = (item.get("bt_index"), item.get("auction"))
+                    if key in seen:
+                        continue
+                    out.append(item)
+                    seen.add(key)
+                    if len(out) >= RULES_MATCHES_MAX_RETURNED:
+                        truncated = True
+                        break
+        return out, truncated
     
     # Metrics accumulators
     model_a_wins = 0
@@ -2907,7 +3710,14 @@ def handle_bidding_arena(
     imp_diffs: List[int] = []
     sum_dd_a = 0
     sum_dd_b = 0
-    sample_deals: List[Dict[str, Any]] = []
+    sample_deals_output: List[Dict[str, Any]] = []  # Output list for processed sample deals
+    
+    # Diagnostic counters for debugging match rate
+    diag_no_matched_indices = 0
+    diag_rules_none = 0
+    diag_dd_a_none = 0
+    diag_dd_b_none = 0
+    diag_first_failure_reasons: list[str] = []
     
     # Contract agreement
     same_contract = 0
@@ -2947,10 +3757,54 @@ def handle_bidding_arena(
         "W": {"a_wins": 0, "b_wins": 0, "ties": 0, "count": 0},
     }
     
+    def _rejection_reason_for(model: str, auction_val: Any, dd_score_val: Any, dealer: str) -> str | None:
+        """Return a short reason string if this model can't be compared for this deal."""
+        if model == "Actual":
+            if dd_score_val is None:
+                return "Actual: missing DD_Score_Declarer"
+            return None
+        # Rules or Raw_Rules
+        model_name = model  # "Rules" or "Raw_Rules"
+        if auction_val is None:
+            # Distinguish "no match" from "can't verify because criteria bitmaps are missing for this dealer".
+            try:
+                d = str(dealer or "N").upper()
+                missing_seats = []
+                for s in SEAT_RANGE:
+                    df = deal_criteria_by_seat_dfs.get(s, {}).get(d)
+                    if df is None or df.is_empty():
+                        missing_seats.append(s)
+                if missing_seats:
+                    return f"{model_name}: no matching auction (missing/empty criteria bitmap for dealer={d}, seat(s)={missing_seats})"
+            except Exception:
+                pass
+            if rules_search_mode == "onthefly" and rules_search_limit is not None:
+                return f"{model_name}: no matching auction after criteria (searched top {rules_search_limit} completed auctions)"
+            return f"{model_name}: no matching auction after criteria"
+        if dd_score_val is None:
+            return f"{model_name}: DD score unavailable for chosen auction"
+        return None
+    
     # Process each deal
-    for row in sample_df.iter_rows(named=True):
+    # Limit sample output to min(sample_size, 200) to avoid excessive memory usage
+    max_sample_output = min(sample_size, 200)
+    sample_deals = sample_df.to_dicts()
+    for row in sample_deals:
         deal_idx = row.get("_row_idx", 0)
-        dealer = row.get("Dealer", "N")
+        # Robustly handle Dealer (could be string or int)
+        dealer_val = row.get("Dealer", "N")
+        if isinstance(dealer_val, int):
+            dealer = ["N", "E", "S", "W"][dealer_val % 4]
+        elif isinstance(dealer_val, str):
+            dealer = dealer_val.upper()
+            if dealer not in ["N", "E", "S", "W"]:
+                dealer = "N"
+        else:
+            dealer = "N"
+        
+        # Ensure dealer is a string for all subsequent calls
+        dealer = str(dealer)
+        
         vul = row.get("Vul", "None")
         bid_str = row.get("_bid_str", "")
         par_score = row.get("ParScore")
@@ -2966,46 +3820,413 @@ def handle_bidding_arena(
         # ---------------------------------------------------------------------------
         # Get auction for each model
         # ---------------------------------------------------------------------------
-        # Helper to get Rules auction (uses pre-computed if available)
-        def get_rules_auction() -> Optional[str]:
+        def _rules_no_match_debug(deal_idx_i: int, dealer_dir: str | int, matched_indices: List[int] | None) -> str:
+            """Best-effort diagnostic string when Rules can't find any matching BT auction.
+
+            Uses merged rules + CSV overlay (the Rules path), not Raw_Rules.
+            We only call this for a small number of sampled deals, so it can afford to check a few candidates.
+            """
+            try:
+                if isinstance(dealer_dir, int):
+                    d = ["N", "E", "S", "W"][dealer_dir % 4]
+                else:
+                    d = str(dealer_dir or "N").upper()
+                    if d not in ["N", "E", "S", "W"]:
+                        d = "N"
+                # Decide candidate list based on matching strategy
+                # Use base rows and apply merged rules + CSV overlay (same as Rules model)
+                candidates: list[dict[str, Any]] = []
+                if has_precomputed_matches:
+                    if not matched_indices:
+                        return "no candidates (Matched_BT_Indices empty)"
+                    # Use up to N candidates from the precomputed list, apply merged rules + overlay
+                    for bt_idx in matched_indices[:25]:
+                        bt_row = bt_idx_to_row_base.get(int(bt_idx))
+                        if bt_row is not None:
+                            # Apply merged rules + CSV overlay (same as _apply_merged_rules_to_bt_row)
+                            candidates.append(_apply_merged_rules_to_bt_row(bt_row))
+                else:
+                    # On-the-fly path: use base rows, apply merged rules + overlay
+                    # Default pool first, then fallback pool
+                    for bt_row in bt_rules_default_rows_base[:25]:
+                        candidates.append(_apply_merged_rules_to_bt_row(bt_row))
+                    if len(candidates) < 25:
+                        for bt_row in bt_completed_rows_base[:25]:
+                            candidates.append(_apply_merged_rules_to_bt_row(bt_row))
+
+                if not candidates:
+                    return "no candidates available"
+                
+                # Show variety of candidate auctions
+                unique_auctions = list(set(str(c.get("Auction", "?")) for c in candidates[:10]))[:5]
+                
+                # Diagnostic: how many matched_indices are actually found in bt_idx_to_row_base?
+                if matched_indices:
+                    found_count = sum(1 for idx in matched_indices[:25] if bt_idx_to_row_base.get(int(idx)) is not None)
+                    total_count = min(25, len(matched_indices))
+                    if found_count < total_count:
+                        return f"MISMATCH: only {found_count}/{total_count} matched_indices found in bt_idx_to_row_base (missing rows in bt_seat1_df?)"
+
+                # Check each candidate and find WHY it failed
+                # Collect failures for first few candidates to show diversity
+                candidate_failures: list[str] = []
+                for cand in candidates:
+                    cand_failed = False
+                    cand_failure_info = ""
+                    for seat in SEAT_RANGE:
+                        crits = cand.get(agg_expr_col(seat)) or []
+                        if not crits:
+                            continue
+                        criteria_df = deal_criteria_by_seat_dfs.get(seat, {}).get(d)
+                        if criteria_df is None or criteria_df.is_empty():
+                            cand_failed = True
+                            cand_failure_info = f"missing bitmap (dealer={d}, seat={seat})"
+                            break
+                        failed: list[str] = []
+                        for c in crits:
+                            if c not in criteria_df.columns:
+                                continue  # Skip untracked (same as actual matching)
+                            try:
+                                if not bool(criteria_df[c][int(deal_idx_i)]):
+                                    failed.append(str(c))
+                            except Exception:
+                                pass
+                        if failed:
+                            auc = cand.get("Auction")
+                            cand_failure_info = f"{auc}: S{seat} failed {failed[:3]}"
+                            cand_failed = True
+                            break
+                    if cand_failed and len(candidate_failures) < 3:
+                        candidate_failures.append(cand_failure_info)
+                    elif not cand_failed:
+                        # This candidate should have matched - unexpected!
+                        auc = cand.get("Auction")
+                        return f"unexpected: candidate {auc} passed all criteria but wasn't matched"
+                
+                if candidate_failures:
+                    return f"checked {len(candidates)} candidates (auctions: {unique_auctions}); failures: {candidate_failures}"
+                return f"checked {len(candidates)} candidates; no failures found (unexpected)"
+            except Exception as e:
+                return f"debug failed: {e}"
+
+        need_rules = (model_a == "Rules") or (model_b == "Rules")  # Learned rules
+        need_raw_rules = (model_a == "Raw_Rules") or (model_b == "Raw_Rules")  # Original BT rules
+        need_rules_matches_list = need_rules and (len(sample_deals) < 50)
+
+        # Pick a single Rules auction (learned criteria) for scoring
+        # Pass `row` as deal_row for dynamic SL evaluation
+        matched_indices = row.get("Matched_BT_Indices") if has_precomputed_matches else None
+        if need_rules:
+            # PRIORITIZE: Try actual auction first if it's in BT
+            rules_auction = None
+            rules_actual_bt_lookup: str = ""
+            rules_actual_criteria_ok: bool | None = None
+            rules_actual_first_failure: str = ""
+            rules_actual_bt_index: int | None = None
+            rules_actual_seat1_criteria: str = ""
+            rules_actual_base_criteria_by_seat: str = ""
+            rules_actual_merged_criteria_by_seat: str = ""
+            rules_actual_merged_only_criteria_by_seat: str = ""
+            if bid_str:
+                # Normalize the deal's auction to the BT's seat-1 view for lookup.
+                bid_norm_full = normalize_auction_input(str(bid_str))
+                bid_str_seat1 = re.sub(r"(?i)^(p-)+", "", bid_norm_full)
+                bid_key = bid_str_seat1.lower()
+                lead_passes = _count_leading_passes(bid_norm_full)
+
+                def _rotate_bt_row_for_leading_passes(bt_row: Dict[str, Any], n_passes: int) -> Dict[str, Any]:
+                    """Rotate a BT row's seat-indexed columns to match a deal with leading passes.
+                    
+                    The BT is stored in seat-1 view (no leading passes). For a deal auction like
+                    'p-p-p-1N-p-p-p', the opener is seat 4 relative to dealer, so we must rotate
+                    Agg_Expr_Seat_* (and other seat-indexed columns) accordingly before evaluating.
+                    """
+                    try:
+                        n = int(n_passes)
+                    except Exception:
+                        n = 0
+                    if n <= 0:
+                        return bt_row
+                    try:
+                        expanded = _expand_row_to_all_seats(bt_row, allow_initial_passes=True)
+                        if 0 <= n < len(expanded):
+                            return expanded[n]
+                    except Exception:
+                        pass
+                    return bt_row
+
+                def _criteria_by_seat_str(bt_row: Dict[str, Any]) -> str:
+                    parts: list[str] = []
+                    for s in SEAT_RANGE:
+                        try:
+                            crits = bt_row.get(agg_expr_col(s)) or []
+                            if crits:
+                                txt = "; ".join(str(x) for x in crits[:25])
+                            else:
+                                txt = "(no criteria)"
+                            parts.append(f"S{s}: {txt}")
+                        except Exception:
+                            parts.append(f"S{s}: (error)")
+                    return " | ".join(parts)
+
+                def _apply_merged_rules_to_bt_row_no_overlay(bt_row: Dict[str, Any]) -> Dict[str, Any]:
+                    """Apply merged rules to seat 1 ONLY (no CSV overlay).
+                    
+                    This is a debug helper so we can distinguish issues coming from:
+                    - bbo_bt_merged_rules.parquet (merged rules), vs
+                    - CSV overlay (runtime)
+                    """
+                    result = dict(bt_row)
+                    if merged_rules_lookup is not None:
+                        bt_idx = bt_row.get("bt_index")
+                        if bt_idx is not None:
+                            try:
+                                bt_idx_i = int(bt_idx)
+                                merged = merged_rules_lookup.get(bt_idx_i)
+                                if merged:
+                                    result[agg_expr_col(1)] = list(merged)
+                            except Exception:
+                                pass
+                    return result
+
+                bt_row_actual = bt_auction_to_row_base.get(bid_key)
+                if bt_row_actual is None:
+                    # Handle common variants with/without the trailing "-p-p-p".
+                    if bid_key.endswith("-p-p-p"):
+                        bt_row_actual = bt_auction_to_row_base.get(bid_key[: -len("-p-p-p")])
+                    else:
+                        bt_row_actual = bt_auction_to_row_base.get(bid_key + "-p-p-p")
+                if bt_row_actual is None:
+                    # Fallback: O(1) lookup in the full completed-auctions cache (avoid per-deal Polars scans)
+                    bt_row_actual = bt_auction_to_row_full_base.get(bid_key)
+                    if bt_row_actual is None:
+                        if bid_key.endswith("-p-p-p"):
+                            bt_row_actual = bt_auction_to_row_full_base.get(bid_key[: -len("-p-p-p")])
+                        else:
+                            bt_row_actual = bt_auction_to_row_full_base.get(bid_key + "-p-p-p")
+                    if bt_row_actual is not None:
+                        rules_actual_bt_lookup = "found_bt_full"
+                    else:
+                        # As a last resort, fall back to the shared helper (still slower; should be rare)
+                        try:
+                            bt_match, _auction_for_search = _lookup_bt_row(bt_seat1_df, str(bid_str))
+                            if bt_match.height > 0:
+                                cols = ["Auction", "bt_index", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
+                                cols = [c for c in cols if c in bt_match.columns]
+                                bt_row_actual = bt_match.select(cols).to_dicts()[0]
+                                rules_actual_bt_lookup = "found_bt_full"
+                                if len(diag_first_failure_reasons) < 3:
+                                    diag_first_failure_reasons.append(f"FOUND in bt_seat1_df: {_auction_for_search}")
+                        except Exception as e:
+                            rules_actual_bt_lookup = "lookup_error"
+                            if len(diag_first_failure_reasons) < 3:
+                                diag_first_failure_reasons.append(f"LOOKUP ERROR: {e}")
+                
+                if bt_row_actual:
+                    if not rules_actual_bt_lookup:
+                        rules_actual_bt_lookup = "found_bt_candidates"
+                    try:
+                        bt_idx_val = bt_row_actual.get("bt_index")
+                        rules_actual_bt_index = int(bt_idx_val) if bt_idx_val is not None else None
+                    except Exception:
+                        rules_actual_bt_index = None
+                    try:
+                        # Apply merged rules in seat-1 view first, then rotate to the deal's leading-pass seat.
+                        merged_bt_row_actual = _apply_merged_rules_to_bt_row(bt_row_actual)
+                        merged_bt_row_actual = _rotate_bt_row_for_leading_passes(merged_bt_row_actual, lead_passes)
+                    except Exception:
+                        merged_bt_row_actual = _rotate_bt_row_for_leading_passes(bt_row_actual, lead_passes)
+
+                    # Diagnostic: compare rotated base vs rotated merged+overlay criteria.
+                    try:
+                        base_rot = _rotate_bt_row_for_leading_passes(bt_row_actual, lead_passes)
+                        rules_actual_base_criteria_by_seat = _criteria_by_seat_str(base_rot)
+                    except Exception:
+                        rules_actual_base_criteria_by_seat = ""
+                    try:
+                        merged_only = _apply_merged_rules_to_bt_row_no_overlay(bt_row_actual)
+                        merged_only_rot = _rotate_bt_row_for_leading_passes(merged_only, lead_passes)
+                        rules_actual_merged_only_criteria_by_seat = _criteria_by_seat_str(merged_only_rot)
+                    except Exception:
+                        rules_actual_merged_only_criteria_by_seat = ""
+                    try:
+                        rules_actual_merged_criteria_by_seat = _criteria_by_seat_str(merged_bt_row_actual)
+                    except Exception:
+                        rules_actual_merged_criteria_by_seat = ""
+
+                    meets = _deal_meets_all_seat_criteria(int(deal_idx), dealer, merged_bt_row_actual, row)
+                    rules_actual_criteria_ok = bool(meets)
+
+                    # Capture "seat 1" criteria used for UI/debug (note: after rotation, seat 1 is dealer-relative).
+                    try:
+                        s1 = merged_bt_row_actual.get(agg_expr_col(1)) or []
+                        rules_actual_seat1_criteria = "; ".join(str(x) for x in s1[:50])
+                    except Exception:
+                        rules_actual_seat1_criteria = ""
+
+                    if meets:
+                        # Keep the deal's full auction (including leading passes) for correct declarer/scoring.
+                        rules_auction = bid_norm_full
+                    else:
+                        try:
+                            ff = _first_failure_for_bt_row(
+                                int(deal_idx),
+                                dealer,
+                                merged_bt_row_actual,
+                                row,
+                            )
+                            rules_actual_first_failure = ff or ""
+                        except Exception:
+                            rules_actual_first_failure = ""
+                        if len(diag_first_failure_reasons) < 5:
+                            diag_first_failure_reasons.append(f"CRITERIA FAILED [{bid_norm_full}]")
+                        rules_auction = None
+                else:
+                    # Auction not found in BT at all
+                    if not rules_actual_bt_lookup:
+                        rules_actual_bt_lookup = "not_in_bt"
+                    if len(diag_first_failure_reasons) < 5:
+                        diag_first_failure_reasons.append(f"NOT IN BT [{bid_str}]")
+            
+            # If actual auction didn't match (or isn't in BT), search other candidates:
+            # 1) default: merged-rules candidate pool
+            # 2) fallback: generic on-the-fly candidate pool
+            if rules_auction is None:
+                if has_precomputed_matches:
+                    if not matched_indices:
+                        diag_no_matched_indices += 1
+                    rules_auction = _find_first_merged_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
+                else:
+                    rules_auction = _find_first_merged_rules_match_default(int(deal_idx), dealer, row)
+                    if rules_auction is None and rules_search_mode == "merged_default":
+                        rules_auction = _find_first_merged_rules_match_onthefly(int(deal_idx), dealer, row)
+            
+            if rules_auction is None:
+                diag_rules_none += 1
+                # Capture first 5 failure reasons for debugging
+                if len(diag_first_failure_reasons) < 5:
+                    debug_reason = _rules_no_match_debug(int(deal_idx), dealer, matched_indices)
+                    diag_first_failure_reasons.append(debug_reason)
+        else:
+            rules_auction = None
+            rules_actual_bt_lookup = ""
+            rules_actual_criteria_ok = None
+            rules_actual_first_failure = ""
+            rules_actual_bt_index = None
+            rules_actual_seat1_criteria = ""
+            rules_actual_base_criteria_by_seat = ""
+            rules_actual_merged_criteria_by_seat = ""
+            rules_actual_merged_only_criteria_by_seat = ""
+        
+        # Pick Raw_Rules auction (original BT criteria)
+        if need_raw_rules:
             if has_precomputed_matches:
                 matched_indices = row.get("Matched_BT_Indices")
-                return _find_rules_auction_precomputed(matched_indices)
+                raw_rules_auction = _find_first_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
             else:
-                return _find_rules_auction_onthefly(int(deal_idx), dealer)
+                raw_rules_auction = _find_first_rules_match_onthefly(int(deal_idx), dealer, row)
+        else:
+            raw_rules_auction = None
+
+        # Collect all matches only for deals that are surfaced in Sample Deal Comparisons.
+        # Uses merged rules (the new Rules model) for consistency with rules_auction
+        rules_matches: list[dict[str, Any]] = []
+        rules_matches_truncated = False
+        if need_rules_matches_list:
+            if has_precomputed_matches:
+                matched_indices = row.get("Matched_BT_Indices")
+                rules_matches, rules_matches_truncated = _find_merged_rules_matches_precomputed(int(deal_idx), dealer, matched_indices, row)
+            else:
+                rules_matches, rules_matches_truncated = _find_merged_rules_matches_onthefly(int(deal_idx), dealer, row)
+        
+        # Helper to get auction result for a model
+        def _get_model_result(model: str) -> Tuple[Any, Any, Any]:
+            """Get (contract, auction, dd_score) for a model."""
+            if model == "Actual":
+                return row.get("Contract", ""), bid_str, row.get("DD_Score_Declarer")
+            elif model == "Rules":
+                if rules_auction:
+                    return (
+                        get_ai_contract(rules_auction, dealer),
+                        rules_auction,
+                        get_dd_score_for_auction(rules_auction, dealer, row),
+                    )
+                return None, None, None
+            elif model == "Raw_Rules":
+                if raw_rules_auction:
+                    return (
+                        get_ai_contract(raw_rules_auction, dealer),
+                        raw_rules_auction,
+                        get_dd_score_for_auction(raw_rules_auction, dealer, row),
+                    )
+                return None, None, None
+            return None, None, None
         
         # Model A
-        if model_a == "Actual":
-            contract_a = row.get("Contract", "")
-            dd_score_a = row.get("DD_Score_Declarer")
-            auction_a = bid_str
-        else:  # Rules
-            rules_auction = get_rules_auction()
-            if rules_auction:
-                contract_a = get_ai_contract(rules_auction, dealer)
-                auction_a = rules_auction
-                dd_score_a = get_dd_score_for_auction(rules_auction, dealer, row)
-            else:
-                contract_a = None
-                auction_a = None
-                dd_score_a = None
+        contract_a, auction_a, dd_score_a = _get_model_result(model_a)
         
         # Model B
-        if model_b == "Actual":
-            contract_b = row.get("Contract", "")
-            dd_score_b = row.get("DD_Score_Declarer")
-            auction_b = bid_str
-        else:  # Rules
-            rules_auction = get_rules_auction()
-            if rules_auction:
-                contract_b = get_ai_contract(rules_auction, dealer)
-                auction_b = rules_auction
-                dd_score_b = get_dd_score_for_auction(rules_auction, dealer, row)
-            else:
-                contract_b = None
-                auction_b = None
-                dd_score_b = None
+        contract_b, auction_b, dd_score_b = _get_model_result(model_b)
         
+        # Collect sample deals (include rejected deals, with reason)
+        if len(sample_deals_output) < max_sample_output:
+            reason_a = _rejection_reason_for(model_a, auction_a, dd_score_a, dealer)
+            reason_b = _rejection_reason_for(model_b, auction_b, dd_score_b, dealer)
+            rejection_reason = reason_a or reason_b
+
+            # Add a small diagnostic for the common confusion case: Rules has no match.
+            rules_debug = ""
+            if (model_a != "Actual" and auction_a is None) or (model_b != "Actual" and auction_b is None):
+                mi = row.get("Matched_BT_Indices") if has_precomputed_matches else None
+                rules_debug = _rules_no_match_debug(int(deal_idx), dealer, mi)
+
+            auctions_match = (auction_a == auction_b) if auction_a and auction_b else False
+            rules_matches_auctions_str = ""
+            try:
+                if rules_matches:
+                    rules_matches_auctions_str = ", ".join(
+                        str(m.get("auction")) for m in rules_matches if m and m.get("auction") is not None
+                    )
+            except Exception:
+                rules_matches_auctions_str = ""
+            sample_deals_output.append(
+                {
+                    "index": row.get("index"),
+                    "_row_idx": row.get("_row_idx"),
+                    "Dealer": dealer,
+                    "Vul": vul,
+                    "Hand_N": row.get("Hand_N"),
+                    "Hand_E": row.get("Hand_E"),
+                    "Hand_S": row.get("Hand_S"),
+                    "Hand_W": row.get("Hand_W"),
+                    f"Auction_{model_a}": auction_a,
+                    f"Auction_{model_b}": auction_b,
+                    "Rules_Actual_BT_Lookup": rules_actual_bt_lookup,
+                    "Rules_Actual_BT_Index": rules_actual_bt_index,
+                    "Rules_Actual_Criteria_OK": rules_actual_criteria_ok,
+                    "Rules_Actual_First_Failure": rules_actual_first_failure,
+                    "Rules_Actual_Seat1_Criteria": rules_actual_seat1_criteria,
+                    "Rules_Actual_BT_Base_Criteria_By_Seat": rules_actual_base_criteria_by_seat,
+                    "Rules_Actual_BT_MergedOnly_Criteria_By_Seat": rules_actual_merged_only_criteria_by_seat,
+                    "Rules_Actual_BT_Merged_Criteria_By_Seat": rules_actual_merged_criteria_by_seat,
+                    "Rules_Matches_Count": len(rules_matches),
+                    "Rules_Matches_Truncated": bool(rules_matches_truncated),
+                    # String form only (avoid List[Null] / List[str] inference problems in Polars/AgGrid)
+                    "Rules_Matches_Auctions_Str": rules_matches_auctions_str,
+                    "Auction_Rules_Selected": rules_auction,
+                    f"DD_Score_{model_a}": (int(dd_score_a) if dd_score_a is not None else None),
+                    f"DD_Score_{model_b}": (int(dd_score_b) if dd_score_b is not None else None),
+                    "IMP_Diff": None,
+                    "Auctions_Match": auctions_match,
+                    "Rejection_Reason": rejection_reason or "",
+                    "Rules_NoMatch_Debug": rules_debug,
+                    # Additional fields for display
+                    "Result": row.get("Result", ""),
+                    "Score": row.get("Score", ""),
+                    "ParScore": row.get("ParScore", par_score),
+                }
+            )
+
         # Skip if we don't have scores for both models
         if dd_score_a is None or dd_score_b is None:
             continue
@@ -3034,26 +4255,11 @@ def handle_bidding_arena(
         sum_dd_a += score_a
         sum_dd_b += score_b
 
-        # Collect a small sample of deal-level comparisons for UI
-        if len(sample_deals) < 50:
-            # Include whether the auctions match
-            auctions_match = (auction_a == auction_b) if auction_a and auction_b else False
-            sample_deals.append(
-                {
-                    "Dealer": dealer,
-                    "Vul": vul,
-                    "Hand_N": row.get("Hand_N"),
-                    "Hand_E": row.get("Hand_E"),
-                    "Hand_S": row.get("Hand_S"),
-                    "Hand_W": row.get("Hand_W"),
-                    f"Auction_{model_a}": auction_a,
-                    f"Auction_{model_b}": auction_b,
-                    f"DD_Score_{model_a}": score_a,
-                    f"DD_Score_{model_b}": score_b,
-                    "IMP_Diff": imp_signed,
-                    "Auctions_Match": auctions_match,
-                }
-            )
+        # Patch in IMP_Diff for the last appended sample row if it corresponds to this deal.
+        # (We always append before the skip-check, so at this point the last row is this deal.)
+        if sample_deals_output:
+            sample_deals_output[-1]["IMP_Diff"] = imp_signed
+            sample_deals_output[-1]["Rejection_Reason"] = ""
         
         # Segmentation updates
         if vul in by_vulnerability:
@@ -3288,12 +4494,38 @@ def handle_bidding_arena(
     }
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[bidding-arena] {elapsed_ms:.1f}ms ({contracts_compared} compared)")
+    print(f"[bidding-arena] {elapsed_ms:.1f}ms ({contracts_compared}/{analyzed_deals} compared)")
+    print(f"[bidding-arena] DIAG: no_matched_indices={diag_no_matched_indices}, rules_none={diag_rules_none}")
+    # Show actual auctions from sampled deals
+    actual_auctions_sample = [d.get("Auction_Actual", d.get("_bid_str", "?"))[:30] for d in sample_deals_output[:10]]
+    print(f"[bidding-arena] DIAG actual auctions (first 10): {actual_auctions_sample}")
+    # Show raw Matched_BT_Indices to check if data is correct
+    if sample_deals_output and len(sample_deals_output) >= 3:
+        for i in range(3):
+            deal = sample_deals_output[i]
+            matched = deal.get("Matched_BT_Indices", [])
+            matched_preview = matched[:3] if matched else "NONE"
+            auction = deal.get("Auction_Actual", "?")[:25]
+            print(f"[bidding-arena] DIAG deal[{i}] auction='{auction}', Matched_BT_Indices[:3]={matched_preview}")
+    if diag_first_failure_reasons:
+        print(f"[bidding-arena] DIAG first failures:")
+        for i, reason in enumerate(diag_first_failure_reasons[:3]):
+            print(f"  [{i+1}] {reason[:200]}")
     
     return {
         "model_a": model_a,
         "model_b": model_b,
         "deals_source": deals_source,
+        "rules_search": {
+            "mode": rules_search_mode,
+            "search_all_bt_rows": bool(search_all_bt_rows),
+            "candidate_count": rules_search_limit,
+            "fallback_candidate_count": rules_search_limit_fallback,
+            "note": (
+                "mode=merged_default means Rules first searches BT rows with a merged-rules entry (bt_index in merged_rules_lookup), "
+                "then falls back to the generic on-the-fly pool if no match is found."
+            ),
+        },
         "total_deals": total_deals,
         "analyzed_deals": analyzed_deals,
         "deals_compared": contracts_compared,
@@ -3341,7 +4573,7 @@ def handle_bidding_arena(
             for hcp, data in sorted(by_hcp_range.items()) if data["count"] > 0
         },
         "segmentation": segmentation,
-        "sample_deals": sample_deals,
+        "sample_deals": sample_deals_output,
         "elapsed_ms": round(elapsed_ms, 1),
     }
 
@@ -3417,7 +4649,39 @@ def _build_criteria_mask_for_dealer(
     criteria_by_seat: Dict[int, List[str]],
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, pl.DataFrame]],
 ) -> Tuple[Optional[pl.Series], List[str]]:
-    """Build a mask matching criteria for a specific dealer."""
+    """Build a mask matching criteria for a specific dealer.
+
+    IMPORTANT (pipeline note):
+    - Criteria of the form `SL_S >= SL_H` (and related suit-length relational comparisons) are currently
+      evaluated dynamically here by parsing `Hand_{N/E/S/W}`.
+    - For best performance and consistency with the "pre-computed bitmaps" architecture, the bitmap
+      creator should add explicit bitmap columns for suit-length relational comparisons, e.g.:
+        - `SL_S >= SL_H`, `SL_S >= SL_D`, `SL_S >= SL_C`
+        - and the other suit pairs / operators that appear in BT criteria
+      so these do not need to be computed on the fly.
+    """
+    def _seat_dir_for_dealer(dealer_dir: str, seat: int) -> str:
+        """Seat 1 is dealer; seat 2 is LHO; seat 3 is partner; seat 4 is RHO."""
+        try:
+            dealer_i = DIRECTIONS.index(str(dealer_dir))
+        except Exception:
+            dealer_i = 0
+        seat_i = max(1, min(4, int(seat)))
+        return DIRECTIONS[(dealer_i + seat_i - 1) % 4]
+
+    def _sl_len_expr(direction: str, suit: str) -> pl.Expr:
+        """Polars expression to get suit length from hand column."""
+        hand_col = f"Hand_{direction}"
+        idx = SUIT_IDX[suit]
+        # Hand format: "S.H.D.C" (e.g., "AKQJ.T98.765.32")
+        return (
+            pl.col(hand_col)
+            .cast(pl.Utf8)
+            .str.split(".")
+            .list.get(idx)
+            .str.len_chars()
+        )
+
     dealer_mask = deal_df["Dealer"] == dealer
     if not dealer_mask.any():
         return None, []
@@ -3435,8 +4699,36 @@ def _build_criteria_mask_for_dealer(
         
         for crit in criteria_list:
             if crit not in available_cols:
-                if crit not in invalid_criteria:
-                    invalid_criteria.append(crit)
+                # Try dynamic suit-length comparisons (not precomputed as bitmap columns).
+                parsed = parse_sl_comparison_relative(str(crit))
+                if parsed is None:
+                    if crit not in invalid_criteria:
+                        invalid_criteria.append(crit)
+                    continue
+                left_s, op, right_s = parsed
+                seat_dir = _seat_dir_for_dealer(dealer, seat)
+                left_e = _sl_len_expr(seat_dir, left_s)
+                right_e = _sl_len_expr(seat_dir, right_s)
+                if op == ">=":
+                    dyn = (left_e >= right_e)
+                elif op == "<=":
+                    dyn = (left_e <= right_e)
+                elif op == ">":
+                    dyn = (left_e > right_e)
+                elif op == "<":
+                    dyn = (left_e < right_e)
+                elif op == "==":
+                    dyn = (left_e == right_e)
+                elif op == "!=":
+                    dyn = (left_e != right_e)
+                else:
+                    if crit not in invalid_criteria:
+                        invalid_criteria.append(crit)
+                    continue
+                dyn_series = deal_df.select(dyn.fill_null(False).alias("_dyn")).get_column("_dyn")
+                all_seats_mask = all_seats_mask & dyn_series
+                if not all_seats_mask.any():
+                    return None, invalid_criteria
                 continue
             col = seat_criteria_df[crit]
             all_seats_mask = all_seats_mask & col
@@ -3793,7 +5085,8 @@ def handle_auction_dd_analysis(
         }
     
     # Use first match
-    bt_row = exact_matches.row(0, named=True)
+    overlay = state.get("custom_criteria_overlay") or []
+    bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(exact_matches.row(0, named=True)), overlay)
     bt_row_display = {
         "Auction": bt_row.get("Auction"),
         "bt_index": bt_row.get("bt_index"),
@@ -4095,6 +5388,7 @@ def handle_rank_bids_by_ev(
     deal_df = state["deal_df"]
     bt_seat1_df = state.get("bt_seat1_df")
     deal_criteria_by_seat_dfs = state["deal_criteria_by_seat_dfs"]
+    overlay = state.get("custom_criteria_overlay") or []
     
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
@@ -4264,7 +5558,7 @@ def handle_rank_bids_by_ev(
             constant_seats.append(seat)
     
     if constant_seats and not next_bid_rows.is_empty():
-        first_row = next_bid_rows.row(0, named=True)
+        first_row = _apply_custom_criteria_overlay_to_bt_row(dict(next_bid_rows.row(0, named=True)), overlay)
         for dealer in DIRECTIONS:
             dealer_mask = deal_df["Dealer"] == dealer
             
@@ -4321,7 +5615,9 @@ def handle_rank_bids_by_ev(
         global_mask = None
         
         # Optimization: Pre-fetch non-constant criteria lists
-        seat_criteria_lists = {s: row.get(f"Agg_Expr_Seat_{s}") or [] for s in non_constant_seats}
+        # Apply overlay per candidate row before extracting criteria lists
+        row_overlayed = _apply_custom_criteria_overlay_to_bt_row(dict(row), overlay) if overlay else row
+        seat_criteria_lists = {s: row_overlayed.get(f"Agg_Expr_Seat_{s}") or [] for s in non_constant_seats}
         
         for dealer in DIRECTIONS:
             # Use pre-computed parent mask (includes dealer_mask and opening_seat_mask)
@@ -4982,6 +6278,10 @@ def handle_contract_ev_deals(
 
     if bt_row is None:
         return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+    # Apply hot-reloadable custom criteria overlay before building criteria masks.
+    overlay = state.get("custom_criteria_overlay") or []
+    bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(bt_row), overlay)
     opening_seat_mask = None
     if "bid" in deal_df.columns:
         if expected_passes == 0:

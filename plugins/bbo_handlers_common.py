@@ -24,6 +24,11 @@ SEAT_RANGE = range(1, 5)  # Seats 1-4
 MAX_SAMPLE_SIZE = 10_000  # Default sample limit for performance
 DEFAULT_SEED = 42
 
+# Suit index mapping (Spades, Hearts, Diamonds, Clubs in PBN order)
+SUIT_IDX: Dict[str, int] = {"S": 0, "H": 1, "D": 2, "C": 3}
+
+# Directions in clockwise order starting from North
+DIRECTIONS_LIST: List[str] = ["N", "E", "S", "W"]
 
 def agg_expr_col(seat: int) -> str:
     """Get the Agg_Expr column name for a seat."""
@@ -52,7 +57,7 @@ class HandlerState:
     passed to all handlers.
     """
     deal_df: pl.DataFrame
-    bt_seat1_df: pl.DataFrame
+    bt_seat1_df: Optional[pl.DataFrame] = None
     bt_stats_df: Optional[pl.DataFrame] = None
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, pl.DataFrame]] = field(default_factory=dict)
     duckdb_conn: Any = None  # DuckDB connection
@@ -451,20 +456,26 @@ def lookup_bt_row(
     Returns:
         Tuple of (matched_df, normalized_auction_string)
     """
-    # Normalize: strip leading passes
-    auction_for_search = re.sub(r"^(p-)+", "", bid_str.lower()) if bid_str else ""
-    
-    # Try exact match
-    bt_match = bt_lookup_df.filter(
-        pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search
-    )
-    
-    # Fallback: try with trailing passes
-    if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
-        bt_match = bt_lookup_df.filter(
-            pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search + "-p-p-p"
-        )
-    
+    # Canonicalize auction tokens (e.g. "1nt" -> "1N", "pass" -> "p"), then strip leading passes (seat-1 view).
+    # IMPORTANT: This is used for *literal* auction lookups, not regex matching.
+    auction_norm = normalize_auction_input(bid_str) if bid_str else ""
+    auction_for_search = re.sub(r"(?i)^(p-)+", "", auction_norm).lower() if auction_norm else ""
+
+    # Try common variants with/without trailing "-p-p-p" because BT rows aren't always consistent
+    # across endpoints (some use completed-auction rows, some use prefix rows).
+    candidates: list[str] = []
+    if auction_for_search:
+        candidates.append(auction_for_search)
+        if auction_for_search.endswith("-p-p-p"):
+            candidates.append(auction_for_search[: -len("-p-p-p")])
+        else:
+            candidates.append(auction_for_search + "-p-p-p")
+
+    if not candidates:
+        return bt_lookup_df.head(0), auction_for_search
+
+    auc_col = pl.col("Auction").cast(pl.Utf8).str.to_lowercase()
+    bt_match = bt_lookup_df.filter(auc_col.is_in(candidates))
     return bt_match, auction_for_search
 
 
@@ -568,6 +579,7 @@ def batch_check_wrong_bids(
     joined_df: pl.DataFrame,
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
     seat_filter: int | None = None,
+    criteria_overlay: list[dict[str, Any]] | None = None,
 ) -> pl.DataFrame:
     """Batch-check wrong bids for a joined deals+BT DataFrame.
     
@@ -588,9 +600,13 @@ def batch_check_wrong_bids(
     first_wrong_list: List[int | None] = []
     
     seats_to_check = [seat_filter] if seat_filter else list(SEAT_RANGE)
+
+    from plugins.custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_overlay
     
     # Process rows - still a loop but without per-row DataFrame filters
     for row in joined_df.iter_rows(named=True):
+        if criteria_overlay:
+            row = _apply_overlay(dict(row), criteria_overlay)
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         
@@ -600,7 +616,7 @@ def batch_check_wrong_bids(
         for seat in seats_to_check:
             if seat is None:
                 continue
-            criteria_list = row.get(agg_expr_col(seat))
+            criteria_list = row.get(agg_expr_col(seat)) or []
             if not criteria_list:
                 continue
             
@@ -706,4 +722,160 @@ def check_deal_criteria_conformance_bitmap(
                 result["first_wrong_seat"] = seat
     
     return result
+
+
+# ===========================================================================
+# Suit Length (SL) Evaluation Helpers
+# ===========================================================================
+# These are used for dynamic evaluation of SL criteria (e.g., SL_S >= 5)
+# to ensure correct seat-direction mapping.
+
+def seat_to_direction(dealer: str, seat: int) -> str:
+    """Convert seat number (1-4) to direction (N/E/S/W) given the dealer.
+    
+    Seat 1 is always the dealer. Seats rotate clockwise.
+    
+    Args:
+        dealer: The dealer direction ('N', 'E', 'S', 'W')
+        seat: The seat number (1-4)
+    
+    Returns:
+        The direction for that seat
+    """
+    try:
+        dealer_i = DIRECTIONS_LIST.index(dealer.upper())
+    except ValueError:
+        dealer_i = 0
+    seat_i = max(1, min(4, int(seat)))
+    return DIRECTIONS_LIST[(dealer_i + seat_i - 1) % 4]
+
+
+def hand_suit_length(deal_row: Dict[str, Any], direction: str, suit: str) -> Optional[int]:
+    """Get the length of a suit from a deal row's hand.
+    
+    Args:
+        deal_row: Dict containing Hand_N, Hand_E, Hand_S, Hand_W keys
+        direction: The direction ('N', 'E', 'S', 'W')
+        suit: The suit ('S', 'H', 'D', 'C')
+    
+    Returns:
+        The suit length, or None if the hand can't be parsed
+    """
+    hand = deal_row.get(f"Hand_{direction}")
+    if hand is None:
+        return None
+    suits = str(hand).split(".")
+    if len(suits) != 4:
+        return None
+    idx = SUIT_IDX.get(suit.upper())
+    if idx is None:
+        return None
+    try:
+        return len(suits[idx])
+    except (IndexError, TypeError):
+        return None
+
+
+def parse_sl_comparison_relative(criterion: str) -> Optional[Tuple[str, str, str]]:
+    """Parse suit-to-suit comparison like 'SL_S >= SL_H'.
+    
+    Args:
+        criterion: The criterion string
+    
+    Returns:
+        Tuple of (left_suit, operator, right_suit) or None if not matched
+    """
+    c = str(criterion).strip().replace("≥", ">=").replace("≤", "<=")
+    m = re.match(r"^SL_([SHDC])\s*(>=|<=|>|<|==|!=)\s*SL_([SHDC])$", c)
+    if m is None:
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+def parse_sl_comparison_numeric(criterion: str) -> Optional[Tuple[str, str, int]]:
+    """Parse suit-to-number comparison like 'SL_S >= 5'.
+    
+    Args:
+        criterion: The criterion string
+    
+    Returns:
+        Tuple of (suit, operator, number) or None if not matched
+    """
+    c = str(criterion).strip().replace("≥", ">=").replace("≤", "<=")
+    m = re.match(r"^SL_([SHDC])\s*(>=|<=|>|<|==|!=)\s*(\d+)$", c)
+    if m is None:
+        return None
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def eval_comparison(left: int, op: str, right: int) -> bool:
+    """Evaluate a comparison between two integers.
+    
+    Args:
+        left: Left operand
+        op: Operator ('>=', '<=', '>', '<', '==', '!=')
+        right: Right operand
+    
+    Returns:
+        The result of the comparison
+    """
+    if op == ">=":
+        return left >= right
+    if op == "<=":
+        return left <= right
+    if op == ">":
+        return left > right
+    if op == "<":
+        return left < right
+    if op == "==":
+        return left == right
+    if op == "!=":
+        return left != right
+    return False
+
+
+def evaluate_sl_criterion(
+    criterion: str,
+    dealer: str,
+    seat: int,
+    deal_row: Dict[str, Any],
+    fail_on_missing: bool = True,
+) -> Optional[bool]:
+    """Evaluate a suit-length criterion dynamically.
+    
+    Args:
+        criterion: The criterion string (e.g., 'SL_S >= 5' or 'SL_S >= SL_H')
+        dealer: The dealer direction
+        seat: The seat number (1-4)
+        deal_row: Dict containing hand data
+        fail_on_missing: If True, return False when hand data is missing.
+                        If False, return None (treat as untracked).
+    
+    Returns:
+        True if criterion passes, False if fails (or can't evaluate when fail_on_missing=True), 
+        None if not an SL criterion OR can't evaluate when fail_on_missing=False
+    """
+    direction = seat_to_direction(dealer, seat)
+    
+    # Try suit-to-suit comparison (e.g., SL_S >= SL_H)
+    parsed_rel = parse_sl_comparison_relative(criterion)
+    if parsed_rel is not None:
+        left_s, op, right_s = parsed_rel
+        lv = hand_suit_length(deal_row, direction, left_s)
+        rv = hand_suit_length(deal_row, direction, right_s)
+        if lv is None or rv is None:
+            return False if fail_on_missing else None
+        return eval_comparison(lv, op, rv)
+    
+    # Try suit-to-number comparison (e.g., SL_S >= 5)
+    parsed_num = parse_sl_comparison_numeric(criterion)
+    if parsed_num is not None:
+        suit, op, num_val = parsed_num
+        lv = hand_suit_length(deal_row, direction, suit)
+        if lv is None:
+            return False if fail_on_missing else None
+        return eval_comparison(lv, op, num_val)
+    
+    # Not an SL criterion - fall through to bitmap lookup
+    return None
 
