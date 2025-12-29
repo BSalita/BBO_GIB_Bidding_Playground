@@ -748,14 +748,19 @@ def filter_deals_by_distribution_duckdb(
         return df, f"-- Error: {e}\n{sql_query}"
 
 
-def api_get(path: str) -> Dict[str, Any]:
-    resp = requests.get(f"{API_BASE}{path}")
+DEFAULT_API_TIMEOUT = 60  # seconds; prevents Streamlit from hanging indefinitely
+
+
+def api_get(path: str, timeout: int | None = None) -> Dict[str, Any]:
+    """GET from API with a default timeout to prevent hanging."""
+    resp = requests.get(f"{API_BASE}{path}", timeout=timeout or DEFAULT_API_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 
-def api_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    resp = requests.post(f"{API_BASE}{path}", json=payload)
+def api_post(path: str, payload: Dict[str, Any], timeout: int | None = None) -> Dict[str, Any]:
+    """POST to API with a default timeout to prevent hanging."""
+    resp = requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout or DEFAULT_API_TIMEOUT)
     try:
         resp.raise_for_status()
     except requests.HTTPError as e:
@@ -1632,7 +1637,7 @@ def render_bidding_table_explorer():
     elif auction_pattern != raw_auction_pattern:
         st.sidebar.caption(f"→ {auction_pattern}")
     
-    sample_size = st.sidebar.number_input("Sample Size", value=100, min_value=1, max_value=10000, key="bt_explorer_sample")
+    sample_size = st.sidebar.number_input("Sample Size", value=25, min_value=1, max_value=10000, key="bt_explorer_sample")
     min_matches = st.sidebar.number_input("Min Matching Deals (0=all)", value=0, min_value=0, max_value=100000)
     
     st.sidebar.divider()
@@ -1817,7 +1822,7 @@ def render_analyze_deal():
     match_seat = st.sidebar.selectbox("Match Auction Seat", [1, 2, 3, 4], index=0,
         help="Which seat's criteria to match against the deal")
     
-    max_auctions = st.sidebar.number_input("Max Auctions to Show", value=50, min_value=1, max_value=500)
+    max_auctions = st.sidebar.number_input("Max Auctions to Show", value=20, min_value=1, max_value=500)
     
     include_par = st.sidebar.checkbox("Calculate Par Score", value=True,
         help="Calculate par score using double-dummy analysis (server-side)")
@@ -2500,7 +2505,7 @@ def render_auction_criteria_debugger():
             "Sample Size",
             min_value=1,
             max_value=10000,
-            value=100,
+            value=25,
             help="Number of deals to analyze"
         )
     
@@ -2814,7 +2819,7 @@ def render_bidding_arena():
     # Options
     col3, col4, col5 = st.columns(3)
     with col3:
-        sample_size = st.number_input("Sample Size", min_value=10, max_value=10000, value=100, step=100)
+        sample_size = st.number_input("Sample Size", min_value=10, max_value=10000, value=25, step=100)
     with col4:
         seed = st.number_input("Random Seed", min_value=0, value=42)
     with col5:
@@ -3095,9 +3100,10 @@ def render_bidding_arena():
                     else:
                         st.info("No segmentation data available.")
 
-            # Sample deals
+            # Sample deals - split into two views:
+            # 1. "Match Actual Auction" - diagnostic view of criteria matching
+            # 2. "Deal Comparison" - side-by-side comparison where Rules found a match
             if "sample_deals" in data and data["sample_deals"]:
-                st.subheader("🎯 Sample Deal Comparisons")
                 sample_df = pl.DataFrame(data["sample_deals"])
                 # Avoid mixing list-typed "Rules_Matches_Auctions" into Auction_* columns (breaks Polars casting).
                 # Instead, render an optional string column for debugging/visibility.
@@ -3118,6 +3124,117 @@ def render_bidding_arena():
                     except Exception:
                         # If list casting fails (e.g., List[Null] everywhere), just skip this derived column.
                         pass
+
+                # ─────────────────────────────────────────────────────────────
+                # Section 1: "Deal Comparison" - only deals with matched Rules auction
+                # ─────────────────────────────────────────────────────────────
+                rules_col = f"Auction_{model_a}" if model_a == "Rules" else f"Auction_{model_b}" if model_b == "Rules" else None
+                actual_col = "Auction_Actual"
+                comparison_df = None
+                if rules_col and rules_col in sample_df.columns and actual_col in sample_df.columns:
+                    # Filter to deals where Rules found a match (non-null, non-empty)
+                    comparison_df = sample_df.filter(
+                        pl.col(rules_col).is_not_null() & (pl.col(rules_col) != "")
+                    )
+                    if comparison_df.height > 0:
+                        st.subheader("⚔️ Deal Comparison")
+                        st.caption(f"Deals where Rules found a matching BT auction ({comparison_df.height}/{sample_df.height} deals)")
+                        
+                        # Add Match column: does Rules auction match Actual?
+                        comparison_df = comparison_df.with_columns(
+                            (pl.col(actual_col).str.to_lowercase() == pl.col(rules_col).str.to_lowercase())
+                            .alias("Auction_Match")
+                        )
+                        
+                        # Focused columns for comparison
+                        compare_cols = [
+                            "index",
+                            "Dealer",
+                            "Vul",
+                            actual_col,
+                            rules_col,
+                            "Auction_Match",
+                            "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                            f"DD_Score_{model_a}" if f"DD_Score_{model_a}" in sample_df.columns else None,
+                            f"DD_Score_{model_b}" if f"DD_Score_{model_b}" in sample_df.columns else None,
+                            "IMP_Diff",
+                        ]
+                        compare_cols = [c for c in compare_cols if c and c in comparison_df.columns]
+                        compare_remaining = [c for c in comparison_df.columns if c not in compare_cols]
+                        comparison_df = comparison_df.select(compare_cols + compare_remaining)
+                        
+                        # Show match rate
+                        if "Auction_Match" in comparison_df.columns:
+                            match_count = comparison_df.filter(pl.col("Auction_Match")).height
+                            match_pct = 100 * match_count / comparison_df.height if comparison_df.height > 0 else 0
+                            st.metric("Auction Match Rate", f"{match_pct:.1f}%", f"{match_count}/{comparison_df.height} deals")
+                        
+                        render_aggrid(
+                            comparison_df,
+                            key="arena_deal_comparison",
+                            height=calc_grid_height(len(comparison_df)),
+                            table_name="deal_comparison",
+                            update_mode=GridUpdateMode.SELECTION_CHANGED,
+                            show_copy_panel=True,
+                            copy_panel_default_col="index",
+                            hide_cols=["_row_idx", "Rules_Matches", "Rules_Matches_Auctions", "Auction_Rules_Selected"],
+                        )
+                    else:
+                        st.info("No deals with matched Rules auction for comparison.")
+                
+                # ─────────────────────────────────────────────────────────────
+                # Section 2: "No BT Match" - deals requiring investigation
+                # ─────────────────────────────────────────────────────────────
+                if rules_col and rules_col in sample_df.columns:
+                    # Filter to deals where Rules did NOT find a match (null or empty)
+                    no_match_df = sample_df.filter(
+                        pl.col(rules_col).is_null() | (pl.col(rules_col) == "")
+                    )
+                    if no_match_df.height > 0:
+                        st.subheader("🔎 No BT Match (Investigation Needed)")
+                        st.caption(f"Deals where no BT auction matched criteria ({no_match_df.height}/{sample_df.height} deals)")
+                        
+                        # Focused columns for investigation
+                        investigate_cols = [
+                            "index",
+                            "Dealer",
+                            "Vul",
+                            "Auction_Actual",
+                            "Rules_Actual_BT_Lookup",
+                            "Rules_Actual_Criteria_OK",
+                            "Rules_Actual_First_Failure",
+                            "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                            "Rules_Actual_BT_Index",
+                            "Rules_Actual_Lead_Passes",
+                            "Rules_Actual_Opener_Seat",
+                            "Rules_Actual_Seat1_Criteria",
+                            "Rules_Actual_BT_Base_Criteria_By_Seat",
+                            "Rules_Actual_BT_MergedOnly_Criteria_By_Seat",
+                            "Rules_Actual_BT_Merged_Criteria_By_Seat",
+                        ]
+                        investigate_existing = [c for c in investigate_cols if c in no_match_df.columns]
+                        investigate_remaining = [c for c in no_match_df.columns if c not in investigate_existing]
+                        no_match_df = no_match_df.select(investigate_existing + investigate_remaining)
+                        
+                        render_aggrid(
+                            no_match_df,
+                            key="arena_no_bt_match",
+                            height=calc_grid_height(len(no_match_df)),
+                            table_name="no_bt_match",
+                            update_mode=GridUpdateMode.SELECTION_CHANGED,
+                            show_copy_panel=True,
+                            copy_panel_default_col="index",
+                            hide_cols=["_row_idx", "Rules_Matches", "Rules_Matches_Auctions", "Auction_Rules_Selected"],
+                        )
+                    else:
+                        st.success("All deals have a matching BT auction!")
+                
+                # ─────────────────────────────────────────────────────────────
+                # Section 3: "Match Actual Auction" - full diagnostic view
+                # ─────────────────────────────────────────────────────────────
+                st.subheader("🔍 Match Actual Auction")
+                st.caption("Diagnostic view: checks if each deal's actual auction matches BT criteria")
+                
                 # Order columns sensibly - Hand_[NESW] in NESW order
                 priority_cols = [
                     "index",
@@ -3128,6 +3245,8 @@ def render_bidding_arena():
                     f"Auction_{model_b}",
                     "Rules_Actual_BT_Lookup",
                     "Rules_Actual_BT_Index",
+                    "Rules_Actual_Lead_Passes",
+                    "Rules_Actual_Opener_Seat",
                     "Rules_Actual_Criteria_OK",
                     "Rules_Actual_First_Failure",
                     "Rules_Actual_Seat1_Criteria",

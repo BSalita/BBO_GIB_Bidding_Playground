@@ -460,7 +460,7 @@ def lookup_bt_row(
     # IMPORTANT: This is used for *literal* auction lookups, not regex matching.
     auction_norm = normalize_auction_input(bid_str) if bid_str else ""
     auction_for_search = re.sub(r"(?i)^(p-)+", "", auction_norm).lower() if auction_norm else ""
-
+    
     # Try common variants with/without trailing "-p-p-p" because BT rows aren't always consistent
     # across endpoints (some use completed-auction rows, some use prefix rows).
     candidates: list[str] = []
@@ -748,6 +748,46 @@ def seat_to_direction(dealer: str, seat: int) -> str:
         dealer_i = 0
     seat_i = max(1, min(4, int(seat)))
     return DIRECTIONS_LIST[(dealer_i + seat_i - 1) % 4]
+
+
+def format_seat_notation(
+    dealer: str,
+    seat: int,
+    *,
+    lead_passes: int = 0,
+    include_bt_seat: bool = False,
+) -> str:
+    """Format a seat label in direction-first notation.
+
+    Examples:
+    - dealer='N', seat=1 -> 'N(S1)'
+    - dealer='E', seat=2 -> 'S(S2)'
+    - include_bt_seat=True, lead_passes=1 -> 'S(S2, BT_S1)'
+
+    Notes:
+    - `seat` is always dealer-relative (Seat 1 = dealer).
+    - When a BT row has been rotated for leading passes, `lead_passes` lets us annotate
+      which *BT seat* (seat-1/opener-relative) the dealer-relative seat corresponds to.
+    """
+    try:
+        d = str(dealer or "N").upper()
+    except Exception:
+        d = "N"
+    seat_i = max(1, min(4, int(seat)))
+    try:
+        dir_i = seat_to_direction(d, seat_i)
+    except Exception:
+        dir_i = "?"
+
+    if include_bt_seat:
+        try:
+            lp = int(lead_passes or 0)
+        except Exception:
+            lp = 0
+        bt_seat = ((seat_i - 1 - (lp % 4)) % 4) + 1 if lp else seat_i
+        return f"{dir_i}(S{seat_i}, BT_S{bt_seat})"
+
+    return f"{dir_i}(S{seat_i})"
 
 
 def hand_suit_length(deal_row: Dict[str, Any], direction: str, suit: str) -> Optional[int]:

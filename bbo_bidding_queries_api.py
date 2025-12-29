@@ -585,7 +585,7 @@ def _apply_auction_criteria(
             
             matching_mask = matches_partial & (pl.col(dealer_col) == dealer)
             matching_rows = df.filter(matching_mask)
-                
+            
             # Track rejected rows if requested
             if track_rejected and matching_rows.height > 0:
                 for row_idx in range(matching_rows.height):
@@ -602,7 +602,7 @@ def _apply_auction_criteria(
                             'Seat': int(seat),
                             'Direction': str(direction),
                         })
-                
+            
             # Apply filter: keep rows that don't match OR satisfy criteria
             combined_criteria = _combine_criteria_expressions(criteria_exprs)
             try:

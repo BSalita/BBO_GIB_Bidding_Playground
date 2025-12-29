@@ -94,11 +94,11 @@ from plugins.bbo_handlers_common import (
     batch_check_wrong_bids,
     # SL (Suit Length) evaluation helpers
     seat_to_direction,
+    format_seat_notation as _format_seat_notation,
     hand_suit_length,
     parse_sl_comparison_relative,
     parse_sl_comparison_numeric,
     eval_comparison,
-    evaluate_sl_criterion,
 )
 
 
@@ -1222,6 +1222,7 @@ def handle_deal_criteria_failures_batch(
         results.append({
             "seat": seat, 
             "seat_dir": seat_to_direction(dealer, seat),
+            "seat_label": _format_seat_notation(dealer, seat, include_bt_seat=False),
             "passed": passed, 
             "failed": failed, 
             "untracked": untracked
@@ -3236,10 +3237,10 @@ def handle_bidding_arena(
         else:
             sample_df = pinned_df
     else:
-        if sample_size < total_deals:
-            sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
-        else:
-            sample_df = deals_prepared
+    if sample_size < total_deals:
+        sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
+    else:
+        sample_df = deals_prepared
     
     analyzed_deals = sample_df.height
     
@@ -3265,7 +3266,7 @@ def handle_bidding_arena(
     bt_completed_rows_base: list[dict[str, Any]] = []  # Backstop pool (without overlay)
     bt_rules_default_rows_base: list[dict[str, Any]] = []  # Default pool (without overlay)
     RULES_MATCHES_MAX_RETURNED = 200  # UI payload guardrail
-
+        
     def _auction_key_seat1(auction: Any) -> str:
         """Canonical seat-1 lookup key for auctions.
         
@@ -3293,13 +3294,19 @@ def handle_bidding_arena(
             d = str(dealer or "N").upper()
         except Exception:
             d = "N"
+        # Optional seat mapping metadata (when bt_row has been rotated for leading passes).
+        try:
+            lead_passes = int(bt_row.get("_lead_passes", 0) or 0)
+        except Exception:
+            lead_passes = 0
         for seat in SEAT_RANGE:
             criteria_list = bt_row.get(agg_expr_col(seat)) or []
             if not criteria_list:
                 continue
             criteria_df = (deal_criteria_by_seat_dfs.get(seat, {}) or {}).get(d)
             if criteria_df is None or criteria_df.is_empty():
-                return f"S{seat}: missing bitmap dealer={d}"
+                seat_label = _format_seat_notation(d, seat, lead_passes=lead_passes, include_bt_seat=True)
+                return f"{seat_label}: missing bitmap dealer={d}"
             for criterion in criteria_list:
                 crit_s = str(criterion).strip()
                 # Dynamic SL evaluation if possible
@@ -3308,15 +3315,18 @@ def handle_bidding_arena(
                     if sl_result is True:
                         continue
                     if sl_result is False:
-                        return f"S{seat}: failed {crit_s}"
+                        seat_label = _format_seat_notation(d, seat, lead_passes=lead_passes, include_bt_seat=True)
+                        return f"{seat_label}: failed {crit_s}"
                 # Bitmap evaluation
                 if criterion not in criteria_df.columns:
                     continue
                 try:
                     if not bool(criteria_df[criterion][deal_idx]):
-                        return f"S{seat}: failed {crit_s}"
+                        seat_label = _format_seat_notation(d, seat, lead_passes=lead_passes, include_bt_seat=True)
+                        return f"{seat_label}: failed {crit_s}"
                 except (IndexError, KeyError, TypeError):
-                    return f"S{seat}: bitmap lookup error for {crit_s}"
+                    seat_label = _format_seat_notation(d, seat, lead_passes=lead_passes, include_bt_seat=True)
+                    return f"{seat_label}: bitmap lookup error for {crit_s}"
         return None
 
     def _deal_meets_all_seat_criteria(deal_idx: int, dealer: str, bt_row: Dict[str, Any], deal_row: Dict[str, Any] | None = None) -> bool:
@@ -3328,17 +3338,17 @@ def handle_bidding_arena(
         If deal_row is provided, SL (suit length) criteria are evaluated dynamically
         to ensure correct seat-direction mapping.
         """
-        for seat in SEAT_RANGE:
-            criteria_list = bt_row.get(agg_expr_col(seat))
-            if not criteria_list:
-                continue  # No criteria for this seat = passes
-            
-            seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
-            criteria_df = seat_dfs.get(dealer)
-            if criteria_df is None or criteria_df.is_empty():
-                return False  # Can't verify = fail
-            
-            for criterion in criteria_list:
+            for seat in SEAT_RANGE:
+                criteria_list = bt_row.get(agg_expr_col(seat))
+                if not criteria_list:
+                    continue  # No criteria for this seat = passes
+                
+                seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
+                criteria_df = seat_dfs.get(dealer)
+                if criteria_df is None or criteria_df.is_empty():
+                    return False  # Can't verify = fail
+                
+                for criterion in criteria_list:
                 crit_s = str(criterion).strip()
                 
                 # Try dynamic SL evaluation first if deal_row is provided
@@ -3351,17 +3361,17 @@ def handle_bidding_arena(
                     # sl_result is None - not an SL criterion OR hand data missing, fall through to bitmap
                 
                 # Bitmap lookup for non-SL criteria
-                if criterion not in criteria_df.columns:
+                    if criterion not in criteria_df.columns:
                     # Unknown criterion - skip it (can't verify, assume passes)
                     # Note: This means CSV overlay criteria not in bitmap will be IGNORED
                     # for matching purposes. Dynamic SL evaluation handles SL criteria.
                     continue
-                try:
-                    if not bool(criteria_df[criterion][deal_idx]):
-                        return False  # Failed this criterion
-                except (IndexError, KeyError):
-                    return False
-        return True
+                    try:
+                        if not bool(criteria_df[criterion][deal_idx]):
+                            return False  # Failed this criterion
+                    except (IndexError, KeyError):
+                        return False
+            return True
         
     def _find_rules_matches_precomputed(
         deal_idx: int,
@@ -3390,7 +3400,7 @@ def handle_bidding_arena(
         """Return matching BT candidates from the on-the-fly candidate pool (up to max returned)."""
         out: list[dict[str, Any]] = []
         truncated = False
-        for bt_row in bt_completed_rows:
+            for bt_row in bt_completed_rows:
             if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
                 out.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")})
                 if len(out) >= RULES_MATCHES_MAX_RETURNED:
@@ -3415,7 +3425,7 @@ def handle_bidding_arena(
             if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
                 auc = bt_row.get("Auction")
                 return str(auc) if auc is not None else None
-        return None
+            return None
 
     def _find_first_rules_match_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
         """Fast path: return first matching auction from the on-the-fly candidate pool."""
@@ -3535,16 +3545,41 @@ def handle_bidding_arena(
         # - full: generic completed pool (used ONLY for "is actual auction in BT?" checks)
         #
         # Key by seat-1 normalized, lowercased auction string for robust lookup.
-        bt_auction_to_row_base = {
-            _auction_key_seat1(r.get("Auction")): r
-            for r in bt_rules_default_rows_base
-            if r.get("Auction")
-        }
-        bt_auction_to_row_full_base = {
-            _auction_key_seat1(r.get("Auction")): r
-            for r in bt_completed_rows_base
-            if r.get("Auction")
-        }
+        def _build_bt_auction_cache(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            """Build a robust seat-1 auction lookup cache.
+            
+            Multiple BT rows can map to the same seat-1 key if the source BT includes
+            leading-pass variants (e.g., '1N-p-p-p' and 'p-1N-p-p-p'). When that happens,
+            we must prefer the *canonical* row with the fewest leading passes; otherwise the
+            cache can silently point at an already-rotated criteria row and seats will look
+            'confused' in downstream debug output.
+            """
+            out: dict[str, dict[str, Any]] = {}
+            for r in rows:
+                auc = r.get("Auction")
+                if not auc:
+                    continue
+                k = _auction_key_seat1(auc)
+                if not k:
+                    continue
+                if k not in out:
+                    out[k] = r
+                    continue
+                try:
+                    old_passes = _count_leading_passes(out[k].get("Auction"))
+                except Exception:
+                    old_passes = 99
+                try:
+                    new_passes = _count_leading_passes(auc)
+                except Exception:
+                    new_passes = 99
+                # Prefer the row with fewer leading passes (more canonical seat-1 representation).
+                if new_passes < old_passes:
+                    out[k] = r
+            return out
+
+        bt_auction_to_row_base = _build_bt_auction_cache(bt_rules_default_rows_base)
+        bt_auction_to_row_full_base = _build_bt_auction_cache(bt_completed_rows_base)
         rules_search_limit = len(bt_rules_default_rows_base)
         rules_search_limit_fallback = len(bt_completed_rows_base)
         
@@ -3830,7 +3865,7 @@ def handle_bidding_arena(
                 if isinstance(dealer_dir, int):
                     d = ["N", "E", "S", "W"][dealer_dir % 4]
                 else:
-                    d = str(dealer_dir or "N").upper()
+                d = str(dealer_dir or "N").upper()
                     if d not in ["N", "E", "S", "W"]:
                         d = "N"
                 # Decide candidate list based on matching strategy
@@ -3856,7 +3891,7 @@ def handle_bidding_arena(
 
                 if not candidates:
                     return "no candidates available"
-                
+
                 # Show variety of candidate auctions
                 unique_auctions = list(set(str(c.get("Auction", "?")) for c in candidates[:10]))[:5]
                 
@@ -3893,7 +3928,8 @@ def handle_bidding_arena(
                                 pass
                         if failed:
                             auc = cand.get("Auction")
-                            cand_failure_info = f"{auc}: S{seat} failed {failed[:3]}"
+                            seat_label = _format_seat_notation(d, seat, include_bt_seat=False)
+                            cand_failure_info = f"{auc}: {seat_label} failed {failed[:3]}"
                             cand_failed = True
                             break
                     if cand_failed and len(candidate_failures) < 3:
@@ -3916,6 +3952,9 @@ def handle_bidding_arena(
         # Pick a single Rules auction (learned criteria) for scoring
         # Pass `row` as deal_row for dynamic SL evaluation
         matched_indices = row.get("Matched_BT_Indices") if has_precomputed_matches else None
+        # Always define these for the sample-deals output schema (even if Rules model not requested).
+        rules_actual_lead_passes: int | None = None
+        rules_actual_opener_seat: int | None = None
         if need_rules:
             # PRIORITIZE: Try actual auction first if it's in BT
             rules_auction = None
@@ -3933,6 +3972,8 @@ def handle_bidding_arena(
                 bid_str_seat1 = re.sub(r"(?i)^(p-)+", "", bid_norm_full)
                 bid_key = bid_str_seat1.lower()
                 lead_passes = _count_leading_passes(bid_norm_full)
+                rules_actual_lead_passes = int(lead_passes)
+                rules_actual_opener_seat = int((lead_passes % 4) + 1)
 
                 def _rotate_bt_row_for_leading_passes(bt_row: Dict[str, Any], n_passes: int) -> Dict[str, Any]:
                     """Rotate a BT row's seat-indexed columns to match a deal with leading passes.
@@ -3945,17 +3986,28 @@ def handle_bidding_arena(
                         n = int(n_passes)
                     except Exception:
                         n = 0
+                    # Always attach metadata for debugging / seat mapping clarity.
                     if n <= 0:
-                        return bt_row
+                        out0 = dict(bt_row)
+                        out0["_lead_passes"] = 0
+                        out0["_opener_seat"] = 1
+                        return out0
                     try:
                         expanded = _expand_row_to_all_seats(bt_row, allow_initial_passes=True)
                         if 0 <= n < len(expanded):
-                            return expanded[n]
+                            outn = dict(expanded[n])
+                            outn["_lead_passes"] = n
+                            # expand_row_to_all_seats already sets _opener_seat; keep it if present.
+                            outn.setdefault("_opener_seat", n + 1)
+                            return outn
                     except Exception:
                         pass
-                    return bt_row
+                    out_fallback = dict(bt_row)
+                    out_fallback["_lead_passes"] = n
+                    out_fallback["_opener_seat"] = (n % 4) + 1
+                    return out_fallback
 
-                def _criteria_by_seat_str(bt_row: Dict[str, Any]) -> str:
+                def _criteria_by_seat_str(bt_row: Dict[str, Any], dealer_dir: str, lead_passes: int) -> str:
                     parts: list[str] = []
                     for s in SEAT_RANGE:
                         try:
@@ -3964,7 +4016,13 @@ def handle_bidding_arena(
                                 txt = "; ".join(str(x) for x in crits[:25])
                             else:
                                 txt = "(no criteria)"
-                            parts.append(f"S{s}: {txt}")
+                            seat_label = _format_seat_notation(
+                                dealer_dir,
+                                int(s),
+                                lead_passes=int(lead_passes or 0),
+                                include_bt_seat=True,
+                            )
+                            parts.append(f"{seat_label}: {txt}")
                         except Exception:
                             parts.append(f"S{s}: (error)")
                     return " | ".join(parts)
@@ -4040,17 +4098,17 @@ def handle_bidding_arena(
                     # Diagnostic: compare rotated base vs rotated merged+overlay criteria.
                     try:
                         base_rot = _rotate_bt_row_for_leading_passes(bt_row_actual, lead_passes)
-                        rules_actual_base_criteria_by_seat = _criteria_by_seat_str(base_rot)
+                        rules_actual_base_criteria_by_seat = _criteria_by_seat_str(base_rot, dealer, lead_passes)
                     except Exception:
                         rules_actual_base_criteria_by_seat = ""
                     try:
                         merged_only = _apply_merged_rules_to_bt_row_no_overlay(bt_row_actual)
                         merged_only_rot = _rotate_bt_row_for_leading_passes(merged_only, lead_passes)
-                        rules_actual_merged_only_criteria_by_seat = _criteria_by_seat_str(merged_only_rot)
+                        rules_actual_merged_only_criteria_by_seat = _criteria_by_seat_str(merged_only_rot, dealer, lead_passes)
                     except Exception:
                         rules_actual_merged_only_criteria_by_seat = ""
                     try:
-                        rules_actual_merged_criteria_by_seat = _criteria_by_seat_str(merged_bt_row_actual)
+                        rules_actual_merged_criteria_by_seat = _criteria_by_seat_str(merged_bt_row_actual, dealer, lead_passes)
                     except Exception:
                         rules_actual_merged_criteria_by_seat = ""
 
@@ -4092,11 +4150,11 @@ def handle_bidding_arena(
             # 1) default: merged-rules candidate pool
             # 2) fallback: generic on-the-fly candidate pool
             if rules_auction is None:
-                if has_precomputed_matches:
+            if has_precomputed_matches:
                     if not matched_indices:
                         diag_no_matched_indices += 1
                     rules_auction = _find_first_merged_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
-                else:
+            else:
                     rules_auction = _find_first_merged_rules_match_default(int(deal_idx), dealer, row)
                     if rules_auction is None and rules_search_mode == "merged_default":
                         rules_auction = _find_first_merged_rules_match_onthefly(int(deal_idx), dealer, row)
@@ -4145,7 +4203,7 @@ def handle_bidding_arena(
             if model == "Actual":
                 return row.get("Contract", ""), bid_str, row.get("DD_Score_Declarer")
             elif model == "Rules":
-                if rules_auction:
+            if rules_auction:
                     return (
                         get_ai_contract(rules_auction, dealer),
                         rules_auction,
@@ -4203,6 +4261,8 @@ def handle_bidding_arena(
                     f"Auction_{model_b}": auction_b,
                     "Rules_Actual_BT_Lookup": rules_actual_bt_lookup,
                     "Rules_Actual_BT_Index": rules_actual_bt_index,
+                    "Rules_Actual_Lead_Passes": rules_actual_lead_passes,
+                    "Rules_Actual_Opener_Seat": rules_actual_opener_seat,
                     "Rules_Actual_Criteria_OK": rules_actual_criteria_ok,
                     "Rules_Actual_First_Failure": rules_actual_first_failure,
                     "Rules_Actual_Seat1_Criteria": rules_actual_seat1_criteria,
@@ -4702,8 +4762,8 @@ def _build_criteria_mask_for_dealer(
                 # Try dynamic suit-length comparisons (not precomputed as bitmap columns).
                 parsed = parse_sl_comparison_relative(str(crit))
                 if parsed is None:
-                    if crit not in invalid_criteria:
-                        invalid_criteria.append(crit)
+                if crit not in invalid_criteria:
+                    invalid_criteria.append(crit)
                     continue
                 left_s, op, right_s = parsed
                 seat_dir = _seat_dir_for_dealer(dealer, seat)
