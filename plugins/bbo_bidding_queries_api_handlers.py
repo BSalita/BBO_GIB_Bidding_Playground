@@ -3237,10 +3237,10 @@ def handle_bidding_arena(
         else:
             sample_df = pinned_df
     else:
-    if sample_size < total_deals:
-        sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
-    else:
-        sample_df = deals_prepared
+        if sample_size < total_deals:
+            sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
+        else:
+            sample_df = deals_prepared
     
     analyzed_deals = sample_df.height
     
@@ -3338,17 +3338,17 @@ def handle_bidding_arena(
         If deal_row is provided, SL (suit length) criteria are evaluated dynamically
         to ensure correct seat-direction mapping.
         """
-            for seat in SEAT_RANGE:
-                criteria_list = bt_row.get(agg_expr_col(seat))
-                if not criteria_list:
-                    continue  # No criteria for this seat = passes
-                
-                seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
-                criteria_df = seat_dfs.get(dealer)
-                if criteria_df is None or criteria_df.is_empty():
-                    return False  # Can't verify = fail
-                
-                for criterion in criteria_list:
+        for seat in SEAT_RANGE:
+            criteria_list = bt_row.get(agg_expr_col(seat))
+            if not criteria_list:
+                continue  # No criteria for this seat = passes
+            
+            seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
+            criteria_df = seat_dfs.get(dealer)
+            if criteria_df is None or criteria_df.is_empty():
+                return False  # Can't verify = fail
+            
+            for criterion in criteria_list:
                 crit_s = str(criterion).strip()
                 
                 # Try dynamic SL evaluation first if deal_row is provided
@@ -3361,17 +3361,17 @@ def handle_bidding_arena(
                     # sl_result is None - not an SL criterion OR hand data missing, fall through to bitmap
                 
                 # Bitmap lookup for non-SL criteria
-                    if criterion not in criteria_df.columns:
+                if criterion not in criteria_df.columns:
                     # Unknown criterion - skip it (can't verify, assume passes)
                     # Note: This means CSV overlay criteria not in bitmap will be IGNORED
                     # for matching purposes. Dynamic SL evaluation handles SL criteria.
                     continue
-                    try:
-                        if not bool(criteria_df[criterion][deal_idx]):
-                            return False  # Failed this criterion
-                    except (IndexError, KeyError):
-                        return False
-            return True
+                try:
+                    if not bool(criteria_df[criterion][deal_idx]):
+                        return False  # Failed this criterion
+                except (IndexError, KeyError):
+                    return False
+        return True
         
     def _find_rules_matches_precomputed(
         deal_idx: int,
@@ -3400,7 +3400,7 @@ def handle_bidding_arena(
         """Return matching BT candidates from the on-the-fly candidate pool (up to max returned)."""
         out: list[dict[str, Any]] = []
         truncated = False
-            for bt_row in bt_completed_rows:
+        for bt_row in bt_completed_rows:
             if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
                 out.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")})
                 if len(out) >= RULES_MATCHES_MAX_RETURNED:
@@ -3865,7 +3865,7 @@ def handle_bidding_arena(
                 if isinstance(dealer_dir, int):
                     d = ["N", "E", "S", "W"][dealer_dir % 4]
                 else:
-                d = str(dealer_dir or "N").upper()
+                    d = str(dealer_dir or "N").upper()
                     if d not in ["N", "E", "S", "W"]:
                         d = "N"
                 # Decide candidate list based on matching strategy
@@ -4150,11 +4150,11 @@ def handle_bidding_arena(
             # 1) default: merged-rules candidate pool
             # 2) fallback: generic on-the-fly candidate pool
             if rules_auction is None:
-            if has_precomputed_matches:
+                if has_precomputed_matches:
                     if not matched_indices:
                         diag_no_matched_indices += 1
                     rules_auction = _find_first_merged_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
-            else:
+                else:
                     rules_auction = _find_first_merged_rules_match_default(int(deal_idx), dealer, row)
                     if rules_auction is None and rules_search_mode == "merged_default":
                         rules_auction = _find_first_merged_rules_match_onthefly(int(deal_idx), dealer, row)
@@ -4203,7 +4203,7 @@ def handle_bidding_arena(
             if model == "Actual":
                 return row.get("Contract", ""), bid_str, row.get("DD_Score_Declarer")
             elif model == "Rules":
-            if rules_auction:
+                if rules_auction:
                     return (
                         get_ai_contract(rules_auction, dealer),
                         rules_auction,
@@ -4762,8 +4762,8 @@ def _build_criteria_mask_for_dealer(
                 # Try dynamic suit-length comparisons (not precomputed as bitmap columns).
                 parsed = parse_sl_comparison_relative(str(crit))
                 if parsed is None:
-                if crit not in invalid_criteria:
-                    invalid_criteria.append(crit)
+                    if crit not in invalid_criteria:
+                        invalid_criteria.append(crit)
                     continue
                 left_s, op, right_s = parsed
                 seat_dir = _seat_dir_for_dealer(dealer, seat)
