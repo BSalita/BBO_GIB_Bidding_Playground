@@ -67,6 +67,81 @@ def calculate_imp(score_diff: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Elapsed Time Formatting
+# ---------------------------------------------------------------------------
+
+def format_elapsed(ms: float) -> str:
+    """Format elapsed time in seconds (e.g., 5380.4ms -> '5.38s').
+    
+    This is the single source of truth for elapsed time display.
+    """
+    return f"{ms / 1000:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Pattern Matching (literal prefix vs regex)
+# ---------------------------------------------------------------------------
+
+# Regex metacharacters that indicate a pattern needs regex matching
+_REGEX_METACHAR_RE = re.compile(r'[\[\].*+?^${}()|\\]')
+
+# Cache for compiled regex patterns (thread-safe via GIL for reads)
+_pattern_cache: Dict[str, re.Pattern] = {}
+
+
+def is_regex_pattern(pattern: str) -> bool:
+    """Check if a pattern contains regex metacharacters.
+    
+    Returns True if the pattern should be matched using regex,
+    False if it can use fast string prefix matching.
+    
+    Examples:
+        is_regex_pattern("1C") -> False (literal)
+        is_regex_pattern("1C-P") -> False (literal)
+        is_regex_pattern("^1[CD]$") -> True (regex)
+        is_regex_pattern("1.*") -> True (regex)
+    """
+    return bool(_REGEX_METACHAR_RE.search(pattern))
+
+
+def get_cached_regex(pattern: str) -> re.Pattern:
+    """Get a compiled regex pattern, using cache for performance.
+    
+    Patterns are compiled with re.IGNORECASE for case-insensitive matching.
+    """
+    if pattern not in _pattern_cache:
+        # Auto-anchor if not already anchored (for prefix matching behavior)
+        if not pattern.startswith('^'):
+            pattern = '^' + pattern
+        _pattern_cache[pattern] = re.compile(pattern, re.IGNORECASE)
+    return _pattern_cache[pattern]
+
+
+def pattern_matches(pattern: str, text: str) -> bool:
+    """Match a pattern against text using hybrid literal/regex matching.
+    
+    For literal patterns (no regex metacharacters): uses fast startswith()
+    For regex patterns: uses compiled regex with caching
+    
+    Args:
+        pattern: The pattern to match (literal prefix or regex)
+        text: The text to match against
+        
+    Returns:
+        True if the pattern matches, False otherwise
+    """
+    if not pattern:
+        return True  # Empty pattern matches everything
+    
+    if is_regex_pattern(pattern):
+        # Regex path (slower but flexible)
+        return bool(get_cached_regex(pattern).match(text))
+    else:
+        # Literal path (fast string prefix matching)
+        return text.upper().startswith(pattern.upper())
+
+
+# ---------------------------------------------------------------------------
 # Auction/Contract Parsing
 # ---------------------------------------------------------------------------
 

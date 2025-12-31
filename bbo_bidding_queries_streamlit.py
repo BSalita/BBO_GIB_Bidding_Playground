@@ -41,6 +41,7 @@ from bbo_bidding_queries_lib import (
     normalize_auction_pattern_to_seat1,
     normalize_auction_input,
     normalize_auction_user_text,
+    format_elapsed,
 )
 
 
@@ -1158,9 +1159,9 @@ def render_opening_bids_by_deal():
     deals = data.get("deals", [])
     elapsed_ms = data.get("elapsed_ms", 0)
     if not deals:
-        st.info(f"No deals matched the specified filters. ({elapsed_ms/1000:.1f}s)")
+        st.info(f"No deals matched the specified filters. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(deals)} deal(s) in {elapsed_ms/1000:.1f}s")
+        st.success(f"Found {len(deals)} deal(s) in {format_elapsed(elapsed_ms)}")
         for d in deals:
             st.subheader(f"Dealer {d['dealer']} – Deal Index {d['index']}")
             st.write(f"Opening seat: {d.get('opening_seat')}")
@@ -1243,9 +1244,9 @@ def render_random_auction_samples():
     samples = data.get("samples", [])
     elapsed_ms = data.get("elapsed_ms", 0)
     if not samples:
-        st.info(f"No completed auctions found. ({elapsed_ms/1000:.1f}s)")
+        st.info(f"No completed auctions found. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(samples)} matching auction(s) in {elapsed_ms/1000:.1f}s")
+        st.success(f"Found {len(samples)} matching auction(s) in {format_elapsed(elapsed_ms)}")
         
         # Build combined DataFrame from all samples for comparison
         all_rows = []
@@ -1319,9 +1320,9 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
     samples = data.get("samples", [])
     elapsed_ms = data.get("elapsed_ms", 0)
     if not samples:
-        st.info(f"No auctions matched the pattern. ({elapsed_ms/1000:.1f}s)")
+        st.info(f"No auctions matched the pattern. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(samples)} matching auction(s) in {elapsed_ms/1000:.1f}s")
+        st.success(f"Found {len(samples)} matching auction(s) in {format_elapsed(elapsed_ms)}")
         
         def _to_int_or_default(x: Any, default: int = 1) -> int:
             try:
@@ -1495,9 +1496,9 @@ def render_deals_by_auction_pattern(pattern: str | None):
     
     auctions = data.get("auctions", [])
     if not auctions:
-        st.info(f"No auctions matched the pattern. ({elapsed_ms/1000:.1f}s)")
+        st.info(f"No auctions matched the pattern. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(auctions)} matching auction(s) in {elapsed_ms/1000:.1f}s")
+        st.success(f"Found {len(auctions)} matching auction(s) in {format_elapsed(elapsed_ms)}")
         for i, a in enumerate(auctions, start=1):
             bt_idx = a.get("bt_index")
             bt_suffix = f" (bt_index={bt_idx})" if bt_idx is not None else ""
@@ -1733,11 +1734,11 @@ def render_bidding_table_explorer():
     elapsed_ms = data.get("elapsed_ms", 0)
     
     if total_matches == 0:
-        st.warning(f"No auctions match pattern: `{auction_pattern}` ({elapsed_ms/1000:.1f}s)")
+        st.warning(f"No auctions match pattern: `{auction_pattern}` ({format_elapsed(elapsed_ms)})")
         if data.get("message"):
             st.info(data["message"])
     else:
-        st.success(f"Found {total_matches:,} auctions matching pattern: `{auction_pattern}` ({elapsed_ms/1000:.1f}s)")
+        st.success(f"Found {total_matches:,} auctions matching pattern: `{auction_pattern}` ({format_elapsed(elapsed_ms)})")
         
         if rows:
             display_df = pl.DataFrame(rows)
@@ -1953,9 +1954,9 @@ def render_analyze_deal():
         elapsed_ms = match_data.get("elapsed_ms", 0)
         
         if not matches:
-            st.warning(f"No matching auctions found for seat {match_seat}. ({elapsed_ms/1000:.1f}s)")
+            st.warning(f"No matching auctions found for seat {match_seat}. ({format_elapsed(elapsed_ms)})")
         else:
-            st.success(f"Found {len(matches)} matching auction(s) for seat {match_seat} in {elapsed_ms/1000:.1f}s")
+            st.success(f"Found {len(matches)} matching auction(s) for seat {match_seat} in {format_elapsed(elapsed_ms)}")
             matches_df = pl.DataFrame(matches)
             matches_df = order_columns(matches_df, priority_cols=[
                 "Auction", "Rules_Auction", "Expr",
@@ -2126,11 +2127,11 @@ def render_analyze_actual_auctions():
     effective_pattern = data["pattern"]
     
     if not groups:
-        st.warning(f"No auctions matched pattern: `{effective_pattern}` ({elapsed_ms/1000:.1f}s)")
+        st.warning(f"No auctions matched pattern: `{effective_pattern}` ({format_elapsed(elapsed_ms)})")
         return
     
     deals_msg = f", {total_matching_deals:,} deals" if isinstance(total_matching_deals, int) and total_matching_deals >= 0 else ""
-    st.success(f"Found {total_auctions:,} matching auctions{deals_msg}, showing {len(groups)} groups ({elapsed_ms/1000:.1f}s)")
+    st.success(f"Found {total_auctions:,} matching auctions{deals_msg}, showing {len(groups)} groups ({format_elapsed(elapsed_ms)})")
     
     for i, group in enumerate(groups):
         bid_auction = group.get("auction")
@@ -2581,26 +2582,30 @@ def render_auction_criteria_debugger():
                 bt_index = target_row.get("index")
                 st.success(f"Found BT row: **bt_index={bt_index}**, Auction=**{target_row.get('Auction')}**")
                 
-                # Show criteria per seat (BT row: raw/overlay)
+                # Show criteria per seat as a DataFrame (BT row: raw/overlay)
                 criteria_by_seat = {}
+                seat_rows = []
                 for seat in [1, 2, 3, 4]:
                     criteria = target_row.get(f"Agg_Expr_Seat_{seat}", [])
-                    if criteria:
-                        criteria_by_seat[seat] = criteria
-                        st.write(f"**Seat {seat}** ({len(criteria)} criteria): `{criteria[:5]}{'...' if len(criteria) > 5 else ''}`")
-                    else:
-                        st.write(f"**Seat {seat}** (no criteria)")
-
-                # If present, show the Rules model’s seat-1 criteria (merged+overlay) for this bt_index.
+                    criteria_by_seat[seat] = criteria if criteria else []
+                    criteria_str = "; ".join(criteria[:10]) + ("..." if len(criteria) > 10 else "") if criteria else "(none)"
+                    seat_rows.append({
+                        "Seat": seat,
+                        "Count": len(criteria) if criteria else 0,
+                        "Criteria": criteria_str,
+                    })
+                
+                # If present, add Rules model's seat-1 criteria (merged+overlay) for this bt_index.
                 rules_s1 = target_row.get("Agg_Expr_Seat_1_Rules")
                 if rules_s1 is not None:
-                    st.markdown("**Rules (merged+overlay) Seat 1 criteria**")
-                    if rules_s1:
-                        st.write(f"Seat 1 Rules criteria ({len(rules_s1)}): `{rules_s1[:8]}{'...' if len(rules_s1) > 8 else ''}`")
-                    else:
-                        st.write("Seat 1 Rules criteria: (none)")
+                    rules_str = "; ".join(rules_s1[:10]) + ("..." if len(rules_s1) > 10 else "") if rules_s1 else "(none)"
+                    seat_rows[0]["Rules_S1_Criteria"] = rules_str
+                    seat_rows[0]["Rules_S1_Count"] = len(rules_s1) if rules_s1 else 0
                 
-                if not criteria_by_seat:
+                seat_df = pl.DataFrame(seat_rows)
+                st.dataframe(seat_df, use_container_width=True, hide_index=True)
+                
+                if not any(criteria_by_seat.values()):
                     st.info("No criteria on any seat for this BT row.")
                 
                 st.divider()
@@ -2707,7 +2712,6 @@ def render_auction_criteria_debugger():
                 
                 # Display results table
                 if results_data:
-                    import polars as pl
                     results_df = pl.DataFrame(results_data)
                     
                     # Show SQL query equivalent
@@ -3050,7 +3054,7 @@ def render_bidding_arena():
                 st.session_state["_arena_cache_data"] = data
             
             elapsed_ms = data.get("elapsed_ms", 0)
-            st.caption(f"Completed in {elapsed_ms:.0f}ms")
+            st.caption(f"Completed in {format_elapsed(elapsed_ms)}")
             rules_search = data.get("rules_search") or {}
             if rules_search:
                 st.caption(
@@ -3641,7 +3645,7 @@ def render_bidding_arena():
                                 except Exception as e:
                                     st.warning(f"Failed to compute Failed Exprs: {e}")
 
-                            seq_df = order_columns(seq_df, priority_cols=["index", "Auction", "Seat", "BT_Seat", "is_match_row", "Expr", "Agg_Expr_Seat", "Failed Exprs"])
+                            seq_df = order_columns(seq_df, priority_cols=["index", "Auction", "Seat", "BT_Seat", "is_match_row", "Failed Exprs", "Expr", "Agg_Expr_Seat"])
                             if "index" in seq_df.columns:
                                 seq_df = seq_df.sort("index")
 
@@ -4319,7 +4323,7 @@ def render_rank_by_ev():
         st.info(data["message"])
     
     opening_seat = data.get("opening_seat", "Dealer (Seat 1)")
-    st.success(f"✅ Analyzed {total_bids} bids, {total_matches:,} matched deals ({elapsed_ms/1000:.1f}s) — Opener: {opening_seat}")
+    st.success(f"✅ Analyzed {total_bids} bids, {total_matches:,} matched deals ({format_elapsed(elapsed_ms)}) — Opener: {opening_seat}")
     
     # -------------------------------------------------------------------------
     # Bid Rankings Table (with row selection)
@@ -4867,6 +4871,301 @@ def render_rank_by_ev():
 
 
 # ---------------------------------------------------------------------------
+# Auction Builder – Build an auction step-by-step with BT lookups
+# ---------------------------------------------------------------------------
+
+def render_auction_builder():
+    """Build an auction step-by-step by selecting bids from BT-derived options."""
+    st.header("🔨 Auction Builder")
+    st.markdown("""
+    Build an auction step-by-step. At each step, select the next bid from available 
+    BT continuations. See criteria (Agg_Expr) for each seat and find matching deals.
+    """)
+    
+    # Initialize session state for auction path
+    if "auction_builder_path" not in st.session_state:
+        st.session_state.auction_builder_path = []  # List of {"bid": str, "bt_index": int, "agg_expr": list}
+    if "auction_builder_options" not in st.session_state:
+        st.session_state.auction_builder_options = {}  # Cache of available options per prefix
+    
+    # Sidebar controls
+    st.sidebar.subheader("Auction Builder Controls")
+    
+    # Initial auction input
+    initial_auction_raw = st.sidebar.text_input(
+        "Start from Auction",
+        value="",
+        help="Enter an auction to start from (e.g., '1S-P-2S' or '1N'). Leave empty to start from opening bids.",
+        key="auction_builder_initial",
+    )
+    initial_auction = normalize_auction_input(initial_auction_raw).upper() if initial_auction_raw.strip() else ""
+    
+    if st.sidebar.button("📥 Load Initial Auction", type="primary", disabled=not initial_auction):
+        # Parse and load the initial auction
+        if initial_auction:
+            bids = [b.strip() for b in initial_auction.split("-") if b.strip()]
+            new_path = []
+            for i, bid in enumerate(bids):
+                new_path.append({
+                    "bid": bid.upper(),
+                    "bt_index": None,  # Will be populated on next fetch
+                    "agg_expr": [],
+                    "is_complete": False,
+                })
+            st.session_state.auction_builder_path = new_path
+            st.session_state.auction_builder_options = {}  # Clear cache
+            st.rerun()
+    
+    if st.sidebar.button("🔄 Reset Auction", type="secondary"):
+        st.session_state.auction_builder_path = []
+        st.session_state.auction_builder_options = {}
+        st.rerun()
+    
+    st.sidebar.divider()
+    
+    max_matching_deals = st.sidebar.number_input(
+        "Max Matching Deals",
+        value=25,
+        min_value=1,
+        max_value=500,
+        help="Maximum deals to show in matching deals list"
+    )
+    
+    seed = st.sidebar.number_input(
+        "Random Seed",
+        value=42,
+        min_value=0,
+        help="Seed for reproducible deal sampling"
+    )
+    
+    # Build current auction string from path
+    current_path = st.session_state.auction_builder_path
+    current_auction = "-".join([step["bid"] for step in current_path]) if current_path else ""
+    current_seat = len(current_path) + 1  # Next seat to bid (1-indexed)
+    
+    # Check if auction is complete
+    is_complete = False
+    if current_path:
+        last_step = current_path[-1]
+        is_complete = last_step.get("is_complete", False)
+    
+    # Display current auction state
+    st.subheader("Current Auction")
+    if current_auction:
+        st.success(f"**{current_auction}**" + (" ✅ (Complete)" if is_complete else ""))
+    else:
+        st.info("No bids yet. Select an opening bid below.")
+    
+    # Fetch available next bids using fast /list-next-bids endpoint
+    def get_next_bid_options(prefix: str) -> list[dict]:
+        """Get available next bids from BT using the optimized list-next-bids endpoint."""
+        cache_key = (prefix or "__opening__", seed)  # Include seed in cache key
+        if cache_key in st.session_state.auction_builder_options:
+            return st.session_state.auction_builder_options[cache_key]
+        
+        try:
+            # Use fast /list-next-bids endpoint which uses next_bid_indices for O(1) lookup
+            response = requests.post(
+                f"{API_BASE}/list-next-bids",
+                json={"auction": prefix or ""},
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            next_bids = data.get("next_bids", [])
+            
+            if not next_bids:
+                error = data.get("error", "")
+                if error:
+                    st.caption(f"🔍 {error}")
+                else:
+                    st.caption(f"🔍 No next bids found for: `{prefix or '(opening)'}`")
+            
+            # Convert to expected format
+            options = []
+            for item in next_bids:
+                options.append({
+                    "bid": item.get("bid", ""),
+                    "bt_index": item.get("bt_index"),
+                    "agg_expr": item.get("agg_expr", []) or [],
+                    "is_complete": item.get("is_completed_auction", False),
+                })
+            
+            # Already sorted by the API
+            st.session_state.auction_builder_options[cache_key] = options
+            return options
+            
+        except requests.exceptions.RequestException as e:
+            st.error(f"API error fetching bid options: {e}")
+            return []
+        except Exception as e:
+            st.error(f"Error fetching bid options: {e}")
+            return []
+    
+    # Display bid selection columns
+    if not is_complete:
+        st.subheader(f"Select Bid for Seat {current_seat}")
+        
+        with st.spinner("Loading available bids..."):
+            options = get_next_bid_options(current_auction)
+        
+        if not options:
+            st.warning("No more bids available in BT for this auction prefix.")
+        else:
+            # Create a formatted list for selectbox
+            option_labels = []
+            for opt in options:
+                expr_preview = "; ".join(opt["agg_expr"][:3]) if opt.get("agg_expr") else "(no criteria)"
+                if len(opt.get("agg_expr", [])) > 3:
+                    expr_preview += "..."
+                complete_marker = " ✅" if opt.get("is_complete") else ""
+                option_labels.append(f"{opt['bid']}{complete_marker} — {expr_preview}")
+            
+            selected_idx = st.selectbox(
+                f"Next Bid (Seat {current_seat})",
+                range(len(options)),
+                format_func=lambda i: option_labels[i],
+                key=f"auction_builder_seat_{current_seat}",
+            )
+            
+            if st.button("➕ Add Bid", type="primary"):
+                selected_opt = options[selected_idx]
+                st.session_state.auction_builder_path.append(selected_opt)
+                # Clear cached options for next level
+                new_auction = "-".join([step["bid"] for step in st.session_state.auction_builder_path])
+                if new_auction not in st.session_state.auction_builder_options:
+                    pass  # Will fetch on next render
+                st.rerun()
+    
+    # Undo last bid button
+    if current_path:
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("⬅️ Undo Last Bid"):
+                st.session_state.auction_builder_path.pop()
+                st.rerun()
+    
+    st.divider()
+    
+    # Summary DataFrame
+    if current_path:
+        st.subheader("📋 Auction Summary")
+        
+        summary_rows = []
+        for i, step in enumerate(current_path):
+            seat = i + 1
+            direction = ["N", "E", "S", "W"][(seat - 1) % 4]  # Assuming dealer is N
+            criteria_str = "; ".join(step.get("agg_expr", [])[:8])
+            if len(step.get("agg_expr", [])) > 8:
+                criteria_str += "..."
+            summary_rows.append({
+                "Seat": seat,
+                "Direction": direction,
+                "Bid": step["bid"],
+                "BT Index": step.get("bt_index"),
+                "Criteria Count": len(step.get("agg_expr", [])),
+                "Agg_Expr": criteria_str if criteria_str else "(none)",
+                "Complete": "✅" if step.get("is_complete") else "",
+            })
+        
+        summary_df = pl.DataFrame(summary_rows)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        
+        st.divider()
+        
+        # Matching Deals section - on-demand loading via button
+        st.subheader("🎯 Matching Deals")
+        st.caption(f"Deals where the actual auction matches: **{current_auction}**")
+        
+        # Use session state to track if deals have been loaded for this auction
+        deals_cache_key = f"auction_builder_deals_{current_auction}"
+        
+        if st.button("🔍 Find Matching Deals", type="secondary"):
+            st.session_state[deals_cache_key] = None  # Force refresh
+        
+        # Check if we have cached deals or need to load
+        if deals_cache_key in st.session_state and st.session_state[deals_cache_key] is not None:
+            # Show cached deals
+            cached_data = st.session_state[deals_cache_key]
+            sample_deals = cached_data.get("sample_deals", [])
+            if sample_deals:
+                st.success(f"Found **{len(sample_deals)}** matching deals")
+                deals_df = pl.DataFrame(cached_data.get("display_rows", []))
+                render_aggrid(
+                    deals_df,
+                    key="auction_builder_deals",
+                    height=calc_grid_height(len(deals_df), max_height=400),
+                    table_name="auction_builder_deals",
+                )
+            else:
+                st.info("No deals found matching this auction pattern.")
+        elif deals_cache_key in st.session_state:
+            # Button was clicked, load deals
+            with st.spinner("Fetching matching deals..."):
+                try:
+                    # Use bidding arena to get deals matching this auction
+                    arena_response = requests.post(
+                        f"{API_BASE}/bidding-arena",
+                        json={
+                            "model_a": "Actual",
+                            "model_b": "Rules",
+                            "sample_size": int(max_matching_deals),
+                            "seed": int(seed),
+                            "auction_pattern": f"^{current_auction.upper()}(-P)*$"  # Match with optional trailing passes
+                        },
+                        timeout=120
+                    )
+                    arena_response.raise_for_status()
+                    arena_data = arena_response.json()
+                    
+                    sample_deals = arena_data.get("sample_deals", [])
+                    
+                    # Build display DataFrame
+                    display_rows = []
+                    for deal in sample_deals:
+                        display_rows.append({
+                            "index": deal.get("index"),
+                            "Dealer": deal.get("Dealer"),
+                            "Vul": deal.get("Vul"),
+                            "Hand_N": deal.get("Hand_N", ""),
+                            "Hand_E": deal.get("Hand_E", ""),
+                            "Hand_S": deal.get("Hand_S", ""),
+                            "Hand_W": deal.get("Hand_W", ""),
+                            "Auction_Actual": deal.get("Auction_Actual", ""),
+                            "Contract": deal.get("Contract", ""),
+                            "Result": deal.get("Result", ""),
+                            "Score": deal.get("Score", ""),
+                            "ParScore": deal.get("ParScore", ""),
+                        })
+                    
+                    # Cache the results
+                    st.session_state[deals_cache_key] = {
+                        "sample_deals": sample_deals,
+                        "display_rows": display_rows,
+                    }
+                    
+                    if sample_deals:
+                        st.success(f"Found **{len(sample_deals)}** matching deals")
+                        deals_df = pl.DataFrame(display_rows)
+                        render_aggrid(
+                            deals_df,
+                            key="auction_builder_deals",
+                            height=calc_grid_height(len(deals_df), max_height=400),
+                            table_name="auction_builder_deals",
+                        )
+                    else:
+                        st.info("No deals found matching this auction pattern.")
+                        
+                except requests.exceptions.RequestException as e:
+                    st.error(f"API error: {e}")
+                except Exception as e:
+                    st.error(f"Error fetching deals: {e}")
+        else:
+            st.info("Click the button above to find matching deals.")
+
+
+# ---------------------------------------------------------------------------
 # Main UI – function selector and controls
 # ---------------------------------------------------------------------------
 
@@ -4878,6 +5177,7 @@ func_choice = st.sidebar.selectbox(
         "Deals by Auction Pattern",      # Primary: find deals matching auction criteria
         "Analyze Actual Auctions",       # Group deals by bid column, analyze outcomes
         "Bidding Arena",                 # Head-to-head model comparison
+        "Auction Builder",               # Build auction step-by-step with BT lookups
         "Auction Criteria Debugger",     # Debug why an auction is rejected
         "Wrong Bid Analysis",            # Wrong bid statistics and leaderboard
         "Custom Criteria Editor",        # Manage bbo_custom_auction_criteria.csv
@@ -4905,6 +5205,7 @@ FUNC_DESCRIPTIONS = {
     "Deals by Auction Pattern": "Find deals matching an auction pattern's criteria. Compare Rules contracts vs actual using DD scores and EV.",
     "Analyze Actual Auctions": "Group deals by their actual auction (bid column). Analyze criteria compliance, score deltas, and outcomes.",
     "Bidding Arena": "Head-to-head model comparison. Compare bidding models (Rules, Actual, NN, etc.) with DD scores, EV, and IMP differentials.",
+    "Auction Builder": "Build an auction step-by-step by selecting bids from BT-derived options. See criteria per seat and find matching deals.",
     "Wrong Bid Analysis": "Analyze wrong bids: statistics, failed criteria summary, and leaderboard of auctions with highest wrong bid rates.",
     "Custom Criteria Editor": "Manage custom auction criteria applied as a hot-reloadable overlay. Add/edit/delete rules and apply without restarting the server.",
     "Rank Next Bids by EV": "Rank all possible next bids after an auction by EV. Empty input shows opening bids.",
@@ -5029,6 +5330,8 @@ match func_choice:
         render_analyze_actual_auctions()
     case "Bidding Arena":
         render_bidding_arena()
+    case "Auction Builder":
+        render_auction_builder()
     case "Auction Criteria Debugger":
         render_auction_criteria_debugger()
     case "Wrong Bid Analysis":

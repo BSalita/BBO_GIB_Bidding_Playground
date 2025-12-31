@@ -62,6 +62,8 @@ from plugins.bbo_handlers_common import (
     invalid_criteria_col,
     # Canonical casing (single source of truth)
     normalize_auction_case,
+    # Elapsed time formatting
+    format_elapsed,
     # Typed state
     HandlerState,
     # Auction helpers
@@ -101,6 +103,7 @@ from plugins.bbo_handlers_common import (
     parse_sl_comparison_relative,
     parse_sl_comparison_numeric,
     eval_comparison,
+    annotate_criterion_with_value,
 )
 
 
@@ -505,7 +508,7 @@ def handle_openings_by_deal_index(
         )
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[openings-by-deal-index] {elapsed_ms:.1f}ms, {len(out_deals)} deals")
+    print(f"[openings-by-deal-index] {format_elapsed(elapsed_ms)}, {len(out_deals)} deals")
     return {
         "deals": out_deals,
         "auction_criteria_loaded": criteria_loaded,
@@ -545,7 +548,7 @@ def handle_random_auction_sequences(
 
     if completed_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[random-auction-sequences] {elapsed_ms:.1f}ms (empty)")
+        print(f"[random-auction-sequences] {format_elapsed(elapsed_ms)} (empty)")
         return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(n_samples, completed_df.height)
@@ -731,7 +734,7 @@ LIMIT {sample_n}"""
         })
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[random-auction-sequences] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
+    print(f"[random-auction-sequences] {format_elapsed(elapsed_ms)} ({len(out_samples)} samples)")
     return {"samples": out_samples, "elapsed_ms": round(elapsed_ms, 1), "sql_query": sql_query}
 
 
@@ -940,7 +943,7 @@ def handle_auction_sequences_matching(
         total_matching = total_matching * 4
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[auction-sequences-matching] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
+    print(f"[auction-sequences-matching] {format_elapsed(elapsed_ms)} ({len(out_samples)} samples)")
     return {
         "pattern": pattern,
         "samples": out_samples,
@@ -1134,7 +1137,7 @@ def handle_auction_sequences_by_index(
         total_matching = total_matching * 4
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[auction-sequences-by-index] {elapsed_ms:.1f}ms ({len(out_samples)} samples)")
+    print(f"[auction-sequences-by-index] {format_elapsed(elapsed_ms)} ({len(out_samples)} samples)")
     return {
         "indices": requested,
         "missing_indices": missing_indices,
@@ -1221,12 +1224,17 @@ def handle_deal_criteria_failures_batch(
         untracked_set = set(untracked)
         passed = [c for c in crit_norm if c not in failed_set and c not in untracked_set]
 
+        # Annotate failed criteria with actual values (e.g., 'HCP <= 11' -> 'HCP(10) <= 11')
+        failed_annotated = [
+            annotate_criterion_with_value(c, dealer, seat, row) for c in failed
+        ]
+
         results.append({
             "seat": seat, 
             "seat_dir": seat_to_direction(dealer, seat),
             "seat_label": _format_seat_notation(dealer, seat, include_bt_seat=False),
             "passed": passed, 
-            "failed": failed, 
+            "failed": failed_annotated, 
             "untracked": untracked
         })
 
@@ -1379,7 +1387,7 @@ def handle_pbn_lookup(
             print(f"[pbn-lookup] Warning: Could not find matched BT auctions: {e}")
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[pbn-lookup] Found {matching.height} matches, {len(matched_bt_auctions)} BT auctions in {elapsed_ms:.1f}ms")
+    print(f"[pbn-lookup] Found {matching.height} matches, {len(matched_bt_auctions)} BT auctions in {format_elapsed(elapsed_ms)}")
     
     return {
         "matches": matches_list,
@@ -1450,7 +1458,7 @@ def handle_deals_matching_auction(
 
     if filtered_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[deals-matching-auction] {elapsed_ms:.1f}ms (no matches)")
+        print(f"[deals-matching-auction] {format_elapsed(elapsed_ms)} (no matches)")
         return {"pattern": pattern, "auctions": [], "elapsed_ms": round(elapsed_ms, 1)}
 
     sample_n = min(n_auction_samples, filtered_df.height)
@@ -1755,7 +1763,7 @@ def handle_deals_matching_auction(
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     total_deals_count = sum(len(a.get("deals", [])) for a in out_auctions)
-    print(f"[deals-matching-auction] {elapsed_ms:.1f}ms ({len(out_auctions)} auctions, {total_deals_count} deals)")
+    print(f"[deals-matching-auction] {format_elapsed(elapsed_ms)} ({len(out_auctions)} auctions, {total_deals_count} deals)")
     
     response: Dict[str, Any] = {"pattern": pattern, "auctions": out_auctions, "elapsed_ms": round(elapsed_ms, 1)}
     if dist_pattern or sorted_shape:
@@ -1896,7 +1904,7 @@ def handle_bidding_table_statistics(
         total_matches = total_matches * 4
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[bidding-table-statistics] {elapsed_ms:.1f}ms ({len(result_rows)} rows from {total_matches} matches)")
+    print(f"[bidding-table-statistics] {format_elapsed(elapsed_ms)} ({len(result_rows)} rows from {total_matches} matches)")
     
     final_sql_query = dist_sql_query if dist_sql_query else f"SELECT * FROM auctions WHERE Auction ~* '{regex_pattern}' LIMIT {sample_n}"
 
@@ -2014,7 +2022,7 @@ def handle_find_matching_auctions(
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
     criteria_filtered = pre_criteria_count - post_criteria_count
-    print(f"[find-matching-auctions] {elapsed_ms:.1f}ms ({len(result_rows)} matches, {criteria_filtered} filtered by CSV criteria)")
+    print(f"[find-matching-auctions] {format_elapsed(elapsed_ms)} ({len(result_rows)} matches, {criteria_filtered} filtered by CSV criteria)")
     
     response: Dict[str, Any] = {
         "sql_query": sql_query, "auctions": result_rows, "total_matches": len(result_rows),
@@ -2289,7 +2297,7 @@ def handle_process_pbn(
         results.append(deal)
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[process-pbn] {elapsed_ms:.1f}ms ({len(results)} deals, type={input_type})")
+    print(f"[process-pbn] {format_elapsed(elapsed_ms)} ({len(results)} deals, type={input_type})")
     
     return {"deals": results, "count": len(results), "input_type": input_type, "input_source": input_source, "elapsed_ms": round(elapsed_ms, 1)}
 
@@ -2494,7 +2502,7 @@ LIMIT {n_auction_groups}"""
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
     total_deals_out = sum(g["sample_count"] for g in auction_groups)
-    print(f"[group-by-bid] {elapsed_ms:.1f}ms ({len(auction_groups)} groups, {total_deals_out} deals)")
+    print(f"[group-by-bid] {format_elapsed(elapsed_ms)} ({len(auction_groups)} groups, {total_deals_out} deals)")
     
     return {
         "pattern": pattern, "auction_groups": auction_groups, "total_matching_deals": filtered_df.height,
@@ -2635,7 +2643,7 @@ def handle_wrong_bid_stats(
     }
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[wrong-bid-stats] {elapsed_ms:.1f}ms ({analyzed_deals} analyzed, {deals_with_wrong_bid} wrong)")
+    print(f"[wrong-bid-stats] {format_elapsed(elapsed_ms)} ({analyzed_deals} analyzed, {deals_with_wrong_bid} wrong)")
     
     return {
         # Legacy flat fields
@@ -2776,7 +2784,7 @@ def handle_failed_criteria_summary(
         seat_breakdown[f"seat_{s}"] = [{"criterion": c, "fail_count": cnt} for c, cnt in seat_top]
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[failed-criteria-summary] {elapsed_ms:.1f}ms ({analyzed_deals} analyzed)")
+    print(f"[failed-criteria-summary] {format_elapsed(elapsed_ms)} ({analyzed_deals} analyzed)")
     
     return {
         "total_deals": total_deals,
@@ -2919,7 +2927,7 @@ def handle_wrong_bid_leaderboard(
     top_leaderboard = leaderboard[:top_n]
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[wrong-bid-leaderboard] {elapsed_ms:.1f}ms ({analyzed_deals} analyzed)")
+    print(f"[wrong-bid-leaderboard] {format_elapsed(elapsed_ms)} ({analyzed_deals} analyzed)")
     
     return {
         "analyzed_deals": analyzed_deals,
@@ -3318,14 +3326,20 @@ def handle_bidding_arena(
                         continue
                     if sl_result is False:
                         seat_label = _format_seat_notation(d, seat, lead_passes=lead_passes, include_bt_seat=True)
-                        return f"{seat_label}: failed {crit_s}"
+                        annotated = annotate_criterion_with_value(crit_s, d, seat, deal_row)
+                        return f"{seat_label}: failed {annotated}"
                 # Bitmap evaluation
-                if criterion not in criteria_df.columns:
+                if crit_s not in criteria_df.columns:
                     continue
                 try:
-                    if not bool(criteria_df[criterion][deal_idx]):
+                    if not bool(criteria_df[crit_s][deal_idx]):
                         seat_label = _format_seat_notation(d, seat, lead_passes=lead_passes, include_bt_seat=True)
-                        return f"{seat_label}: failed {crit_s}"
+                        # Annotate if deal_row is available
+                        if deal_row is not None:
+                            annotated = annotate_criterion_with_value(crit_s, d, seat, deal_row)
+                        else:
+                            annotated = crit_s
+                        return f"{seat_label}: failed {annotated}"
                 except (IndexError, KeyError, TypeError):
                     seat_label = _format_seat_notation(d, seat, lead_passes=lead_passes, include_bt_seat=True)
                     return f"{seat_label}: bitmap lookup error for {crit_s}"
@@ -3363,13 +3377,13 @@ def handle_bidding_arena(
                     # sl_result is None - not an SL criterion OR hand data missing, fall through to bitmap
                 
                 # Bitmap lookup for non-SL criteria
-                if criterion not in criteria_df.columns:
+                if crit_s not in criteria_df.columns:
                     # Unknown criterion - skip it (can't verify, assume passes)
                     # Note: This means CSV overlay criteria not in bitmap will be IGNORED
                     # for matching purposes. Dynamic SL evaluation handles SL criteria.
                     continue
                 try:
-                    if not bool(criteria_df[criterion][deal_idx]):
+                    if not bool(criteria_df[crit_s][deal_idx]):
                         return False  # Failed this criterion
                 except (IndexError, KeyError):
                     return False
@@ -4565,7 +4579,7 @@ def handle_bidding_arena(
     }
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[bidding-arena] {elapsed_ms:.1f}ms ({contracts_compared}/{analyzed_deals} compared)")
+    print(f"[bidding-arena] {format_elapsed(elapsed_ms)} ({contracts_compared}/{analyzed_deals} compared)")
     print(f"[bidding-arena] DIAG: no_matched_indices={diag_no_matched_indices}, rules_none={diag_rules_none}")
     # Show actual auctions from sampled deals
     actual_auctions_sample = [d.get("Auction_Actual", d.get("_bid_str", "?"))[:30] for d in sample_deals_output[:10]]
@@ -5400,7 +5414,7 @@ WHERE -- criteria matching for auction '{auction_normalized}'{vul_clause}
 LIMIT {max_deals}"""
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[auction-dd-analysis] Found {total_matches} matches, returning {len(dd_data)} rows in {elapsed_ms:.1f}ms")
+    print(f"[auction-dd-analysis] Found {total_matches} matches, returning {len(dd_data)} rows in {format_elapsed(elapsed_ms)}")
     
     return {
         "auction_input": auction,
@@ -5418,6 +5432,177 @@ LIMIT {max_deals}"""
         "vul_filter": vul_filter,
         "vul_breakdown": vul_breakdown,  # Show distribution of Vul values in matched deals
         "sql_query": sql_query,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# List Next Bids – Fast lookup using next_bid_indices (no EV computation)
+# ---------------------------------------------------------------------------
+
+def handle_list_next_bids(
+    state: Dict[str, Any],
+    auction: str,
+) -> Dict[str, Any]:
+    """Fast lookup of available next bids using BT's next_bid_indices.
+    
+    Uses the sorted BT structure for efficient lookups:
+    - For opening bids: filter by is_opening_bid=True
+    - For continuations: find parent row, then lookup next_bid_indices
+    
+    Returns:
+        - auction_input: The input auction
+        - auction_normalized: Normalized form
+        - next_bids: List of dicts with bid, bt_index, agg_expr, is_completed_auction
+        - elapsed_ms: Processing time
+    """
+    t0 = time.perf_counter()
+    
+    bt_seat1_df = state.get("bt_seat1_df")
+    if bt_seat1_df is None:
+        raise ValueError("bt_seat1_df not loaded")
+    
+    if "next_bid_indices" not in bt_seat1_df.columns:
+        raise ValueError("next_bid_indices column not loaded in bt_seat1_df")
+    
+    auction_input = normalize_auction_input(auction)
+    auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
+    
+    next_bids: List[Dict[str, Any]] = []
+    
+    if not auction_input:
+        # Opening bids: use pre-computed bt_openings_df (tiny, fast)
+        bt_openings_df = state.get("bt_openings_df")
+        
+        if bt_openings_df is not None and bt_openings_df.height > 0:
+            # Use pre-computed opening bids table (very fast)
+            # bt_openings_df has: bt_index, Auction (the bid), seat, Agg_Expr_Seat_1..4
+            # Get unique Auction values (opening bids) for seat=1
+            seat1_df = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
+            unique_auctions = seat1_df.select("Auction").unique()
+            
+            seen_bids: set[str] = set()
+            for row in seat1_df.iter_rows(named=True):
+                bid = row.get("Auction") or ""
+                if bid and bid.upper() not in seen_bids:
+                    seen_bids.add(bid.upper())
+                    next_bids.append({
+                        "bid": bid.upper(),
+                        "bt_index": row.get("bt_index"),
+                        "agg_expr": row.get("Agg_Expr_Seat_1") or [],
+                        "is_completed_auction": False,  # Opening bids are not complete
+                    })
+        else:
+            # Fallback: filter bt_seat1_df (slower)
+            if "is_opening_bid" not in bt_seat1_df.columns:
+                raise ValueError("is_opening_bid column not found")
+            if "candidate_bid" not in bt_seat1_df.columns:
+                raise ValueError("candidate_bid column not found")
+            
+            opening_df = bt_seat1_df.filter(pl.col("is_opening_bid"))
+            
+            # Get unique bids efficiently
+            cols_needed = ["candidate_bid", "bt_index", "Agg_Expr_Seat_1", "is_completed_auction"]
+            cols_available = [c for c in cols_needed if c in opening_df.columns]
+            
+            unique_bids_df = opening_df.select(cols_available).unique(subset=["candidate_bid"], keep="first")
+            
+            for row in unique_bids_df.iter_rows(named=True):
+                bid = row.get("candidate_bid") or ""
+                if bid:
+                    next_bids.append({
+                        "bid": bid.upper(),
+                        "bt_index": row.get("bt_index"),
+                        "agg_expr": row.get("Agg_Expr_Seat_1") or [],
+                        "is_completed_auction": row.get("is_completed_auction", False),
+                    })
+    else:
+        # Find parent BT row for this auction prefix using FAST exact match
+        auction_for_lookup = auction_input.rstrip("-").upper() if auction_input else ""
+        
+        # Check for pass-only prefix
+        is_passes_only = not auction_normalized or auction_normalized.lower() in ("p", "")
+        expected_passes = _count_leading_passes(auction_input)
+        
+        if is_passes_only and expected_passes > 0:
+            auction_for_lookup = "-".join(["P"] * expected_passes)
+        
+        # Fast exact match on Auction column (no regex, no column transformation)
+        parent_matches = bt_seat1_df.filter(
+            pl.col("Auction").cast(pl.Utf8).str.to_uppercase() == auction_for_lookup
+        )
+        
+        if parent_matches.height == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "auction_input": auction_input,
+                "auction_normalized": auction_normalized,
+                "next_bids": [],
+                "error": f"No BT row found for auction '{auction_for_lookup}'",
+                "elapsed_ms": round(elapsed_ms, 1),
+            }
+        
+        parent_row = parent_matches.row(0, named=True)
+        next_indices = parent_row.get("next_bid_indices") or []
+        
+        if not next_indices:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "auction_input": auction_input,
+                "auction_normalized": auction_normalized,
+                "parent_bt_index": parent_row.get("bt_index"),
+                "next_bids": [],
+                "elapsed_ms": round(elapsed_ms, 1),
+            }
+        
+        # Lookup next bid rows by bt_index
+        next_df = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
+        
+        # Determine seat for Agg_Expr lookup
+        call_tokens = [t for t in auction_for_lookup.split("-") if t] if auction_for_lookup else []
+        next_seat = (len(call_tokens) % 4) + 1
+        agg_expr_col = f"Agg_Expr_Seat_{next_seat}"
+        
+        # Get unique bids efficiently (next_df is typically small, but be safe)
+        cols_needed = ["candidate_bid", "bt_index", agg_expr_col, "is_completed_auction"]
+        cols_available = [c for c in cols_needed if c in next_df.columns]
+        
+        unique_next_df = next_df.select(cols_available).unique(subset=["candidate_bid"], keep="first")
+        
+        for row in unique_next_df.iter_rows(named=True):
+            bid = row.get("candidate_bid") or ""
+            if bid:
+                next_bids.append({
+                    "bid": bid.upper(),
+                    "bt_index": row.get("bt_index"),
+                    "agg_expr": row.get(agg_expr_col) or [],
+                    "is_completed_auction": row.get("is_completed_auction", False),
+                })
+    
+    # Sort: regular bids by level/suit, then D/R, then P
+    def sort_key(item: Dict[str, Any]) -> tuple:
+        bid = item.get("bid", "")
+        if bid == "P":
+            return (2, 0, "")
+        if bid in ("D", "R"):
+            return (1, 0, bid)
+        try:
+            level = int(bid[0])
+            suit = bid[1:] if len(bid) > 1 else ""
+            suit_order = {"C": 1, "D": 2, "H": 3, "S": 4, "N": 5}.get(suit, 0)
+            return (0, level, suit_order)
+        except:
+            return (0, 0, bid)
+    
+    next_bids.sort(key=sort_key)
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[list-next-bids] {format_elapsed(elapsed_ms)} ({len(next_bids)} bids for '{auction_input or '(opening)'}')")
+    
+    return {
+        "auction_input": auction_input,
+        "auction_normalized": auction_normalized,
+        "next_bids": next_bids,
         "elapsed_ms": round(elapsed_ms, 1),
     }
 
@@ -6242,7 +6427,7 @@ def handle_rank_bids_by_ev(
         dd_data_by_bid[bid_name] = bid_dd_data
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[rank-bids-by-ev] {total_next_bids} bids analyzed, {total_matches} deals in {elapsed_ms:.1f}ms")
+    print(f"[rank-bids-by-ev] {total_next_bids} bids analyzed, {total_matches} deals in {format_elapsed(elapsed_ms)}")
     
     # Describe the opening seat filter
     opening_seat = expected_passes + 1  # Seat 1-4

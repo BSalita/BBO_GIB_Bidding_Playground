@@ -78,6 +78,10 @@ import mlBridgeLib.mlBridgeBiddingLib as mlBridgeBiddingLib
 
 from bbo_bidding_queries_lib import (
     evaluate_criterion_for_hand,
+    format_elapsed,
+    is_regex_pattern,
+    get_cached_regex,
+    pattern_matches,
 )
 
 # ---------------------------------------------------------------------------
@@ -600,8 +604,14 @@ def _apply_auction_criteria(
     rejected_rows: list[dict] = []
     
     for partial_auction, criteria in criteria_list:
-        # Use consistent auction normalization
-        matches_partial = _normalize_auction_expr(auction_col).str.starts_with(partial_auction)
+        # Hybrid matching: literal prefix for simple patterns, regex for complex ones
+        if is_regex_pattern(partial_auction):
+            # Regex path - auto-anchor for prefix matching
+            regex_pat = partial_auction if partial_auction.startswith('^') else f'^{partial_auction}'
+            matches_partial = _normalize_auction_expr(auction_col).str.contains(f'(?i){regex_pat}')
+        else:
+            # Fast literal path
+            matches_partial = _normalize_auction_expr(auction_col).str.starts_with(partial_auction)
         num_dashes = partial_auction.count('-')
         seat = num_dashes + 1
             
@@ -614,14 +624,14 @@ def _apply_auction_criteria(
             
             matching_mask = matches_partial & (pl.col(dealer_col) == dealer)
             matching_rows = df.filter(matching_mask)
-                
+            
             # Track rejected rows if requested
             if track_rejected and matching_rows.height > 0:
                 for row_idx in range(matching_rows.height):
                     row = matching_rows.row(row_idx, named=True)
                     single_row_df = matching_rows.slice(row_idx, 1)
                     failed_criteria = _check_row_criteria(single_row_df, criteria_exprs)
-                        
+                    
                     if len(failed_criteria) > 0:
                         rejected_rows.append({
                             'Auction': str(row.get(auction_col, '')),
@@ -631,7 +641,7 @@ def _apply_auction_criteria(
                             'Seat': int(seat),
                             'Direction': str(direction),
                         })
-                
+            
             # Apply filter: keep rows that don't match OR satisfy criteria
             combined_criteria = _combine_criteria_expressions(criteria_exprs)
             try:
@@ -895,6 +905,11 @@ class AuctionDDAnalysisRequest(BaseModel):
     vul_filter: Optional[str] = None  # Filter by vulnerability: None, Both, NS, EW (None = all)
     include_hands: bool = True  # Include Hand_N/E/S/W columns in output
     include_scores: bool = True  # Include DD_Score columns in addition to DD tricks
+
+
+class ListNextBidsRequest(BaseModel):
+    """Request for List Next Bids: fast lookup of available next bids using BT's next_bid_indices."""
+    auction: str = ""  # Auction prefix (empty = opening bids)
 
 
 class RankBidsByEVRequest(BaseModel):
@@ -1288,6 +1303,26 @@ def _heavy_init() -> None:
         )
         _log_memory("after directional_to_directionless")
 
+        # TEMPORARY FIX: Force unknown criteria columns to True until bitmaps are regenerated.
+        # These criteria exist in BT data but weren't in the bitmap generation pipeline.
+        # ALWAYS overwrite (even if column exists with False values).
+        # Remove this block after regenerating bitmaps with the updated mlBridgeAugmentLib.py.
+        _unknown_criteria_cols = [
+            pl.lit(True).alias("Forcing_One_Round"),
+            pl.lit(True).alias("Opponents_Cannot_Play_Undoubled_Below_2N"),
+            pl.lit(True).alias("Forcing_To_2N"),
+            pl.lit(True).alias("Forcing_To_3N"),
+        ]
+        for direction in list(deal_criteria_by_direction_dfs.keys()):
+            df = deal_criteria_by_direction_dfs[direction]
+            # ALWAYS overwrite these columns with True (even if they exist with False)
+            deal_criteria_by_direction_dfs[direction] = df.with_columns(_unknown_criteria_cols)
+        for seat in list(deal_criteria_by_seat_dfs.keys()):
+            for direction in list(deal_criteria_by_seat_dfs[seat].keys()):
+                df = deal_criteria_by_seat_dfs[seat][direction]
+                deal_criteria_by_seat_dfs[seat][direction] = df.with_columns(_unknown_criteria_cols)
+        print("[init] TEMPORARY: Forced unknown criteria columns (Forcing_One_Round, Forcing_To_2N, etc.) to True")
+
         # Capture the canonical set of criterion names (as used by the bitmap DataFrames).
         # These are "original expressions" (directionless) after directional_to_directionless renaming.
         # We'll use this set to normalize CSV criteria strings on reload (mainly whitespace differences).
@@ -1557,8 +1592,12 @@ def preview_custom_criteria(req: CustomCriteriaPreviewRequest) -> Dict[str, Any]
     with _STATE_LOCK:
         bt_seat1_df = STATE["bt_seat1_df"]
     
-    # Find auctions that start with this partial (ignore leading passes)
-    matches = bt_seat1_df.filter(_normalize_auction_expr().str.starts_with(partial))
+    # Hybrid matching: literal prefix for simple patterns, regex for complex ones
+    if is_regex_pattern(partial):
+        regex_pat = partial if partial.startswith('^') else f'^{partial}'
+        matches = bt_seat1_df.filter(_normalize_auction_expr().str.contains(f'(?i){regex_pat}'))
+    else:
+        matches = bt_seat1_df.filter(_normalize_auction_expr().str.starts_with(partial))
     
     # Determine which seat this affects
     num_dashes = partial.count('-')
@@ -1960,7 +1999,8 @@ def _filter_auctions_by_hand_criteria(
         
         # Check each criterion set
         for partial_auction, criteria in criteria_list:
-            if auction_norm.startswith(partial_auction):
+            # Hybrid matching: literal prefix for simple patterns, regex for complex ones
+            if pattern_matches(partial_auction, auction_norm):
                 # This auction matches this partial - check criteria
                 # Determine which seat made the last bid of the partial auction
                 num_dashes = partial_auction.count('-')
@@ -2199,7 +2239,7 @@ def execute_sql(req: ExecuteSQLRequest) -> Dict[str, Any]:
             result = DUCKDB_CONN.execute(limited_sql).pl()
         
         elapsed_ms = (time.time() - t0) * 1000
-        print(f"[execute-sql] {result.height} rows in {elapsed_ms:.1f}ms")
+        print(f"[execute-sql] {result.height} rows in {format_elapsed(elapsed_ms)}")
         
         return {
             "rows": result.to_dicts(),
@@ -2382,6 +2422,38 @@ def auction_dd_analysis(req: AuctionDDAnalysisRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("auction-dd-analysis", e)
+
+
+@app.post("/list-next-bids")
+def list_next_bids(req: ListNextBidsRequest) -> Dict[str, Any]:
+    """Fast lookup of available next bids using BT's next_bid_indices.
+    
+    Given an auction prefix (or empty for opening bids), returns all valid next bids
+    with their bt_index and Agg_Expr criteria. Uses the sorted BT structure for
+    efficient O(log n) lookups instead of regex scanning.
+    """
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    
+    with _STATE_LOCK:
+        state = dict(STATE)
+    
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_list_next_bids(
+            state=state,
+            auction=req.auction,
+        )
+        if reload_info:
+            resp["_reload_info"] = reload_info
+        return resp
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log_and_raise("list-next-bids", e)
 
 
 @app.post("/rank-bids-by-ev")

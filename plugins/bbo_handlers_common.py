@@ -47,6 +47,14 @@ def normalize_auction_case(auction: str) -> str:
     return auction.upper() if auction else ""
 
 
+def format_elapsed(ms: float) -> str:
+    """Format elapsed time in seconds (e.g., 5380.4ms -> '5.38s').
+    
+    This is the single source of truth for elapsed time display.
+    """
+    return f"{ms / 1000:.2f}s"
+
+
 def agg_expr_col(seat: int) -> str:
     """Get the Agg_Expr column name for a seat."""
     return f"Agg_Expr_Seat_{seat}"
@@ -889,6 +897,82 @@ def eval_comparison(left: int, op: str, right: int) -> bool:
     if op == "!=":
         return left != right
     return False
+
+
+def annotate_criterion_with_value(
+    criterion: str,
+    dealer: str,
+    seat: int,
+    deal_row: Dict[str, Any],
+) -> str:
+    """Annotate a criterion with the actual value of its left-hand side variable.
+    
+    Examples:
+        'HCP <= 11' -> 'HCP(10) <= 11'
+        'SL_S >= 5' -> 'SL_S(3) >= 5'
+        'Total_Points >= 20' -> 'Total_Points(18) >= 20'
+        'SL_S >= SL_H' -> 'SL_S(3) >= SL_H(4)'
+    
+    Args:
+        criterion: The criterion string
+        dealer: The dealer direction (N/E/S/W)
+        seat: The seat number (1-4)
+        deal_row: Dict containing hand data
+    
+    Returns:
+        The criterion string with actual values annotated, or original if can't parse
+    """
+    direction = seat_to_direction(dealer, seat)
+    crit_s = str(criterion).strip().replace("≥", ">=").replace("≤", "<=")
+    
+    # Try suit-to-suit comparison: SL_S >= SL_H
+    parsed_rel = parse_sl_comparison_relative(crit_s)
+    if parsed_rel is not None:
+        left_suit, op, right_suit = parsed_rel
+        lv = hand_suit_length(deal_row, direction, left_suit)
+        rv = hand_suit_length(deal_row, direction, right_suit)
+        lv_str = f"({lv})" if lv is not None else "(?)"
+        rv_str = f"({rv})" if rv is not None else "(?)"
+        return f"SL_{left_suit}{lv_str} {op} SL_{right_suit}{rv_str}"
+    
+    # Try suit-to-number comparison: SL_S >= 5
+    parsed_num = parse_sl_comparison_numeric(crit_s)
+    if parsed_num is not None:
+        suit, op, num_val = parsed_num
+        lv = hand_suit_length(deal_row, direction, suit)
+        lv_str = f"({lv})" if lv is not None else "(?)"
+        return f"SL_{suit}{lv_str} {op} {num_val}"
+    
+    # Try general variable comparison: VAR op NUMBER (e.g., HCP <= 11, Total_Points >= 20)
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|>|<|==|!=)\s*(\d+)$", crit_s)
+    if m:
+        var_name = m.group(1)
+        op = m.group(2)
+        num_val = m.group(3)
+        
+        # Look up the variable value from deal_row
+        actual_val = None
+        var_upper = var_name.upper()
+        
+        if var_upper == "HCP":
+            actual_val = deal_row.get(f"HCP_{direction}")
+        elif var_upper == "TOTAL_POINTS":
+            actual_val = deal_row.get(f"Total_Points_{direction}")
+        else:
+            # Try with direction suffix first, then without
+            actual_val = deal_row.get(f"{var_name}_{direction}")
+            if actual_val is None:
+                actual_val = deal_row.get(var_name)
+        
+        if actual_val is not None:
+            try:
+                actual_val = int(actual_val)
+                return f"{var_name}({actual_val}) {op} {num_val}"
+            except (ValueError, TypeError):
+                pass
+    
+    # Can't parse or annotate - return original
+    return criterion
 
 
 def evaluate_sl_criterion(
