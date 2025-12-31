@@ -1099,6 +1099,26 @@ if bt_df_rows is not None and deal_df_rows is not None:
     st.info(f"📊 Loaded data: **{deal_df_rows:,}** deals, **{bt_df_rows:,}** bidding table entries")
 
 # ---------------------------------------------------------------------------
+# Auto-reload custom criteria overlay on every page refresh
+# ---------------------------------------------------------------------------
+# This ensures CSV edits are picked up immediately without manual button clicks.
+# The reload is fast (just re-reads the CSV) so it's safe to do on every refresh.
+
+def _auto_reload_criteria_overlay():
+    """Silently reload custom criteria overlay from CSV."""
+    try:
+        resp = requests.post(f"{API_BASE}/custom-criteria-reload", timeout=10)
+        if resp.ok:
+            data = resp.json()
+            rules_count = data.get("stats", {}).get("rules_applied", 0)
+            # Store in session state for display in sidebar if needed
+            st.session_state["_criteria_overlay_rules"] = rules_count
+    except Exception:
+        pass  # Silently ignore - criteria will use last loaded version
+
+_auto_reload_criteria_overlay()
+
+# ---------------------------------------------------------------------------
 # Page Render Functions - one per selectbox option
 # ---------------------------------------------------------------------------
 
@@ -3471,7 +3491,7 @@ def render_bidding_arena():
                             raw_for_passes = str(auction_text).strip()
                             raw_for_passes = raw_for_passes.lstrip("^").rstrip("$").strip()
                             m_pass = re.match(r"(?i)^((p-)+)", raw_for_passes)
-                            leading_passes = (m_pass.group(1).lower().count("p-")) if m_pass else 0
+                            leading_passes = (m_pass.group(1).upper().count("P-")) if m_pass else 0
 
                             # For drilldown we want the BT seat-1 canonical auction (no leading p- padding),
                             # so the sequence we show matches the actual bt_seat1 row (e.g. "1s-p-p-p"),
@@ -3796,8 +3816,10 @@ def render_custom_criteria_editor():
                         key=f"partial_{idx}",
                         label_visibility="collapsed",
                     )
-                    if new_partial != rule["partial_auction"]:
-                        st.session_state.criteria_rules[idx]["partial_auction"] = new_partial
+                    # Normalize to canonical uppercase
+                    new_partial_normalized = new_partial.strip().upper() if new_partial else ""
+                    if new_partial_normalized != rule["partial_auction"]:
+                        st.session_state.criteria_rules[idx]["partial_auction"] = new_partial_normalized
                 
                 with cols[1]:
                     criteria_str = ", ".join(rule["criteria"])
@@ -3935,7 +3957,7 @@ def render_custom_criteria_editor():
             if new_partial and new_criteria_input:
                 new_criteria = [c.strip() for c in new_criteria_input.split(",") if c.strip()]
                 st.session_state.criteria_rules.append({
-                    "partial_auction": new_partial.strip().lower(),
+                    "partial_auction": new_partial.strip().upper(),  # Canonical uppercase
                     "criteria": new_criteria,
                 })
                 st.success(f"Added rule for '{new_partial}'")

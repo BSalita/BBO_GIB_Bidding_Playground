@@ -30,6 +30,23 @@ SUIT_IDX: Dict[str, int] = {"S": 0, "H": 1, "D": 2, "C": 3}
 # Directions in clockwise order starting from North
 DIRECTIONS_LIST: List[str] = ["N", "E", "S", "W"]
 
+# ===========================================================================
+# Canonical Auction Casing (single source of truth)
+# ===========================================================================
+
+def normalize_auction_case(auction: str) -> str:
+    """Normalize auction string to canonical UPPERCASE form.
+    
+    This is the single source of truth for auction casing throughout the codebase.
+    All auction strings for display/comparison should use this function.
+    
+    Examples:
+        normalize_auction_case("1n-p-2c") -> "1N-P-2C"
+        normalize_auction_case("p-p-1h-d-r") -> "P-P-1H-D-R"
+    """
+    return auction.upper() if auction else ""
+
+
 def agg_expr_col(seat: int) -> str:
     """Get the Agg_Expr column name for a seat."""
     return f"Agg_Expr_Seat_{seat}"
@@ -249,7 +266,7 @@ def count_leading_passes(auction: Any) -> int:
     """Count leading passes in an auction.
     
     Args:
-        auction: Auction as string ("p-p-1N-...") or list (["p", "p", "1N", ...])
+        auction: Auction as string ("P-P-1N-...") or list (["P", "P", "1N", ...])
     
     Returns:
         Number of leading passes (0-3)
@@ -263,15 +280,15 @@ def count_leading_passes(auction: Any) -> int:
             return 0
         # Normalize separators (space/comma/dash) to canonical dash format
         norm = normalize_auction_input(auction)
-        bids = [b.strip().lower() for b in norm.split("-")] if norm else []
+        bids = [b.strip().upper() for b in norm.split("-")] if norm else []
     elif isinstance(auction, list):
-        bids = [str(b).strip().lower() for b in auction]
+        bids = [str(b).strip().upper() for b in auction]
     else:
         return 0
     
     count = 0
     for bid in bids:
-        if bid in ("p", "pass"):
+        if bid in ("P", "PASS"):
             count += 1
         else:
             break
@@ -456,25 +473,25 @@ def lookup_bt_row(
     Returns:
         Tuple of (matched_df, normalized_auction_string)
     """
-    # Canonicalize auction tokens (e.g. "1nt" -> "1N", "pass" -> "p"), then strip leading passes (seat-1 view).
+    # Canonicalize auction tokens (e.g. "1nt" -> "1N", "pass" -> "P"), then strip leading passes (seat-1 view).
     # IMPORTANT: This is used for *literal* auction lookups, not regex matching.
     auction_norm = normalize_auction_input(bid_str) if bid_str else ""
-    auction_for_search = re.sub(r"(?i)^(p-)+", "", auction_norm).lower() if auction_norm else ""
+    auction_for_search = re.sub(r"(?i)^(P-)+", "", auction_norm).upper() if auction_norm else ""
     
-    # Try common variants with/without trailing "-p-p-p" because BT rows aren't always consistent
+    # Try common variants with/without trailing "-P-P-P" because BT rows aren't always consistent
     # across endpoints (some use completed-auction rows, some use prefix rows).
     candidates: list[str] = []
     if auction_for_search:
         candidates.append(auction_for_search)
-        if auction_for_search.endswith("-p-p-p"):
-            candidates.append(auction_for_search[: -len("-p-p-p")])
+        if auction_for_search.endswith("-P-P-P"):
+            candidates.append(auction_for_search[: -len("-P-P-P")])
         else:
-            candidates.append(auction_for_search + "-p-p-p")
+            candidates.append(auction_for_search + "-P-P-P")
 
     if not candidates:
         return bt_lookup_df.head(0), auction_for_search
 
-    auc_col = pl.col("Auction").cast(pl.Utf8).str.to_lowercase()
+    auc_col = pl.col("Auction").cast(pl.Utf8).str.to_uppercase()
     bt_match = bt_lookup_df.filter(auc_col.is_in(candidates))
     return bt_match, auction_for_search
 
@@ -501,7 +518,7 @@ def get_bt_info_from_match(bt_match: pl.DataFrame) -> Dict[str, Any] | None:
 def prepare_deals_with_bid_str(deal_df: pl.DataFrame) -> pl.DataFrame:
     """Add _bid_str and _auction_key columns to deal DataFrame for joining.
     
-    _auction_key is normalized: lowercase, leading passes stripped, trailing -p-p-p removed.
+    _auction_key is normalized: UPPERCASE (canonical), leading passes stripped, trailing -P-P-P removed.
     """
     bid_dtype = deal_df.schema.get("bid")
     
@@ -518,12 +535,12 @@ def prepare_deals_with_bid_str(deal_df: pl.DataFrame) -> pl.DataFrame:
             ).alias("_bid_str")
         )
     
-    # Add normalized auction key for joining
+    # Add normalized auction key for joining (canonical UPPERCASE)
     df = df.with_columns(
         pl.col("_bid_str")
-        .str.to_lowercase()
-        .str.replace(r"^(p-)+", "")  # Strip leading passes
-        .str.replace(r"-p-p-p$", "")  # Strip trailing passes for matching
+        .str.to_uppercase()
+        .str.replace(r"^(P-)+", "")  # Strip leading passes
+        .str.replace(r"-P-P-P$", "")  # Strip trailing passes for matching
         .alias("_auction_key")
     )
     
@@ -533,17 +550,17 @@ def prepare_deals_with_bid_str(deal_df: pl.DataFrame) -> pl.DataFrame:
 def prepare_bt_for_join(bt_df: pl.DataFrame) -> pl.DataFrame:
     """Add _auction_key column to BT DataFrame for joining.
     
-    Filters to completed auctions only and normalizes the auction key.
+    Filters to completed auctions only and normalizes the auction key (canonical UPPERCASE).
     """
     if "is_completed_auction" in bt_df.columns:
         bt_df = bt_df.filter(pl.col("is_completed_auction"))
     
-    # Add normalized key (BT auctions are already seat-1 normalized, just need lowercase + strip trailing passes)
+    # Add normalized key (BT auctions are already seat-1 normalized, just need uppercase + strip trailing passes)
     return bt_df.with_columns(
         pl.col("Auction")
         .cast(pl.Utf8)
-        .str.to_lowercase()
-        .str.replace(r"-p-p-p$", "")  # Strip trailing passes for matching
+        .str.to_uppercase()
+        .str.replace(r"-P-P-P$", "")  # Strip trailing passes for matching
         .alias("_auction_key")
     )
 
@@ -881,10 +898,12 @@ def evaluate_sl_criterion(
     deal_row: Dict[str, Any],
     fail_on_missing: bool = True,
 ) -> Optional[bool]:
-    """Evaluate a suit-length criterion dynamically.
+    """Evaluate a suit-length or complex criterion dynamically.
     
     Args:
-        criterion: The criterion string (e.g., 'SL_S >= 5' or 'SL_S >= SL_H')
+        criterion: The criterion string. Supports:
+            - Simple: 'SL_S >= 5', 'SL_S >= SL_H'
+            - Complex: '(SL_D > SL_H | SL_D > SL_S)', 'SL_D >= SL_C & SL_D > SL_H'
         dealer: The dealer direction
         seat: The seat number (1-4)
         deal_row: Dict containing hand data
@@ -893,7 +912,7 @@ def evaluate_sl_criterion(
     
     Returns:
         True if criterion passes, False if fails (or can't evaluate when fail_on_missing=True), 
-        None if not an SL criterion OR can't evaluate when fail_on_missing=False
+        None if not an SL/complex criterion OR can't evaluate when fail_on_missing=False
     """
     direction = seat_to_direction(dealer, seat)
     
@@ -916,6 +935,277 @@ def evaluate_sl_criterion(
             return False if fail_on_missing else None
         return eval_comparison(lv, op, num_val)
     
-    # Not an SL criterion - fall through to bitmap lookup
+    # Try complex expression with logical operators (e.g., SL_D > SL_H | SL_D > SL_S)
+    if is_complex_expression(criterion):
+        return evaluate_complex_expression(criterion, dealer, seat, deal_row, fail_on_missing)
+    
+    # Not an SL/complex criterion - fall through to bitmap lookup
     return None
+
+
+# ===========================================================================
+# Complex Criteria Expression Evaluator
+# ===========================================================================
+# Uses CriteriaEvaluator from mlBridgeBiddingLib for parsing complex expressions
+# with logical operators (&, |, and, or, not) and parentheses.
+
+# Lazy-loaded singleton instance of CriteriaEvaluator
+_criteria_evaluator = None
+
+
+def _get_criteria_evaluator():
+    """Get or create the CriteriaEvaluator singleton."""
+    global _criteria_evaluator
+    if _criteria_evaluator is None:
+        from mlBridgeLib.mlBridgeBiddingLib import CriteriaEvaluator
+        _criteria_evaluator = CriteriaEvaluator()
+    return _criteria_evaluator
+
+
+def strip_criterion_comments(expr: str) -> str:
+    """Strip inline comments from a criterion expression.
+    
+    A '#' character marks the beginning of a comment - everything from '#'
+    to the end of the line is ignored.
+    
+    Args:
+        expr: The expression string, possibly containing comments
+        
+    Returns:
+        The expression with comments removed and whitespace stripped
+    """
+    evaluator = _get_criteria_evaluator()
+    return evaluator.strip_comments(expr)
+
+
+def is_complex_expression(expr: str) -> bool:
+    """Check if an expression contains logical operators or parentheses.
+    
+    Complex expressions require the full CriteriaEvaluator; simple expressions
+    can use the faster regex-based parsers.
+    """
+    # Check for logical operators or grouping parentheses
+    return bool(re.search(r'[&|()]|\band\b|\bor\b|\bnot\b', expr, re.IGNORECASE))
+
+
+def parse_complex_expression(expr: str) -> Tuple[Tuple[str, ...], List[str]]:
+    """Parse a complex expression into postfix tokens.
+    
+    Args:
+        expr: The expression string (e.g., "(SL_D > SL_H | SL_D > SL_S)")
+        
+    Returns:
+        Tuple of (postfix_tokens, variables)
+        - postfix_tokens: Tuple of tokens in postfix notation
+        - variables: List of variable names found in the expression
+    """
+    evaluator = _get_criteria_evaluator()
+    
+    # Strip comments first
+    expr = evaluator.strip_comments(expr)
+    if not expr:
+        return tuple(), []
+    
+    # Tokenize and convert to postfix
+    tokens = re.findall(evaluator.token_pattern, expr)
+    postfix = evaluator.infix_to_postfix(tokens)
+    
+    # Extract variable names (anything that matches identifier pattern and isn't an operator)
+    ops = set(evaluator.ops.keys())
+    variables = [t for t in postfix if re.match(r'^[a-zA-Z_]\w*$', t) and t not in ops]
+    
+    return postfix, variables
+
+
+def evaluate_complex_expression(
+    expr: str,
+    dealer: str,
+    seat: int,
+    deal_row: Dict[str, Any],
+    fail_on_missing: bool = True,
+) -> Optional[bool]:
+    """Evaluate a complex expression against a single deal's hand data.
+    
+    Supports logical operators (&, |, and, or, not) and parentheses.
+    
+    Args:
+        expr: The expression string (e.g., "(SL_D > SL_H | SL_D > SL_S)")
+        dealer: The dealer direction (N/E/S/W)
+        seat: The seat number (1-4)
+        deal_row: Dict containing hand data (Hand_N, Hand_E, Hand_S, Hand_W, HCP_N, etc.)
+        fail_on_missing: If True, return False when hand data is missing.
+                        If False, return None (treat as untracked).
+    
+    Returns:
+        True if expression passes, False if fails, None if can't evaluate
+    """
+    evaluator = _get_criteria_evaluator()
+    
+    # Strip comments
+    expr = evaluator.strip_comments(expr)
+    if not expr:
+        return True  # Empty expression = passes
+    
+    # Get direction for this seat
+    direction = seat_to_direction(dealer, seat)
+    
+    # Tokenize and convert to postfix
+    tokens = re.findall(evaluator.token_pattern, expr)
+    if not tokens:
+        return True  # No tokens = passes
+    
+    postfix = evaluator.infix_to_postfix(tokens)
+    
+    # Build variable values dict for this deal/direction
+    var_values: Dict[str, Any] = {}
+    missing_vars: List[str] = []
+    
+    for token in postfix:
+        if token in evaluator.ops or token.isnumeric() or token in ('(', ')'):
+            continue
+        if not re.match(r'^[a-zA-Z_]\w*$', token):
+            continue
+        if token in var_values:
+            continue
+            
+        # Resolve variable value
+        val = _resolve_variable_value(token, direction, deal_row)
+        if val is None:
+            missing_vars.append(token)
+        else:
+            var_values[token] = val
+    
+    if missing_vars:
+        return False if fail_on_missing else None
+    
+    # Evaluate postfix expression
+    try:
+        result = _evaluate_postfix_single(postfix, var_values, evaluator.ops)
+        return bool(result)
+    except Exception:
+        return False if fail_on_missing else None
+
+
+def _resolve_variable_value(
+    var_name: str,
+    direction: str,
+    deal_row: Dict[str, Any],
+) -> Optional[int]:
+    """Resolve a variable name to its value for a given direction.
+    
+    Handles:
+    - SL_S, SL_H, SL_D, SL_C -> suit length from hand
+    - HCP -> high card points (from HCP_{direction} column)
+    - Total_Points -> total points (from Total_Points_{direction} column)
+    """
+    var_upper = var_name.upper()
+    
+    # Suit length variables
+    if var_upper.startswith("SL_") and len(var_upper) == 4:
+        suit = var_upper[-1]
+        if suit in SUIT_IDX:
+            return hand_suit_length(deal_row, direction, suit)
+    
+    # HCP variable
+    if var_upper == "HCP":
+        hcp_col = f"HCP_{direction}"
+        val = deal_row.get(hcp_col)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+        return None
+    
+    # Total_Points variable
+    if var_upper == "TOTAL_POINTS":
+        tp_col = f"Total_Points_{direction}"
+        val = deal_row.get(tp_col)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+        return None
+    
+    # Try direct column lookup (for any other variable)
+    # First try with direction suffix, then without
+    for col in [f"{var_name}_{direction}", var_name]:
+        val = deal_row.get(col)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+    
+    return None
+
+
+def _evaluate_postfix_single(
+    postfix: Tuple[str, ...],
+    var_values: Dict[str, Any],
+    ops: Dict[str, Any],
+) -> Any:
+    """Evaluate a postfix expression using single values (not vectorized).
+    
+    Args:
+        postfix: Tuple of tokens in postfix notation
+        var_values: Dict mapping variable names to their values
+        ops: Dict mapping operator strings to operator functions
+        
+    Returns:
+        The result of evaluating the expression
+    """
+    import operator as op_module
+    
+    # Map operators to scalar versions (not numpy vectorized)
+    scalar_ops = {
+        '==': op_module.eq,
+        '!=': op_module.ne,
+        '<=': op_module.le,
+        '>=': op_module.ge,
+        '<': op_module.lt,
+        '>': op_module.gt,
+        '&': lambda a, b: bool(a) and bool(b),
+        '|': lambda a, b: bool(a) or bool(b),
+        '+': op_module.add,
+        '-': op_module.sub,
+        '*': op_module.mul,
+        '/': op_module.truediv,
+        '//': op_module.floordiv,
+        '%': op_module.mod,
+        '**': op_module.pow,
+        'and': lambda a, b: bool(a) and bool(b),
+        'or': lambda a, b: bool(a) or bool(b),
+        'not': lambda a: not bool(a),
+    }
+    
+    stack: List[Any] = []
+    
+    for token in postfix:
+        if token.isnumeric():
+            stack.append(int(token))
+        elif token in scalar_ops:
+            if token == 'not':
+                if not stack:
+                    raise ValueError(f"Empty stack for 'not' operator")
+                a = stack.pop()
+                stack.append(scalar_ops[token](a))
+            else:
+                if len(stack) < 2:
+                    raise ValueError(f"Insufficient operands for '{token}'")
+                b = stack.pop()
+                a = stack.pop()
+                stack.append(scalar_ops[token](a, b))
+        elif re.match(r'^[a-zA-Z_]\w*$', token):
+            if token not in var_values:
+                raise ValueError(f"Unknown variable: {token}")
+            stack.append(var_values[token])
+        else:
+            raise ValueError(f"Invalid token: {token}")
+    
+    if len(stack) != 1:
+        raise ValueError(f"Invalid expression result: stack has {len(stack)} items")
+    
+    return stack[0]
 

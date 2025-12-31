@@ -60,6 +60,8 @@ from plugins.bbo_handlers_common import (
     agg_expr_col,
     wrong_bid_col,
     invalid_criteria_col,
+    # Canonical casing (single source of truth)
+    normalize_auction_case,
     # Typed state
     HandlerState,
     # Auction helpers
@@ -2406,13 +2408,13 @@ LIMIT {n_auction_groups}"""
         bt_info = None
         bt_auction = None
         if available_bt_cols:
-            # Strip leading "p-" prefixes (use regex, not lstrip which removes individual chars)
-            auction_for_search = re.sub(r"^(p-)+", "", (bid_auction.lower() if bid_auction else ""))
+            # Strip leading "P-" prefixes (use regex, not lstrip which removes individual chars)
+            auction_for_search = re.sub(r"^(P-)+", "", (bid_auction.upper() if bid_auction else ""))
 
-            bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_for_search)
-            if bt_match.height == 0 and not auction_for_search.endswith("-p-p-p"):
-                auction_with_passes = auction_for_search + "-p-p-p"
-                bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_lowercase() == auction_with_passes)
+            bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_uppercase() == auction_for_search)
+            if bt_match.height == 0 and not auction_for_search.endswith("-P-P-P"):
+                auction_with_passes = auction_for_search + "-P-P-P"
+                bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_uppercase() == auction_with_passes)
             if bt_match.height > 0:
                 bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(bt_match.row(0, named=True)), overlay)
                 bt_info = {c: bt_row.get(c) for c in available_bt_cols if c in bt_row}
@@ -3270,9 +3272,9 @@ def handle_bidding_arena(
     def _auction_key_seat1(auction: Any) -> str:
         """Canonical seat-1 lookup key for auctions.
         
-        - Normalizes tokens via normalize_auction_input (1nt/1n -> 1N, pass -> p)
+        - Normalizes tokens via normalize_auction_input (1nt/1n -> 1N, pass -> P)
         - Strips leading passes (seat-1 view)
-        - Lowercases for stable dict keys
+        - UPPERCASE for canonical form (stable dict keys)
         """
         if auction is None:
             return ""
@@ -3280,8 +3282,8 @@ def handle_bidding_arena(
             s = normalize_auction_input(str(auction))
         except Exception:
             s = str(auction)
-        s = re.sub(r"(?i)^(p-)+", "", s)
-        return s.lower()
+        s = re.sub(r"(?i)^(P-)+", "", s)
+        return s.upper()
     
     def _first_failure_for_bt_row(
         deal_idx: int,
@@ -3969,8 +3971,8 @@ def handle_bidding_arena(
             if bid_str:
                 # Normalize the deal's auction to the BT's seat-1 view for lookup.
                 bid_norm_full = normalize_auction_input(str(bid_str))
-                bid_str_seat1 = re.sub(r"(?i)^(p-)+", "", bid_norm_full)
-                bid_key = bid_str_seat1.lower()
+                bid_str_seat1 = re.sub(r"(?i)^(P-)+", "", bid_norm_full)
+                bid_key = bid_str_seat1.upper()  # Canonical UPPERCASE
                 lead_passes = _count_leading_passes(bid_norm_full)
                 rules_actual_lead_passes = int(lead_passes)
                 rules_actual_opener_seat = int((lead_passes % 4) + 1)
@@ -4049,19 +4051,19 @@ def handle_bidding_arena(
 
                 bt_row_actual = bt_auction_to_row_base.get(bid_key)
                 if bt_row_actual is None:
-                    # Handle common variants with/without the trailing "-p-p-p".
-                    if bid_key.endswith("-p-p-p"):
-                        bt_row_actual = bt_auction_to_row_base.get(bid_key[: -len("-p-p-p")])
+                    # Handle common variants with/without the trailing "-P-P-P".
+                    if bid_key.endswith("-P-P-P"):
+                        bt_row_actual = bt_auction_to_row_base.get(bid_key[: -len("-P-P-P")])
                     else:
-                        bt_row_actual = bt_auction_to_row_base.get(bid_key + "-p-p-p")
+                        bt_row_actual = bt_auction_to_row_base.get(bid_key + "-P-P-P")
                 if bt_row_actual is None:
                     # Fallback: O(1) lookup in the full completed-auctions cache (avoid per-deal Polars scans)
                     bt_row_actual = bt_auction_to_row_full_base.get(bid_key)
                     if bt_row_actual is None:
-                        if bid_key.endswith("-p-p-p"):
-                            bt_row_actual = bt_auction_to_row_full_base.get(bid_key[: -len("-p-p-p")])
+                        if bid_key.endswith("-P-P-P"):
+                            bt_row_actual = bt_auction_to_row_full_base.get(bid_key[: -len("-P-P-P")])
                         else:
-                            bt_row_actual = bt_auction_to_row_full_base.get(bid_key + "-p-p-p")
+                            bt_row_actual = bt_auction_to_row_full_base.get(bid_key + "-P-P-P")
                     if bt_row_actual is not None:
                         rules_actual_bt_lookup = "found_bt_full"
                     else:
@@ -4199,22 +4201,29 @@ def handle_bidding_arena(
         
         # Helper to get auction result for a model
         def _get_model_result(model: str) -> Tuple[Any, Any, Any]:
-            """Get (contract, auction, dd_score) for a model."""
+            """Get (contract, auction, dd_score) for a model.
+            
+            All auction strings are normalized to canonical uppercase for consistent comparison.
+            """
             if model == "Actual":
-                return row.get("Contract", ""), bid_str, row.get("DD_Score_Declarer")
+                # Normalize to canonical case for consistent display/comparison
+                auction_out = normalize_auction_case(bid_str)
+                return row.get("Contract", ""), auction_out, row.get("DD_Score_Declarer")
             elif model == "Rules":
                 if rules_auction:
+                    auction_out = normalize_auction_case(rules_auction)
                     return (
                         get_ai_contract(rules_auction, dealer),
-                        rules_auction,
+                        auction_out,
                         get_dd_score_for_auction(rules_auction, dealer, row),
                     )
                 return None, None, None
             elif model == "Raw_Rules":
                 if raw_rules_auction:
+                    auction_out = normalize_auction_case(raw_rules_auction)
                     return (
                         get_ai_contract(raw_rules_auction, dealer),
-                        raw_rules_auction,
+                        auction_out,
                         get_dd_score_for_auction(raw_rules_auction, dealer, row),
                     )
                 return None, None, None
@@ -4243,10 +4252,12 @@ def handle_bidding_arena(
             try:
                 if rules_matches:
                     rules_matches_auctions_str = ", ".join(
-                        str(m.get("auction")) for m in rules_matches if m and m.get("auction") is not None
+                        normalize_auction_case(str(m.get("auction"))) for m in rules_matches if m and m.get("auction") is not None
                     )
             except Exception:
                 rules_matches_auctions_str = ""
+            # Normalize rules_auction to canonical case for display
+            rules_auction_display = normalize_auction_case(rules_auction) if rules_auction else None
             sample_deals_output.append(
                 {
                     "index": row.get("index"),
@@ -4273,7 +4284,7 @@ def handle_bidding_arena(
                     "Rules_Matches_Truncated": bool(rules_matches_truncated),
                     # String form only (avoid List[Null] / List[str] inference problems in Polars/AgGrid)
                     "Rules_Matches_Auctions_Str": rules_matches_auctions_str,
-                    "Auction_Rules_Selected": rules_auction,
+                    "Auction_Rules_Selected": rules_auction_display,
                     f"DD_Score_{model_a}": (int(dd_score_a) if dd_score_a is not None else None),
                     f"DD_Score_{model_b}": (int(dd_score_b) if dd_score_b is not None else None),
                     "IMP_Diff": None,

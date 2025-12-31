@@ -342,14 +342,14 @@ INIT_STEPS_WITHOUT_PREWARM = 6
 def _normalize_auction_expr(col_name: str = "Auction") -> pl.Expr:
     """Create a Polars expression that normalizes auction strings.
     
-    Normalizes by: lowercase, strip leading passes (p-).
+    Normalizes by: UPPERCASE (canonical), strip leading passes (P-).
     This is used consistently across all auction matching code.
     """
     return (
         pl.col(col_name)
         .cast(pl.Utf8)
-        .str.to_lowercase()
-        .str.replace(r"^(p-)+", "")
+        .str.to_uppercase()
+        .str.replace(r"^(P-)+", "")
     )
 
 
@@ -358,11 +358,28 @@ def _normalize_auction_expr(col_name: str = "Auction") -> pl.Expr:
 # ---------------------------------------------------------------------------
 
 
+def _strip_inline_comment(s: str) -> str:
+    """Strip inline comments from a string (everything after #)."""
+    pos = s.find('#')
+    if pos != -1:
+        s = s[:pos]
+    return s.strip()
+
+
 def _load_auction_criteria() -> list[tuple[str, list[str]]]:
     """Load criteria.csv and return list of (partial_auction, [criteria...]).
     
     CSV format: partial_auction,criterion1,criterion2,...
     Example row: 1c,SL_S >= SL_H,HCP >= 12
+    
+    Comments:
+    - Lines starting with # are skipped entirely
+    - Inline comments (text after #) are stripped from each cell
+    
+    Complex expressions with &, |, parentheses are supported:
+    - (SL_D > SL_H | SL_D > SL_S) - OR logic
+    - SL_D >= SL_C & SL_D > SL_H - AND logic
+    - Parentheses for grouping
     """
     if not auction_criteria_file.exists():
         return []
@@ -372,11 +389,23 @@ def _load_auction_criteria() -> list[tuple[str, list[str]]]:
         with open(auction_criteria_file, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
             for row in reader:
-                if not row or row[0].startswith('#'):  # Skip empty lines and comments
+                if not row:
                     continue
-                partial_auction = row[0].strip().lower()
-                criteria = [c.strip() for c in row[1:] if c.strip()]
-                if partial_auction and criteria:
+                # Skip lines where first cell is a comment
+                first_cell = row[0].strip()
+                if first_cell.startswith('#'):
+                    continue
+                # Strip inline comments from first cell (partial auction) - canonical UPPERCASE
+                partial_auction = _strip_inline_comment(first_cell).upper()
+                if not partial_auction:
+                    continue
+                # Strip inline comments from each criterion
+                criteria = []
+                for c in row[1:]:
+                    c_clean = _strip_inline_comment(c)
+                    if c_clean:
+                        criteria.append(c_clean)
+                if criteria:
                     criteria_list.append((partial_auction, criteria))
     except Exception as e:
         print(f"[auction-criteria] Error loading {auction_criteria_file}: {e}")
@@ -437,7 +466,7 @@ def _build_custom_criteria_overlay(available_criteria_names: set[str] | None = N
             unknown_criteria.append(c0)
 
         overlay.append(
-            {"partial": partial_auction.strip().lower(), "seat": int(seat), "criteria": normalized_criteria}
+            {"partial": partial_auction.strip().upper(), "seat": int(seat), "criteria": normalized_criteria}  # Canonical UPPERCASE
         )
 
     # Provide a UI-friendly "rules" list for `/custom-criteria-info`.
@@ -585,14 +614,14 @@ def _apply_auction_criteria(
             
             matching_mask = matches_partial & (pl.col(dealer_col) == dealer)
             matching_rows = df.filter(matching_mask)
-            
+                
             # Track rejected rows if requested
             if track_rejected and matching_rows.height > 0:
                 for row_idx in range(matching_rows.height):
                     row = matching_rows.row(row_idx, named=True)
                     single_row_df = matching_rows.slice(row_idx, 1)
                     failed_criteria = _check_row_criteria(single_row_df, criteria_exprs)
-                    
+                        
                     if len(failed_criteria) > 0:
                         rejected_rows.append({
                             'Auction': str(row.get(auction_col, '')),
@@ -602,7 +631,7 @@ def _apply_auction_criteria(
                             'Seat': int(seat),
                             'Direction': str(direction),
                         })
-            
+                
             # Apply filter: keep rows that don't match OR satisfy criteria
             combined_criteria = _combine_criteria_expressions(criteria_exprs)
             try:
@@ -1457,7 +1486,7 @@ def save_custom_criteria_rules(req: CustomCriteriaSaveRequest) -> Dict[str, Any]
             # Write header comment
             writer.writerow(["# Custom auction criteria - format: partial_auction,criterion1,criterion2,..."])
             for rule in req.rules:
-                row = [rule.partial_auction.strip().lower()] + [c.strip() for c in rule.criteria]
+                row = [rule.partial_auction.strip().upper()] + [c.strip() for c in rule.criteria]  # Canonical UPPERCASE
                 writer.writerow(row)
         
         return {
@@ -1523,12 +1552,12 @@ def preview_custom_criteria(req: CustomCriteriaPreviewRequest) -> Dict[str, Any]
     """Preview how many auctions would be affected by a rule."""
     _ensure_ready()
     
-    partial = req.partial_auction.strip().lower()
+    partial = req.partial_auction.strip().upper()  # Canonical UPPERCASE
     
     with _STATE_LOCK:
         bt_seat1_df = STATE["bt_seat1_df"]
     
-    # Find auctions that start with this partial (case-insensitive, ignore leading passes)
+    # Find auctions that start with this partial (ignore leading passes)
     matches = bt_seat1_df.filter(_normalize_auction_expr().str.starts_with(partial))
     
     # Determine which seat this affects
@@ -1918,12 +1947,12 @@ def _filter_auctions_by_hand_criteria(
     rejected_info = []
     rows_to_keep = []
     
-    # Criteria matching is defined in "seat-1 view" (no leading p-), so strip leading passes for matching.
-    _pass_prefix_re = re.compile(r"^(p-)+")
+    # Criteria matching is defined in "seat-1 view" (no leading P-), so strip leading passes for matching.
+    _pass_prefix_re = re.compile(r"^(P-)+")
     
     for row_idx in range(df.height):
         row = df.row(row_idx, named=True)
-        auction = str(row.get(auction_col, '')).lower()
+        auction = str(row.get(auction_col, '')).upper()  # Canonical UPPERCASE
         auction_norm = _pass_prefix_re.sub("", auction)
         keep_row = True
         failed_criteria = []

@@ -75,9 +75,9 @@ def normalize_auction_input(auction: str) -> str:
 
     - Accepts bid separators: '-', whitespace, or ','
     - Canonical output separator is '-'
-    - Normalizes passes: 'pass' -> 'p'
+    - Normalizes passes: 'pass' -> 'P'
     - Normalizes NT: '1nt', '1n' -> '1N'
-    - Uppercases strain letters (CDHSN) and level digits are preserved
+    - Uppercases all tokens (canonical UPPERCASE form)
 
     This is intended for literal auction strings (not regex patterns).
     """
@@ -98,7 +98,7 @@ def normalize_auction_input(auction: str) -> str:
             continue
         tl = t.lower()
         if tl in ("p", "pass"):
-            out.append("p")
+            out.append("P")  # Canonical uppercase
             continue
         # Normalize suit symbols if user pasted them
         if any(sym in t for sym in suit_map):
@@ -187,8 +187,8 @@ def normalize_auction_pattern(pattern: str) -> str:
     if re.search(r"(\.\*|\.\+|\[[^\]]*\]\*|\[[^\]]*\]\+)$", pattern):
         return pattern + ("$" if has_end_anchor else "")
 
-    # Append trailing passes
-    pattern = pattern + "-p-p-p"
+    # Append trailing passes (canonical uppercase)
+    pattern = pattern + "-P-P-P"
     return pattern + ("$" if has_end_anchor else "")
 
 
