@@ -4306,6 +4306,7 @@ def handle_bidding_arena(
                     "Rejection_Reason": rejection_reason or "",
                     "Rules_NoMatch_Debug": rules_debug,
                     # Additional fields for display
+                    "Contract": row.get("Contract", ""),
                     "Result": row.get("Result", ""),
                     "Score": row.get("Score", ""),
                     "ParScore": row.get("ParScore", par_score),

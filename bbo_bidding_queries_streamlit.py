@@ -806,6 +806,7 @@ def render_aggrid(
     hide_cols: list[str] | None = None,
     show_copy_panel: bool = False,
     copy_panel_default_col: str | None = None,
+    fit_columns_to_view: bool = False,
 ) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
     
@@ -924,6 +925,19 @@ def render_aggrid(
     gb.configure_selection(selection_mode="single", use_checkbox=False, suppressRowClickSelection=False)
     # Explicitly set row/header heights to ensure consistent sizing
     # suppressCellFocus prevents cell-level focus (keeps row selection clean) but can interfere with copy UX.
+    # Tighten specific columns that tend to be too wide (must be before build())
+    # Width is max of target width and column name length (approx 8px per char)
+    tight_cols = {
+        "Score": 70, "ParScore": 80, "Result": 60, "Contract": 70,
+        "Dealer": 60, "Vul": 50, "index": 70,
+    }
+    CHAR_WIDTH = 9  # Approximate pixels per character for header text
+    for col_name, target_width in tight_cols.items():
+        if col_name in df.columns:
+            header_width = len(col_name) * CHAR_WIDTH + 20  # Add padding for sort icon
+            width = max(target_width, header_width)
+            gb.configure_column(col_name, width=width, maxWidth=width + 20)
+    
     gb.configure_grid_options(
         rowHeight=28,
         headerHeight=32,
@@ -944,13 +958,16 @@ def render_aggrid(
     default_col_def.setdefault("cellStyle", {"padding": "2px 6px"})
     grid_options["defaultColDef"] = default_col_def
 
+    # Choose auto-size mode: FIT_ALL_COLUMNS_TO_VIEW for compact tables, FIT_CONTENTS for wide tables
+    auto_size_mode = ColumnsAutoSizeMode.FIT_ALL_COLUMNS_TO_VIEW if fit_columns_to_view else ColumnsAutoSizeMode.FIT_CONTENTS
+    
     response = AgGrid(
         df.to_pandas(),
         gridOptions=grid_options,
         height=height,
         theme="balham",
         key=key,
-        columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
+        columns_auto_size_mode=auto_size_mode,
         # Critical UX: clicking a row should only highlight it locally and NOT
         # emit selection/model updates back to Streamlit (which would cause a rerun)
         # unless specifically requested via update_mode.
@@ -2603,7 +2620,7 @@ def render_auction_criteria_debugger():
                     seat_rows[0]["Rules_S1_Count"] = len(rules_s1) if rules_s1 else 0
                 
                 seat_df = pl.DataFrame(seat_rows)
-                st.dataframe(seat_df, use_container_width=True, hide_index=True)
+                render_aggrid(seat_df, key="auction_debugger_seats", height=calc_grid_height(len(seat_df)), table_name="auction_debugger_seats")
                 
                 if not any(criteria_by_seat.values()):
                     st.info("No criteria on any seat for this BT row.")
@@ -4889,40 +4906,6 @@ def render_auction_builder():
         st.session_state.auction_builder_options = {}  # Cache of available options per prefix
     
     # Sidebar controls
-    st.sidebar.subheader("Auction Builder Controls")
-    
-    # Initial auction input
-    initial_auction_raw = st.sidebar.text_input(
-        "Start from Auction",
-        value="",
-        help="Enter an auction to start from (e.g., '1S-P-2S' or '1N'). Leave empty to start from opening bids.",
-        key="auction_builder_initial",
-    )
-    initial_auction = normalize_auction_input(initial_auction_raw).upper() if initial_auction_raw.strip() else ""
-    
-    if st.sidebar.button("📥 Load Initial Auction", type="primary", disabled=not initial_auction):
-        # Parse and load the initial auction
-        if initial_auction:
-            bids = [b.strip() for b in initial_auction.split("-") if b.strip()]
-            new_path = []
-            for i, bid in enumerate(bids):
-                new_path.append({
-                    "bid": bid.upper(),
-                    "bt_index": None,  # Will be populated on next fetch
-                    "agg_expr": [],
-                    "is_complete": False,
-                })
-            st.session_state.auction_builder_path = new_path
-            st.session_state.auction_builder_options = {}  # Clear cache
-            st.rerun()
-    
-    if st.sidebar.button("🔄 Reset Auction", type="secondary"):
-        st.session_state.auction_builder_path = []
-        st.session_state.auction_builder_options = {}
-        st.rerun()
-    
-    st.sidebar.divider()
-    
     max_matching_deals = st.sidebar.number_input(
         "Max Matching Deals",
         value=25,
@@ -4949,12 +4932,85 @@ def render_auction_builder():
         last_step = current_path[-1]
         is_complete = last_step.get("is_complete", False)
     
-    # Display current auction state
+    # Display current auction state with editable input
     st.subheader("Current Auction")
-    if current_auction:
-        st.success(f"**{current_auction}**" + (" ✅ (Complete)" if is_complete else ""))
-    else:
-        st.info("No bids yet. Select an opening bid below.")
+    
+    # Track last applied auction to prevent render loops
+    if "auction_builder_last_applied" not in st.session_state:
+        st.session_state.auction_builder_last_applied = ""
+    
+    col_auction, col_apply, col_undo, col_spacer = st.columns([3, 1, 1, 3])
+    with col_auction:
+        # Use dynamic key based on path length to force update when bids are added
+        edit_key = f"auction_builder_edit_input_{len(current_path)}"
+        edited_auction = st.text_input(
+            "Edit auction directly",
+            value=current_auction,
+            placeholder="e.g., 1C-P-1H-P (Enter to apply)",
+            label_visibility="collapsed",
+            key=edit_key,
+        )
+    with col_apply:
+        apply_edit = st.button("Apply", key="auction_builder_apply_edit")
+    with col_undo:
+        if current_path and st.button("⬅️ Undo", key="auction_builder_undo"):
+            st.session_state.auction_builder_path.pop()
+            st.session_state.auction_builder_last_applied = ""
+            st.rerun()
+    
+    # Handle manual auction edit - trigger on Enter (value change) OR button click
+    # But skip if we just applied this same value (prevents render loop)
+    edited_normalized = normalize_auction_input(edited_auction).upper() if edited_auction else ""
+    already_applied = edited_normalized == st.session_state.auction_builder_last_applied
+    value_changed = edited_normalized != current_auction.upper()
+    
+    if (value_changed or apply_edit) and not already_applied:
+        edited_normalized = normalize_auction_input(edited_auction).upper()
+        if edited_normalized:
+            bids = [b.strip() for b in edited_normalized.split("-") if b.strip()]
+            new_path = []
+            
+            # Fetch bid data from API for each step to get proper agg_expr
+            for i, bid in enumerate(bids):
+                prefix = "-".join([b["bid"] for b in new_path]) if new_path else ""
+                
+                # Try to get bid info from API
+                bid_info = {"bid": bid.upper(), "bt_index": None, "agg_expr": [], "is_complete": False}
+                try:
+                    resp = requests.post(
+                        f"{API_BASE}/list-next-bids",
+                        json={"auction": prefix},
+                        timeout=5
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        for nb in data.get("next_bids", []):
+                            if nb.get("bid", "").upper() == bid.upper():
+                                bid_info = {
+                                    "bid": bid.upper(),
+                                    "bt_index": nb.get("bt_index"),
+                                    "agg_expr": nb.get("agg_expr", []),
+                                    "is_complete": nb.get("is_completed_auction", False),
+                                }
+                                break
+                except Exception:
+                    pass  # Use default empty info
+                
+                new_path.append(bid_info)
+            
+            st.session_state.auction_builder_path = new_path
+            st.session_state.auction_builder_options = {}  # Clear cache
+            st.session_state.auction_builder_last_applied = edited_normalized  # Prevent re-trigger
+            st.rerun()
+        else:
+            # Clear auction
+            st.session_state.auction_builder_path = []
+            st.session_state.auction_builder_options = {}
+            st.session_state.auction_builder_last_applied = ""  # Prevent re-trigger
+            st.rerun()
+    
+    if is_complete:
+        st.success("✅ Auction Complete")
     
     # Fetch available next bids using fast /list-next-bids endpoint
     def get_next_bid_options(prefix: str) -> list[dict]:
@@ -5003,9 +5059,11 @@ def render_auction_builder():
             st.error(f"Error fetching bid options: {e}")
             return []
     
-    # Display bid selection columns
+    # Display bid selection
     if not is_complete:
-        st.subheader(f"Select Bid for Seat {current_seat}")
+        # Seat cycles 1-4, Bid Num is always increasing
+        seat_1_to_4 = ((current_seat - 1) % 4) + 1
+        st.markdown(f"**Select Bid for Seat {seat_1_to_4}**")
         
         with st.spinner("Loading available bids..."):
             options = get_next_bid_options(current_auction)
@@ -5013,40 +5071,75 @@ def render_auction_builder():
         if not options:
             st.warning("No more bids available in BT for this auction prefix.")
         else:
-            # Create a formatted list for selectbox
-            option_labels = []
-            for opt in options:
-                expr_preview = "; ".join(opt["agg_expr"][:3]) if opt.get("agg_expr") else "(no criteria)"
-                if len(opt.get("agg_expr", [])) > 3:
-                    expr_preview += "..."
-                complete_marker = " ✅" if opt.get("is_complete") else ""
-                option_labels.append(f"{opt['bid']}{complete_marker} — {expr_preview}")
+            # Sort options: P first, then D, then R, then rest alphabetically
+            def bid_sort_key(opt):
+                bid = opt.get("bid", "").upper()
+                if bid == "P":
+                    return (0, bid)
+                elif bid == "D":
+                    return (1, bid)
+                elif bid == "R":
+                    return (2, bid)
+                else:
+                    return (3, bid)
             
-            selected_idx = st.selectbox(
-                f"Next Bid (Seat {current_seat})",
-                range(len(options)),
-                format_func=lambda i: option_labels[i],
-                key=f"auction_builder_seat_{current_seat}",
+            sorted_options = sorted(options, key=bid_sort_key)
+            
+            # Build DataFrame for bid selection
+            bid_rows = []
+            for i, opt in enumerate(sorted_options):
+                criteria_list = opt.get("agg_expr", [])
+                criteria_str = "; ".join(criteria_list[:5])
+                if len(criteria_list) > 5:
+                    criteria_str += "..."
+                complete_marker = " ✅" if opt.get("is_complete") else ""
+                bid_rows.append({
+                    "_idx": i,
+                    "Bid Num": current_seat,
+                    "Seat": seat_1_to_4,
+                    "Bid": f"{opt['bid']}{complete_marker}",
+                    "Criteria": criteria_str if criteria_str else "(none)",
+                })
+            
+            bids_df = pl.DataFrame(bid_rows)
+            
+            # Use AgGrid with row selection
+            gb = GridOptionsBuilder.from_dataframe(bids_df.to_pandas())
+            gb.configure_selection(selection_mode="single", use_checkbox=False)
+            gb.configure_column("_idx", hide=True)
+            gb.configure_column("Bid Num", width=70)
+            gb.configure_column("Seat", width=50)
+            gb.configure_column("Bid", width=80)
+            gb.configure_column("Criteria", flex=1)
+            grid_options = gb.build()
+            
+            # Track last selected to detect new clicks
+            if "auction_builder_last_selected" not in st.session_state:
+                st.session_state.auction_builder_last_selected = None
+            
+            grid_response = AgGrid(
+                bids_df.to_pandas(),
+                gridOptions=grid_options,
+                height=min(200, 35 + len(bid_rows) * 28),
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                key=f"auction_builder_bids_grid_{current_seat}",
+                theme="streamlit",
             )
             
-            if st.button("➕ Add Bid", type="primary"):
-                selected_opt = options[selected_idx]
-                st.session_state.auction_builder_path.append(selected_opt)
-                # Clear cached options for next level
-                new_auction = "-".join([step["bid"] for step in st.session_state.auction_builder_path])
-                if new_auction not in st.session_state.auction_builder_options:
-                    pass  # Will fetch on next render
-                st.rerun()
-    
-    # Undo last bid button
-    if current_path:
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            if st.button("⬅️ Undo Last Bid"):
-                st.session_state.auction_builder_path.pop()
-                st.rerun()
-    
-    st.divider()
+            selected_rows = grid_response.get("selected_rows")
+            if selected_rows is not None and len(selected_rows) > 0:
+                selected_row = selected_rows[0] if isinstance(selected_rows, list) else selected_rows.iloc[0].to_dict()
+                selected_idx = int(selected_row.get("_idx", 0))
+                selected_bid = sorted_options[selected_idx]["bid"]
+                
+                # Check if this is a new selection (different from last)
+                selection_key = f"{current_auction}-{selected_bid}"
+                if selection_key != st.session_state.auction_builder_last_selected:
+                    st.session_state.auction_builder_last_selected = selection_key
+                    selected_opt = sorted_options[selected_idx]
+                    st.session_state.auction_builder_path.append(selected_opt)
+                    st.session_state.auction_builder_last_applied = ""
+                    st.rerun()
     
     # Summary DataFrame
     if current_path:
@@ -5054,14 +5147,14 @@ def render_auction_builder():
         
         summary_rows = []
         for i, step in enumerate(current_path):
-            seat = i + 1
-            direction = ["N", "E", "S", "W"][(seat - 1) % 4]  # Assuming dealer is N
+            bid_num = i + 1
+            seat_1_to_4 = ((bid_num - 1) % 4) + 1
             criteria_str = "; ".join(step.get("agg_expr", [])[:8])
             if len(step.get("agg_expr", [])) > 8:
                 criteria_str += "..."
             summary_rows.append({
-                "Seat": seat,
-                "Direction": direction,
+                "Bid Num": bid_num,
+                "Seat": seat_1_to_4,
                 "Bid": step["bid"],
                 "BT Index": step.get("bt_index"),
                 "Criteria Count": len(step.get("agg_expr", [])),
@@ -5070,9 +5163,7 @@ def render_auction_builder():
             })
         
         summary_df = pl.DataFrame(summary_rows)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-        
-        st.divider()
+        render_aggrid(summary_df, key="auction_builder_summary", height=calc_grid_height(len(summary_df)), table_name="auction_builder_summary")
         
         # Matching Deals section - on-demand loading via button
         st.subheader("🎯 Matching Deals")
@@ -5235,7 +5326,7 @@ if show_custom_criteria:
                     if rules:
                         st.markdown(f"**{len(rules)} rules applied** affecting {stats.get('auctions_modified', 0):,} auctions")
                         rules_df = pl.DataFrame(rules)
-                        st.dataframe(rules_df.to_pandas(), use_container_width=True)
+                        render_aggrid(rules_df, key="custom_criteria_rules", height=calc_grid_height(len(rules_df)), table_name="custom_criteria_rules")
                     else:
                         st.info("No rules defined in the CSV file.")
             else:
