@@ -626,7 +626,7 @@ def batch_check_wrong_bids(
     
     seats_to_check = [seat_filter] if seat_filter else list(SEAT_RANGE)
 
-    from plugins.custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_overlay
+    from plugins.bbo_bt_custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_overlay
     
     # Process rows - still a loop but without per-row DataFrame filters
     for row in joined_df.iter_rows(named=True):

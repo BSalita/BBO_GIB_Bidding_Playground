@@ -107,7 +107,7 @@ from plugins.bbo_handlers_common import (
 )
 
 
-from plugins.custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_custom_criteria_overlay_to_bt_row
+from plugins.bbo_bt_custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_custom_criteria_overlay_to_bt_row
 
 
 def _compute_seat_stats_for_bt_row(
