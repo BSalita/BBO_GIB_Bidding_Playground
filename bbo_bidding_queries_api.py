@@ -30,14 +30,14 @@ import pathlib
 import pyarrow.parquet as pq
 
 # Add mlBridgeLib to path so its internal imports work (append, not insert, to avoid shadowing the package)
-sys.path.append(os.path.join(os.path.dirname(__file__), "mlBridgeLib"))
+sys.path.append(str(pathlib.Path(__file__).parent / "mlBridgeLib"))
 
 import psutil
 
 
 def _fast_exit_handler(signum, frame):
     """Exit immediately without Python's slow garbage collection cleanup."""
-    print("\n[shutdown] Received signal, exiting immediately (skipping GC cleanup). Takes about 20 seconds.")
+    print("\n[shutdown] Received signal, exiting immediately (skipping python GC cleanup). Takes about 30 seconds to clean system pagefile cache.")
     os._exit(0)
 
 
@@ -206,6 +206,50 @@ def _get_handler_module():
     return handler_module
 
 
+_AGG_EXPR_SEAT_COLS = {
+    "Agg_Expr_Seat_1",
+    "Agg_Expr_Seat_2",
+    "Agg_Expr_Seat_3",
+    "Agg_Expr_Seat_4",
+}
+
+# If Agg_Expr columns appear on a huge bt_seat1_df, we will thrash pagefile.
+# This is a safety rail to prevent accidental regressions.
+_MAX_BT_ROWS_ALLOWED_WITH_AGG_EXPR_LOADED = 5_000_000
+
+
+def _sanity_check_state_for_memory(state: Dict[str, Any]) -> None:
+    """Fail-fast checks to prevent catastrophic memory/pagefile thrashing.
+
+    Invariants:
+    - `STATE["bt_seat1_df"]` should NOT include Agg_Expr_Seat_* columns for the full BT
+      (461M rows). Those columns must be loaded on-demand for small bt_index subsets.
+    - If any endpoint needs on-demand Agg_Expr loading, `STATE["bt_seat1_file"]` must exist.
+    """
+    bt_df = state.get("bt_seat1_df")
+    if isinstance(bt_df, pl.DataFrame):
+        if _AGG_EXPR_SEAT_COLS.intersection(set(bt_df.columns)):
+            if bt_df.height > _MAX_BT_ROWS_ALLOWED_WITH_AGG_EXPR_LOADED:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "FATAL: bt_seat1_df was loaded with Agg_Expr_Seat_* columns for a large BT.\n"
+                        f"Rows={bt_df.height:,} (limit={_MAX_BT_ROWS_ALLOWED_WITH_AGG_EXPR_LOADED:,}).\n"
+                        "This will cause massive RAM/pagefile thrashing.\n"
+                        "Fix: do not load Agg_Expr_Seat_* in _load_bt_seat1_df; load on-demand by bt_index."
+                    ),
+                )
+
+    # If we are running the lightweight BT (no Agg_Expr in memory), ensure the file path is present.
+    # This supports on-demand loading in handler utilities.
+    bt_file = state.get("bt_seat1_file")
+    if bt_file is None:
+        # Not all endpoints need it, but missing it usually indicates a state wiring bug.
+        # Keep as a warning-only check to avoid breaking read-only endpoints.
+        # (Handlers that require on-demand Agg_Expr will raise a clearer error.)
+        pass
+
+
 def _prepare_handler_call() -> Tuple[Dict[str, Any], dict, Any]:
     """Common setup for endpoint handlers.
     
@@ -220,6 +264,7 @@ def _prepare_handler_call() -> Tuple[Dict[str, Any], dict, Any]:
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
+    _sanity_check_state_for_memory(state)
     handler_module = _get_handler_module()
     return state, reload_info, handler_module
 
@@ -299,12 +344,12 @@ else:
 
 exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
 bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented_matches.parquet")
-bt_seat1_file = dataPath.joinpath("bbo_bt_seat1.parquet")  # Clean seat-1-only table
+bt_seat1_file = dataPath.joinpath("bbo_bt_compiled.parquet")  # Pre-compiled BT with learned rules baked in
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
-# Merged rules file: learned criteria with deduplication (for Rules model)
-merged_rules_file = dataPath.joinpath("bbo_bt_merged_rules.parquet")
+# New rules file: detailed rule discovery metrics (detailed view)
+new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
 
 # ---------------------------------------------------------------------------
 # Constants for hand criteria
@@ -612,6 +657,8 @@ def _apply_auction_criteria(
         else:
             # Fast literal path
             matches_partial = _normalize_auction_expr(auction_col).str.starts_with(partial_auction)
+        
+        # Calculate seat from partial auction (used in both paths)
         num_dashes = partial_auction.count('-')
         seat = num_dashes + 1
             
@@ -663,14 +710,14 @@ def _check_required_files() -> list[str]:
     """Check that required data files exist. Returns list of missing files.
     
     NOTE:
-    - `bbo_bt_seat1.parquet` is a REQUIRED pipeline artifact for this API. If it's missing,
+    - `bbo_bt_compiled.parquet` is a REQUIRED pipeline artifact for this API. If it's missing,
       something is wrong upstream and we hard-fail rather than falling back.
     - `bbo_bt_criteria_seat1_df.parquet` is now also REQUIRED at runtime; it provides the
       completed-auction criteria/aggregate stats (`bt_stats_df`) used by several endpoints
       (Bidding Table Explorer, Find Matching Auctions, etc.). If it's missing, we fail fast
       instead of running with partially functional endpoints.
     - We intentionally do NOT load the full `bbo_bt_augmented.parquet` into memory; all heavy
-      preprocessing should be done offline by `bbo_bt_build_seat1.py` and friends.
+      preprocessing should be done offline by `bbo_bt_compile_rules.py` and friends.
     """
     required: list[pathlib.Path] = [
         exec_plan_file,
@@ -689,6 +736,15 @@ def _check_required_files() -> list[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler - starts initialization on startup."""
+    # Fast-fail check: ensure all required files exist before starting background thread
+    print("[init] Checking required files...")
+    missing_files = _check_required_files()
+    if missing_files:
+        error_msg = f"FATAL: Missing required files:\n" + "\n".join(f"  - {f}" for f in missing_files)
+        print(f"\n{'='*60}\n{error_msg}\n{'='*60}\n")
+        # Hard fail - prevents server from starting or serving requests in broken state
+        os._exit(1)
+
     # Startup: start initialization in background thread
     with _STATE_LOCK:
         if not STATE["initialized"] and not STATE["initializing"]:
@@ -714,9 +770,51 @@ class StatusResponse(BaseModel):
     bt_df_rows: Optional[int] = None
     deal_df_rows: Optional[int] = None
     loading_step: Optional[str] = None  # Current loading step
-    loaded_files: Optional[Dict[str, Any]] = None  # File name -> row count (int or str like "100 of 1000")
+    loaded_files: Optional[Dict[str, Any]] = None  # File name -> info string (e.g., "1,234 rows × 45 cols (100.5 MB)")
 
 
+def _format_file_info(
+    df: pl.DataFrame | None = None,
+    file_path: pathlib.Path | None = None,
+    row_count: int | str | None = None,
+    col_count: int | None = None,
+    elapsed_secs: float | None = None,
+) -> str:
+    """Format file loading info showing shape, file size, and load time.
+    
+    Examples:
+        "16,234,567 rows × 45 cols (1.2 GB) [5.3s]"
+        "123,456 entries (50.3 MB) [1.2s]"
+    """
+    parts = []
+    
+    # Get shape from DataFrame if provided
+    if df is not None:
+        rows = f"{df.height:,}"
+        cols = df.width
+        parts.append(f"{rows} rows × {cols} cols")
+    elif row_count is not None:
+        if isinstance(row_count, int):
+            parts.append(f"{row_count:,} entries")
+        else:
+            parts.append(str(row_count))
+    
+    # Get file size if path provided
+    if file_path is not None and file_path.exists():
+        size_bytes = file_path.stat().st_size
+        if size_bytes >= 1024 ** 3:
+            size_str = f"{size_bytes / (1024 ** 3):.1f} GB"
+        elif size_bytes >= 1024 ** 2:
+            size_str = f"{size_bytes / (1024 ** 2):.1f} MB"
+        else:
+            size_str = f"{size_bytes / 1024:.1f} KB"
+        parts.append(f"({size_str})")
+    
+    # Add elapsed time if provided
+    if elapsed_secs is not None:
+        parts.append(f"in {elapsed_secs:.1f}s")
+    
+    return " ".join(parts) if parts else "loaded"
 
 
 class InitResponse(BaseModel):
@@ -738,7 +836,8 @@ class RandomAuctionSequencesRequest(BaseModel):
 
 
 class AuctionSequencesMatchingRequest(BaseModel):
-    pattern: str
+    # Allow None from UI; treat it as empty string server-side.
+    pattern: str | None = ""
     n_samples: int = 5
     seed: Optional[int] = 0
     # If True, treat the pattern as applying to all seats (ignore leading initial passes in stored auctions).
@@ -832,6 +931,12 @@ class BTSeatStatsRequest(BaseModel):
     seat: int = 0
     # Optional cap on number of deals to aggregate (0 = all); currently unused.
     max_deals: Optional[int] = 0
+
+
+class NewRulesLookupRequest(BaseModel):
+    """Request for detailed new rules metrics for a specific auction step."""
+    auction: str
+    bt_index: Optional[int] = None
 
 
 class ExecuteSQLRequest(BaseModel):
@@ -956,7 +1061,7 @@ STATE: Dict[str, Any] = {
     "loading_step": None,  # Current loading step description
     "loaded_files": {},  # File name -> row count (updated as files load)
     "deal_df": None,
-    "bt_seat1_df": None,  # Clean seat-1-only table (bbo_bt_seat1.parquet)
+    "bt_seat1_df": None,  # Pre-compiled BT table (bbo_bt_compiled.parquet)
     "bt_openings_df": None,  # Tiny opening-bid lookup table (built from bt_seat1_df)
     "deal_criteria_by_seat_dfs": None,
     "deal_criteria_by_direction_dfs": None,
@@ -968,9 +1073,8 @@ STATE: Dict[str, Any] = {
     # Hot-reloadable overlay rules loaded from bbo_custom_auction_criteria.csv.
     # These rules are applied on-the-fly to BT rows when serving responses and when building criteria masks.
     "custom_criteria_overlay": [],
-    # Merged rules lookup: bt_index -> Merged_Rules list (for Rules model in Bidding Arena)
-    # Loaded from bbo_bt_merged_rules.parquet (optional - if missing, Rules model is disabled)
-    "merged_rules_lookup": None,
+    # Loaded from bbo_bt_new_rules.parquet (optional - for detailed rule inspection)
+    "new_rules_df": None,
     "custom_criteria_stats": {},
     # Set of available criterion names (from deal_criteria_by_direction_dfs) for normalizing CSV criteria strings.
     "available_criteria_names": None,
@@ -997,31 +1101,37 @@ def _register_duckdb_tables(
     bt_seat1_df: pl.DataFrame,
     bt_stats_df: Optional[pl.DataFrame] = None,
 ) -> None:
-    """Register DataFrames with DuckDB for SQL queries."""
+    """Register DataFrames and Views with DuckDB for SQL queries.
+    
+    For very large tables (like auctions), we use a View pointing directly to 
+    the Parquet file to avoid memory bloat from DuckDB's Polars scanner.
+    """
     global DUCKDB_CONN
     with _DUCKDB_LOCK:
         if DUCKDB_CONN is None:
             DUCKDB_CONN = duckdb.connect()
         
         # Register Polars DataFrames directly with DuckDB (Zero-copy)
-        # DuckDB can see Polars objects in the local scope if we use the same name,
-        # or we can use the register() method.
         DUCKDB_CONN.register("deals", deal_df)
-        DUCKDB_CONN.register("auctions", bt_seat1_df)
+        
+        # For the massive auctions table, use a View pointing to the Parquet file 
+        # instead of the in-memory Polars DataFrame to save memory.
+        # DuckDB can query the Parquet file directly with high performance.
+        DUCKDB_CONN.execute(f"CREATE OR REPLACE VIEW auctions AS SELECT * FROM read_parquet('{bt_seat1_file}')")
         
         if bt_stats_df is not None:
             DUCKDB_CONN.register("auction_stats", bt_stats_df)
             print(
-                "[duckdb] Registered Polars DataFrames (Zero-copy): "
+                "[duckdb] Registered Polars DataFrames and Views: "
                 f"deals ({deal_df.height:,} rows), "
-                f"auctions ({bt_seat1_df.height:,} rows), "
+                f"auctions (View on {bt_seat1_file.name}), "
                 f"auction_stats ({bt_stats_df.height:,} rows)"
             )
         else:
             print(
-                "[duckdb] Registered Polars DataFrames (Zero-copy): "
+                "[duckdb] Registered Polars DataFrames and Views: "
                 f"deals ({deal_df.height:,} rows), "
-                f"auctions ({bt_seat1_df.height:,} rows)"
+                f"auctions (View on {bt_seat1_file.name})"
             )
 
 
@@ -1058,8 +1168,16 @@ def _build_additional_deal_columns() -> List[str]:
 
 
 def _load_bt_seat1_df() -> pl.DataFrame:
-    """Load bt_seat1_df with only the columns needed at runtime."""
-    print(f"[init] Loading bt_seat1_df from {bt_seat1_file} (selective columns)...")
+    """Load bt_seat1_df with only the LIGHTWEIGHT columns needed at runtime.
+    
+    IMPORTANT: We intentionally do NOT load the heavy Agg_Expr_Seat_X columns here.
+    These 4 columns contain List(String) data that explodes to 100+ GB in RAM for 461M rows.
+    Instead, they are loaded on-demand from the Parquet file only for the specific rows
+    needed by each query (see build_opening_bids_table_from_bt_seat1 for the pattern).
+    """
+    print(f"[init] Loading bt_seat1_df from {bt_seat1_file} (lightweight columns only)...")
+    
+    # Use scan for efficient column selection
     bt_seat1_scan = pl.scan_parquet(bt_seat1_file)
     available_cols = bt_seat1_scan.collect_schema().names()
     
@@ -1067,60 +1185,35 @@ def _load_bt_seat1_df() -> pl.DataFrame:
     if "bt_index" not in available_cols:
         raise ValueError(f"REQUIRED column 'bt_index' missing from {bt_seat1_file}. Pipeline error.")
     
-    # Columns required for API operations
+    # LIGHTWEIGHT columns only - no Agg_Expr_Seat_X (those are loaded on-demand)
     required_cols = [
         "bt_index", "Auction", "is_opening_bid", "is_completed_auction",
         "seat", "candidate_bid", "npasses", "auction_len", "Expr",
-        "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
+        # Agg_Expr_Seat_1..4 are INTENTIONALLY EXCLUDED - too heavy (100+ GB)
         "previous_bid_indices", "next_bid_indices",
         "matching_deal_count",
     ]
     cols_to_load = [c for c in required_cols if c in available_cols]
-    print(f"[init] Loading {len(cols_to_load)} of {len(available_cols)} columns...")
+    print(f"[init] Loading {len(cols_to_load)} of {len(available_cols)} columns (excluding heavy Agg_Expr columns)...")
     
-    return bt_seat1_scan.select(cols_to_load).collect()
-
-
-def _load_merged_rules() -> Dict[int, List[str]] | None:
-    """Load merged rules for Rules model (optional).
+    # Optimization: Categoricalize repeated strings and downcast integers
+    # Note: We normalize Auction to uppercase during load to avoid expensive runtime 
+    # string operations on 461M rows.
+    df = (
+        bt_seat1_scan.select(cols_to_load)
+        .with_columns([
+            pl.col("bt_index").cast(pl.UInt32),
+            pl.col("Auction").str.to_uppercase(),
+            pl.col("candidate_bid").cast(pl.Categorical),
+            pl.col("seat").cast(pl.UInt8),
+            pl.col("npasses").cast(pl.UInt8),
+            pl.col("auction_len").cast(pl.UInt8),
+            pl.col("matching_deal_count").cast(pl.UInt32),
+        ])
+        .collect()
+    )
     
-    IMPORTANT: We key this lookup by `bt_index` (int) to avoid fragile auction-string
-    normalization/matching issues.
-    """
-    if not merged_rules_file.exists():
-        print(f"[init] Merged rules file not found: {merged_rules_file}")
-        print("[init] Rules model will be disabled in Bidding Arena (only Raw_Rules available)")
-        return None
-    
-    try:
-        print(f"[init] Loading merged rules from {merged_rules_file}...")
-        merged_rules_df = pl.read_parquet(merged_rules_file)
-        if "bt_index" not in merged_rules_df.columns:
-            raise ValueError("Merged rules parquet missing required column: bt_index")
-        if "Merged_Rules" not in merged_rules_df.columns:
-            raise ValueError("Merged rules parquet missing required column: Merged_Rules")
-
-        lookup: dict[int, list[str]] = {}
-        for bt_index, merged_rules in (
-            merged_rules_df
-            .select(["bt_index", "Merged_Rules"])
-            .drop_nulls(["bt_index", "Merged_Rules"])
-            .iter_rows()
-        ):
-            try:
-                bt_idx_i = int(bt_index)
-            except Exception:
-                continue
-            if not merged_rules:
-                continue
-            lookup[bt_idx_i] = list(merged_rules)
-
-        print(f"[init] Loaded {len(lookup):,} merged rules entries (Rules model enabled)")
-        return lookup
-    except Exception as e:
-        print(f"[init] WARNING: Failed to load merged rules from {merged_rules_file}: {e}")
-        print("[init] Rules model will be disabled in Bidding Arena (only Raw_Rules available)")
-        return None
+    return df
 
 
 def _prewarm_all_endpoints(bt_seat1_df: pl.DataFrame) -> None:
@@ -1198,6 +1291,7 @@ def _prewarm_all_endpoints(bt_seat1_df: pl.DataFrame) -> None:
     _prewarm_endpoint("bidding-models", list_bidding_models)
     _prewarm_endpoint("bidding-arena", bidding_arena, BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
     _prewarm_endpoint("rank-bids-by-ev", rank_bids_by_ev, RankBidsByEVRequest(auction="", max_deals=10, seed=42))
+    _prewarm_endpoint("new-rules-lookup", new_rules_lookup, NewRulesLookupRequest(auction="1S-p-2C"))
 
     total_prewarm_s = time.perf_counter() - prewarm_t0
     print(f"[init] All endpoints pre-warmed in {total_prewarm_s:.2f}s")
@@ -1215,18 +1309,6 @@ def _heavy_init() -> None:
     printing and updating globals for an interactive notebook, it populates
     the shared STATE dict for use by the API endpoints.
     """
-
-    # Check required files exist before starting
-    print("[init] Checking required files...")
-    missing_files = _check_required_files()
-    if missing_files:
-        error_msg = f"Missing required files:\n" + "\n".join(f"  - {f}" for f in missing_files)
-        print(f"[init] ERROR: {error_msg}")
-        with _STATE_LOCK:
-            STATE["initialized"] = False
-            STATE["initializing"] = False
-            STATE["error"] = error_msg
-        return
 
     t0 = time.time()
     print("[init] Starting initialization...")
@@ -1261,14 +1343,16 @@ def _heavy_init() -> None:
         # Load deals (optionally limited by --deal-rows for faster debugging)
         n_rows_msg = f" (limited to {_cli_deal_rows:,} rows)" if _cli_deal_rows else ""
         _update_loading_status(2, f"Loading deal_df ({bbo_mldf_augmented_file.name}){n_rows_msg}...")
+        t0_deal = time.perf_counter()
         deal_df = load_deal_df(bbo_mldf_augmented_file, valid_deal_columns, mldf_n_rows=_cli_deal_rows)
+        elapsed_deal = time.perf_counter() - t0_deal
         
         # Get total row count for display (when using --deal-rows)
         if _cli_deal_rows:
             total_rows = pq.read_metadata(bbo_mldf_augmented_file).num_rows
-            row_info = f"{deal_df.height:,} of {total_rows:,}"
+            row_info = f"{deal_df.height:,} of {total_rows:,} rows × {deal_df.width} cols in {elapsed_deal:.1f}s"
         else:
-            row_info = f"{deal_df.height:,}"
+            row_info = _format_file_info(df=deal_df, file_path=bbo_mldf_augmented_file, elapsed_secs=elapsed_deal)
         _update_loading_status(3, "Building criteria bitmaps...", "deal_df", row_info)
         _log_memory("after load_deal_df")
 
@@ -1338,14 +1422,17 @@ def _heavy_init() -> None:
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load clean seat-1-only table (used for pattern matching - no p- prefix issues)
+        t0_bt = time.perf_counter()
         bt_seat1_df = _load_bt_seat1_df()
+        elapsed_bt = time.perf_counter() - t0_bt
         
         # IMPORTANT:
         # Do NOT strip leading 'p-' prefixes here.
         # Those prefixes encode seat/turn order and are required for correct declarer/contract logic
         # (AI/DD/IMP computations). Matching code strips prefixes at query time instead.
-        _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_df.height)
-        print(f"[init] bt_seat1_df: {bt_seat1_df.height:,} rows (clean seat-1 data)")
+        bt_seat1_info = _format_file_info(df=bt_seat1_df, file_path=bt_seat1_file, elapsed_secs=elapsed_bt)
+        _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_info)
+        print(f"[init] bt_seat1_df: {bt_seat1_info} (clean seat-1 data)")
         
         # Load hot-reloadable criteria overlay (does NOT mutate bt_seat1_df)
         overlay, custom_criteria_stats = _build_custom_criteria_overlay(available_criteria_names)
@@ -1358,34 +1445,55 @@ def _heavy_init() -> None:
             raise FileNotFoundError(f"REQUIRED stats file missing: {bt_criteria_seat1_file}. Pipeline error.")
         
         try:
+            t0_stats = time.perf_counter()
             bt_stats_df = pl.read_parquet(bt_criteria_seat1_file)
-            print(f"[init] bt_stats_df: {bt_stats_df.height:,} rows (completed auctions with criteria/aggregates)")
+            elapsed_stats = time.perf_counter() - t0_stats
+            bt_stats_info = _format_file_info(df=bt_stats_df, file_path=bt_criteria_seat1_file, elapsed_secs=elapsed_stats)
+            print(f"[init] bt_stats_df: {bt_stats_info} (completed auctions with criteria/aggregates)")
             # Track in loaded_files so the UI "Files loaded" list includes stats.
-            _update_loading_status(5, "Loading bt_seat1_df and bt_stats_df...", "bt_stats_df", bt_stats_df.height)
+            _update_loading_status(5, "Loading bt_seat1_df and bt_stats_df...", "bt_stats_df", bt_stats_info)
         except Exception as e:
             print(f"[init] ERROR: Failed to load bt_stats_df from {bt_criteria_seat1_file}: {e}")
             raise
         _log_memory("after load bt_stats_df")
 
-        # Load merged rules for Rules model (optional - not required for startup)
-        merged_rules_lookup = _load_merged_rules()
-        if merged_rules_lookup:
-            _update_loading_status(5, "Loading merged rules...", "merged_rules", len(merged_rules_lookup))
-        _log_memory("after load merged_rules")
+        # Load new rules detailed metrics (optional)
+        new_rules_df = None
+        if new_rules_file.exists():
+            try:
+                print(f"[init] Loading new rules metrics from {new_rules_file}...")
+                t0_new = time.perf_counter()
+                new_rules_df = pl.read_parquet(new_rules_file)
+                if "step_auction" in new_rules_df.columns:
+                    new_rules_df = new_rules_df.with_columns(pl.col("step_auction").str.to_uppercase())
+                elapsed_new = time.perf_counter() - t0_new
+                new_rules_info = _format_file_info(df=new_rules_df, file_path=new_rules_file, elapsed_secs=elapsed_new)
+                # Key by step_auction for fast lookup
+                _update_loading_status(5, "Loading new rules metrics...", "new_rules", new_rules_info)
+            except Exception as e:
+                print(f"[init] WARNING: Failed to load new rules from {new_rules_file}: {e}")
+        _log_memory("after load new_rules")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
-        _update_loading_status(6, "Processing opening bids (seat1-only)...", "bt_seat1_df", bt_seat1_df.height)
+        _update_loading_status(6, "Processing opening bids (seat1-only)...", "bt_openings", "computing...")
+        t0_openings = time.perf_counter()
+        # NOTE: `bt_parquet_file` is used to load heavy Agg_Expr columns on-demand.
+        # Some type-checkers may have stale signatures for mlBridgeBiddingLib; runtime signature supports it.
         results, bt_openings_df = mlBridgeBiddingLib.process_opening_bids_from_bt_seat1(
             deal_df=deal_df,
             bt_seat1_df=bt_seat1_df,
             deal_criteria_by_seat_dfs=deal_criteria_by_seat_dfs,
+            bt_parquet_file=bt_seat1_file,  # type: ignore[call-arg]
         )
-        _update_loading_status(6, "Preparing to serve..." if not _cli_prewarm else "Preparing to serve (pre-warm next)...")
+        elapsed_openings = time.perf_counter() - t0_openings
+        bt_openings_info = f"{bt_openings_df.height:,} rows × {bt_openings_df.width} cols in {elapsed_openings:.1f}s"
+        _update_loading_status(6, "Preparing to serve...", "bt_openings", bt_openings_info)
         _log_memory("after process_opening_bids")
 
         with _STATE_LOCK:
             STATE["deal_df"] = deal_df
             STATE["bt_seat1_df"] = bt_seat1_df
+            STATE["bt_seat1_file"] = bt_seat1_file  # For on-demand Agg_Expr loading in handlers
             STATE["bt_openings_df"] = bt_openings_df
             STATE["deal_criteria_by_seat_dfs"] = deal_criteria_by_seat_dfs
             STATE["deal_criteria_by_direction_dfs"] = deal_criteria_by_direction_dfs
@@ -1394,7 +1502,7 @@ def _heavy_init() -> None:
             STATE["custom_criteria_overlay"] = overlay
             STATE["custom_criteria_stats"] = custom_criteria_stats
             STATE["available_criteria_names"] = available_criteria_names
-            STATE["merged_rules_lookup"] = merged_rules_lookup
+            STATE["new_rules_df"] = new_rules_df
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
@@ -1442,6 +1550,21 @@ def _heavy_init() -> None:
 # ---------------------------------------------------------------------------
 # API endpoints: status & init
 # ---------------------------------------------------------------------------
+
+
+@app.post("/new-rules-lookup")
+def new_rules_lookup(req: NewRulesLookupRequest) -> Dict[str, Any]:
+    """Look up detailed new rules metrics for a specific auction sequence."""
+    state, reload_info, handler = _prepare_handler_call()
+    try:
+        resp = handler.handle_new_rules_lookup(
+            state=state,
+            auction=req.auction,
+            bt_index=req.bt_index,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("new-rules-lookup", e)
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -2029,9 +2152,19 @@ def _filter_auctions_by_hand_criteria(
     
     if len(rows_to_keep) == df.height:
         return df, rejected_info  # No filtering needed
+
+    if not rows_to_keep:
+        # IMPORTANT: If the keep-list is empty, Polars will infer Null dtype for the join key,
+        # causing `u64` vs `null` join failures. Return an empty frame with the same schema.
+        return df.head(0), rejected_info
     
     # Select rows in a type-checker-friendly way (and preserve order).
-    idx_df = pl.DataFrame({"_i": rows_to_keep, "_pos": list(range(len(rows_to_keep)))})
+    idx_df = pl.DataFrame(
+        {
+            "_i": pl.Series(rows_to_keep, dtype=pl.UInt64),
+            "_pos": pl.Series(list(range(len(rows_to_keep))), dtype=pl.UInt32),
+        }
+    )
     filtered_df = (
         df.with_row_index("_i")
         .join(idx_df, on="_i", how="inner")
@@ -2548,4 +2681,11 @@ if __name__ == "__main__":  # pragma: no cover
     args = parser.parse_args()
 
     print("Starting API server...")
+    try:
+        source_file = pathlib.Path(__file__)
+        source_mtime = source_file.stat().st_mtime
+        source_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(source_mtime))
+        print(f"[init] Source file: {source_file.name} (modified: {source_date})")
+    except Exception:
+        pass
     uvicorn.run(app, host=args.host, port=args.port, reload=False)

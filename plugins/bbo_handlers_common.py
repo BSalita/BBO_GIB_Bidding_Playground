@@ -7,14 +7,205 @@ dataclass to eliminate primitive obsession and magic numbers/strings.
 
 from __future__ import annotations
 
+import pathlib
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import polars as pl
 
-from bbo_bidding_queries_lib import normalize_auction_pattern, normalize_auction_input, normalize_auction_user_text
+from bbo_bidding_queries_lib import normalize_auction_pattern, normalize_auction_input, normalize_auction_user_text, pattern_matches
 from mlBridgeLib.mlBridgeBiddingLib import DIRECTIONS
+
+
+# ===========================================================================
+# On-Demand Agg_Expr Loading (Memory Optimization)
+# ===========================================================================
+
+def load_agg_expr_for_bt_indices(
+    bt_indices: List[int],
+    bt_parquet_file: Union[pathlib.Path, str],
+) -> Dict[int, Dict[str, List[str]]]:
+    """Load Agg_Expr columns for specific bt_indices from the Parquet file.
+    
+    This is a memory-efficient way to get criteria data for specific rows
+    without loading the heavy Agg_Expr columns (100+ GB) for all 461M rows.
+    
+    Uses DuckDB for efficient lookup (row group pruning, bloom filters) instead of
+    scanning all 461M rows with Polars.
+    
+    Args:
+        bt_indices: List of bt_index values to load
+        bt_parquet_file: Path to the compiled BT parquet file
+    
+    Returns:
+        Dict mapping bt_index -> {col_name: list of criteria strings}
+        e.g., {12345: {"Agg_Expr_Seat_1": ["HCP >= 10", "SL_S >= 4"], ...}}
+    """
+    if not bt_indices:
+        return {}
+
+    # Safety rail: prevent accidental "load Agg_Expr for the whole BT" behavior.
+    # Typical requests should load O(1..10_000) indices. Larger loads are almost certainly a bug
+    # and can reintroduce pagefile thrashing.
+    _MAX_ON_DEMAND_BT_INDICES = 250_000
+    uniq = sorted({int(x) for x in bt_indices if x is not None})
+    if len(uniq) > _MAX_ON_DEMAND_BT_INDICES:
+        raise ValueError(
+            f"Refusing to load Agg_Expr for {len(uniq):,} bt_indices (limit={_MAX_ON_DEMAND_BT_INDICES:,}). "
+            "This would be extremely slow and memory-heavy. Load smaller subsets or implement caching/batching."
+        )
+    
+    # Use DuckDB for efficient lookup - it can use Parquet row group pruning and bloom filters
+    # which is MUCH faster than Polars' full scan for small IN lists.
+    #
+    # NOTE: We intentionally do NOT provide a Polars fallback here; if DuckDB is unavailable,
+    # we'd rather fail loudly than silently reintroduce multi-second timeouts.
+    import duckdb
+
+    # Create a fresh connection for thread safety
+    conn = duckdb.connect(":memory:")
+
+    # Build the IN list as comma-separated values
+    in_list = ", ".join(str(x) for x in uniq)
+
+    # Escape backslashes in the file path for SQL
+    file_path = str(bt_parquet_file).replace("\\", "/")
+
+    query = f"""
+        SELECT bt_index, Agg_Expr_Seat_1, Agg_Expr_Seat_2, Agg_Expr_Seat_3, Agg_Expr_Seat_4
+        FROM read_parquet('{file_path}')
+        WHERE bt_index IN ({in_list})
+    """
+
+    try:
+        result_rel = conn.execute(query)
+        rows = result_rel.fetchall()
+        col_names = [desc[0] for desc in result_rel.description]
+    finally:
+        conn.close()
+
+    result: Dict[int, Dict[str, List[str]]] = {}
+    for row in rows:
+        row_dict = dict(zip(col_names, row))
+        bt_idx = row_dict["bt_index"]
+        result[bt_idx] = {}
+        for seat in range(1, 5):
+            col = f"Agg_Expr_Seat_{seat}"
+            if col in row_dict:
+                val = row_dict[col]
+                # DuckDB may return list or None
+                result[bt_idx][col] = list(val) if val else []
+
+    return result
+
+
+def enrich_bt_row_with_agg_expr(
+    bt_row: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Enrich a BT row with Agg_Expr columns loaded on-demand from Parquet.
+    
+    If the row already has Agg_Expr columns, returns as-is.
+    Otherwise, loads them from the Parquet file using bt_index.
+    
+    Args:
+        bt_row: Row dict from bt_seat1_df (may lack Agg_Expr columns)
+        state: API state dict containing bt_seat1_file
+    
+    Returns:
+        Row dict with Agg_Expr columns populated
+    """
+    # Check if already has Agg_Expr data
+    if "Agg_Expr_Seat_1" in bt_row and bt_row.get("Agg_Expr_Seat_1") is not None:
+        return bt_row
+    
+    # Get bt_index for lookup
+    bt_index = bt_row.get("bt_index")
+    if bt_index is None:
+        return bt_row
+    
+    # Get parquet file path from state
+    bt_parquet_file = state.get("bt_seat1_file")
+    if bt_parquet_file is None:
+        raise RuntimeError(
+            "Agg_Expr columns are not loaded in-memory, but state['bt_seat1_file'] is missing. "
+            "This is a wiring bug: set STATE['bt_seat1_file'] during initialization."
+        )
+    
+    # Load Agg_Expr for this bt_index
+    agg_data = load_agg_expr_for_bt_indices([int(bt_index)], bt_parquet_file)
+    if bt_index in agg_data:
+        bt_row = dict(bt_row)  # Copy to avoid mutation
+        bt_row.update(agg_data[bt_index])
+    
+    return bt_row
+
+# ===========================================================================
+# Criteria Deduplication (keep least restrictive bounds)
+# ===========================================================================
+
+# Regex to parse numeric inequality criteria: e.g., "HCP >= 10", "SL_S <= 5"
+_INEQ_PATTERN = re.compile(r'^(\w+)\s*(>=|<=|>|<|==)\s*(-?\d+)$')
+
+
+def dedupe_criteria_least_restrictive(criteria: List[str]) -> List[str]:
+    """Deduplicate criteria list, keeping least restrictive bounds for each variable.
+    
+    When multiple criteria refer to the same variable with the same operator:
+    - For >= or >: keep the SMALLEST value (allows more hands through)
+    - For <= or <: keep the LARGEST value (allows more hands through)
+    - For ==: keep first occurrence (exact match, can't merge)
+    
+    Non-numeric (boolean) criteria are kept as-is.
+    
+    Examples:
+        ["HCP >= 3", "HCP >= 5", "HCP <= 10"]  -> ["HCP >= 3", "HCP <= 10"]
+        ["SL_S >= 4", "SL_S >= 2", "Balanced"] -> ["SL_S >= 2", "Balanced"]
+    """
+    if not criteria:
+        return []
+    
+    # Track inequalities: (var_name, operator) -> best_value
+    inequalities: Dict[Tuple[str, str], int] = {}
+    # Track non-numeric criteria (preserve order)
+    other: List[str] = []
+    # Track original inequality strings to preserve spacing/formatting
+    ineq_format: Dict[Tuple[str, str], str] = {}
+    
+    for crit in criteria:
+        crit_str = str(crit).strip()
+        match = _INEQ_PATTERN.match(crit_str)
+        if match:
+            var_name, op, value_str = match.groups()
+            value = int(value_str)
+            key = (var_name, op)
+            
+            if key not in inequalities:
+                inequalities[key] = value
+                ineq_format[key] = f"{var_name} {op} {value}"
+            else:
+                existing = inequalities[key]
+                # For lower bounds (>=, >): keep smallest (least restrictive)
+                if op in ('>=', '>'):
+                    if value < existing:
+                        inequalities[key] = value
+                        ineq_format[key] = f"{var_name} {op} {value}"
+                # For upper bounds (<=, <): keep largest (least restrictive)
+                elif op in ('<=', '<'):
+                    if value > existing:
+                        inequalities[key] = value
+                        ineq_format[key] = f"{var_name} {op} {value}"
+                # For ==: first wins (can't merge different equality values)
+        else:
+            # Non-numeric criterion - add if not already present
+            if crit_str not in other:
+                other.append(crit_str)
+    
+    # Combine: inequalities first (sorted for consistency), then other
+    result = sorted(ineq_format.values()) + other
+    return result
+
 
 # ===========================================================================
 # Constants (eliminates magic numbers/strings)
@@ -29,6 +220,19 @@ SUIT_IDX: Dict[str, int] = {"S": 0, "H": 1, "D": 2, "C": 3}
 
 # Directions in clockwise order starting from North
 DIRECTIONS_LIST: List[str] = ["N", "E", "S", "W"]
+
+# Model name constants (for rules matching)
+MODEL_RULES = "Rules"  # Full pipeline: compiled BT + CSV overlay
+MODEL_RULES_BASE = "Rules_Base"  # Compiled BT only (base + learned pre-merged)
+MODEL_RULES_LEARNED = "Rules_Learned"  # Same as Rules_Base (backwards compat)
+MODEL_ACTUAL = "Actual"  # Use actual auction from deal
+
+# Models that use pre-compiled BT without overlay
+MODELS_NO_OVERLAY = frozenset({MODEL_RULES_BASE, MODEL_RULES_LEARNED})
+
+# NOTE (backwards compatibility):
+# - MODEL_RULES_LEARNED is retained for UI/API compatibility, but is now equivalent to MODEL_RULES_BASE
+#   because learned rules are pre-compiled into `bbo_bt_compiled.parquet`.
 
 # ===========================================================================
 # Canonical Auction Casing (single source of truth)
@@ -107,6 +311,183 @@ class HandlerState:
             "deal_criteria_by_seat_dfs": self.deal_criteria_by_seat_dfs,
             "duckdb_conn": self.duckdb_conn,
         }
+
+
+# ===========================================================================
+# Auction Rule Application (Learned + Custom)
+# ===========================================================================
+
+def normalize_auction_for_overlay(auction: str) -> str:
+    """Normalize auction for overlay prefix matching: UPPERCASE and strip leading passes.
+    
+    This uses the canonical uppercase form for consistency across the codebase.
+    """
+    a = (auction or "").strip().upper()
+    # Strip leading 'P-' prefixes (seat-1 view matching)
+    while a.startswith("P-"):
+        a = a[2:]
+    return a
+
+
+def _ensure_list_criteria(val: Any) -> list[str]:
+    """Ensure criteria is a list of strings. 
+    Handles both pl.List(pl.Utf8) and pipe-separated strings (memory optimization).
+    """
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [str(x) for x in val if x]
+    if isinstance(val, str):
+        if not val:
+            return []
+        return [x for x in val.split("|") if x]
+    return []
+
+
+def dedupe_criteria_all_seats(bt_row: dict[str, Any]) -> dict[str, Any]:
+    """Deduplicate criteria for all seats in a BT row.
+    
+    Modifies the row in place and returns it.
+    Uses least-restrictive bounds when deduplicating.
+    """
+    for seat in SEAT_RANGE:
+        col = f"Agg_Expr_Seat_{seat}"
+        if col in bt_row:
+            # Handle both list and pipe-separated categorical string
+            val = bt_row.get(col)
+            lst = _ensure_list_criteria(val)
+            if lst:
+                bt_row[col] = dedupe_criteria_least_restrictive(lst)
+            else:
+                bt_row[col] = []
+    return bt_row
+
+
+def apply_custom_criteria_overlay_to_bt_row(
+    bt_row: dict[str, Any],
+    overlay: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Apply overlay criteria rules to a BT row dict in-place (returns the dict).
+
+    Overlay rule format: {"partial": str, "seat": int, "criteria": list[str]}
+
+    This helper is intentionally lightweight and safe:
+    - If overlay is empty, returns the row unchanged.
+    - If Auction is missing, returns unchanged.
+    - De-dupes criteria while preserving order.
+    """
+    if not overlay:
+        # Still need to ensure lists if they were pipe-separated
+        for seat in SEAT_RANGE:
+            col = f"Agg_Expr_Seat_{seat}"
+            if col in bt_row:
+                bt_row[col] = _ensure_list_criteria(bt_row[col])
+        return bt_row
+
+    auction = bt_row.get("Auction")
+    if not auction:
+        return bt_row
+
+    auction_norm = normalize_auction_for_overlay(str(auction))
+    if not auction_norm:
+        return bt_row
+
+    # Ensure existing criteria are lists before appending
+    for seat in SEAT_RANGE:
+        col = f"Agg_Expr_Seat_{seat}"
+        if col in bt_row:
+            bt_row[col] = _ensure_list_criteria(bt_row[col])
+
+    for rule in overlay:
+        partial = str(rule.get("partial") or "")
+        if not partial:
+            continue
+        # Hybrid matching: literal prefix for simple patterns, regex for complex ones
+        if not pattern_matches(partial, auction_norm):
+            continue
+
+        try:
+            seat = int(rule.get("seat") or 0)
+        except Exception:
+            continue
+        if seat < 1 or seat > 4:
+            continue
+
+        crit_to_add = rule.get("criteria") or []
+        if not crit_to_add:
+            continue
+
+        col = f"Agg_Expr_Seat_{seat}"
+        existing = bt_row.get(col) or []
+        combined = list(existing)
+        for c in crit_to_add:
+            if c not in combined:
+                combined.append(c)
+        bt_row[col] = combined
+
+    return bt_row
+
+
+def apply_overlay_and_dedupe(
+    bt_row: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply CSV overlay to a BT row and deduplicate criteria.
+    
+    Note: Merged rules are pre-compiled into bbo_bt_compiled.parquet,
+    so this function only applies the CSV overlay on top.
+    
+    If the row lacks Agg_Expr columns (memory optimization), they are
+    loaded on-demand from the Parquet file using bt_index.
+    
+    Args:
+        bt_row: BT row dict (will be copied, not mutated)
+        state: API state dict containing custom_criteria_overlay and bt_seat1_file
+    
+    Returns:
+        New dict with overlay applied and criteria deduplicated
+    """
+    result = dict(bt_row)
+    # Enrich with Agg_Expr columns if missing (on-demand load from Parquet)
+    result = enrich_bt_row_with_agg_expr(result, state)
+    overlay = state.get("custom_criteria_overlay")
+    result = apply_custom_criteria_overlay_to_bt_row(result, overlay)
+    return dedupe_criteria_all_seats(result)
+
+
+# Backwards compatibility alias
+apply_all_rules_to_bt_row = apply_overlay_and_dedupe
+
+
+def apply_rules_by_model(
+    bt_row: dict[str, Any],
+    state: dict[str, Any],
+    model_name: str,
+) -> dict[str, Any]:
+    """Apply rules based on model variant.
+    
+    Note: Merged rules are pre-compiled into bbo_bt_compiled.parquet.
+    
+    Model mapping:
+    - MODEL_RULES_BASE / MODEL_RULES_LEARNED: Return row as-is (already compiled)
+    - MODEL_RULES: Apply CSV overlay + deduplicate
+    
+    Args:
+        bt_row: BT row dict (will be copied, not mutated)
+        state: API state dict
+        model_name: One of MODEL_RULES, MODEL_RULES_BASE, MODEL_RULES_LEARNED
+    
+    Returns:
+        New dict with appropriate rules applied
+    """
+    if model_name in MODELS_NO_OVERLAY:
+        return dict(bt_row)
+    
+    if model_name == MODEL_RULES:
+        return apply_overlay_and_dedupe(bt_row, state)
+    
+    # Unknown model - return copy unchanged
+    return dict(bt_row)
 
 
 # ===========================================================================
@@ -594,10 +975,77 @@ def join_deals_with_bt(
         bt_cols = [agg_expr_col(s) for s in SEAT_RANGE]
     
     # Select only needed columns from BT to avoid column conflicts
-    bt_select = ["_auction_key"] + [c for c in bt_cols if c in bt_df.columns]
+    # Always carry bt_index when present so callers can do on-demand enrichment later.
+    bt_select = ["_auction_key"]
+    if "bt_index" in bt_df.columns:
+        bt_select.append("bt_index")
+    bt_select += [c for c in bt_cols if c in bt_df.columns]
     bt_slim = bt_df.select(bt_select).unique(subset=["_auction_key"])
     
     return deals_df.join(bt_slim, on="_auction_key", how="left")
+
+
+def join_deals_with_bt_on_demand(
+    deals_df: pl.DataFrame,
+    bt_df: pl.DataFrame,
+    state: Dict[str, Any],
+    bt_cols: List[str] | None = None,
+) -> pl.DataFrame:
+    """Join deals with BT data, ensuring Agg_Expr_Seat_* are available (loaded on-demand).
+
+    This is required when the API runs with a lightweight in-memory `bt_seat1_df` that
+    intentionally excludes Agg_Expr_Seat_1..4 to avoid 1TB pagefile thrashing.
+
+    Strategy:
+    - Join by `_auction_key` to get at least `bt_index`.
+    - If Agg_Expr columns are missing, load them from the BT Parquet file for just the
+      small set of bt_index values present in the joined result, and join back on bt_index.
+    """
+    if bt_cols is None:
+        bt_cols = [agg_expr_col(s) for s in SEAT_RANGE]
+
+    joined = join_deals_with_bt(deals_df, bt_df, bt_cols=bt_cols)
+
+    needs_agg = any(c.startswith("Agg_Expr_Seat_") for c in bt_cols)
+    has_any_agg = any((c in joined.columns) for c in bt_cols)
+    if not needs_agg or has_any_agg:
+        return joined
+
+    if "bt_index" not in joined.columns:
+        # Without bt_index we cannot load Agg_Expr on-demand safely.
+        return joined
+
+    bt_parquet_file = state.get("bt_seat1_file")
+    if bt_parquet_file is None:
+        raise RuntimeError(
+            "join_deals_with_bt_on_demand requires state['bt_seat1_file'] to load Agg_Expr columns on-demand."
+        )
+
+    bt_indices = (
+        joined
+        .select(pl.col("bt_index").drop_nulls().cast(pl.Int64).unique())
+        .to_series()
+        .to_list()
+    )
+    bt_indices = [int(x) for x in bt_indices if x is not None]
+    if not bt_indices:
+        return joined
+
+    # Load Agg_Expr columns for only the needed bt_index values and join back.
+    cols = ["bt_index"] + [c for c in bt_cols if c.startswith("Agg_Expr_Seat_")]
+    scan = pl.scan_parquet(str(bt_parquet_file))
+    available = scan.collect_schema().names()
+    cols_to_load = [c for c in cols if c in available]
+    if len(cols_to_load) <= 1:
+        return joined
+
+    agg_df = (
+        scan.filter(pl.col("bt_index").is_in(bt_indices))
+        .select(cols_to_load)
+        .collect()
+    )
+
+    return joined.join(agg_df, on="bt_index", how="left")
 
 
 def batch_check_wrong_bids(
@@ -605,6 +1053,7 @@ def batch_check_wrong_bids(
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
     seat_filter: int | None = None,
     criteria_overlay: list[dict[str, Any]] | None = None,
+    state: Dict[str, Any] | None = None,
 ) -> pl.DataFrame:
     """Batch-check wrong bids for a joined deals+BT DataFrame.
     
@@ -630,7 +1079,11 @@ def batch_check_wrong_bids(
     
     # Process rows - still a loop but without per-row DataFrame filters
     for row in joined_df.iter_rows(named=True):
-        if criteria_overlay:
+        if state is not None:
+            # Canonical path: enrich (if needed) + overlay + dedupe
+            row = apply_overlay_and_dedupe(dict(row), state)
+        elif criteria_overlay:
+            # Backwards-compat path
             row = _apply_overlay(dict(row), criteria_overlay)
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")

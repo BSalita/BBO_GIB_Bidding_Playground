@@ -60,6 +60,12 @@ from plugins.bbo_handlers_common import (
     agg_expr_col,
     wrong_bid_col,
     invalid_criteria_col,
+    # Model constants
+    MODEL_RULES,
+    MODEL_RULES_BASE,
+    MODEL_RULES_LEARNED,
+    MODEL_ACTUAL,
+    MODELS_NO_OVERLAY,
     # Canonical casing (single source of truth)
     normalize_auction_case,
     # Elapsed time formatting
@@ -70,6 +76,14 @@ from plugins.bbo_handlers_common import (
     display_auction_with_seat_prefix as _display_auction_with_seat_prefix,
     normalize_to_seat1 as _normalize_to_seat1,
     expand_row_to_all_seats as _expand_row_to_all_seats,
+    # Rule application (overlay only - merged rules pre-compiled in BT)
+    apply_overlay_and_dedupe as _apply_overlay_and_dedupe,
+    apply_all_rules_to_bt_row as _apply_all_rules_to_bt_row,  # backwards compat alias
+    apply_rules_by_model as _apply_rules_by_model,
+    apply_custom_criteria_overlay_to_bt_row as _apply_overlay_only,
+    dedupe_criteria_all_seats,
+    # Criteria deduplication
+    dedupe_criteria_least_restrictive,
     # DataFrame helpers
     take_rows_by_index as _take_rows_by_index,
     effective_seed as _effective_seed,
@@ -96,6 +110,9 @@ from plugins.bbo_handlers_common import (
     prepare_bt_for_join,
     join_deals_with_bt,
     batch_check_wrong_bids,
+    join_deals_with_bt_on_demand,
+    # On-demand Agg_Expr loading (DuckDB-based for efficiency)
+    load_agg_expr_for_bt_indices as _load_agg_expr_for_bt_indices,
     # SL (Suit Length) evaluation helpers
     seat_to_direction,
     format_seat_notation as _format_seat_notation,
@@ -105,6 +122,147 @@ from plugins.bbo_handlers_common import (
     eval_comparison,
     annotate_criterion_with_value,
 )
+
+# ---------------------------------------------------------------------------
+# Tuning constants (avoid magic numbers scattered through handlers)
+# ---------------------------------------------------------------------------
+_CANDIDATE_POOL_LIMIT = 5000
+_DEBUG_CANDIDATE_SAMPLE = 25
+_DEBUG_CRITERIA_PREVIEW = 25
+_RULES_CRITERIA_PREVIEW = 50
+_NEED_RULES_MATCHES_LIST_THRESHOLD = 50
+
+
+# ---------------------------------------------------------------------------
+# BT Traversal Helpers (avoid full-table Auction lookups on 461M-row BT)
+# ---------------------------------------------------------------------------
+#
+# Any code that does `bt_seat1_df.filter(Auction == ...)` or similar will effectively
+# scan a 461M-row table. Instead we resolve auction prefixes by traversing:
+# opening bid bt_index (from bt_openings_df) -> next_bid_indices -> ...
+#
+# This relies on `bt_openings_df` and `bt_seat1_file` being present in state.
+
+_NEXT_BID_INDICES_CACHE: dict[int, list[int]] = {}
+_NEXT_CHILDREN_MIN_CACHE: dict[int, dict[str, int]] = {}
+_CACHE_MAX_PARENTS = 50_000
+
+
+def _cache_put(d: dict, key: Any, val: Any, max_items: int) -> None:
+    """Simple size-capped cache (insertion-order eviction)."""
+    d[key] = val
+    if len(d) > max_items:
+        try:
+            oldest = next(iter(d.keys()))
+            d.pop(oldest, None)
+        except Exception:
+            d.clear()
+
+
+def _bt_file_path_for_sql(state: Dict[str, Any]) -> str:
+    bt_parquet_file = state.get("bt_seat1_file")
+    if bt_parquet_file is None:
+        raise ValueError("bt_seat1_file missing from state; cannot query BT")
+    return str(bt_parquet_file).replace("\\", "/")
+
+
+def _get_next_bid_indices_for_parent(state: Dict[str, Any], parent_bt_index: int) -> list[int]:
+    """Fetch next_bid_indices for a BT node by bt_index, with caching."""
+    p = int(parent_bt_index)
+    cached = _NEXT_BID_INDICES_CACHE.get(p)
+    if cached is not None:
+        return cached
+
+    file_path = _bt_file_path_for_sql(state)
+    conn = duckdb.connect(":memory:")
+    try:
+        row = conn.execute(
+            f"SELECT next_bid_indices FROM read_parquet('{file_path}') WHERE bt_index = {p} LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    out: list[int] = []
+    if row and row[0]:
+        out = [int(x) for x in (row[0] or []) if x is not None]
+
+    _cache_put(_NEXT_BID_INDICES_CACHE, p, out, _CACHE_MAX_PARENTS)
+    return out
+
+
+def _get_child_map_for_parent(state: Dict[str, Any], parent_bt_index: int) -> dict[str, int]:
+    """Return dict: candidate_bid (UPPER) -> child bt_index for a parent node."""
+    p = int(parent_bt_index)
+    cached = _NEXT_CHILDREN_MIN_CACHE.get(p)
+    if cached is not None:
+        return cached
+
+    next_indices = _get_next_bid_indices_for_parent(state, p)
+    if not next_indices:
+        out: dict[str, int] = {}
+        _cache_put(_NEXT_CHILDREN_MIN_CACHE, p, out, _CACHE_MAX_PARENTS)
+        return out
+
+    file_path = _bt_file_path_for_sql(state)
+    in_list = ", ".join(str(int(x)) for x in next_indices if x is not None)
+    if not in_list:
+        out = {}
+        _cache_put(_NEXT_CHILDREN_MIN_CACHE, p, out, _CACHE_MAX_PARENTS)
+        return out
+
+    conn = duckdb.connect(":memory:")
+    try:
+        rows = conn.execute(
+            f"SELECT bt_index, candidate_bid FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    out = {}
+    for bt_idx, cand in rows:
+        if cand is None or bt_idx is None:
+            continue
+        out[str(cand).upper()] = int(bt_idx)
+
+    _cache_put(_NEXT_CHILDREN_MIN_CACHE, p, out, _CACHE_MAX_PARENTS)
+    return out
+
+
+def _resolve_bt_index_by_traversal(state: Dict[str, Any], auction: str) -> int | None:
+    """Resolve a seat-1-view auction prefix to a bt_index by traversing next_bid_indices.
+
+    - Strips leading passes (seat-1 view does not include them).
+    - Uses bt_openings_df for the first non-pass call, then walks via next_bid_indices.
+    - Supports internal P calls (continuations).
+    """
+    auction_input = normalize_auction_input(auction)
+    auction_norm = re.sub(r"(?i)^(P-)+", "", auction_input).rstrip("-").upper()
+    tokens = [t for t in auction_norm.split("-") if t]
+    if not tokens:
+        return None
+
+    bt_openings_df = state.get("bt_openings_df")
+    if not isinstance(bt_openings_df, pl.DataFrame) or bt_openings_df.is_empty():
+        raise ValueError("bt_openings_df is missing/empty; cannot traverse BT without Auction scans")
+
+    seat1_open = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
+    first_tok = tokens[0].upper()
+    first_match = seat1_open.filter(pl.col("Auction") == first_tok)
+    if first_match.height == 0:
+        return None
+    bt_idx = first_match.row(0, named=True).get("bt_index")
+    if bt_idx is None:
+        return None
+    parent_bt_index = int(bt_idx)
+
+    for tok in tokens[1:]:
+        child_map = _get_child_map_for_parent(state, parent_bt_index)
+        nxt = child_map.get(str(tok).upper())
+        if nxt is None:
+            return None
+        parent_bt_index = int(nxt)
+
+    return parent_bt_index
 
 
 from plugins.bbo_bt_custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_custom_criteria_overlay_to_bt_row
@@ -585,31 +743,17 @@ LIMIT {sample_n}"""
 
     out_samples: List[Dict[str, Any]] = []
     overlay = state.get("custom_criteria_overlay") or []
-    merged_rules_lookup = state.get("merged_rules_lookup")
 
     def _with_rules_seat1_cols(raw_row: dict[str, Any]) -> dict[str, Any]:
-        """Return the overlay-applied BT row plus extra columns showing Rules (merged+overlay) seat-1 criteria."""
-        base_row = _apply_custom_criteria_overlay_to_bt_row(dict(raw_row), overlay)
-        try:
-            bt_idx_val = base_row.get(index_col)
-            bt_idx_i = int(bt_idx_val) if bt_idx_val is not None else None
-        except Exception:
-            bt_idx_i = None
-        merged = None
-        if merged_rules_lookup is not None and bt_idx_i is not None:
-            try:
-                merged = merged_rules_lookup.get(bt_idx_i)
-            except Exception:
-                merged = None
-        if merged:
-            rules_row = dict(raw_row)
-            rules_row[agg_expr_col(1)] = list(merged)
-            rules_row = _apply_custom_criteria_overlay_to_bt_row(rules_row, overlay)
-            base_row["Merged_Rules_Seat_1"] = list(merged)
-            base_row["Agg_Expr_Seat_1_Rules"] = rules_row.get(agg_expr_col(1)) or []
-        else:
-            base_row["Merged_Rules_Seat_1"] = []
-            base_row["Agg_Expr_Seat_1_Rules"] = base_row.get(agg_expr_col(1)) or []
+        """Return the canonical BT row (on-demand enriched) with overlay applied.
+
+        MUST use `_apply_all_rules_to_bt_row` so Agg_Expr_Seat_* are present even when
+        bt_seat1_df is loaded in lightweight mode (no Agg_Expr columns).
+        """
+        base_row = _apply_all_rules_to_bt_row(dict(raw_row), state)
+        # Agg_Expr_Seat_1 now contains pre-compiled merged rules
+        base_row["Merged_Rules_Seat_1"] = base_row.get(agg_expr_col(1)) or []
+        base_row["Agg_Expr_Seat_1_Rules"] = base_row.get(agg_expr_col(1)) or []
         return base_row
 
     for row in sampled_df.iter_rows(named=True):
@@ -670,12 +814,14 @@ LIMIT {sample_n}"""
         wrong_bid_rate = 0.0
         
         if deal_df is not None and matched_auction:
+            # Apply merged rules + overlay to get final criteria
+            row_with_rules = _apply_all_rules_to_bt_row(dict(row), state)
             # Build bt_info for wrong bid checking
             bt_info = {
-                "Agg_Expr_Seat_1": row.get("Agg_Expr_Seat_1"),
-                "Agg_Expr_Seat_2": row.get("Agg_Expr_Seat_2"),
-                "Agg_Expr_Seat_3": row.get("Agg_Expr_Seat_3"),
-                "Agg_Expr_Seat_4": row.get("Agg_Expr_Seat_4"),
+                "Agg_Expr_Seat_1": row_with_rules.get("Agg_Expr_Seat_1"),
+                "Agg_Expr_Seat_2": row_with_rules.get("Agg_Expr_Seat_2"),
+                "Agg_Expr_Seat_3": row_with_rules.get("Agg_Expr_Seat_3"),
+                "Agg_Expr_Seat_4": row_with_rules.get("Agg_Expr_Seat_4"),
             }
             
             auction_lower = matched_auction.lower()
@@ -832,32 +978,16 @@ def handle_auction_sequences_matching(
 
     out_samples: List[Dict[str, Any]] = []
     overlay = state.get("custom_criteria_overlay") or []
-    merged_rules_lookup = state.get("merged_rules_lookup")
 
     def _with_rules_seat1_cols(raw_row: dict[str, Any]) -> dict[str, Any]:
-        """Return the overlay-applied BT row plus extra columns showing Rules (merged+overlay) seat-1 criteria."""
-        base_row = _apply_custom_criteria_overlay_to_bt_row(dict(raw_row), overlay)
-        try:
-            bt_idx_val = base_row.get(index_col)
-            bt_idx_i = int(bt_idx_val) if bt_idx_val is not None else None
-        except Exception:
-            bt_idx_i = None
-        merged = None
-        if merged_rules_lookup is not None and bt_idx_i is not None:
-            try:
-                merged = merged_rules_lookup.get(bt_idx_i)
-            except Exception:
-                merged = None
-        if merged:
-            # Apply merged rules to seat 1, then re-apply overlay so CSV can override merged rules.
-            rules_row = dict(raw_row)
-            rules_row[agg_expr_col(1)] = list(merged)
-            rules_row = _apply_custom_criteria_overlay_to_bt_row(rules_row, overlay)
-            base_row["Merged_Rules_Seat_1"] = list(merged)
-            base_row["Agg_Expr_Seat_1_Rules"] = rules_row.get(agg_expr_col(1)) or []
-        else:
-            base_row["Merged_Rules_Seat_1"] = []
-            base_row["Agg_Expr_Seat_1_Rules"] = base_row.get(agg_expr_col(1)) or []
+        """Return the canonical BT row (on-demand enriched) with overlay applied.
+
+        This MUST go through `_apply_all_rules_to_bt_row` so Agg_Expr_Seat_* are available
+        even when bt_seat1_df is loaded in lightweight mode (no Agg_Expr columns).
+        """
+        base_row = _apply_all_rules_to_bt_row(dict(raw_row), state)
+        base_row["Merged_Rules_Seat_1"] = base_row.get(agg_expr_col(1)) or []
+        base_row["Agg_Expr_Seat_1_Rules"] = base_row.get(agg_expr_col(1)) or []
         return base_row
 
     for row in sampled_df.iter_rows(named=True):
@@ -898,8 +1028,13 @@ def handle_auction_sequences_matching(
         for col in agg_expr_cols:
             if col in seq_df.columns:
                 out_cols.append(col)
+        # Include rules pipeline variation columns for seat 1
+        for col in ("Agg_Expr_S1_Base", "Agg_Expr_S1_Learned", "Agg_Expr_S1_Full",
+                    "Merged_Rules_Seat_1", "Agg_Expr_Seat_1_Rules"):
+            if col in seq_df.columns:
+                out_cols.append(col)
         
-        seq_df = seq_df.select(out_cols)
+        seq_df = seq_df.select([c for c in out_cols if c in seq_df.columns])
         if index_col == "bt_index":
             seq_df = seq_df.rename({"bt_index": "index"})
 
@@ -1057,14 +1192,9 @@ def handle_auction_sequences_by_index(
         if prev_indices:
             for idx in prev_indices:
                 if idx in prev_rows_lookup:
-                    sequence_data.append(
-                        _apply_custom_criteria_overlay_to_bt_row(dict(prev_rows_lookup[idx]), overlay)
-                    )
+                    sequence_data.append(_apply_all_rules_to_bt_row(dict(prev_rows_lookup[idx]), state))
         sequence_data.append(
-            _apply_custom_criteria_overlay_to_bt_row(
-                {c: row[c] for c in available_display_cols if c in row},
-                overlay,
-            )
+            _apply_all_rules_to_bt_row({c: row[c] for c in available_display_cols if c in row}, state)
         )
 
         seq_df = pl.DataFrame(sequence_data)
@@ -1384,7 +1514,8 @@ def handle_pbn_lookup(
                 pbn_input, bt_completed, max_matches=10
             )
         except Exception as e:
-            print(f"[pbn-lookup] Warning: Could not find matched BT auctions: {e}")
+            # Non-fatal: this endpoint still returns deal matches even if we fail to suggest BT auctions.
+            print(f"[pbn-lookup] Warning: Could not find matched BT auctions: {type(e).__name__}: {e}")
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"[pbn-lookup] Found {matching.height} matches, {len(matched_bt_auctions)} BT auctions in {format_elapsed(elapsed_ms)}")
@@ -1474,13 +1605,15 @@ def handle_deals_matching_auction(
     out_auctions: List[Dict[str, Any]] = []
     overlay = state.get("custom_criteria_overlay") or []
     
-    # Initialize loop variables for type checker (they're always bound when used due to early return)
+    # Initialize loop variables for type checker
     auction: str = ""
     auction_info: Dict[str, Any] = {}
     combined_df: pl.DataFrame = pl.DataFrame()
 
-    for auction_row in sampled_auctions.iter_rows(named=True):
-        auction_row = _apply_custom_criteria_overlay_to_bt_row(dict(auction_row), overlay)
+    for auction_row_raw in sampled_auctions.iter_rows(named=True):
+        # Canonical: enrich Agg_Expr if missing + apply overlay + dedupe
+        auction_row = _apply_all_rules_to_bt_row(dict(auction_row_raw), state)
+
         auction = auction_row["Auction"]
 
         auction_info = {
@@ -1829,7 +1962,7 @@ def handle_bidding_table_statistics(
         regex_pattern = f"(?i){auction_pattern}"
         matched_df = base_df.filter(auction_expr.str.contains(regex_pattern))
     except Exception as e:
-        raise ValueError(f"Invalid regex pattern: {e}")
+        raise ValueError(f"Invalid regex pattern: {type(e).__name__}: {e}")
     
     if matched_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -1890,9 +2023,8 @@ def handle_bidding_table_statistics(
                 print(f"[bidding-table-statistics] Distribution filter error: {e}")
     
     result_rows = result_df.to_dicts()
-    overlay = state.get("custom_criteria_overlay") or []
-    if overlay:
-        result_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in result_rows]
+    # Canonical: enrich Agg_Expr if missing + apply overlay + dedupe
+    result_rows = [_apply_all_rules_to_bt_row(r, state) for r in result_rows]
     
     # Expand each matched row to 4 seat variants when allow_initial_passes is True
     if allow_initial_passes:
@@ -1996,7 +2128,8 @@ def handle_find_matching_auctions(
     
     join_df = matching_df.join(bt_seat1_df, on="bt_index", how="left", suffix="_bt")
     
-    result_cols = ["Auction"]
+    # Keep bt_index so we can enrich Agg_Expr on-demand in lightweight mode
+    result_cols = ["bt_index", "Auction"]
     if "matching_deal_count" in join_df.columns:
         result_cols.append("matching_deal_count")
     for s in range(1, 5):
@@ -2010,9 +2143,8 @@ def handle_find_matching_auctions(
     result_cols = [c for c in result_cols if c in join_df.columns]
     result_df = join_df.select(result_cols)
     result_rows = result_df.to_dicts()
-    overlay = state.get("custom_criteria_overlay") or []
-    if overlay:
-        result_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in result_rows]
+    # Canonical: enrich Agg_Expr if missing + apply overlay + dedupe
+    result_rows = [_apply_all_rules_to_bt_row(r, state) for r in result_rows]
     # Display: prepend leading passes for the requested seat.
     for r in result_rows:
         if "Auction" in r:
@@ -2098,11 +2230,13 @@ def _compute_wrong_bid_rate_for_bt_row(
     wrong_bid_count = 0
     wrong_by_seat = {1: 0, 2: 0, 3: 0, 4: 0}
     
+    # Apply merged rules + overlay to get final criteria
+    bt_row_with_rules = _apply_all_rules_to_bt_row(dict(bt_row), state)
     bt_info = {
-        "Agg_Expr_Seat_1": bt_row.get("Agg_Expr_Seat_1"),
-        "Agg_Expr_Seat_2": bt_row.get("Agg_Expr_Seat_2"),
-        "Agg_Expr_Seat_3": bt_row.get("Agg_Expr_Seat_3"),
-        "Agg_Expr_Seat_4": bt_row.get("Agg_Expr_Seat_4"),
+        "Agg_Expr_Seat_1": bt_row_with_rules.get("Agg_Expr_Seat_1"),
+        "Agg_Expr_Seat_2": bt_row_with_rules.get("Agg_Expr_Seat_2"),
+        "Agg_Expr_Seat_3": bt_row_with_rules.get("Agg_Expr_Seat_3"),
+        "Agg_Expr_Seat_4": bt_row_with_rules.get("Agg_Expr_Seat_4"),
     }
     
     for row in sample_df.iter_rows(named=True):
@@ -2150,9 +2284,8 @@ def handle_bt_seat_stats(
         seat: 1-4 for specific seat, 0 for all seats.
         max_deals: Optional cap on deals to aggregate (currently unused; exact stats).
     """
-    # Apply hot-reloadable custom criteria overlay so stats reflect current CSV rules.
-    overlay = state.get("custom_criteria_overlay") or []
-    bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(bt_row), overlay)
+    # Canonical: enrich Agg_Expr if missing + apply overlay + dedupe
+    bt_row = _apply_all_rules_to_bt_row(dict(bt_row), state)
 
     if seat == 0:
         seats = [1, 2, 3, 4]
@@ -2388,14 +2521,15 @@ LIMIT {n_auction_groups}"""
     available_deal_cols = [c for c in deal_cols if c in filtered_df.columns]
     
     bt_cols = ["Auction", "Expr", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"]
-    overlay = state.get("custom_criteria_overlay") or []
     
     bt_lookup_df = bt_seat1_df
     # Hard fail if is_completed_auction is missing
     if "is_completed_auction" not in bt_lookup_df.columns:
         raise ValueError("REQUIRED column 'is_completed_auction' missing from bt_seat1_df. Pipeline error.")
         bt_lookup_df = bt_lookup_df.filter(pl.col("is_completed_auction"))
-    available_bt_cols = [c for c in bt_cols if c in bt_lookup_df.columns]
+    # Do not gate on bt_lookup_df columns: in lightweight mode Agg_Expr columns are missing
+    # but will be loaded on-demand via `_apply_all_rules_to_bt_row`.
+    available_bt_cols = bt_cols
     
     auction_groups = []
     
@@ -2415,18 +2549,19 @@ LIMIT {n_auction_groups}"""
         
         bt_info = None
         bt_auction = None
-        if available_bt_cols:
-            # Strip leading "P-" prefixes (use regex, not lstrip which removes individual chars)
-            auction_for_search = re.sub(r"^(P-)+", "", (bid_auction.upper() if bid_auction else ""))
+        # Strip leading "P-" prefixes (use regex, not lstrip which removes individual chars)
+        auction_for_search = re.sub(r"^(P-)+", "", (bid_auction.upper() if bid_auction else ""))
 
-            bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_uppercase() == auction_for_search)
-            if bt_match.height == 0 and not auction_for_search.endswith("-P-P-P"):
-                auction_with_passes = auction_for_search + "-P-P-P"
-                bt_match = bt_lookup_df.filter(pl.col("Auction").cast(pl.Utf8).str.to_uppercase() == auction_with_passes)
-            if bt_match.height > 0:
-                bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(bt_match.row(0, named=True)), overlay)
-                bt_info = {c: bt_row.get(c) for c in available_bt_cols if c in bt_row}
-                bt_auction = bt_row.get("Auction")
+        # Fast exact match on Auction (pre-normalized)
+        bt_match = bt_lookup_df.filter(pl.col("Auction") == auction_for_search)
+        if bt_match.height == 0 and not auction_for_search.endswith("-P-P-P"):
+            auction_with_passes = auction_for_search + "-P-P-P"
+            bt_match = bt_lookup_df.filter(pl.col("Auction") == auction_with_passes)
+        if bt_match.height > 0:
+            # Canonical: enrich Agg_Expr if missing + apply overlay + dedupe
+            bt_row = _apply_all_rules_to_bt_row(dict(bt_match.row(0, named=True)), state)
+            bt_info = {c: bt_row.get(c) for c in available_bt_cols if c in bt_row}
+            bt_auction = bt_row.get("Auction")
         
         if bt_auction:
             group_deals = group_deals.with_columns(pl.lit(bt_auction).alias("Auction"))
@@ -2561,11 +2696,10 @@ def handle_wrong_bid_stats(
     
     # Prepare BT for join and join once (instead of per-row lookups)
     bt_prepared = prepare_bt_for_join(bt_seat1_df)
-    joined_df = join_deals_with_bt(sample_df, bt_prepared)
-    overlay = state.get("custom_criteria_overlay") or []
+    joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
     
     # Batch check wrong bids (still loops but no per-row filter operations)
-    result_df = batch_check_wrong_bids(joined_df, deal_criteria_by_seat_dfs, seat, criteria_overlay=overlay)
+    result_df = batch_check_wrong_bids(joined_df, deal_criteria_by_seat_dfs, seat, state=state)
     
     # Aggregate statistics from result_df
     wrong_rows = result_df.filter(pl.col("first_wrong_seat").is_not_null())
@@ -2715,8 +2849,7 @@ def handle_failed_criteria_summary(
     
     # Prepare BT for join and join once (eliminates per-row filter operations)
     bt_prepared = prepare_bt_for_join(bt_seat1_df)
-    joined_df = join_deals_with_bt(sample_df, bt_prepared)
-    overlay = state.get("custom_criteria_overlay") or []
+    joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
     
     # Track criteria failures
     criteria_fail_counts: Dict[str, int] = {}
@@ -2726,8 +2859,8 @@ def handle_failed_criteria_summary(
     # Process each deal - now without per-row BT lookups (already joined)
     seats_to_check = [seat] if seat else list(range(1, 5))
     for row in joined_df.iter_rows(named=True):
-        if overlay:
-            row = _apply_custom_criteria_overlay_to_bt_row(dict(row), overlay)
+        # Canonical: ensure Agg_Expr is available + overlay + dedupe
+        row = _apply_all_rules_to_bt_row(dict(row), state)
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         
@@ -2842,8 +2975,7 @@ def handle_wrong_bid_leaderboard(
     
     # Prepare BT for join and join once (eliminates per-row filter operations)
     bt_prepared = prepare_bt_for_join(bt_seat1_df)
-    joined_df = join_deals_with_bt(sample_df, bt_prepared)
-    overlay = state.get("custom_criteria_overlay") or []
+    joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
     
     # Track wrong bids by (bid, seat)
     bid_seat_wrong: Dict[Tuple[str, int], int] = {}
@@ -2853,8 +2985,8 @@ def handle_wrong_bid_leaderboard(
     # Process each deal - now without per-row BT lookups (already joined)
     seats_to_check = [seat] if seat else list(range(1, 5))
     for row in joined_df.iter_rows(named=True):
-        if overlay:
-            row = _apply_custom_criteria_overlay_to_bt_row(dict(row), overlay)
+        # Canonical: ensure Agg_Expr is available + overlay + dedupe
+        row = _apply_all_rules_to_bt_row(dict(row), state)
         deal_idx = row.get("_row_idx", 0)
         dealer = row.get("Dealer", "N")
         bid_str = row.get("_bid_str", "")
@@ -3147,13 +3279,12 @@ def handle_bidding_arena(
     """Handle /bidding-arena endpoint (Bidding Arena).
     
     Provides comprehensive head-to-head comparison between two bidding models.
-    Currently supports "Rules", "Raw_Rules", and "Actual" models.
-    Future: "NN", "RF", "Fuzzy", etc.
     
-    IMPORTANT: "Rules" model uses learned criteria + CSV overlay.
-    "Raw_Rules" model finds the BT completed auction whose criteria ALL match
-    the deal's hand features (using bitmap lookups). This is NOT the same as looking
-    up the BT row by the actual auction string.
+    Supported models:
+    - "Actual": Human bids from the dataset
+    - "Rules": Full pipeline (Base + Learned + CSV Overlay)
+    - "Rules_Learned": Base + Learned (no CSV overlay)
+    - "Rules_Base": Base only (original GIB criteria)
     
     Args:
         deals_uri: Optional file path or URL to load custom deals from.
@@ -3177,24 +3308,15 @@ def handle_bidding_arena(
     bt_seat1_df = state.get("bt_seat1_df")
     
     # Validate models
-    # "Rules" uses learned criteria from bbo_bt_merged_rules.parquet + CSV overlay (default)
-    # "Raw_Rules" uses original BT criteria + CSV overlay (no learned criteria)
-    merged_rules_lookup = state.get("merged_rules_lookup")
-    valid_models = {"Raw_Rules", "Actual"}
-    if merged_rules_lookup is not None:
-        valid_models.add("Rules")
+    # Note: Merged rules are pre-compiled into BT, so all models are available
+    valid_models = {MODEL_ACTUAL, MODEL_RULES_BASE, MODEL_RULES, MODEL_RULES_LEARNED}
     
     if model_a not in valid_models:
-        raise ValueError(f"Invalid model_a: {model_a}. Valid models: {valid_models}")
+        raise ValueError(f"Invalid model_a: {model_a}. Valid: {valid_models}")
     if model_b not in valid_models:
-        raise ValueError(f"Invalid model_b: {model_b}. Valid models: {valid_models}")
+        raise ValueError(f"Invalid model_b: {model_b}. Valid: {valid_models}")
     if model_a == model_b:
         raise ValueError("model_a and model_b must be different")
-    
-    # Check if Rules model is requested but not available
-    if (model_a == "Rules" or model_b == "Rules") and merged_rules_lookup is None:
-        raise ValueError("Rules model requested but merged_rules_lookup not loaded. "
-                         "Ensure bbo_bt_merged_rules.parquet exists in data directory.")
     
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
@@ -3262,7 +3384,7 @@ def handle_bidding_arena(
     has_precomputed_matches = False
 
     # Rules candidate source:
-    # - Default: restrict to BT rows that have a merged-rules entry (bt_index in merged_rules_lookup)
+    # - Default: use all completed BT rows (merged rules are pre-compiled)
     # - Backstop: fall back to generic on-the-fly candidate pool (bt_seat1 completed auctions)
     rules_search_mode = "merged_default"
     rules_search_limit: int | None = None
@@ -3475,32 +3597,31 @@ def handle_bidding_arena(
                 cols = ["bt_index", "Auction", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
                 cols = [c for c in cols if c in bt_seat1_df.columns]
                 lookup_df = bt_seat1_df.select(cols).filter(pl.col("bt_index").is_in(needed_idxs))
-                lookup_rows_base = lookup_df.to_dicts()
-                # Store base rows (without overlay) for Rules model
-                for r in lookup_rows_base:
-                    bt_idx = r.get("bt_index")
-                    if bt_idx is not None:
-                        bt_idx_to_row_base[int(bt_idx)] = r
-                    auc = r.get("Auction")
-                    if auc:
-                        # Normalize key to seat-1 view + lowercase so deal auctions with leading passes
-                        # (e.g. "p-p-p-1N-p-p-p") can be looked up reliably.
-                        k = _auction_key_seat1(auc)
-                        bt_auction_to_row_base[k] = r
-                # Apply overlay for Rules model
-                if overlay:
-                    lookup_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in lookup_rows_base]
-                else:
-                    lookup_rows = lookup_rows_base
+                lookup_rows_raw = lookup_df.to_dicts()
+                
+                # Apply Overlay + Dedup (merged rules are pre-compiled in BT)
+                overlay = state.get("custom_criteria_overlay") or []
+                
+                lookup_rows = []
+                for r in lookup_rows_raw:
+                    p = dict(r)
+                    if overlay:
+                        p = _apply_overlay_only(p, overlay)
+                    p = dedupe_criteria_all_seats(p)
+                    lookup_rows.append(p)
+
+                # Store pre-processed rows
                 for r in lookup_rows:
                     bt_idx = r.get("bt_index")
-                    auction = r.get("Auction")
-                    if bt_idx is None:
-                        continue
-                    bt_idx_i = int(bt_idx)
-                    bt_idx_to_row[bt_idx_i] = r
-                    if auction:
-                        bt_idx_to_auction[bt_idx_i] = str(auction)
+                    if bt_idx is not None:
+                        bt_idx_i = int(bt_idx)
+                        bt_idx_to_row_base[bt_idx_i] = r # Base rows in this scope are already merged
+                        bt_idx_to_row[bt_idx_i] = r
+                        auc = r.get("Auction")
+                        if auc:
+                            bt_idx_to_auction[bt_idx_i] = str(auc)
+                            k = _auction_key_seat1(auc)
+                            bt_auction_to_row_base[k] = r
             except Exception:
                 bt_idx_to_row = {}
                 bt_idx_to_row_base = {}
@@ -3516,60 +3637,96 @@ def handle_bidding_arena(
         else:
             bt_completed = bt_seat1_df
 
-        # Default Rules candidate pool: BT rows that have a merged rules entry.
-        merged_rules_lookup = state.get("merged_rules_lookup") or {}
-        if merged_rules_lookup:
-            try:
-                merged_bt_indices = list(merged_rules_lookup.keys())
-            except Exception:
-                merged_bt_indices = []
-        else:
-            merged_bt_indices = []
-
+        # Rules candidate pool: use completed auctions (merged rules are pre-compiled in BT)
         bt_rules_default = bt_completed
-        if merged_bt_indices and "bt_index" in bt_rules_default.columns:
-            bt_rules_default = bt_rules_default.filter(pl.col("bt_index").is_in(merged_bt_indices))
-        else:
-            # If merged rules aren't available, default pool degenerates to the generic completed pool.
-            rules_search_mode = "onthefly"
         
         if not search_all_bt_rows:
             # Limit pools for performance (default + fallback)
             if "matching_deal_count" in bt_rules_default.columns:
-                bt_rules_default = bt_rules_default.sort("matching_deal_count", descending=True).head(5000)
+                bt_rules_default = bt_rules_default.sort("matching_deal_count", descending=True).head(_CANDIDATE_POOL_LIMIT)
             elif "bt_index" in bt_rules_default.columns:
-                bt_rules_default = bt_rules_default.sort("bt_index").head(5000)
+                bt_rules_default = bt_rules_default.sort("bt_index").head(_CANDIDATE_POOL_LIMIT)
             else:
-                bt_rules_default = bt_rules_default.head(5000)
+                bt_rules_default = bt_rules_default.head(_CANDIDATE_POOL_LIMIT)
 
             if "matching_deal_count" in bt_completed.columns:
-                bt_completed = bt_completed.sort("matching_deal_count", descending=True).head(5000)
+                bt_completed = bt_completed.sort("matching_deal_count", descending=True).head(_CANDIDATE_POOL_LIMIT)
             elif "bt_index" in bt_completed.columns:
-                bt_completed = bt_completed.sort("bt_index").head(5000)
+                bt_completed = bt_completed.sort("bt_index").head(_CANDIDATE_POOL_LIMIT)
             else:
-                bt_completed = bt_completed.head(5000)
+                bt_completed = bt_completed.head(_CANDIDATE_POOL_LIMIT)
+
+        # -------------------------------------------------------------------
+        # Memory optimization: bt_seat1_df is loaded without Agg_Expr_Seat_*.
+        # The Bidding Arena NEEDS criteria to evaluate candidates, so load
+        # Agg_Expr for JUST the candidate pools on-demand (DuckDB, fast).
+        # -------------------------------------------------------------------
+        if "Agg_Expr_Seat_1" not in bt_rules_default.columns or "Agg_Expr_Seat_1" not in bt_completed.columns:
+            bt_parquet_file = state.get("bt_seat1_file")
+            if bt_parquet_file is None:
+                raise ValueError("bt_seat1_file missing from state; cannot load Agg_Expr on-demand for bidding-arena")
+            if "bt_index" not in bt_rules_default.columns or "bt_index" not in bt_completed.columns:
+                raise ValueError("bt_index missing from BT candidate pool; cannot load Agg_Expr on-demand for bidding-arena")
+
+            needed_idxs = (
+                pl.concat(
+                    [
+                        bt_rules_default.select(pl.col("bt_index").cast(pl.Int64)),
+                        bt_completed.select(pl.col("bt_index").cast(pl.Int64)),
+                    ],
+                    how="vertical",
+                )
+                .unique()
+                .to_series()
+                .to_list()
+            )
+            needed_idxs = [int(x) for x in needed_idxs if x is not None]
+            if needed_idxs:
+                agg_data = _load_agg_expr_for_bt_indices(needed_idxs, bt_parquet_file)
+                agg_rows: list[dict[str, Any]] = []
+                for bt_idx, cols_dict in agg_data.items():
+                    row: dict[str, Any] = {"bt_index": bt_idx}
+                    for k, v in cols_dict.items():
+                        row[k] = v
+                    agg_rows.append(row)
+                if agg_rows:
+                    agg_df = pl.DataFrame(agg_rows)
+                    bt_rules_default = bt_rules_default.join(agg_df, on="bt_index", how="left")
+                    bt_completed = bt_completed.join(agg_df, on="bt_index", how="left")
         
         # Convert pools to list of dicts for iteration
         bt_cols = ["Auction", "bt_index", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
         bt_cols = [c for c in bt_cols if c in bt_completed.columns]
 
-        bt_rules_default_rows_base = bt_rules_default.select(bt_cols).to_dicts() if bt_rules_default is not None else []
-        bt_completed_rows_base = bt_completed.select(bt_cols).to_dicts()
+        # NOTE: We intentionally do NOT build a global auction->bt_index map here.
+        # It was extremely expensive on the 461M-row BT and is not used by the Arena.
+
+        # PRE-PROCESS CANDIDATE POOLS: Apply Overlay + Dedup (merged rules pre-compiled in BT)
+        overlay = state.get("custom_criteria_overlay") or []
+        
+        def _fully_pre_process_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            out = []
+            for r in rows:
+                processed = dict(r)
+                # Apply custom CSV overlay
+                if overlay:
+                    processed = _apply_overlay_only(processed, overlay)
+                # Deduplicate criteria (keep least restrictive)
+                processed = dedupe_criteria_all_seats(processed)
+                out.append(processed)
+            return out
+
+        bt_rules_default_rows_base = _fully_pre_process_rows(
+            bt_rules_default.select(bt_cols).to_dicts() if bt_rules_default is not None else []
+        )
+        bt_completed_rows_base = _fully_pre_process_rows(
+            bt_completed.select(bt_cols).to_dicts()
+        )
 
         # Build Auction->row caches for fast lookup.
         # - default: merged-rules pool only (preferred when searching candidates)
         # - full: generic completed pool (used ONLY for "is actual auction in BT?" checks)
-        #
-        # Key by seat-1 normalized, lowercased auction string for robust lookup.
         def _build_bt_auction_cache(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-            """Build a robust seat-1 auction lookup cache.
-            
-            Multiple BT rows can map to the same seat-1 key if the source BT includes
-            leading-pass variants (e.g., '1N-p-p-p' and 'p-1N-p-p-p'). When that happens,
-            we must prefer the *canonical* row with the fewest leading passes; otherwise the
-            cache can silently point at an already-rotated criteria row and seats will look
-            'confused' in downstream debug output.
-            """
             out: dict[str, dict[str, Any]] = {}
             for r in rows:
                 auc = r.get("Auction")
@@ -3589,7 +3746,6 @@ def handle_bidding_arena(
                     new_passes = _count_leading_passes(auc)
                 except Exception:
                     new_passes = 99
-                # Prefer the row with fewer leading passes (more canonical seat-1 representation).
                 if new_passes < old_passes:
                     out[k] = r
             return out
@@ -3605,108 +3761,165 @@ def handle_bidding_arena(
             print(f"[bidding-arena] merged-default {len(bt_rules_default_rows_base)} candidates (top 5: {top_auctions})")
         else:
             print(f"[bidding-arena] {len(bt_completed_rows_base)} candidates (top 5: {top_auctions})")
-        overlay = state.get("custom_criteria_overlay") or []
-        if overlay:
-            bt_completed_rows = [_apply_custom_criteria_overlay_to_bt_row(r, overlay) for r in bt_completed_rows_base]
-        else:
-            bt_completed_rows = bt_completed_rows_base
+        
+        # IMPORTANT: These rows are now fully pre-processed.
+        bt_completed_rows = bt_completed_rows_base
         
         def _find_rules_auction_onthefly(deal_idx: int, dealer: str) -> Optional[str]:
             """Find the first completed auction whose criteria ALL match this deal."""
             return _find_first_rules_match_onthefly(deal_idx, dealer)
     
     # ---------------------------------------------------------------------------
+    # Optimization: Deal-Level Criteria Cache (LAZY)
+    #
+    # IMPORTANT: Agg_Expr criteria strings can have very high cardinality (thousands+).
+    # Pre-evaluating "all unique criteria in the candidate pool" per deal can be slower
+    # than the actual search. Instead, evaluate criteria lazily on first use and cache.
+    # ---------------------------------------------------------------------------
+    class DealCriteriaCache:
+        def __init__(self, deal_idx: int, dealer: str, deal_row: Dict[str, Any]):
+            self.deal_idx = int(deal_idx)
+            self.dealer = str(dealer or "N").upper()
+            self.deal_row = deal_row
+            # Per-seat caches: criterion -> bool result
+            self.results: Dict[int, Dict[str, bool]] = {s: {} for s in SEAT_RANGE}
+            # Keep references to bitmap dfs + a set of column names for O(1) membership
+            self.criteria_df_by_seat: Dict[int, pl.DataFrame] = {}
+            self.criteria_cols_by_seat: Dict[int, set[str]] = {}
+            for s in SEAT_RANGE:
+                df = (deal_criteria_by_seat_dfs.get(s, {}) or {}).get(self.dealer)
+                if df is None or df.is_empty():
+                    continue
+                self.criteria_df_by_seat[s] = df
+                self.criteria_cols_by_seat[s] = set(df.columns)
+
+        def check(self, seat: int, criterion: Any) -> bool:
+            """Return whether this deal satisfies a single criterion for a given seat."""
+            try:
+                s = int(seat)
+            except Exception:
+                return False
+            crit_s = str(criterion).strip()
+            if not crit_s:
+                return True
+            cached = self.results[s].get(crit_s)
+            if cached is not None:
+                return cached
+
+            # Dynamic SL evaluation (correct seat-direction mapping)
+            sl_res = evaluate_sl_criterion(crit_s, self.dealer, s, self.deal_row, fail_on_missing=False)
+            if sl_res is not None:
+                self.results[s][crit_s] = bool(sl_res)
+                return bool(sl_res)
+
+            # Bitmap evaluation
+            df = self.criteria_df_by_seat.get(s)
+            if df is None:
+                self.results[s][crit_s] = False
+                return False
+            if crit_s not in self.criteria_cols_by_seat.get(s, set()):
+                # Unknown / untracked criterion => pass (consistent with current matching semantics)
+                self.results[s][crit_s] = True
+                return True
+            try:
+                ok = bool(df[crit_s][self.deal_idx])
+            except Exception:
+                ok = False
+            self.results[s][crit_s] = ok
+            return ok
+
+        def meets_all(self, bt_row: Dict[str, Any]) -> bool:
+            for s in SEAT_RANGE:
+                col = f"Agg_Expr_Seat_{s}"
+                crits = bt_row.get(col) or []
+                if not crits:
+                    continue
+                for crit in crits:
+                    if not self.check(int(s), crit):
+                        return False
+            return True
+
+    def _deal_meets_all_seat_criteria_cached(cache: DealCriteriaCache, bt_row: Dict[str, Any]) -> bool:
+        return cache.meets_all(bt_row)
+
+    # ---------------------------------------------------------------------------
     # Rules Model Matching Setup (Learned Criteria)
     # ---------------------------------------------------------------------------
-    # Rules model uses learned criteria from bbo_bt_merged_rules.parquet.
-    # We key the lookup by bt_index to avoid fragile auction-string matching.
+    # Rules model uses learned criteria pre-compiled into bbo_bt_compiled.parquet.
+    # No runtime rule application needed - just use BT data directly.
     
-    use_rules = model_a == "Rules" or model_b == "Rules"  # Rules = learned + CSV overlay
+    use_rules = (model_a in (MODEL_RULES, MODEL_RULES_LEARNED)) or (model_b in (MODEL_RULES, MODEL_RULES_LEARNED))
     
-    def _apply_merged_rules_to_bt_row(bt_row: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply Merged_Rules to seat-1, then apply CSV overlay on top.
-        
-        Flow:
-        1. Get merged rules for seat 1 from merged_rules_lookup (if available)
-        2. Apply CSV overlay on top (so CSV can disable/modify merged rules)
-        
-        IMPORTANT: CSV overlay is ALWAYS applied, even if no merged rules exist.
-        """
-        overlay = state.get("custom_criteria_overlay") or []
-        
-        # Start with a copy to avoid mutating the original
-        result = dict(bt_row)
-        
-        # Apply merged rules to seat 1 if available
-        if merged_rules_lookup is not None:
-            bt_idx = bt_row.get("bt_index")
-            if bt_idx is not None:
-                try:
-                    bt_idx_i = int(bt_idx)
-                    merged = merged_rules_lookup.get(bt_idx_i)
-                    if merged:
-                        # Rules model: seat-1 criteria is driven by merged rules (pipeline output).
-                        result[agg_expr_col(1)] = list(merged)
-                except Exception:
-                    pass
-        
-        # ALWAYS apply CSV overlay on top (so CSV can modify/disable rules)
-        if overlay:
-            result = _apply_custom_criteria_overlay_to_bt_row(result, overlay)
-        
-        return result
+    def _apply_overlay_to_bt_row(bt_row: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply overlay to BT row. Merged rules are pre-compiled."""
+        return _apply_overlay_and_dedupe(bt_row, state)
     
-    def _deal_meets_merged_criteria(deal_idx: int, dealer: str, bt_row: Dict[str, Any], deal_row: Dict[str, Any] | None = None) -> bool:
-        """Check if a deal meets criteria using Merged_Rules for seat 1."""
-        merged_row = _apply_merged_rules_to_bt_row(bt_row)
-        return _deal_meets_all_seat_criteria(deal_idx, dealer, merged_row, deal_row)
-    
-    def _find_first_merged_rules_match_precomputed(
-        deal_idx: int,
-        dealer: str,
+    def _deal_meets_merged_criteria(cache: DealCriteriaCache, bt_row: Dict[str, Any]) -> bool:
+        """Check if a deal meets criteria. bt_row is already pre-processed."""
+        return _deal_meets_all_seat_criteria_cached(cache, bt_row)
+
+    def _deal_meets_learned_criteria(cache: DealCriteriaCache, bt_row: Dict[str, Any]) -> bool:
+        """Check if a deal meets criteria. bt_row is already pre-processed."""
+        return _deal_meets_all_seat_criteria_cached(cache, bt_row)
+
+    def _find_first_learned_rules_match_precomputed(
+        cache: DealCriteriaCache,
         matched_indices: List[int] | None,
-        deal_row: Dict[str, Any] | None = None,
     ) -> str | None:
-        """Find first matching auction using Merged_Rules criteria (precomputed path).
-        
-        Uses bt_idx_to_row_base (without overlay), then _apply_merged_rules_to_bt_row
-        applies merged rules + CSV overlay.
-        """
         if not matched_indices:
             return None
         for bt_idx in matched_indices:
-            # Use base rows - overlay is applied inside _apply_merged_rules_to_bt_row
             bt_row = bt_idx_to_row_base.get(int(bt_idx))
-            if bt_row and _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
-    
-    def _find_first_merged_rules_match_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
-        """Find first matching auction using Merged_Rules criteria (on-the-fly path).
-        
-        Uses bt_completed_rows_base (without overlay), then _apply_merged_rules_to_bt_row
-        applies merged rules + CSV overlay.
-        """
-        for bt_row in bt_completed_rows_base:
-            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+            if bt_row and _deal_meets_learned_criteria(cache, bt_row):
                 auc = bt_row.get("Auction")
                 return str(auc) if auc is not None else None
         return None
 
-    def _find_first_merged_rules_match_default(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
+    def _find_first_learned_rules_match_default(cache: DealCriteriaCache) -> str | None:
+        for bt_row in bt_rules_default_rows_base:
+            if _deal_meets_learned_criteria(cache, bt_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+
+    def _find_first_learned_rules_match_onthefly(cache: DealCriteriaCache) -> str | None:
+        for bt_row in bt_completed_rows_base:
+            if _deal_meets_learned_criteria(cache, bt_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+    
+    def _find_first_merged_rules_match_precomputed(
+        cache: DealCriteriaCache,
+        matched_indices: List[int] | None,
+    ) -> str | None:
+        if not matched_indices:
+            return None
+        for bt_idx in matched_indices:
+            bt_row = bt_idx_to_row_base.get(int(bt_idx))
+            if bt_row and _deal_meets_merged_criteria(cache, bt_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+    
+    def _find_first_merged_rules_match_onthefly(cache: DealCriteriaCache) -> str | None:
+        for bt_row in bt_completed_rows_base:
+            if _deal_meets_merged_criteria(cache, bt_row):
+                auc = bt_row.get("Auction")
+                return str(auc) if auc is not None else None
+        return None
+
+    def _find_first_merged_rules_match_default(cache: DealCriteriaCache) -> str | None:
         """Default path: search the merged-rules candidate pool first, then fall back to None."""
         for bt_row in bt_rules_default_rows_base:
-            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+            if _deal_meets_merged_criteria(cache, bt_row):
                 auc = bt_row.get("Auction")
                 return str(auc) if auc is not None else None
         return None
     
     def _find_merged_rules_matches_precomputed(
-        deal_idx: int,
-        dealer: str,
+        cache: DealCriteriaCache,
         matched_indices: List[int] | None,
-        deal_row: Dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         """Return all matching BT candidates using merged rules (up to max returned)."""
         if not matched_indices:
@@ -3718,20 +3931,19 @@ def handle_bidding_arena(
             bt_row = bt_idx_to_row_base.get(bt_idx_i)
             if bt_row is None:
                 continue
-            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+            if _deal_meets_merged_criteria(cache, bt_row):
                 out.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction")})
                 if len(out) >= RULES_MATCHES_MAX_RETURNED:
                     truncated = True
                     break
         return out, truncated
 
-    def _find_merged_rules_matches_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], bool]:
+    def _find_merged_rules_matches_onthefly(cache: DealCriteriaCache) -> tuple[list[dict[str, Any]], bool]:
         """Return matching BT candidates using merged rules, default pool first (up to max returned)."""
         out: list[dict[str, Any]] = []
         truncated = False
-        # Default source: merged-rules rows
         for bt_row in bt_rules_default_rows_base:
-            if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+            if _deal_meets_merged_criteria(cache, bt_row):
                 out.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")})
                 if len(out) >= RULES_MATCHES_MAX_RETURNED:
                     truncated = True
@@ -3740,7 +3952,7 @@ def handle_bidding_arena(
         if not truncated and len(out) < RULES_MATCHES_MAX_RETURNED:
             seen = set((m.get("bt_index"), m.get("auction")) for m in out)
             for bt_row in bt_completed_rows_base:
-                if _deal_meets_merged_criteria(deal_idx, dealer, bt_row, deal_row):
+                if _deal_meets_merged_criteria(cache, bt_row):
                     item = {"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")}
                     key = (item.get("bt_index"), item.get("auction"))
                     if key in seen:
@@ -3810,12 +4022,12 @@ def handle_bidding_arena(
     
     def _rejection_reason_for(model: str, auction_val: Any, dd_score_val: Any, dealer: str) -> str | None:
         """Return a short reason string if this model can't be compared for this deal."""
-        if model == "Actual":
+        if model == MODEL_ACTUAL:
             if dd_score_val is None:
-                return "Actual: missing DD_Score_Declarer"
+                return f"{MODEL_ACTUAL}: missing DD_Score_Declarer"
             return None
-        # Rules or Raw_Rules
-        model_name = model  # "Rules" or "Raw_Rules"
+        # Rules model variant
+        model_name = model
         if auction_val is None:
             # Distinguish "no match" from "can't verify because criteria bitmaps are missing for this dealer".
             try:
@@ -3856,6 +4068,9 @@ def handle_bidding_arena(
         # Ensure dealer is a string for all subsequent calls
         dealer = str(dealer)
         
+        # Create criteria cache once per deal for efficient repeated criteria checks
+        deal_cache = DealCriteriaCache(int(deal_idx), dealer, row)
+        
         vul = row.get("Vul", "None")
         bid_str = row.get("_bid_str", "")
         par_score = row.get("ParScore")
@@ -3874,7 +4089,7 @@ def handle_bidding_arena(
         def _rules_no_match_debug(deal_idx_i: int, dealer_dir: str | int, matched_indices: List[int] | None) -> str:
             """Best-effort diagnostic string when Rules can't find any matching BT auction.
 
-            Uses merged rules + CSV overlay (the Rules path), not Raw_Rules.
+            Uses merged rules + CSV overlay (the Rules path), not Rules_Base.
             We only call this for a small number of sampled deals, so it can afford to check a few candidates.
             """
             try:
@@ -3890,20 +4105,20 @@ def handle_bidding_arena(
                 if has_precomputed_matches:
                     if not matched_indices:
                         return "no candidates (Matched_BT_Indices empty)"
-                    # Use up to N candidates from the precomputed list, apply merged rules + overlay
-                    for bt_idx in matched_indices[:25]:
+                    # Use up to N candidates from the precomputed list, apply overlay
+                    for bt_idx in matched_indices[:_DEBUG_CANDIDATE_SAMPLE]:
                         bt_row = bt_idx_to_row_base.get(int(bt_idx))
                         if bt_row is not None:
-                            # Apply merged rules + CSV overlay (same as _apply_merged_rules_to_bt_row)
-                            candidates.append(_apply_merged_rules_to_bt_row(bt_row))
+                            # Apply overlay + dedupe (merged rules are pre-compiled)
+                            candidates.append(_apply_overlay_to_bt_row(bt_row))
                 else:
                     # On-the-fly path: use base rows, apply merged rules + overlay
                     # Default pool first, then fallback pool
-                    for bt_row in bt_rules_default_rows_base[:25]:
-                        candidates.append(_apply_merged_rules_to_bt_row(bt_row))
-                    if len(candidates) < 25:
-                        for bt_row in bt_completed_rows_base[:25]:
-                            candidates.append(_apply_merged_rules_to_bt_row(bt_row))
+                    for bt_row in bt_rules_default_rows_base[:_DEBUG_CANDIDATE_SAMPLE]:
+                        candidates.append(_apply_overlay_to_bt_row(bt_row))
+                    if len(candidates) < _DEBUG_CANDIDATE_SAMPLE:
+                        for bt_row in bt_completed_rows_base[:_DEBUG_CANDIDATE_SAMPLE]:
+                            candidates.append(_apply_overlay_to_bt_row(bt_row))
 
                 if not candidates:
                     return "no candidates available"
@@ -3913,8 +4128,8 @@ def handle_bidding_arena(
                 
                 # Diagnostic: how many matched_indices are actually found in bt_idx_to_row_base?
                 if matched_indices:
-                    found_count = sum(1 for idx in matched_indices[:25] if bt_idx_to_row_base.get(int(idx)) is not None)
-                    total_count = min(25, len(matched_indices))
+                    found_count = sum(1 for idx in matched_indices[:_DEBUG_CANDIDATE_SAMPLE] if bt_idx_to_row_base.get(int(idx)) is not None)
+                    total_count = min(_DEBUG_CANDIDATE_SAMPLE, len(matched_indices))
                     if found_count < total_count:
                         return f"MISMATCH: only {found_count}/{total_count} matched_indices found in bt_idx_to_row_base (missing rows in bt_seat1_df?)"
 
@@ -3961,9 +4176,11 @@ def handle_bidding_arena(
             except Exception as e:
                 return f"debug failed: {e}"
 
-        need_rules = (model_a == "Rules") or (model_b == "Rules")  # Learned rules
-        need_raw_rules = (model_a == "Raw_Rules") or (model_b == "Raw_Rules")  # Original BT rules
-        need_rules_matches_list = need_rules and (len(sample_deals) < 50)
+        need_rules_final = (model_a == MODEL_RULES) or (model_b == MODEL_RULES)  # Stage 3/3
+        need_rules_learned = (model_a == MODEL_RULES_LEARNED) or (model_b == MODEL_RULES_LEARNED)  # Stage 2/3
+        need_rules = need_rules_final or need_rules_learned
+        need_rules_base = (model_a == MODEL_RULES_BASE) or (model_b == MODEL_RULES_BASE)  # Stage 1/3
+        need_rules_matches_list = need_rules and (len(sample_deals) < _NEED_RULES_MATCHES_LIST_THRESHOLD)
 
         # Pick a single Rules auction (learned criteria) for scoring
         # Pass `row` as deal_row for dynamic SL evaluation
@@ -3971,7 +4188,8 @@ def handle_bidding_arena(
         # Always define these for the sample-deals output schema (even if Rules model not requested).
         rules_actual_lead_passes: int | None = None
         rules_actual_opener_seat: int | None = None
-        if need_rules:
+        rules_learned_auction: str | None = None
+        if need_rules_final:
             # PRIORITIZE: Try actual auction first if it's in BT
             rules_auction = None
             rules_actual_bt_lookup: str = ""
@@ -4029,7 +4247,7 @@ def handle_bidding_arena(
                         try:
                             crits = bt_row.get(agg_expr_col(s)) or []
                             if crits:
-                                txt = "; ".join(str(x) for x in crits[:25])
+                                txt = "; ".join(str(x) for x in crits[:_DEBUG_CRITERIA_PREVIEW])
                             else:
                                 txt = "(no criteria)"
                             seat_label = _format_seat_notation(
@@ -4043,25 +4261,12 @@ def handle_bidding_arena(
                             parts.append(f"S{s}: (error)")
                     return " | ".join(parts)
 
-                def _apply_merged_rules_to_bt_row_no_overlay(bt_row: Dict[str, Any]) -> Dict[str, Any]:
-                    """Apply merged rules to seat 1 ONLY (no CSV overlay).
+                def _copy_bt_row_without_overlay(bt_row: Dict[str, Any]) -> Dict[str, Any]:
+                    """Return a copy of the BT row without applying CSV overlay.
                     
-                    This is a debug helper so we can distinguish issues coming from:
-                    - bbo_bt_merged_rules.parquet (merged rules), vs
-                    - CSV overlay (runtime)
+                    Used when we need the pre-compiled rules without overlay modifications.
                     """
-                    result = dict(bt_row)
-                    if merged_rules_lookup is not None:
-                        bt_idx = bt_row.get("bt_index")
-                        if bt_idx is not None:
-                            try:
-                                bt_idx_i = int(bt_idx)
-                                merged = merged_rules_lookup.get(bt_idx_i)
-                                if merged:
-                                    result[agg_expr_col(1)] = list(merged)
-                            except Exception:
-                                pass
-                    return result
+                    return dict(bt_row)
 
                 bt_row_actual = bt_auction_to_row_base.get(bid_key)
                 if bt_row_actual is None:
@@ -4081,20 +4286,32 @@ def handle_bidding_arena(
                     if bt_row_actual is not None:
                         rules_actual_bt_lookup = "found_bt_full"
                     else:
-                        # As a last resort, fall back to the shared helper (still slower; should be rare)
+                        # As a last resort, resolve by traversal (no Auction scans).
                         try:
-                            bt_match, _auction_for_search = _lookup_bt_row(bt_seat1_df, str(bid_str))
-                            if bt_match.height > 0:
-                                cols = ["Auction", "bt_index", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
-                                cols = [c for c in cols if c in bt_match.columns]
-                                bt_row_actual = bt_match.select(cols).to_dicts()[0]
-                                rules_actual_bt_lookup = "found_bt_full"
-                                if len(diag_first_failure_reasons) < 3:
-                                    diag_first_failure_reasons.append(f"FOUND in bt_seat1_df: {_auction_for_search}")
+                            bt_idx = _resolve_bt_index_by_traversal(state, bid_str_seat1)
+                            if bt_idx is not None:
+                                file_path = _bt_file_path_for_sql(state)
+                                conn = duckdb.connect(":memory:")
+                                try:
+                                    bt_df_row = conn.execute(
+                                        f"""
+                                        SELECT bt_index, Auction, {agg_expr_col(1)}, {agg_expr_col(2)}, {agg_expr_col(3)}, {agg_expr_col(4)}
+                                        FROM read_parquet('{file_path}')
+                                        WHERE bt_index = {int(bt_idx)}
+                                        LIMIT 1
+                                        """
+                                    ).pl()
+                                finally:
+                                    conn.close()
+                                if not bt_df_row.is_empty():
+                                    bt_row_actual = dict(bt_df_row.row(0, named=True))
+                                    rules_actual_bt_lookup = "found_bt_traversal"
+                                    if len(diag_first_failure_reasons) < 3:
+                                        diag_first_failure_reasons.append(f"FOUND by traversal: bt_index={bt_idx}")
                         except Exception as e:
                             rules_actual_bt_lookup = "lookup_error"
                             if len(diag_first_failure_reasons) < 3:
-                                diag_first_failure_reasons.append(f"LOOKUP ERROR: {e}")
+                                diag_first_failure_reasons.append(f"TRAVERSAL LOOKUP ERROR: {e}")
                 
                 if bt_row_actual:
                     if not rules_actual_bt_lookup:
@@ -4106,7 +4323,7 @@ def handle_bidding_arena(
                         rules_actual_bt_index = None
                     try:
                         # Apply merged rules in seat-1 view first, then rotate to the deal's leading-pass seat.
-                        merged_bt_row_actual = _apply_merged_rules_to_bt_row(bt_row_actual)
+                        merged_bt_row_actual = _apply_overlay_to_bt_row(bt_row_actual)
                         merged_bt_row_actual = _rotate_bt_row_for_leading_passes(merged_bt_row_actual, lead_passes)
                     except Exception:
                         merged_bt_row_actual = _rotate_bt_row_for_leading_passes(bt_row_actual, lead_passes)
@@ -4118,7 +4335,7 @@ def handle_bidding_arena(
                     except Exception:
                         rules_actual_base_criteria_by_seat = ""
                     try:
-                        merged_only = _apply_merged_rules_to_bt_row_no_overlay(bt_row_actual)
+                        merged_only = _copy_bt_row_without_overlay(bt_row_actual)
                         merged_only_rot = _rotate_bt_row_for_leading_passes(merged_only, lead_passes)
                         rules_actual_merged_only_criteria_by_seat = _criteria_by_seat_str(merged_only_rot, dealer, lead_passes)
                     except Exception:
@@ -4134,7 +4351,7 @@ def handle_bidding_arena(
                     # Capture "seat 1" criteria used for UI/debug (note: after rotation, seat 1 is dealer-relative).
                     try:
                         s1 = merged_bt_row_actual.get(agg_expr_col(1)) or []
-                        rules_actual_seat1_criteria = "; ".join(str(x) for x in s1[:50])
+                        rules_actual_seat1_criteria = "; ".join(str(x) for x in s1[:_RULES_CRITERIA_PREVIEW])
                     except Exception:
                         rules_actual_seat1_criteria = ""
 
@@ -4169,11 +4386,11 @@ def handle_bidding_arena(
                 if has_precomputed_matches:
                     if not matched_indices:
                         diag_no_matched_indices += 1
-                    rules_auction = _find_first_merged_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
+                    rules_auction = _find_first_merged_rules_match_precomputed(deal_cache, matched_indices)
                 else:
-                    rules_auction = _find_first_merged_rules_match_default(int(deal_idx), dealer, row)
+                    rules_auction = _find_first_merged_rules_match_default(deal_cache)
                     if rules_auction is None and rules_search_mode == "merged_default":
-                        rules_auction = _find_first_merged_rules_match_onthefly(int(deal_idx), dealer, row)
+                        rules_auction = _find_first_merged_rules_match_onthefly(deal_cache)
             
             if rules_auction is None:
                 diag_rules_none += 1
@@ -4191,16 +4408,26 @@ def handle_bidding_arena(
             rules_actual_base_criteria_by_seat = ""
             rules_actual_merged_criteria_by_seat = ""
             rules_actual_merged_only_criteria_by_seat = ""
+
+        # Compute Rules_Learned auction (stage 2/3) only if requested.
+        if need_rules_learned:
+            if has_precomputed_matches:
+                mi2 = row.get("Matched_BT_Indices") if has_precomputed_matches else None
+                rules_learned_auction = _find_first_learned_rules_match_precomputed(deal_cache, mi2)
+            else:
+                rules_learned_auction = _find_first_learned_rules_match_default(deal_cache)
+                if rules_learned_auction is None and rules_search_mode == "merged_default":
+                    rules_learned_auction = _find_first_learned_rules_match_onthefly(deal_cache)
         
-        # Pick Raw_Rules auction (original BT criteria)
-        if need_raw_rules:
+        # Pick Rules_Base auction (original BT criteria)
+        if need_rules_base:
             if has_precomputed_matches:
                 matched_indices = row.get("Matched_BT_Indices")
-                raw_rules_auction = _find_first_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
+                rules_base_auction = _find_first_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
             else:
-                raw_rules_auction = _find_first_rules_match_onthefly(int(deal_idx), dealer, row)
+                rules_base_auction = _find_first_rules_match_onthefly(int(deal_idx), dealer, row)
         else:
-            raw_rules_auction = None
+            rules_base_auction = None
 
         # Collect all matches only for deals that are surfaced in Sample Deal Comparisons.
         # Uses merged rules (the new Rules model) for consistency with rules_auction
@@ -4209,9 +4436,9 @@ def handle_bidding_arena(
         if need_rules_matches_list:
             if has_precomputed_matches:
                 matched_indices = row.get("Matched_BT_Indices")
-                rules_matches, rules_matches_truncated = _find_merged_rules_matches_precomputed(int(deal_idx), dealer, matched_indices, row)
+                rules_matches, rules_matches_truncated = _find_merged_rules_matches_precomputed(deal_cache, matched_indices)
             else:
-                rules_matches, rules_matches_truncated = _find_merged_rules_matches_onthefly(int(deal_idx), dealer, row)
+                rules_matches, rules_matches_truncated = _find_merged_rules_matches_onthefly(deal_cache)
         
         # Helper to get auction result for a model
         def _get_model_result(model: str) -> Tuple[Any, Any, Any]:
@@ -4219,11 +4446,10 @@ def handle_bidding_arena(
             
             All auction strings are normalized to canonical uppercase for consistent comparison.
             """
-            if model == "Actual":
-                # Normalize to canonical case for consistent display/comparison
+            if model == MODEL_ACTUAL:
                 auction_out = normalize_auction_case(bid_str)
                 return row.get("Contract", ""), auction_out, row.get("DD_Score_Declarer")
-            elif model == "Rules":
+            elif model == MODEL_RULES:
                 if rules_auction:
                     auction_out = normalize_auction_case(rules_auction)
                     return (
@@ -4232,13 +4458,22 @@ def handle_bidding_arena(
                         get_dd_score_for_auction(rules_auction, dealer, row),
                     )
                 return None, None, None
-            elif model == "Raw_Rules":
-                if raw_rules_auction:
-                    auction_out = normalize_auction_case(raw_rules_auction)
+            elif model == MODEL_RULES_LEARNED:
+                if rules_learned_auction:
+                    auction_out = normalize_auction_case(rules_learned_auction)
                     return (
-                        get_ai_contract(raw_rules_auction, dealer),
+                        get_ai_contract(rules_learned_auction, dealer),
                         auction_out,
-                        get_dd_score_for_auction(raw_rules_auction, dealer, row),
+                        get_dd_score_for_auction(rules_learned_auction, dealer, row),
+                    )
+                return None, None, None
+            elif model == MODEL_RULES_BASE:
+                if rules_base_auction:
+                    auction_out = normalize_auction_case(rules_base_auction)
+                    return (
+                        get_ai_contract(rules_base_auction, dealer),
+                        auction_out,
+                        get_dd_score_for_auction(rules_base_auction, dealer, row),
                     )
                 return None, None, None
             return None, None, None
@@ -4257,7 +4492,7 @@ def handle_bidding_arena(
 
             # Add a small diagnostic for the common confusion case: Rules has no match.
             rules_debug = ""
-            if (model_a != "Actual" and auction_a is None) or (model_b != "Actual" and auction_b is None):
+            if (model_a != MODEL_ACTUAL and auction_a is None) or (model_b != MODEL_ACTUAL and auction_b is None):
                 mi = row.get("Matched_BT_Indices") if has_precomputed_matches else None
                 rules_debug = _rules_no_match_debug(int(deal_idx), dealer, mi)
 
@@ -4608,7 +4843,7 @@ def handle_bidding_arena(
             "candidate_count": rules_search_limit,
             "fallback_candidate_count": rules_search_limit_fallback,
             "note": (
-                "mode=merged_default means Rules first searches BT rows with a merged-rules entry (bt_index in merged_rules_lookup), "
+                "mode=merged_default means Rules first searches BT rows with learned criteria (pre-compiled in BT), "
                 "then falls back to the generic on-the-fly pool if no match is found."
             ),
         },
@@ -4669,7 +4904,7 @@ def handle_bidding_arena(
 # ---------------------------------------------------------------------------
 
 # Constants for DD analysis
-_DD_ANALYSIS_STATS_THRESHOLD = 5000  # Use full data if <= this many matches
+_DD_ANALYSIS_STATS_THRESHOLD = _CANDIDATE_POOL_LIMIT  # Use full data if <= this many matches
 _DD_ANALYSIS_MAKE_PCT_THRESHOLD = 0  # Show all contracts (0 = no threshold)
 _DD_ANALYSIS_TOP_RECOMMENDATIONS = 100  # Max contract recommendations to show (high = show all)
 _DD_ANALYSIS_SQL_COLS_LIMIT = 15  # Limit columns in SQL display
@@ -4692,41 +4927,6 @@ _VUL_UI_TO_DATA = {
     "None": "None",
     "Both": "Both",
 }
-
-
-def _find_bt_row_for_auction(bt_df: pl.DataFrame, auction_normalized: str) -> pl.DataFrame:
-    """Find a BT row matching the normalized auction string.
-    
-    Works with both partial and completed auctions.
-    Tries: exact match → case-insensitive exact → prefix match.
-    Returns the matching rows DataFrame or empty DataFrame if no match.
-    """
-    auction_col = bt_df["Auction"].cast(pl.Utf8).str.replace(r"(?i)^(p-)+", "")
-    
-    # Try exact match first (case-sensitive)
-    matches = bt_df.filter(auction_col == auction_normalized)
-    if matches.height > 0:
-        return matches
-    
-    # Try case-insensitive exact match
-    try:
-        regex_pattern = f"(?i)^{re.escape(auction_normalized)}$"
-        matches = bt_df.filter(auction_col.str.contains(regex_pattern))
-        if matches.height > 0:
-            return matches
-    except Exception as e:
-        print(f"[auction-dd-analysis] Regex match failed: {e}")
-    
-    # Try prefix match (for finding auctions that start with the input)
-    try:
-        prefix_pattern = f"(?i)^{re.escape(auction_normalized)}(-|$)"
-        matches = bt_df.filter(auction_col.str.contains(prefix_pattern))
-        if matches.height > 0:
-            return matches
-    except Exception as e:
-        print(f"[auction-dd-analysis] Prefix match failed: {e}")
-    
-    return bt_df.head(0)  # Empty DataFrame
 
 
 def _build_criteria_mask_for_dealer(
@@ -5145,19 +5345,14 @@ def handle_auction_dd_analysis(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
     
-    # DO NOT filter to completed auctions - we want to support partial auctions like "1N"
-    # The BT contains rows for all auction prefixes with their accumulated criteria
-    bt_df = bt_seat1_df
-    
     # Normalize auction input (supports '-', whitespace, or ',' separators), then strip leading passes to match seat-1 view
     auction_normalized = re.sub(r"(?i)^(p-)+", "", normalize_auction_input(auction))
     if not auction_normalized:
         raise ValueError(f"Invalid auction: '{auction}'")
     
-    # Find matching BT row (exact, regex, or prefix match)
-    exact_matches = _find_bt_row_for_auction(bt_df, auction_normalized)
-    
-    if exact_matches.height == 0:
+    # Resolve BT row by traversal (no Auction scans on 461M-row BT).
+    bt_idx = _resolve_bt_index_by_traversal(state, auction_normalized)
+    if bt_idx is None:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return {
             "auction_input": auction,
@@ -5169,10 +5364,37 @@ def handle_auction_dd_analysis(
             "sql_query": f"-- No auction found in BT for: {auction_normalized}",
             "elapsed_ms": round(elapsed_ms, 1),
         }
-    
-    # Use first match
-    overlay = state.get("custom_criteria_overlay") or []
-    bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(exact_matches.row(0, named=True)), overlay)
+
+    # Fetch the row by bt_index (DuckDB) and apply overlay/dedupe.
+    file_path = _bt_file_path_for_sql(state)
+    conn = duckdb.connect(":memory:")
+    try:
+        bt_df_row = conn.execute(
+            f"""
+            SELECT bt_index, Auction, candidate_bid, Expr,
+                   Agg_Expr_Seat_1, Agg_Expr_Seat_2, Agg_Expr_Seat_3, Agg_Expr_Seat_4
+            FROM read_parquet('{file_path}')
+            WHERE bt_index = {int(bt_idx)}
+            LIMIT 1
+            """
+        ).pl()
+    finally:
+        conn.close()
+
+    if bt_df_row.is_empty():
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "auction_input": auction,
+            "auction_normalized": auction_normalized,
+            "bt_row": None,
+            "criteria_breakdown": {},
+            "dd_data": [],
+            "total_matches": 0,
+            "sql_query": f"-- No auction found in BT for: {auction_normalized}",
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+
+    bt_row = _apply_all_rules_to_bt_row(dict(bt_df_row.row(0, named=True)), state)
     bt_row_display = {
         "Auction": bt_row.get("Auction"),
         "bt_index": bt_row.get("bt_index"),
@@ -5480,92 +5702,195 @@ def handle_list_next_bids(
             # bt_openings_df has: bt_index, Auction (the bid), seat, Agg_Expr_Seat_1..4
             # Get unique Auction values (opening bids) for seat=1
             seat1_df = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
-            unique_auctions = seat1_df.select("Auction").unique()
             
             seen_bids: set[str] = set()
             for row in seat1_df.iter_rows(named=True):
                 bid = row.get("Auction") or ""
                 if bid and bid.upper() not in seen_bids:
                     seen_bids.add(bid.upper())
+                    # Apply merged rules + overlay to get final criteria
+                    row_with_rules = _apply_all_rules_to_bt_row(dict(row), state)
+                    crits = row_with_rules.get("Agg_Expr_Seat_1") or []
+                    if not crits:
+                        crits = row_with_rules.get("Expr") or []
+                    else:
+                        expr_list = row_with_rules.get("Expr") or []
+                        if expr_list:
+                            seen = set(str(x) for x in crits)
+                            for x in expr_list:
+                                xs = str(x)
+                                if xs not in seen:
+                                    crits.append(x)
+                                    seen.add(xs)
                     next_bids.append({
                         "bid": bid.upper(),
                         "bt_index": row.get("bt_index"),
-                        "agg_expr": row.get("Agg_Expr_Seat_1") or [],
+                        "agg_expr": crits,
                         "is_completed_auction": False,  # Opening bids are not complete
                     })
         else:
-            # Fallback: filter bt_seat1_df (slower)
-            if "is_opening_bid" not in bt_seat1_df.columns:
-                raise ValueError("is_opening_bid column not found")
-            if "candidate_bid" not in bt_seat1_df.columns:
-                raise ValueError("candidate_bid column not found")
-            
-            opening_df = bt_seat1_df.filter(pl.col("is_opening_bid"))
-            
-            # Get unique bids efficiently
-            cols_needed = ["candidate_bid", "bt_index", "Agg_Expr_Seat_1", "is_completed_auction"]
-            cols_available = [c for c in cols_needed if c in opening_df.columns]
-            
-            unique_bids_df = opening_df.select(cols_available).unique(subset=["candidate_bid"], keep="first")
-            
-            for row in unique_bids_df.iter_rows(named=True):
-                bid = row.get("candidate_bid") or ""
-                if bid:
-                    next_bids.append({
-                        "bid": bid.upper(),
-                        "bt_index": row.get("bt_index"),
-                        "agg_expr": row.get("Agg_Expr_Seat_1") or [],
-                        "is_completed_auction": row.get("is_completed_auction", False),
-                    })
+            # Intentionally no fallback to scanning the full 461M-row bt_seat1_df.
+            # If bt_openings_df isn't available, initialization is incomplete or misconfigured.
+            raise ValueError(
+                "bt_openings_df is missing/empty; refusing to scan bt_seat1_df for opening bids. "
+                "Restart the API server and ensure initialization completes successfully."
+            )
     else:
-        # Find parent BT row for this auction prefix using FAST exact match
-        auction_for_lookup = auction_input.rstrip("-").upper() if auction_input else ""
-        
-        # Check for pass-only prefix
-        is_passes_only = not auction_normalized or auction_normalized.lower() in ("p", "")
-        expected_passes = _count_leading_passes(auction_input)
-        
-        if is_passes_only and expected_passes > 0:
-            auction_for_lookup = "-".join(["P"] * expected_passes)
-        
-        # Fast exact match on Auction column (no regex, no column transformation)
-        parent_matches = bt_seat1_df.filter(
-            pl.col("Auction").cast(pl.Utf8).str.to_uppercase() == auction_for_lookup
-        )
-        
-        if parent_matches.height == 0:
+        # Continuations: traverse the game tree using next_bid_indices instead of looking up by Auction.
+        #
+        # Looking up a single row by Auction in a 461M-row Parquet/DF requires a scan and will time out.
+        # Instead, we:
+        # - Resolve the first call via bt_openings_df (tiny lookup table)
+        # - Walk the tree step-by-step using next_bid_indices + bt_index lookups (DuckDB, small IN lists)
+
+        bt_openings_df = state.get("bt_openings_df")
+        if not isinstance(bt_openings_df, pl.DataFrame) or bt_openings_df.is_empty():
+            raise ValueError("bt_openings_df is missing/empty; cannot resolve auction prefix without full BT scans")
+
+        bt_parquet_file = state.get("bt_seat1_file")
+        if bt_parquet_file is None:
+            raise ValueError("bt_seat1_file missing from state; cannot query BT via DuckDB")
+
+        # Normalize and tokenize
+        auction_for_walk = auction_input.rstrip("-").upper() if auction_input else ""
+        tokens = [t for t in auction_for_walk.split("-") if t]
+        if not tokens:
+            # Should not happen because auction_input is non-empty in this branch, but keep safe.
             elapsed_ms = (time.perf_counter() - t0) * 1000
             return {
                 "auction_input": auction_input,
                 "auction_normalized": auction_normalized,
                 "next_bids": [],
-                "error": f"No BT row found for auction '{auction_for_lookup}'",
                 "elapsed_ms": round(elapsed_ms, 1),
             }
-        
-        parent_row = parent_matches.row(0, named=True)
-        next_indices = parent_row.get("next_bid_indices") or []
-        
-        if not next_indices:
+
+        # Resolve first call (seat=1 view) via openings table
+        seat1_open = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
+        first_tok = tokens[0].upper()
+        first_match = seat1_open.filter(pl.col("Auction") == first_tok)
+        if first_match.height == 0:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             return {
                 "auction_input": auction_input,
                 "auction_normalized": auction_normalized,
-                "parent_bt_index": parent_row.get("bt_index"),
                 "next_bids": [],
+                "error": f"Opening bid '{first_tok}' not found in bt_openings_df",
                 "elapsed_ms": round(elapsed_ms, 1),
             }
-        
-        # Lookup next bid rows by bt_index
-        next_df = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
-        
-        # Determine seat for Agg_Expr lookup
-        call_tokens = [t for t in auction_for_lookup.split("-") if t] if auction_for_lookup else []
-        next_seat = (len(call_tokens) % 4) + 1
+        parent_bt_index = int(first_match.row(0, named=True).get("bt_index") or 0)
+
+        import duckdb
+
+        def _fetch_parent_next_indices(conn: duckdb.DuckDBPyConnection, bt_idx: int) -> list[int]:
+            file_path = str(bt_parquet_file).replace("\\", "/")
+            q = f"SELECT next_bid_indices FROM read_parquet('{file_path}') WHERE bt_index = {int(bt_idx)} LIMIT 1"
+            row = conn.execute(q).fetchone()
+            if not row:
+                return []
+            arr = row[0] or []
+            return [int(x) for x in arr if x is not None]
+
+        def _fetch_children_min(conn: duckdb.DuckDBPyConnection, indices: list[int]) -> pl.DataFrame:
+            file_path = str(bt_parquet_file).replace("\\", "/")
+            in_list = ", ".join(str(int(x)) for x in indices if x is not None)
+            if not in_list:
+                return pl.DataFrame()
+            q = f"""
+                SELECT bt_index, candidate_bid
+                FROM read_parquet('{file_path}')
+                WHERE bt_index IN ({in_list})
+            """
+            return conn.execute(q).pl()
+
+        def _fetch_children_full(conn: duckdb.DuckDBPyConnection, indices: list[int], next_seat: int) -> pl.DataFrame:
+            file_path = str(bt_parquet_file).replace("\\", "/")
+            in_list = ", ".join(str(int(x)) for x in indices if x is not None)
+            if not in_list:
+                return pl.DataFrame()
+            try:
+                s = int(next_seat)
+            except Exception:
+                s = 1
+            s = 1 if s < 1 else (4 if s > 4 else s)
+            agg_col = f"Agg_Expr_Seat_{s}"
+            q = f"""
+                SELECT
+                    bt_index,
+                    Auction,
+                    candidate_bid,
+                    is_completed_auction,
+                    Expr,
+                    {agg_col}
+                FROM read_parquet('{file_path}')
+                WHERE bt_index IN ({in_list})
+            """
+            return conn.execute(q).pl()
+
+        # Walk remaining tokens (if any)
+        conn = duckdb.connect(":memory:")
+        try:
+            for tok in tokens[1:]:
+                next_indices = _fetch_parent_next_indices(conn, parent_bt_index)
+                if not next_indices:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    return {
+                        "auction_input": auction_input,
+                        "auction_normalized": auction_normalized,
+                        "parent_bt_index": parent_bt_index,
+                        "next_bids": [],
+                        "error": f"No next bids found after prefix '{'-'.join(tokens[:tokens.index(tok)])}'",
+                        "elapsed_ms": round(elapsed_ms, 1),
+                    }
+                child_min = _fetch_children_min(conn, next_indices)
+                if child_min.is_empty() or "candidate_bid" not in child_min.columns:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    return {
+                        "auction_input": auction_input,
+                        "auction_normalized": auction_normalized,
+                        "parent_bt_index": parent_bt_index,
+                        "next_bids": [],
+                        "error": "Failed to load next bid rows from BT",
+                        "elapsed_ms": round(elapsed_ms, 1),
+                    }
+                want = tok.upper()
+                hit = child_min.filter(pl.col("candidate_bid").cast(pl.Utf8).str.to_uppercase() == want)
+                if hit.height == 0:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    return {
+                        "auction_input": auction_input,
+                        "auction_normalized": auction_normalized,
+                        "parent_bt_index": parent_bt_index,
+                        "next_bids": [],
+                        "error": f"Bid '{want}' not found among next bids for prefix '{'-'.join(tokens[:tokens.index(tok)])}'",
+                        "elapsed_ms": round(elapsed_ms, 1),
+                    }
+                parent_bt_index = int(hit.row(0, named=True).get("bt_index") or 0)
+
+            # Now list next bids from the resolved parent bt_index
+            next_indices = _fetch_parent_next_indices(conn, parent_bt_index)
+            if not next_indices:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                return {
+                    "auction_input": auction_input,
+                    "auction_normalized": auction_normalized,
+                    "parent_bt_index": parent_bt_index,
+                    "next_bids": [],
+                    "elapsed_ms": round(elapsed_ms, 1),
+                }
+
+            # Determine seat for Agg_Expr lookup based on number of calls so far
+            next_seat = (len(tokens) % 4) + 1
+            next_df = _fetch_children_full(conn, next_indices, next_seat=next_seat)
+        finally:
+            conn.close()
+
+        # Determine seat for Agg_Expr lookup based on number of calls so far
+        next_seat = (len(tokens) % 4) + 1
         agg_expr_col = f"Agg_Expr_Seat_{next_seat}"
         
         # Get unique bids efficiently (next_df is typically small, but be safe)
-        cols_needed = ["candidate_bid", "bt_index", agg_expr_col, "is_completed_auction"]
+        # Include Auction/Expr so overlay + criteria fallback works.
+        cols_needed = ["Auction", "candidate_bid", "bt_index", agg_expr_col, "Expr", "is_completed_auction"]
         cols_available = [c for c in cols_needed if c in next_df.columns]
         
         unique_next_df = next_df.select(cols_available).unique(subset=["candidate_bid"], keep="first")
@@ -5573,10 +5898,26 @@ def handle_list_next_bids(
         for row in unique_next_df.iter_rows(named=True):
             bid = row.get("candidate_bid") or ""
             if bid:
+                # Apply merged rules + overlay to get final criteria
+                row_with_rules = _apply_all_rules_to_bt_row(dict(row), state)
+                # Display/UX: Agg_Expr_Seat_{next_seat} can be empty for a seat's first action.
+                # In that case, fall back to using Expr (current-step criteria).
+                crits = row_with_rules.get(agg_expr_col) or []
+                if not crits:
+                    crits = row_with_rules.get("Expr") or []
+                else:
+                    expr_list = row_with_rules.get("Expr") or []
+                    if expr_list:
+                        seen = set(str(x) for x in crits)
+                        for x in expr_list:
+                            xs = str(x)
+                            if xs not in seen:
+                                crits.append(x)
+                                seen.add(xs)
                 next_bids.append({
                     "bid": bid.upper(),
                     "bt_index": row.get("bt_index"),
-                    "agg_expr": row.get(agg_expr_col) or [],
+                    "agg_expr": crits,
                     "is_completed_auction": row.get("is_completed_auction", False),
                 })
     
@@ -5677,77 +6018,52 @@ def handle_rank_bids_by_ev(
     next_seat = (len(call_tokens) % 4) + 1
     
     if not auction_input:
-        # Truly empty auction: get all opening bids (seat 1 bids)
-        next_bid_rows = bt_seat1_df.filter(pl.col("is_opening_bid"))
+        # Truly empty auction: use precomputed opening-bids table if available.
+        # This avoids touching Agg_Expr for the full 461M-row BT.
+        bt_openings_df = state.get("bt_openings_df")
+        if isinstance(bt_openings_df, pl.DataFrame) and "seat" in bt_openings_df.columns:
+            next_bid_rows = bt_openings_df.filter(pl.col("seat") == 1)
+            # Normalize shape to expected columns for downstream logic
+            if "candidate_bid" not in next_bid_rows.columns and "Auction" in next_bid_rows.columns:
+                next_bid_rows = next_bid_rows.with_columns(pl.col("Auction").alias("candidate_bid"))
+        else:
+            # Intentionally no fallback to scanning the full 461M-row bt_seat1_df.
+            raise ValueError(
+                "bt_openings_df is missing/empty; refusing to scan bt_seat1_df for opening bids. "
+                "Restart the API server and ensure initialization completes successfully."
+            )
     elif is_passes_only and expected_passes > 0:
-        # Pass-only prefix (e.g., "p-", "p-p-", "p-p-p-"): look up the passes in BT
-        # Build the pass sequence: "p", "p-p", or "p-p-p"
+        # Pass-only prefix. Seat-1 view does not support leading passes, but users can request them.
+        # We treat leading passes as seat alignment metadata and traverse the non-pass part.
+        # For pure pass sequences, there is no opening bid to anchor traversal; return empty.
         pass_auction = "-".join(["p"] * expected_passes)
-        bt_matches = _find_bt_row_for_auction(bt_seat1_df, pass_auction)
-        
-        if bt_matches.height == 0:
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            return {
-                "auction_input": auction_input,
-                "auction_normalized": pass_auction,
-                "parent_bt_row": None,
-                "bid_rankings": [],
-                "total_next_bids": 0,
-                "error": f"Pass sequence '{pass_auction}' not found in BT",
-                "elapsed_ms": round(elapsed_ms, 1),
-            }
-        
-        parent_row = bt_matches.row(0, named=True)
-        parent_bt_row = {
-            "bt_index": parent_row.get("bt_index"),
-            "Auction": parent_row.get("Auction"),
-            "candidate_bid": parent_row.get("candidate_bid"),
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "auction_input": auction_input,
+            "auction_normalized": pass_auction,
+            "parent_bt_row": None,
+            "bid_rankings": [],
+            "total_next_bids": 0,
+            "message": f"Pass-only prefix '{pass_auction}' cannot be resolved without Auction scans (disabled).",
+            "elapsed_ms": round(elapsed_ms, 1),
         }
-        
-        # Get next_bid_indices for bids after the passes
-        next_indices = parent_row.get("next_bid_indices") or []
-        if not next_indices:
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            return {
-                "auction_input": auction_input,
-                "auction_normalized": pass_auction,
-                "parent_bt_row": parent_bt_row,
-                "bid_rankings": [],
-                "total_next_bids": 0,
-                "message": f"No next bids found after {expected_passes} pass(es)",
-                "elapsed_ms": round(elapsed_ms, 1),
-            }
-        
-        # Get the BT rows for all next bids
-        next_bid_rows = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
-        
-        # Update auction_normalized for display
-        auction_normalized = pass_auction
     else:
-        # Find the BT row for the auction (includes any leading passes)
-        bt_matches = _find_bt_row_for_auction(bt_seat1_df, auction_for_lookup)
-        
-        if bt_matches.height == 0:
+        # Resolve parent bt_index via traversal (no Auction scans)
+        parent_bt_index = _resolve_bt_index_by_traversal(state, auction_for_lookup)
+        if parent_bt_index is None:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             return {
                 "auction_input": auction_input,
-                "auction_normalized": auction_for_lookup,
+                "auction_normalized": auction_normalized,
                 "parent_bt_row": None,
                 "bid_rankings": [],
                 "total_next_bids": 0,
-                "error": f"Auction '{auction_for_lookup}' not found in BT",
+                "error": f"Auction '{auction_for_lookup}' not found in BT (traversal failed)",
                 "elapsed_ms": round(elapsed_ms, 1),
             }
-        
-        parent_row = bt_matches.row(0, named=True)
-        parent_bt_row = {
-            "bt_index": parent_row.get("bt_index"),
-            "Auction": parent_row.get("Auction"),
-            "candidate_bid": parent_row.get("candidate_bid"),
-        }
-        
-        # Get next_bid_indices
-        next_indices = parent_row.get("next_bid_indices") or []
+
+        parent_bt_row = {"bt_index": parent_bt_index, "Auction": auction_normalized, "candidate_bid": None}
+        next_indices = _get_next_bid_indices_for_parent(state, parent_bt_index)
         if not next_indices:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             return {
@@ -5759,9 +6075,21 @@ def handle_rank_bids_by_ev(
                 "message": "No next bids found (auction may be completed)",
                 "elapsed_ms": round(elapsed_ms, 1),
             }
-        
-        # Get the BT rows for all next bids
-        next_bid_rows = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
+
+        # Fetch next-bid rows by bt_index IN (...) via DuckDB (avoid scanning 461M-row bt_seat1_df)
+        file_path = _bt_file_path_for_sql(state)
+        in_list = ", ".join(str(int(x)) for x in next_indices if x is not None)
+        conn = duckdb.connect(":memory:")
+        try:
+            next_bid_rows = conn.execute(
+                f"""
+                SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr
+                FROM read_parquet('{file_path}')
+                WHERE bt_index IN ({in_list})
+                """
+            ).pl()
+        finally:
+            conn.close()
     
     total_next_bids = next_bid_rows.height
     
@@ -5777,6 +6105,35 @@ def handle_rank_bids_by_ev(
         }
     
     effective_seed = _effective_seed(seed)
+
+    # Ensure Agg_Expr columns exist for next-bid rows (needed below for mask building).
+    # In lightweight mode bt_seat1_df excludes Agg_Expr, so we load them on-demand for these bt_index values.
+    # Uses DuckDB for efficient lookup (much faster than Polars scan for small IN lists).
+    if total_next_bids > 0 and "Agg_Expr_Seat_1" not in next_bid_rows.columns:
+        bt_parquet_file = state.get("bt_seat1_file")
+        if bt_parquet_file is None:
+            raise ValueError("bt_seat1_file missing from state; cannot load Agg_Expr on-demand")
+        if "bt_index" in next_bid_rows.columns:
+            needed = (
+                next_bid_rows
+                .select(pl.col("bt_index").drop_nulls().cast(pl.Int64).unique())
+                .to_series()
+                .to_list()
+            )
+            needed = [int(x) for x in needed if x is not None]
+            if needed:
+                # Use the shared DuckDB-based loader and convert result to DataFrame for join
+                agg_data = _load_agg_expr_for_bt_indices(needed, bt_parquet_file)
+                if agg_data:
+                    # Convert dict to DataFrame for join
+                    agg_rows: list[dict[str, Any]] = []
+                    for bt_idx, cols_dict in agg_data.items():
+                        row: dict[str, Any] = {"bt_index": bt_idx}
+                        for k, v in cols_dict.items():
+                            row[k] = v
+                        agg_rows.append(row)
+                    agg_df = pl.DataFrame(agg_rows)
+                    next_bid_rows = next_bid_rows.join(agg_df, on="bt_index", how="left")
     
     # =========================================================================
     # PRE-FILTER: Opening seat alignment
@@ -5815,7 +6172,7 @@ def handle_rank_bids_by_ev(
             constant_seats.append(seat)
     
     if constant_seats and not next_bid_rows.is_empty():
-        first_row = _apply_custom_criteria_overlay_to_bt_row(dict(next_bid_rows.row(0, named=True)), overlay)
+        first_row = _apply_all_rules_to_bt_row(dict(next_bid_rows.row(0, named=True)), state)
         for dealer in DIRECTIONS:
             dealer_mask = deal_df["Dealer"] == dealer
             
@@ -5873,7 +6230,8 @@ def handle_rank_bids_by_ev(
         
         # Optimization: Pre-fetch non-constant criteria lists
         # Apply overlay per candidate row before extracting criteria lists
-        row_overlayed = _apply_custom_criteria_overlay_to_bt_row(dict(row), overlay) if overlay else row
+        # Canonical: overlay + dedupe (Agg_Expr already loaded above, so this is cheap)
+        row_overlayed = _apply_all_rules_to_bt_row(dict(row), state)
         seat_criteria_lists = {s: row_overlayed.get(f"Agg_Expr_Seat_{s}") or [] for s in non_constant_seats}
         
         for dealer in DIRECTIONS:
@@ -6494,51 +6852,69 @@ def handle_contract_ev_deals(
     bt_row: Optional[Dict[str, Any]] = None
 
     if not auction_input:
-        # Opening bids: bt rows are directly selectable by is_opening_bid + candidate_bid
-        open_df = bt_seat1_df.filter(pl.col("is_opening_bid"))
-        if "candidate_bid" not in open_df.columns:
+        # Opening bids: MUST use bt_openings_df (fast). Do not scan bt_seat1_df (461M rows).
+        bt_openings_df = state.get("bt_openings_df")
+        if not isinstance(bt_openings_df, pl.DataFrame) or bt_openings_df.is_empty():
+            raise ValueError(
+                "bt_openings_df is missing/empty; refusing to scan bt_seat1_df for opening bids. "
+                "Restart the API server and ensure initialization completes successfully."
+            )
+        seat1_df = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
+        bid_norm = str(next_bid or "").strip().upper()
+        if not bid_norm:
             return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
-        bid_df = open_df.filter(pl.col("candidate_bid") == next_bid)
+        bid_df = seat1_df.filter(pl.col("Auction") == bid_norm)
         if bid_df.height == 0:
             return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
-        bt_row = bid_df.row(0, named=True)
+        bt_row = dict(bid_df.row(0, named=True))
+        # Normalize key expected by downstream logic
+        if "candidate_bid" not in bt_row and bt_row.get("Auction"):
+            bt_row["candidate_bid"] = bt_row["Auction"]
     else:
-        # Find the parent BT row for this auction prefix (including pass-only prefixes)
+        # Resolve the parent BT node via traversal (no Auction scans), then fetch the selected next bid via bt_index lookups.
         if is_passes_only and expected_passes > 0:
-            pass_auction = "-".join(["p"] * expected_passes)
-            parent_matches = _find_bt_row_for_auction(bt_seat1_df, pass_auction)
-        else:
-            parent_matches = _find_bt_row_for_auction(bt_seat1_df, auction_for_lookup)
-
-        if parent_matches.height == 0:
+            # Pass-only prefixes are not resolvable without Auction scans (disabled).
             return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
-        parent_row = parent_matches.row(0, named=True)
+        parent_bt_index = _resolve_bt_index_by_traversal(state, auction_for_lookup)
+        if parent_bt_index is None:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
-        # Find candidate row for the selected next bid using next_bid_indices (same as handle_rank_bids_by_ev)
-        next_indices = parent_row.get("next_bid_indices") or []
+        next_indices = _get_next_bid_indices_for_parent(state, parent_bt_index)
         if not next_indices:
             return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
-        idx_df = bt_seat1_df.filter(pl.col("bt_index").is_in(list(next_indices)))
-        if idx_df.height == 0:
+        # Fetch only candidate rows in the next_indices set, then select the chosen bid.
+        file_path = _bt_file_path_for_sql(state)
+        in_list = ", ".join(str(int(x)) for x in next_indices if x is not None)
+        bid_norm = str(next_bid or "").strip().upper()
+        if not bid_norm:
+            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+        conn = duckdb.connect(":memory:")
+        try:
+            q = f"""
+                SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr
+                FROM read_parquet('{file_path}')
+                WHERE bt_index IN ({in_list})
+            """
+            idx_df = conn.execute(q).pl()
+        finally:
+            conn.close()
+
+        if idx_df.is_empty() or "candidate_bid" not in idx_df.columns:
             return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
-        if "candidate_bid" not in idx_df.columns:
+        hit_df = idx_df.filter(pl.col("candidate_bid").cast(pl.Utf8).str.to_uppercase() == bid_norm)
+        if hit_df.height == 0:
             return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
-        next_bid_row_df = idx_df.filter(pl.col("candidate_bid") == next_bid)
-        if next_bid_row_df.height == 0:
-            return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
-
-        bt_row = next_bid_row_df.row(0, named=True)
+        bt_row = hit_df.row(0, named=True)
 
     if bt_row is None:
         return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
-    # Apply hot-reloadable custom criteria overlay before building criteria masks.
-    overlay = state.get("custom_criteria_overlay") or []
-    bt_row = _apply_custom_criteria_overlay_to_bt_row(dict(bt_row), overlay)
+    # Canonical: enrich Agg_Expr if missing + apply overlay + dedupe
+    bt_row = _apply_all_rules_to_bt_row(dict(bt_row), state)
     opening_seat_mask = None
     if "bid" in deal_df.columns:
         if expected_passes == 0:
@@ -6682,4 +7058,77 @@ def handle_contract_ev_deals(
         "total_matches": int(total_matches),
         "returned_count": int(len(deals)),
         "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def handle_new_rules_lookup(
+    state: Dict[str, Any],
+    auction: str,
+    bt_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Handle /new-rules-lookup endpoint."""
+    t0 = time.perf_counter()
+    new_rules_df = state.get("new_rules_df")
+    
+    if new_rules_df is None:
+        return {"error": "New rules metrics (bbo_bt_new_rules.parquet) not loaded on server."}
+    
+    # Normalize auction for lookup
+    auction_norm = auction.strip().upper()
+    
+    # Filter by auction
+    # step_auction column contains the partial auction sequence
+    # Fast exact match on step_auction
+    filtered = new_rules_df.filter(pl.col("step_auction") == auction_norm)
+    
+    if filtered.height == 0:
+        # Try finding by bt_index if provided
+        if bt_index is not None:
+            filtered = new_rules_df.filter(pl.col("bt_index") == bt_index)
+    
+    if filtered.height == 0:
+        return {
+            "found": False,
+            "auction": auction,
+            "bt_index": bt_index,
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)
+        }
+    
+    # Use first match
+    row = filtered.row(0, named=True)
+    
+    # Extract criteria details
+    # criteria_with_metrics: List(Struct) -> converted to List(Dict) by to_dicts()
+    # base_rules: List(Utf8)
+    # discovered_rules: List(Utf8)
+    # New_Rules: List(Utf8)
+    
+    # In bbo_filter_new_rules.ipynb terminology:
+    # Accepted_Criteria = subset of discovered_rules that are in New_Rules
+    # Rejected_Criteria = discovered_rules NOT in New_Rules
+    
+    base_rules = list(row.get("base_rules") or [])
+    discovered_rules = list(row.get("discovered_rules") or [])
+    new_rules = list(row.get("New_Rules") or [])
+    
+    accepted = [c for c in discovered_rules if c in new_rules]
+    rejected = [c for c in discovered_rules if c not in new_rules]
+    
+    # Deduplicate merged rules to keep least restrictive bounds
+    merged_rules_deduped = dedupe_criteria_least_restrictive(new_rules)
+    
+    return {
+        "found": True,
+        "auction": row.get("step_auction"),
+        "bt_index": row.get("bt_index"),
+        "seat": row.get("seat"),
+        "pos_count": row.get("pos_count"),
+        "neg_count": row.get("neg_count"),
+        "base_rules": base_rules,
+        "accepted_criteria": accepted,
+        "rejected_criteria": rejected,
+        "merged_rules": new_rules,  # Raw merged rules (base + accepted)
+        "merged_rules_deduped": merged_rules_deduped,  # Deduplicated with least restrictive bounds
+        "criteria_details": row.get("criteria_with_metrics") or [],
+        "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)
     }

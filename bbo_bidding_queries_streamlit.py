@@ -34,7 +34,7 @@ import re
 from typing import Any, Dict, List, Set
 
 # Add mlBridgeLib to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mlBridgeLib"))
+sys.path.insert(0, str(pathlib.Path(__file__).parent / "mlBridgeLib"))
 
 from bbo_bidding_queries_lib import (
     normalize_auction_pattern,
@@ -806,7 +806,8 @@ def render_aggrid(
     hide_cols: list[str] | None = None,
     show_copy_panel: bool = False,
     copy_panel_default_col: str | None = None,
-    fit_columns_to_view: bool = False,
+    fit_columns_to_view: bool = True,
+    show_sql_expander: bool = True,
 ) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
     
@@ -835,11 +836,44 @@ def render_aggrid(
         st.info("No rows to display.")
         return []
 
-    # Show SQL expander if table_name is provided
-    if table_name:
-        sql_query = generate_passthrough_sql(df, table_name)
+    # ---------------------------------------------------------------------
+    # SQL expander (always on by default)
+    # ---------------------------------------------------------------------
+    # Many tables in this app show a "demo SQL" query. We can make the default
+    # pass-through query fully functional by registering the DataFrame into
+    # local DuckDB and executing it to drive rendering.
+    sql_table = table_name or "df"
+    # Ensure it's a safe identifier for DuckDB (avoid spaces, punctuation).
+    sql_table = re.sub(r"[^A-Za-z0-9_]", "_", str(sql_table))
+    if not sql_table:
+        sql_table = "df"
+    sql_query = generate_passthrough_sql(df, sql_table)
+
+    if show_sql_expander:
         with st.expander("📝 SQL Query", expanded=False):
             st.code(sql_query, language="sql")
+
+    # Best-effort: execute the SQL locally to make it real and drive the rendered df.
+    # If this fails (e.g., unsupported list/struct columns), fall back to the original df.
+    try:
+        # duckdb is imported at module scope in this file
+        local_con = duckdb.connect(":memory:")
+        try:
+            # Register Pandas to DuckDB, then produce a Polars DataFrame back.
+            local_con.register(sql_table, df.to_pandas())
+            result = local_con.execute(sql_query).pl()
+            if isinstance(result, pl.LazyFrame):
+                result = result.collect()
+            if isinstance(result, pl.DataFrame) and result.height == df.height and result.width == df.width:
+                df = result
+            elif isinstance(result, pl.DataFrame) and result.height > 0:
+                # If the SQL changes shape, still show it (it is user-visible SQL).
+                df = result
+        finally:
+            local_con.close()
+    except Exception:
+        # Keep df as-is; SQL remains a best-effort representation.
+        pass
 
     # Round float columns to 2 decimal places for cleaner display
     float_cols = [c for c in df.columns if df[c].dtype in (pl.Float32, pl.Float64)]
@@ -897,10 +931,11 @@ def render_aggrid(
                      n_rows * ROW_HEIGHT + HEADER_HEIGHT + BUFFER)
 
     # Build the grid options
-    gb = GridOptionsBuilder.from_dataframe(df.to_pandas())
+    pandas_df = df.to_pandas()
+    gb = GridOptionsBuilder.from_dataframe(pandas_df)
     # Disable pagination entirely to allow scrolling within the fixed height
     gb.configure_pagination(enabled=False)
-    # Make all columns read-only (not editable), resizable, filterable, sortable
+    # Make all columns read-only (not editable), resizable, filterable, sortable.
     gb.configure_default_column(resizable=True, filter=True, sortable=True, editable=False)
     
     # Custom formatting for columns that should display as percentages
@@ -928,15 +963,87 @@ def render_aggrid(
     # Tighten specific columns that tend to be too wide (must be before build())
     # Width is max of target width and column name length (approx 8px per char)
     tight_cols = {
+        # Matching Deals columns
         "Score": 70, "ParScore": 80, "Result": 60, "Contract": 70,
         "Dealer": 60, "Vul": 50, "index": 70,
+        # Auction Summary columns
+        "Bid Num": 75, "Seat": 55, "Bid": 50, "BT Index": 80,
+        "Criteria Count": 110, "Complete": 75,
+        # Rankings-style stats columns (NV/V split)
+        "Matches_NV": 90, "Matches_V": 85,
+        "Avg Par_NV": 95, "Avg Par_V": 90,
+        "EV_NV": 70, "EV_V": 65,
+        "EV Std_NV": 85, "EV Std_V": 80,
+        # Wrong Bid Analysis columns
+        "criterion": 150, "fail_count": 85, "failure_count": 95,
+        "check_count": 85, "affected_auctions": 115, "fail_rate": 85,
+        "wrong_bid_rate": 105, "wrong_bid_rate_%": 115,
+        "Wrong Bids": 95, "Wrong Bid Rate": 120,
     }
-    CHAR_WIDTH = 9  # Approximate pixels per character for header text
+    # Ensure headers never get truncated: set minWidth based on header text length.
+    # AgGrid's auto-size can shrink columns based on cell contents; minWidth prevents
+    # it from shrinking below what's needed for the column name.
+    CHAR_WIDTH = 12  # Approximate pixels per character for header text
     for col_name, target_width in tight_cols.items():
         if col_name in df.columns:
-            header_width = len(col_name) * CHAR_WIDTH + 20  # Add padding for sort icon
+            # Extra padding accounts for sort icon + (optional) filter/menu affordances.
+            header_width = len(col_name) * CHAR_WIDTH + 48
             width = max(target_width, header_width)
-            gb.configure_column(col_name, width=width, maxWidth=width + 20)
+            # Prevent auto-size from shrinking below the header width.
+            gb.configure_column(col_name, width=width, minWidth=width)
+
+    # ---------------------------------------------------------------------
+    # Autosize columns: max(content width, header width)
+    # ---------------------------------------------------------------------
+    # Streamlit-AgGrid auto-size can under-size headers; we compute a best-effort
+    # width from sampled content (first N rows) and the column name.
+    #
+    # This is intentionally approximate (fast) and avoids scanning huge tables.
+    SAMPLE_ROWS = 200
+    MAX_CHARS = 80  # cap overly wide string columns
+    MIN_WIDTH = 60
+    MAX_WIDTH = 650
+    CELL_PAD = 48  # sort icon + filter/menu affordances + padding
+
+    try:
+        sample_df = pandas_df.head(SAMPLE_ROWS)
+        for col_name in df.columns:
+            if hide_cols and col_name in hide_cols:
+                continue
+            # Respect explicit configs above
+            if col_name in tight_cols:
+                continue
+            if col_name in ("Agg_Expr",):
+                # handled separately (flex)
+                continue
+            if col_name == "Auction":
+                # handled separately (maxWidth)
+                continue
+
+            header_chars = len(str(col_name))
+            # Compute max content length on a sample (NaN/None -> empty)
+            try:
+                series = sample_df[col_name]
+                # Convert to string safely; avoid "nan"
+                vals = series.astype("object").where(series.notna(), "")
+                max_cell_chars = int(vals.map(lambda x: len(str(x))).max()) if len(vals) else 0
+            except Exception:
+                max_cell_chars = 0
+
+            max_chars = min(MAX_CHARS, max(header_chars, max_cell_chars))
+            width = max(MIN_WIDTH, min(MAX_WIDTH, max_chars * CHAR_WIDTH + CELL_PAD))
+            gb.configure_column(col_name, width=width, minWidth=width)
+    except Exception:
+        # Best-effort only; grid still renders fine without these hints.
+        pass
+    
+    # Agg_Expr should flex to fill remaining space, with reasonable max
+    if "Agg_Expr" in df.columns:
+        gb.configure_column("Agg_Expr", flex=1, minWidth=120, maxWidth=400)
+    
+    # Auction column can be wide - constrain it
+    if "Auction" in df.columns:
+        gb.configure_column("Auction", maxWidth=200)
     
     gb.configure_grid_options(
         rowHeight=28,
@@ -960,7 +1067,7 @@ def render_aggrid(
 
     # Choose auto-size mode: FIT_ALL_COLUMNS_TO_VIEW for compact tables, FIT_CONTENTS for wide tables
     auto_size_mode = ColumnsAutoSizeMode.FIT_ALL_COLUMNS_TO_VIEW if fit_columns_to_view else ColumnsAutoSizeMode.FIT_CONTENTS
-    
+
     response = AgGrid(
         df.to_pandas(),
         gridOptions=grid_options,
@@ -1094,9 +1201,9 @@ if not status["initialized"] or status.get("warming", False):
         for file_name, row_count in loaded_files.items():
             # Handle both int and string row counts (e.g., "100 of 15,994,827")
             if isinstance(row_count, int):
-                st.write(f"✅ **{file_name}**: {row_count:,} rows")
+                st.write(f"✅ **{file_name}**: {row_count:,}")
             else:
-                st.write(f"✅ **{file_name}**: {row_count} rows")
+                st.write(f"✅ **{file_name}**: {row_count}")
     
     # Show raw status in expander
     with st.expander("Raw status JSON"):
@@ -1276,8 +1383,11 @@ def render_random_auction_samples():
             combined_df = pl.DataFrame(all_rows)
             combined_df = order_columns(combined_df, priority_cols=[
                 "index", "Auction", "Expr",
+                "Agg_Expr_S1_Base", "Agg_Expr_S1_Learned", "Agg_Expr_S1_Full",
                 "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
             ])
+            if "index" in combined_df.columns:
+                combined_df = combined_df.sort("index")
         else:
             combined_df = pl.DataFrame()
         
@@ -1287,8 +1397,11 @@ def render_random_auction_samples():
             seq_df = pl.DataFrame(s["sequence"]) if isinstance(s["sequence"], list) else s["sequence"]
             seq_df = order_columns(seq_df, priority_cols=[
                 "index", "Auction", "Expr",
+                "Agg_Expr_S1_Base", "Agg_Expr_S1_Learned", "Agg_Expr_S1_Full",
                 "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
             ])
+            if "index" in seq_df.columns:
+                seq_df = seq_df.sort("index")
             render_aggrid(seq_df, key=f"seq_random_{i}", table_name="auction_sequences")
             st.divider()
 
@@ -1318,12 +1431,14 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
         if missing:
             st.warning(f"{len(missing)} bt_index values were not found (or not completed auctions).")
     else:
+        # Ensure we always send a string to the API (avoid 422 if pattern is None).
+        pattern = pattern or ""
         if not pattern:
             st.info("Enter an Auction Regex or provide a bt_index list in the sidebar.")
             return
-    payload = {"pattern": pattern, "allow_initial_passes": bool(allow_initial_passes), "n_samples": int(n_samples), "seed": seed}
-    with st.spinner("Fetching auctions from server. Takes about 10-60 seconds."):
-        data = api_post("/auction-sequences-matching", payload)
+        payload = {"pattern": pattern, "allow_initial_passes": bool(allow_initial_passes), "n_samples": int(n_samples), "seed": seed}
+        with st.spinner("Fetching auctions from server. Takes about 10-60 seconds."):
+            data = api_post("/auction-sequences-matching", payload)
 
     # Show the effective pattern including (p-)* prefix when matching all seats
     effective_pattern = data.get('pattern', pattern)
@@ -1394,6 +1509,8 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
             combined_df = order_columns(combined_df, priority_cols=[
                 "index", "Auction", "Seat", "Expr", "Agg_Expr_Seat",
             ])
+            if "index" in combined_df.columns:
+                combined_df = combined_df.sort("index")
         else:
             combined_df = pl.DataFrame()
         
@@ -1406,6 +1523,8 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
             seq_df = order_columns(seq_df, priority_cols=[
                 "index", "Auction", "Seat", "Expr", "Agg_Expr_Seat",
             ])
+            if "index" in seq_df.columns:
+                seq_df = seq_df.sort("index")
             render_aggrid(seq_df, key=f"seq_pattern_{i}", table_name="auction_sequences")
             st.divider()
     
@@ -1479,6 +1598,12 @@ def render_deals_by_auction_pattern(pattern: str | None):
     st.sidebar.divider()
     seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_deals"))
 
+    # Ensure we always send a string to the API (avoid 422 if pattern is None).
+    pattern = pattern or ""
+    if not pattern:
+        st.info("Enter an Auction Regex in the sidebar.")
+        return
+
     # Build payload with distribution filter params (server-side filtering)
     payload = {
         "pattern": pattern,
@@ -1491,7 +1616,7 @@ def render_deals_by_auction_pattern(pattern: str | None):
         "dist_direction": deal_dist_direction,
     }
 
-    with st.spinner("Fetching Deals Matching Auction from server. Takes about 10-180 seconds."):
+    with st.spinner("Fetching Deals Matching Auction from server. Takes about 15-30s seconds."):
         data = api_post("/deals-matching-auction", payload)
 
     elapsed_ms = data.get("elapsed_ms", 0)
@@ -1561,16 +1686,16 @@ def render_deals_by_auction_pattern(pattern: str | None):
                     st.code(dist_sql, language="sql")
             
             # AI vs Actual Comparison table (show first as summary)
-            total_imp = a.get("total_imp_ai", 0)
+            total_imp = a.get("total_imp_rules", 0)
             total_deals = a.get("total_deals", 0)
-            imp_ai = a.get("imp_ai_advantage", 0)
+            imp_ai = a.get("imp_rules_advantage", 0)
             imp_actual = a.get("imp_actual_advantage", 0)
-            ai_makes = a.get("ai_makes_count", 0)
+            ai_makes = a.get("rules_makes_count", 0)
             contract_makes = a.get("contract_makes_count", 0)
-            ai_par = a.get("ai_par_count", 0)
+            ai_par = a.get("rules_par_count", 0)
             contract_par = a.get("contract_par_count", 0)
             avg_ev_contract = a.get("avg_ev_contract")
-            avg_ev_ai = a.get("avg_ev_ai")
+            avg_ev_ai = a.get("avg_ev_rules")
             avg_ev_diff = a.get("avg_ev_diff")
             
             if total_deals > 0:
@@ -1749,13 +1874,15 @@ def render_bidding_table_explorer():
     total_matches = data.get("total_matches", 0)
     rows = data.get("rows", [])
     elapsed_ms = data.get("elapsed_ms", 0)
+    # Use the pattern returned by API (after server-side normalization) for accurate display
+    actual_pattern = data.get("pattern", auction_pattern)
     
     if total_matches == 0:
-        st.warning(f"No auctions match pattern: `{auction_pattern}` ({format_elapsed(elapsed_ms)})")
+        st.warning(f"No auctions match pattern: `{actual_pattern}` ({format_elapsed(elapsed_ms)})")
         if data.get("message"):
             st.info(data["message"])
     else:
-        st.success(f"Found {total_matches:,} auctions matching pattern: `{auction_pattern}` ({format_elapsed(elapsed_ms)})")
+        st.success(f"Found {total_matches:,} auctions matching pattern: `{actual_pattern}` ({format_elapsed(elapsed_ms)})")
         
         if rows:
             display_df = pl.DataFrame(rows)
@@ -2531,29 +2658,32 @@ def render_auction_criteria_debugger():
     by the Rules model for deals where it's the actual auction.
     """)
     
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        auction_pattern = st.text_input(
-            "Target Auction Pattern",
-            value="1S-p-p-p",
-            help="The auction you want to debug (e.g., 1S-p-p-p, 2H-p-p-p, 5N-p-p-p)"
-        )
-    with col2:
-        sample_size = st.number_input(
-            "Sample Size",
-            min_value=1,
-            max_value=10000,
-            value=25,
-            help="Number of deals to analyze"
-        )
-    
-    seed = st.number_input("Random Seed", min_value=0, value=42, help="For reproducibility")
+    # Wrap inputs + submit in a form so pressing Enter triggers analysis (same as clicking button).
+    with st.form(key="auction_criteria_debugger_form", clear_on_submit=False):
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            auction_pattern = st.text_input(
+                "Target Auction Pattern",
+                value="1S-p-p-p",
+                help="The auction you want to debug (e.g., 1S-p-p-p, 2H-p-p-p, 5N-p-p-p)",
+            )
+        with col2:
+            sample_size = st.number_input(
+                "Sample Size",
+                min_value=1,
+                max_value=10000,
+                value=25,
+                help="Number of deals to analyze",
+            )
+
+        seed = st.number_input("Random Seed", min_value=0, value=42, help="For reproducibility")
+        submitted = st.form_submit_button("🔎 Analyze Auction", type="primary")
     
     if not auction_pattern:
         st.info("Enter an auction pattern to begin.")
         return
     
-    if st.button("🔎 Analyze Auction", type="primary"):
+    if submitted:
         with st.spinner(f"Analyzing why '{auction_pattern}' is rejected..."):
             try:
                 import time
@@ -2826,27 +2956,30 @@ def render_bidding_arena():
         model_names = [m["name"] for m in models_data.get("models", [])]
     except Exception as e:
         st.error(f"Failed to get models: {e}")
-        model_names = ["Raw_Rules", "Actual"]
+        model_names = ["Rules_Base", "Actual"]
 
     # Ensure baseline models are always present (even if /bidding-models omits them)
-    for base_model in ("Raw_Rules", "Actual"):
+    for base_model in ("Actual", "Rules_Base"):
         if base_model not in model_names:
             model_names.append(base_model)
 
-    # Add Rules (learned criteria) only if the server reports merged_rules loaded
+    # Add Rules variations (learned criteria) only if the server reports merged_rules loaded
     try:
         status_resp = requests.get(f"{API_BASE}/status", timeout=10).json()
         loaded_files = status_resp.get("loaded_files") or {}
         merged_ok = ("merged_rules" in loaded_files) and (loaded_files.get("merged_rules") not in (None, 0, "0"))
-        if merged_ok and "Rules" not in model_names:
-            model_names.append("Rules")
+        if merged_ok:
+            # Add all rules pipeline stages
+            for rules_model in ("Rules", "Rules_Learned", "Rules_Base"):
+                if rules_model not in model_names:
+                    model_names.append(rules_model)
     except Exception:
         # If status can't be fetched, don't advertise Rules (learned).
         pass
 
-    # Stable ordering for UI
-    preferred_order = ["Actual", "Rules", "Raw_Rules"]
-    model_names = preferred_order + sorted([m for m in model_names if m not in preferred_order])
+    # Stable ordering for UI - show pipeline stages in order
+    preferred_order = ["Actual", "Rules", "Rules_Learned", "Rules_Base"]
+    model_names = [m for m in preferred_order if m in model_names] + sorted([m for m in model_names if m not in preferred_order])
     
     # Model selection - default to Actual vs Rules
     col1, col2 = st.columns(2)
@@ -3061,7 +3194,7 @@ def render_bidding_arena():
             if st.session_state.get("_arena_cache_key") == cache_key and st.session_state.get("_arena_cache_data") is not None:
                 data = st.session_state["_arena_cache_data"]
             else:
-                timeout_s = 600 if search_all_bt_rows else 120
+                timeout_s = 600 if search_all_bt_rows else 300
                 if search_all_bt_rows:
                     st.warning("Searching all completed BT rows is enabled; this request may take minutes.")
                 response = requests.post(f"{API_BASE}/bidding-arena", json=payload, timeout=timeout_s)
@@ -3357,7 +3490,7 @@ def render_bidding_arena():
                     sel_dealer = str(sel.get("Dealer") or "").upper()
                     dealer_to_seat = {"N": 1, "E": 2, "S": 3, "W": 4}
                     dealer_seat = dealer_to_seat.get(sel_dealer, 1)
-                    rules_like_models = {"Rules", "Raw_Rules"}
+                    rules_like_models = {"Rules", "Rules_Learned", "Rules_Base"}
                     rules_missing_for_row = (
                         (model_a in rules_like_models and not sel.get(f"Auction_{model_a}"))
                         or (model_b in rules_like_models and not sel.get(f"Auction_{model_b}"))
@@ -3370,7 +3503,7 @@ def render_bidding_arena():
                         st.warning("Missing internal deal row index (_row_idx); cannot compute 'Failed Exprs' via bitmap lookups.")
                     rejection_reason = str(sel.get("Rejection_Reason") or "").strip()
                     rejected_model: str | None = None
-                    for m in ("Rules", "Raw_Rules"):
+                    for m in ("Rules", "Rules_Learned", "Rules_Base"):
                         if rejection_reason.startswith(f"{m}: no matching auction"):
                             rejected_model = m
                             break
@@ -4132,7 +4265,11 @@ def render_wrong_bid_analysis():
                             for i in range(1, 5)
                         ]
                     )
-                    render_aggrid(seat_df, key="wrong_bid_per_seat", height=calc_grid_height(len(seat_df)))
+                    render_aggrid(
+                        seat_df, 
+                        key="wrong_bid_per_seat", 
+                        height=calc_grid_height(len(seat_df))
+                    )
 
             except Exception as e:
                 st.error(f"Failed to load stats: {e}")
@@ -4154,7 +4291,11 @@ def render_wrong_bid_analysis():
 
                 if "criteria" in data and data["criteria"]:
                     criteria_df = pl.DataFrame(data["criteria"])
-                    render_aggrid(criteria_df, key="failed_criteria_grid", height=calc_grid_height(len(criteria_df)))
+                    render_aggrid(
+                        criteria_df, 
+                        key="failed_criteria_grid", 
+                        height=calc_grid_height(len(criteria_df))
+                    )
 
                     # Visualization
                     if len(data["criteria"]) > 0:
@@ -4212,7 +4353,12 @@ def render_wrong_bid_analysis():
                             (pl.col("wrong_bid_rate") * 100).round(2).alias("wrong_bid_rate_%")
                         )
 
-                    render_aggrid(lb_df, key="wrong_bid_leaderboard", height=calc_grid_height(len(lb_df)), table_name="leaderboard")
+                    render_aggrid(
+                        lb_df, 
+                        key="wrong_bid_leaderboard", 
+                        height=calc_grid_height(len(lb_df)), 
+                        table_name="leaderboard"
+                    )
                 else:
                     st.info("No auctions found matching criteria.")
 
@@ -4891,6 +5037,133 @@ def render_rank_by_ev():
 # Auction Builder – Build an auction step-by-step with BT lookups
 # ---------------------------------------------------------------------------
 
+def render_new_rules_metrics():
+    """View detailed metrics for newly discovered criteria."""
+    st.header("📈 New Rules Metrics")
+    st.markdown("""
+    Explore detailed metrics for criteria discovered during the rule learning process.
+    This data is loaded from `bbo_bt_new_rules.parquet`.
+    """)
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        auction_pattern = st.text_input(
+            "Auction Step (e.g., 1S-p-2C)",
+            value="1S-p-2C",
+            help="The specific auction step to inspect (prefix + next bid)"
+        )
+    with col2:
+        bt_index = st.number_input("BT Index (optional)", min_value=0, value=0, help="Optional bt_index filter")
+    
+    if not auction_pattern:
+        st.info("Enter an auction step to begin.")
+        return
+    
+    payload: dict[str, Any] = {"auction": auction_pattern}
+    if bt_index > 0:
+        payload["bt_index"] = int(bt_index)
+        
+    with st.spinner(f"Loading metrics for '{auction_pattern}'..."):
+        try:
+            resp = requests.post(f"{API_BASE}/new-rules-lookup", json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if not data.get("found"):
+                st.warning(f"No metrics found for auction: `{auction_pattern}`")
+                if bt_index > 0:
+                    st.caption(f"Checked both auction and bt_index={bt_index}")
+                return
+            
+            # Display Header Info
+            st.success(f"Found metrics for: **{data['auction']}** (BT Index: {data['bt_index']})")
+            
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Seat", data["seat"])
+            with c2:
+                st.metric("Pos Count", f"{data['pos_count']:,}")
+            with c3:
+                st.metric("Neg Count", f"{data['neg_count']:,}")
+            
+            # Rule Sets
+            st.subheader("📋 Rule Sets")
+            
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Base Rules", "Accepted Criteria", "Rejected Criteria", "Merged Rules", "Merged (Deduped)"])
+
+            def _render_rules_df(rules: list[Any], key: str, caption: str | None = None) -> None:
+                """Render a rule list as a DataFrame for easier scanning/filtering."""
+                if caption:
+                    st.caption(caption)
+                if not rules:
+                    st.info("No rules.")
+                    return
+                rows = [{"#": i + 1, "Rule": str(r)} for i, r in enumerate(rules)]
+                df_rules = pl.DataFrame(rows)
+                render_aggrid(
+                    df_rules,
+                    key=key,
+                    height=calc_grid_height(len(df_rules), max_height=350),
+                    table_name=key,
+                )
+            
+            with tab1:
+                _render_rules_df(
+                    data.get("base_rules") or [],
+                    key="new_rules_base_rules",
+                )
+            
+            with tab2:
+                _render_rules_df(
+                    data.get("accepted_criteria") or [],
+                    key="new_rules_accepted",
+                )
+                    
+            with tab3:
+                _render_rules_df(
+                    data.get("rejected_criteria") or [],
+                    key="new_rules_rejected",
+                )
+                    
+            with tab4:
+                _render_rules_df(
+                    data.get("merged_rules") or [],
+                    key="new_rules_merged_raw",
+                    caption="Raw merged rules (base + accepted criteria)",
+                )
+                    
+            with tab5:
+                merged_deduped = data.get("merged_rules_deduped") or []
+                _render_rules_df(
+                    merged_deduped,
+                    key="new_rules_merged_deduped",
+                    caption="Deduplicated: keeps least restrictive bounds (e.g., HCP >= 3 instead of HCP >= 5)",
+                )
+            
+            # Detailed Metrics Table
+            st.subheader("📊 Criteria Details")
+            details = data.get("criteria_details", [])
+            if details:
+                # Add status column (Accepted/Rejected)
+                accepted_set = set(data["accepted_criteria"])
+                for d in details:
+                    d["status"] = "✅ Accepted" if d["criterion"] in accepted_set else "❌ Rejected"
+                
+                df_details = pl.DataFrame(details)
+                
+                # Reorder columns for better view
+                df_details = order_columns(df_details, priority_cols=[
+                    "status", "criterion", "lift", "pos_rate", "neg_rate", "pos_hits", "neg_hits"
+                ])
+                
+                render_aggrid(df_details, key="new_rules_details_grid", height=400)
+            else:
+                st.info("No criteria details available.")
+                
+        except Exception as e:
+            st.error(f"Error fetching new rules metrics: {e}")
+
+
 def render_auction_builder():
     """Build an auction step-by-step by selecting bids from BT-derived options."""
     st.header("🔨 Auction Builder")
@@ -5013,10 +5286,15 @@ def render_auction_builder():
         st.success("✅ Auction Complete")
     
     # Fetch available next bids using fast /list-next-bids endpoint
-    def get_next_bid_options(prefix: str) -> list[dict]:
-        """Get available next bids from BT using the optimized list-next-bids endpoint."""
+    def get_next_bid_options(prefix: str, force_refresh: bool = False) -> list[dict]:
+        """Get available next bids from BT using the optimized list-next-bids endpoint.
+        
+        NOTE: The Auction Summary stores the chosen path with its agg_expr at the time of selection.
+        If the API logic changes (or earlier calls timed out), those stored agg_expr lists may be empty.
+        This helper supports `force_refresh=True` so we can rehydrate the path from the server.
+        """
         cache_key = (prefix or "__opening__", seed)  # Include seed in cache key
-        if cache_key in st.session_state.auction_builder_options:
+        if not force_refresh and cache_key in st.session_state.auction_builder_options:
             return st.session_state.auction_builder_options[cache_key]
         
         try:
@@ -5024,7 +5302,8 @@ def render_auction_builder():
             response = requests.post(
                 f"{API_BASE}/list-next-bids",
                 json={"auction": prefix or ""},
-                timeout=10
+                # list-next-bids can legitimately take >10s on cold caches; use the global timeout.
+                timeout=DEFAULT_API_TIMEOUT
             )
             response.raise_for_status()
             data = response.json()
@@ -5089,8 +5368,8 @@ def render_auction_builder():
             bid_rows = []
             for i, opt in enumerate(sorted_options):
                 criteria_list = opt.get("agg_expr", [])
-                criteria_str = "; ".join(criteria_list[:5])
-                if len(criteria_list) > 5:
+                criteria_str = "; ".join(criteria_list[:8])
+                if len(criteria_list) > 8:
                     criteria_str += "..."
                 complete_marker = " ✅" if opt.get("is_complete") else ""
                 bid_rows.append({
@@ -5143,7 +5422,41 @@ def render_auction_builder():
     
     # Summary DataFrame
     if current_path:
+        # Rehydrate criteria for the stored path if any step has empty agg_expr.
+        # This prevents "Criteria Count = 0" when earlier API calls timed out or used older logic.
+        try:
+            changed = False
+            prefix = ""
+            for i, step in enumerate(list(current_path)):
+                bid = str(step.get("bid", "") or "").upper()
+                if not bid:
+                    prefix = "-".join([str(x.get("bid", "")).upper() for x in current_path[: i + 1] if x.get("bid")])
+                    continue
+                needs_refresh = (not step.get("agg_expr")) or (step.get("bt_index") is None)
+                if needs_refresh:
+                    opts = get_next_bid_options(prefix, force_refresh=True)
+                    for opt in opts:
+                        if str(opt.get("bid", "")).upper() == bid:
+                            step["bt_index"] = opt.get("bt_index")
+                            step["agg_expr"] = opt.get("agg_expr", []) or []
+                            step["is_complete"] = opt.get("is_complete", False)
+                            changed = True
+                            break
+                # Advance prefix for next iteration
+                prefix = "-".join([str(x.get("bid", "")).upper() for x in current_path[: i + 1] if x.get("bid")])
+            if changed:
+                st.session_state.auction_builder_path = current_path
+        except Exception:
+            # Never break the UI due to refresh issues; summary will still render.
+            pass
+
         st.subheader("📋 Auction Summary")
+        
+        # Check for cached deal stats to include in summary
+        deals_cache_key = f"auction_builder_deals_{current_auction}_{max_matching_deals}_{seed}"
+        cached_stats = None
+        if deals_cache_key in st.session_state and st.session_state[deals_cache_key] is not None:
+            cached_stats = st.session_state[deals_cache_key].get("stats")
         
         summary_rows = []
         for i, step in enumerate(current_path):
@@ -5152,7 +5465,7 @@ def render_auction_builder():
             criteria_str = "; ".join(step.get("agg_expr", [])[:8])
             if len(step.get("agg_expr", [])) > 8:
                 criteria_str += "..."
-            summary_rows.append({
+            row = {
                 "Bid Num": bid_num,
                 "Seat": seat_1_to_4,
                 "Bid": step["bid"],
@@ -5160,19 +5473,39 @@ def render_auction_builder():
                 "Criteria Count": len(step.get("agg_expr", [])),
                 "Agg_Expr": criteria_str if criteria_str else "(none)",
                 "Complete": "✅" if step.get("is_complete") else "",
-            })
+            }
+            # Add stats columns only on the last row (they apply to the full auction)
+            # Use Rankings-style naming: Matches, Avg Par, EV at Bid, EV Std (with NV/V suffix)
+            if cached_stats and i == len(current_path) - 1:
+                row["Matches_NV"] = cached_stats.get("matches_nv")
+                row["Matches_V"] = cached_stats.get("matches_v")
+                row["Avg Par_NV"] = cached_stats.get("avg_par_nv")
+                row["Avg Par_V"] = cached_stats.get("avg_par_v")
+                row["EV_NV"] = cached_stats.get("ev_nv")
+                row["EV_V"] = cached_stats.get("ev_v")
+                row["EV Std_NV"] = cached_stats.get("ev_std_nv")
+                row["EV Std_V"] = cached_stats.get("ev_std_v")
+            elif cached_stats:
+                row["Matches_NV"] = None
+                row["Matches_V"] = None
+                row["Avg Par_NV"] = None
+                row["Avg Par_V"] = None
+                row["EV_NV"] = None
+                row["EV_V"] = None
+                row["EV Std_NV"] = None
+                row["EV Std_V"] = None
+            summary_rows.append(row)
         
         summary_df = pl.DataFrame(summary_rows)
         render_aggrid(summary_df, key="auction_builder_summary", height=calc_grid_height(len(summary_df)), table_name="auction_builder_summary")
         
         # Matching Deals section - on-demand loading via button
         st.subheader("🎯 Matching Deals")
-        st.caption(f"Deals where the actual auction matches: **{current_auction}**")
+        st.caption(f"Deals where the actual auction starts with: **{current_auction}**")
         
-        # Use session state to track if deals have been loaded for this auction
-        deals_cache_key = f"auction_builder_deals_{current_auction}"
+        # deals_cache_key already defined above for summary stats lookup
         
-        if st.button("🔍 Find Matching Deals", type="secondary"):
+        if st.button("🔍 Show Matching Deals", type="secondary"):
             st.session_state[deals_cache_key] = None  # Force refresh
         
         # Check if we have cached deals or need to load
@@ -5181,7 +5514,8 @@ def render_auction_builder():
             cached_data = st.session_state[deals_cache_key]
             sample_deals = cached_data.get("sample_deals", [])
             if sample_deals:
-                st.success(f"Found **{len(sample_deals)}** matching deals")
+                elapsed = cached_data.get("elapsed_sec", 0)
+                st.success(f"Found **{len(sample_deals)}** matching deals ({elapsed:.2f}s)")
                 deals_df = pl.DataFrame(cached_data.get("display_rows", []))
                 render_aggrid(
                     deals_df,
@@ -5195,7 +5529,13 @@ def render_auction_builder():
             # Button was clicked, load deals
             with st.spinner("Fetching matching deals..."):
                 try:
+                    import time as _time
+                    _t0 = _time.perf_counter()
+                    
                     # Use bidding arena to get deals matching this auction
+                    # Use prefix match: auctions that START with the current path
+                    # e.g., "1D-1S-P" matches "1D-1S-P-2C-P-P-P", "1D-1S-P-P-P-P", etc.
+                    auction_upper = current_auction.upper()
                     arena_response = requests.post(
                         f"{API_BASE}/bidding-arena",
                         json={
@@ -5203,7 +5543,7 @@ def render_auction_builder():
                             "model_b": "Rules",
                             "sample_size": int(max_matching_deals),
                             "seed": int(seed),
-                            "auction_pattern": f"^{current_auction.upper()}(-P)*$"  # Match with optional trailing passes
+                            "auction_pattern": f"^{auction_upper}($|-.*)"  # Prefix match: exact OR followed by dash+anything
                         },
                         timeout=120
                     )
@@ -5211,6 +5551,56 @@ def render_auction_builder():
                     arena_data = arena_response.json()
                     
                     sample_deals = arena_data.get("sample_deals", [])
+                    
+                    # Compute stats from matching deals, split by vulnerability
+                    # Use Rankings-style naming: Matches, Avg Par, EV (at Bid), EV Std
+                    scores_nv, scores_v = [], []
+                    par_scores_nv, par_scores_v = [], []
+                    
+                    for deal in sample_deals:
+                        vul = str(deal.get("Vul", "")).upper()
+                        is_vul = vul not in ("NONE", "-", "", "O")  # O = None in some formats
+                        
+                        score = deal.get("Score")
+                        par = deal.get("ParScore")
+                        
+                        if score is not None:
+                            try:
+                                s = float(score)
+                                if is_vul:
+                                    scores_v.append(s)
+                                else:
+                                    scores_nv.append(s)
+                            except (ValueError, TypeError):
+                                pass
+                        if par is not None:
+                            try:
+                                p = float(par)
+                                if is_vul:
+                                    par_scores_v.append(p)
+                                else:
+                                    par_scores_nv.append(p)
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Compute EV (average) and EV Std (standard deviation) for each vulnerability
+                    def calc_std(values: list) -> float | None:
+                        if len(values) < 2:
+                            return None
+                        mean = sum(values) / len(values)
+                        variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+                        return round(variance ** 0.5, 1)
+                    
+                    stats = {
+                        "matches_nv": len(scores_nv) if scores_nv else None,
+                        "matches_v": len(scores_v) if scores_v else None,
+                        "avg_par_nv": round(sum(par_scores_nv) / len(par_scores_nv), 1) if par_scores_nv else None,
+                        "avg_par_v": round(sum(par_scores_v) / len(par_scores_v), 1) if par_scores_v else None,
+                        "ev_nv": round(sum(scores_nv) / len(scores_nv), 1) if scores_nv else None,
+                        "ev_v": round(sum(scores_v) / len(scores_v), 1) if scores_v else None,
+                        "ev_std_nv": calc_std(scores_nv),
+                        "ev_std_v": calc_std(scores_v),
+                    }
                     
                     # Build display DataFrame
                     display_rows = []
@@ -5230,21 +5620,20 @@ def render_auction_builder():
                             "ParScore": deal.get("ParScore", ""),
                         })
                     
-                    # Cache the results
+                    # Calculate elapsed time
+                    _elapsed_sec = round(_time.perf_counter() - _t0, 2)
+                    
+                    # Cache the results including stats and timing
                     st.session_state[deals_cache_key] = {
                         "sample_deals": sample_deals,
                         "display_rows": display_rows,
+                        "stats": stats,
+                        "elapsed_sec": _elapsed_sec,
                     }
                     
                     if sample_deals:
-                        st.success(f"Found **{len(sample_deals)}** matching deals")
-                        deals_df = pl.DataFrame(display_rows)
-                        render_aggrid(
-                            deals_df,
-                            key="auction_builder_deals",
-                            height=calc_grid_height(len(deals_df), max_height=400),
-                            table_name="auction_builder_deals",
-                        )
+                        # Rerun to update Auction Summary with the new stats
+                        st.rerun()
                     else:
                         st.info("No deals found matching this auction pattern.")
                         
@@ -5252,8 +5641,6 @@ def render_auction_builder():
                     st.error(f"API error: {e}")
                 except Exception as e:
                     st.error(f"Error fetching deals: {e}")
-        else:
-            st.info("Click the button above to find matching deals.")
 
 
 # ---------------------------------------------------------------------------
@@ -5270,6 +5657,7 @@ func_choice = st.sidebar.selectbox(
         "Bidding Arena",                 # Head-to-head model comparison
         "Auction Builder",               # Build auction step-by-step with BT lookups
         "Auction Criteria Debugger",     # Debug why an auction is rejected
+        "New Rules Metrics",             # View detailed rule discovery metrics
         "Wrong Bid Analysis",            # Wrong bid statistics and leaderboard
         "Custom Criteria Editor",        # Manage bbo_custom_auction_criteria.csv
         "Rank Next Bids by EV",          # Rank next bids after an auction by EV
@@ -5297,6 +5685,8 @@ FUNC_DESCRIPTIONS = {
     "Analyze Actual Auctions": "Group deals by their actual auction (bid column). Analyze criteria compliance, score deltas, and outcomes.",
     "Bidding Arena": "Head-to-head model comparison. Compare bidding models (Rules, Actual, NN, etc.) with DD scores, EV, and IMP differentials.",
     "Auction Builder": "Build an auction step-by-step by selecting bids from BT-derived options. See criteria per seat and find matching deals.",
+    "Auction Criteria Debugger": "Debug why a specific auction is being rejected as a Rules candidate. Shows deals matching an auction pattern and which criteria are blocking.",
+    "New Rules Metrics": "View detailed metrics for newly discovered criteria (lift, pos/neg rates) from bbo_bt_new_rules.parquet.",
     "Wrong Bid Analysis": "Analyze wrong bids: statistics, failed criteria summary, and leaderboard of auctions with highest wrong bid rates.",
     "Custom Criteria Editor": "Manage custom auction criteria applied as a hot-reloadable overlay. Add/edit/delete rules and apply without restarting the server.",
     "Rank Next Bids by EV": "Rank all possible next bids after an auction by EV. Empty input shows opening bids.",
@@ -5425,6 +5815,8 @@ match func_choice:
         render_auction_builder()
     case "Auction Criteria Debugger":
         render_auction_criteria_debugger()
+    case "New Rules Metrics":
+        render_new_rules_metrics()
     case "Wrong Bid Analysis":
         render_wrong_bid_analysis()
     case "Custom Criteria Editor":
