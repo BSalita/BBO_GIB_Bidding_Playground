@@ -16,7 +16,7 @@ from __future__ import annotations
 
 
 import streamlit as st
-from st_aggrid import AgGrid, GridOptionsBuilder, ColumnsAutoSizeMode
+from st_aggrid import AgGrid, GridOptionsBuilder, ColumnsAutoSizeMode, JsCode
 from st_aggrid.shared import GridUpdateMode, DataReturnMode
 import polars as pl
 import duckdb  # type: ignore[import-not-found]
@@ -33,9 +33,6 @@ import sys
 import re
 from typing import Any, Dict, List, Set
 
-# Add mlBridgeLib to path
-sys.path.insert(0, str(pathlib.Path(__file__).parent / "mlBridgeLib"))
-
 from bbo_bidding_queries_lib import (
     normalize_auction_pattern,
     normalize_auction_pattern_to_seat1,
@@ -44,13 +41,19 @@ from bbo_bidding_queries_lib import (
     format_elapsed,
 )
 
+# Import criteria evaluation helpers from handlers
+from plugins.bbo_handlers_common import (
+    evaluate_sl_criterion,
+    annotate_criterion_with_value,
+)
+
 
 API_BASE = "http://127.0.0.1:8000"
 
 
 # ---------------------------------------------------------------------------
 # Par Contract formatting (copied from plugins.bbo_handlers_common to avoid
-# import path issues with mlBridgeLib dependencies)
+# import path issues with mlBridge dependencies)
 # ---------------------------------------------------------------------------
 
 def _to_python_list(x: Any) -> list:
@@ -964,11 +967,12 @@ def render_aggrid(
     # Width is max of target width and column name length (approx 8px per char)
     tight_cols = {
         # Matching Deals columns
-        "Score": 70, "ParScore": 80, "Result": 60, "Contract": 70,
-        "Dealer": 60, "Vul": 50, "index": 70,
+        "Score": 40, "ParScore": 40, "Result": 30, "Contract": 40,
+        "Dealer": 20, "Vul": 30, "index": 70,
+        "Hand_N": 135, "Hand_E": 135, "Hand_S": 135, "Hand_W": 135,
         # Auction Summary columns
-        "Bid Num": 75, "Seat": 55, "Bid": 50, "BT Index": 80,
-        "Criteria Count": 110, "Complete": 75,
+        "Bid Num": 60, "Seat": 55, "Bid": 50, "BT Index": 60,
+        "Criteria Count": 36, "Complete": 30,
         # Rankings-style stats columns (NV/V split)
         "Matches_NV": 90, "Matches_V": 85,
         "Avg Par_NV": 95, "Avg Par_V": 90,
@@ -1037,9 +1041,16 @@ def render_aggrid(
         # Best-effort only; grid still renders fine without these hints.
         pass
     
-    # Agg_Expr should flex to fill remaining space, with reasonable max
+    # Agg_Expr should flex to fill remaining space with word wrap and tooltip
     if "Agg_Expr" in df.columns:
-        gb.configure_column("Agg_Expr", flex=1, minWidth=120, maxWidth=400)
+        gb.configure_column(
+            "Agg_Expr", 
+            flex=1, 
+            minWidth=200,
+            wrapText=True,
+            autoHeight=True,
+            tooltipField="Agg_Expr",  # Show full content on hover
+        )
     
     # Auction column can be wide - constrain it
     if "Auction" in df.columns:
@@ -1049,6 +1060,7 @@ def render_aggrid(
         rowHeight=28,
         headerHeight=32,
         suppressCellFocus=True,
+        tooltipShowDelay=300,  # Show tooltips after 300ms hover
     )
     grid_options = gb.build()
 
@@ -2261,14 +2273,38 @@ def render_analyze_actual_auctions():
     }
     
     with st.spinner("Grouping deals by bid..."):
-        data = api_post("/group-by-bid", payload)
+        try:
+            data = api_post("/group-by-bid", payload)
+        except requests.HTTPError as e:
+            # Handle invalid/malformed regex with a friendly message
+            if "Invalid regex pattern" in str(e) or "regular expression" in str(e):
+                st.error("Malformed Regex")
+            else:
+                st.error(f"API error: {e}")
+            return
+        except Exception as e:
+            st.error(f"Error loading auctions: {e}")
+            return
     
     # Canonical API schema: {pattern, auction_groups, total_matching_deals, unique_auctions, elapsed_ms}
-    groups = data["auction_groups"]
-    elapsed_ms = data["elapsed_ms"]
-    total_auctions = data["unique_auctions"]
-    total_matching_deals = data["total_matching_deals"]
-    effective_pattern = data["pattern"]
+    if not isinstance(data, dict):
+        st.error("Unexpected response from server")
+        return
+
+    detail = data.get("detail") or data.get("error")
+    if detail and ("regex" in str(detail).lower() or "regular expression" in str(detail).lower()):
+        st.error("Malformed Regex")
+        return
+
+    groups = data.get("auction_groups")
+    elapsed_ms = data.get("elapsed_ms", 0)
+    total_auctions = data.get("unique_auctions", 0)
+    total_matching_deals = data.get("total_matching_deals", 0)
+    effective_pattern = data.get("pattern", auction_regex)
+
+    if groups is None:
+        st.error("Unexpected response from server")
+        return
     
     if not groups:
         st.warning(f"No auctions matched pattern: `{effective_pattern}` ({format_elapsed(elapsed_ms)})")
@@ -5170,6 +5206,8 @@ def render_auction_builder():
     st.markdown("""
     Build an auction step-by-step. At each step, select the next bid from available 
     BT continuations. See criteria (Agg_Expr) for each seat and find matching deals.
+    
+    **Tip:** Pin a specific deal to see if each step's criteria match that deal.
     """)
     
     # Initialize session state for auction path
@@ -5177,8 +5215,116 @@ def render_auction_builder():
         st.session_state.auction_builder_path = []  # List of {"bid": str, "bt_index": int, "agg_expr": list}
     if "auction_builder_options" not in st.session_state:
         st.session_state.auction_builder_options = {}  # Cache of available options per prefix
+    if "auction_builder_pinned_deal" not in st.session_state:
+        st.session_state.auction_builder_pinned_deal = None  # Cached pinned deal data
     
     # Sidebar controls
+    st.sidebar.subheader("📌 Pinned Deal")
+    pinned_input = st.sidebar.text_input(
+        "Deal Index or PBN",
+        value="",
+        placeholder="e.g., 12345 or N:AKQ.xxx.xxx.xxxx ...",
+        help="Enter a deal index number or PBN string to pin. Criteria will be evaluated against this deal.",
+    )
+    
+    # Parse and fetch pinned deal
+    pinned_deal: dict | None = None
+    pinned_deal_error: str | None = None
+    
+    if pinned_input.strip():
+        # Check if it's a deal index (numeric) or PBN
+        input_stripped = pinned_input.strip()
+        cache_key = f"pinned_deal_{input_stripped}"
+        
+        if cache_key in st.session_state and st.session_state[cache_key] is not None:
+            pinned_deal = st.session_state[cache_key]
+        else:
+            try:
+                if input_stripped.isdigit():
+                    # Fetch deal by index using SQL query
+                    idx = int(input_stripped)
+                    resp = requests.post(
+                        f"{API_BASE}/execute-sql",
+                        json={
+                            "sql": f"SELECT * FROM deals WHERE index = {idx} LIMIT 1",
+                            "max_rows": 1
+                        },
+                        timeout=10
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        rows = data.get("rows", [])
+                        if rows:
+                            deal_data = dict(rows[0])
+                            deal_data["_source"] = f"index:{idx}"
+                            pinned_deal = deal_data
+                        else:
+                            pinned_deal_error = f"Deal index {idx} not found"
+                    else:
+                        pinned_deal_error = f"API error: {resp.status_code}"
+                else:
+                    # Process as PBN
+                    resp = requests.post(
+                        f"{API_BASE}/process-pbn",
+                        json={"pbn": input_stripped, "include_par": True, "vul": "None"},
+                        timeout=10
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        deals = data.get("deals", [])
+                        if deals:
+                            deal_data = dict(deals[0])
+                            deal_data["_source"] = "pbn"
+                            pinned_deal = deal_data
+                        else:
+                            pinned_deal_error = "Invalid PBN format"
+                    else:
+                        pinned_deal_error = f"API error: {resp.status_code}"
+                
+                if pinned_deal:
+                    st.session_state[cache_key] = pinned_deal
+            except Exception as e:
+                pinned_deal_error = str(e)
+    
+    # Show pinned deal info in sidebar
+    if pinned_deal:
+        st.sidebar.success("✅ Deal pinned")
+        # Show hands compactly
+        hands_str = []
+        for d in ["N", "E", "S", "W"]:
+            hand = pinned_deal.get(f"Hand_{d}", "")
+            if hand:
+                hands_str.append(f"**{d}:** {hand}")
+        if hands_str:
+            st.sidebar.markdown(" | ".join(hands_str[:2]))  # N, E
+            st.sidebar.markdown(" | ".join(hands_str[2:]))  # S, W
+        
+        # Show dealer/vul if available
+        dealer = pinned_deal.get("Dealer", "?")
+        vul = pinned_deal.get("Vul", pinned_deal.get("Vulnerability", "?"))
+        par = pinned_deal.get("ParScore", pinned_deal.get("Par_Score", "?"))
+        st.sidebar.caption(f"Dealer: {dealer} | Vul: {vul} | Par: {par}")
+        
+        if st.sidebar.button("❌ Clear Pinned Deal"):
+            # Clear all pinned deal caches
+            keys_to_clear = [k for k in st.session_state if k.startswith("pinned_deal_")]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.rerun()
+    elif pinned_deal_error:
+        st.sidebar.error(pinned_deal_error)
+    
+    # Checkbox to show/hide failed criteria coloring (only when deal is pinned)
+    show_failed_criteria = False
+    if pinned_deal:
+        show_failed_criteria = st.sidebar.checkbox(
+            "Color failed bidding candidates",
+            value=True,
+            help="Highlight bids that don't match the pinned deal's criteria"
+        )
+    
+    st.sidebar.divider()
+    
     max_matching_deals = st.sidebar.number_input(
         "Max Matching Deals",
         value=25,
@@ -5364,32 +5510,145 @@ def render_auction_builder():
             
             sorted_options = sorted(options, key=bid_sort_key)
             
+            # Helper to check if pinned deal matches criteria for a bid option
+            def check_pinned_match_with_failures(criteria_list: list, seat: int) -> tuple[bool, list[str]]:
+                """Check if pinned deal matches all criteria. Returns (matches, failed_list).
+                
+                Uses evaluate_sl_criterion from bbo_handlers_common which supports:
+                - Simple SL: 'SL_S >= 5'
+                - Relative SL: 'SL_S >= SL_H'
+                - Complex: 'SL_D >= SL_C & ((SL_D > SL_H & SL_D > SL_S) | (SL_H <= 4 & SL_S <= 4))'
+                
+                Also handles simple HCP/Total_Points criteria directly.
+                """
+                if not pinned_deal or not criteria_list:
+                    return True, []
+                
+                dealer = pinned_deal.get("Dealer", "N")
+                directions = ["N", "E", "S", "W"]
+                try:
+                    dealer_idx = directions.index(dealer.upper())
+                except ValueError:
+                    dealer_idx = 0
+                direction = directions[(dealer_idx + seat - 1) % 4]
+                
+                # Capture pinned_deal in a local variable for type checker
+                deal_data = pinned_deal  # Already checked not None above
+                
+                def eval_simple_criterion(crit_str: str) -> bool | None:
+                    """Evaluate simple HCP/Total_Points criteria like 'HCP >= 12'."""
+                    import re as re_mod
+                    m = re_mod.match(r"^(HCP|Total_Points)\s*(>=|<=|>|<|==|!=)\s*(\d+)$", crit_str.strip())
+                    if not m:
+                        return None  # Not a simple criterion
+                    var_name, op, num_str = m.groups()
+                    threshold = int(num_str)
+                    
+                    # Get actual value
+                    if var_name == "HCP":
+                        val = deal_data.get(f"HCP_{direction}")
+                    else:  # Total_Points
+                        val = deal_data.get(f"Total_Points_{direction}")
+                    
+                    if val is None:
+                        return False  # Missing data = fail
+                    
+                    val = int(val)
+                    if op == ">=":
+                        return val >= threshold
+                    elif op == "<=":
+                        return val <= threshold
+                    elif op == ">":
+                        return val > threshold
+                    elif op == "<":
+                        return val < threshold
+                    elif op == "==":
+                        return val == threshold
+                    elif op == "!=":
+                        return val != threshold
+                    return None
+                
+                failed = []
+                for crit in criteria_list:
+                    crit_str = str(crit).strip()
+                    if not crit_str:
+                        continue
+                    try:
+                        # Use the robust evaluator from bbo_handlers_common (handles SL and complex)
+                        result = evaluate_sl_criterion(crit_str, dealer, seat, pinned_deal, fail_on_missing=True)
+                        if result is False:
+                            # Annotate the failed criterion with actual values
+                            annotated = annotate_criterion_with_value(crit_str, dealer, seat, pinned_deal)
+                            failed.append(annotated)
+                        elif result is None:
+                            # Not an SL/complex criterion - try simple HCP/Total_Points
+                            simple_result = eval_simple_criterion(crit_str)
+                            if simple_result is False:
+                                annotated = annotate_criterion_with_value(crit_str, dealer, seat, pinned_deal)
+                                failed.append(annotated)
+                            # If simple_result is None or True, criterion passes (unrecognized = pass)
+                    except Exception:
+                        continue  # Skip unparseable criteria
+                
+                return len(failed) == 0, failed
+            
             # Build DataFrame for bid selection
             bid_rows = []
             for i, opt in enumerate(sorted_options):
                 criteria_list = opt.get("agg_expr", [])
-                criteria_str = "; ".join(criteria_list[:8])
-                if len(criteria_list) > 8:
-                    criteria_str += "..."
+                criteria_str = "; ".join(criteria_list)
                 complete_marker = " ✅" if opt.get("is_complete") else ""
-                bid_rows.append({
+                
+                # Check if pinned deal matches this bid's criteria
+                matches_pinned = None
+                failed_criteria_str = ""
+                if pinned_deal and show_failed_criteria:
+                    matches, failed_list = check_pinned_match_with_failures(criteria_list, seat_1_to_4)
+                    matches_pinned = matches
+                    failed_criteria_str = "; ".join(failed_list) if failed_list else ""
+                
+                row_data = {
                     "_idx": i,
+                    "_matches": matches_pinned,  # Hidden column for styling
                     "Bid Num": current_seat,
                     "Seat": seat_1_to_4,
                     "Bid": f"{opt['bid']}{complete_marker}",
                     "Criteria": criteria_str if criteria_str else "(none)",
-                })
+                }
+                if show_failed_criteria:
+                    row_data["Failed_Criteria"] = failed_criteria_str
+                bid_rows.append(row_data)
             
             bids_df = pl.DataFrame(bid_rows)
             
-            # Use AgGrid with row selection
-            gb = GridOptionsBuilder.from_dataframe(bids_df.to_pandas())
+            # Use AgGrid with row selection and conditional styling
+            pandas_df = bids_df.to_pandas()
+            gb = GridOptionsBuilder.from_dataframe(pandas_df)
             gb.configure_selection(selection_mode="single", use_checkbox=False)
             gb.configure_column("_idx", hide=True)
-            gb.configure_column("Bid Num", width=70)
-            gb.configure_column("Seat", width=50)
-            gb.configure_column("Bid", width=80)
-            gb.configure_column("Criteria", flex=1)
+            gb.configure_column("_matches", hide=True)
+            gb.configure_column("Bid Num", width=85, minWidth=85)
+            gb.configure_column("Seat", width=60, minWidth=60)
+            gb.configure_column("Bid", width=80, minWidth=80)
+            gb.configure_column("Criteria", flex=1, minWidth=100, wrapText=True, autoHeight=True)
+            if show_failed_criteria:
+                gb.configure_column("Failed_Criteria", flex=1, minWidth=120, headerName="Failed Criteria", wrapText=True, autoHeight=True)
+            
+            # Add row styling based on pinned deal match
+            if show_failed_criteria:
+                gb.configure_grid_options(
+                    getRowStyle=JsCode("""
+                        function(params) {
+                            if (params.data._matches === true) {
+                                return {'backgroundColor': '#d4edda'};
+                            } else if (params.data._matches === false) {
+                                return {'backgroundColor': '#f8d7da'};
+                            }
+                            return null;
+                        }
+                    """)
+                )
+            
             grid_options = gb.build()
             
             # Track last selected to detect new clicks
@@ -5397,12 +5656,13 @@ def render_auction_builder():
                 st.session_state.auction_builder_last_selected = None
             
             grid_response = AgGrid(
-                bids_df.to_pandas(),
+                pandas_df,
                 gridOptions=grid_options,
                 height=min(200, 35 + len(bid_rows) * 28),
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 key=f"auction_builder_bids_grid_{current_seat}",
                 theme="streamlit",
+                allow_unsafe_jscode=True,  # Required for JsCode row styling
             )
             
             selected_rows = grid_response.get("selected_rows")
@@ -5424,31 +5684,32 @@ def render_auction_builder():
     if current_path:
         # Rehydrate criteria for the stored path if any step has empty agg_expr.
         # This prevents "Criteria Count = 0" when earlier API calls timed out or used older logic.
-        try:
-            changed = False
-            prefix = ""
-            for i, step in enumerate(list(current_path)):
-                bid = str(step.get("bid", "") or "").upper()
-                if not bid:
+        with st.spinner("Loading auction criteria..."):
+            try:
+                changed = False
+                prefix = ""
+                for i, step in enumerate(list(current_path)):
+                    bid = str(step.get("bid", "") or "").upper()
+                    if not bid:
+                        prefix = "-".join([str(x.get("bid", "")).upper() for x in current_path[: i + 1] if x.get("bid")])
+                        continue
+                    needs_refresh = (not step.get("agg_expr")) or (step.get("bt_index") is None)
+                    if needs_refresh:
+                        opts = get_next_bid_options(prefix, force_refresh=True)
+                        for opt in opts:
+                            if str(opt.get("bid", "")).upper() == bid:
+                                step["bt_index"] = opt.get("bt_index")
+                                step["agg_expr"] = opt.get("agg_expr", []) or []
+                                step["is_complete"] = opt.get("is_complete", False)
+                                changed = True
+                                break
+                    # Advance prefix for next iteration
                     prefix = "-".join([str(x.get("bid", "")).upper() for x in current_path[: i + 1] if x.get("bid")])
-                    continue
-                needs_refresh = (not step.get("agg_expr")) or (step.get("bt_index") is None)
-                if needs_refresh:
-                    opts = get_next_bid_options(prefix, force_refresh=True)
-                    for opt in opts:
-                        if str(opt.get("bid", "")).upper() == bid:
-                            step["bt_index"] = opt.get("bt_index")
-                            step["agg_expr"] = opt.get("agg_expr", []) or []
-                            step["is_complete"] = opt.get("is_complete", False)
-                            changed = True
-                            break
-                # Advance prefix for next iteration
-                prefix = "-".join([str(x.get("bid", "")).upper() for x in current_path[: i + 1] if x.get("bid")])
-            if changed:
-                st.session_state.auction_builder_path = current_path
-        except Exception:
-            # Never break the UI due to refresh issues; summary will still render.
-            pass
+                if changed:
+                    st.session_state.auction_builder_path = current_path
+            except Exception:
+                # Never break the UI due to refresh issues; summary will still render.
+                pass
 
         st.subheader("📋 Auction Summary")
         
@@ -5458,13 +5719,107 @@ def render_auction_builder():
         if deals_cache_key in st.session_state and st.session_state[deals_cache_key] is not None:
             cached_stats = st.session_state[deals_cache_key].get("stats")
         
+        # Helper to evaluate criteria against pinned deal
+        def evaluate_criteria_for_pinned(criteria_list: list, seat: int, dealer: str, deal: dict) -> tuple[bool, list[str]]:
+            """Evaluate criteria against a pinned deal. Returns (all_pass, failed_criteria)."""
+            if not criteria_list or not deal:
+                return True, []
+            
+            # Map seat to direction based on dealer
+            directions = ["N", "E", "S", "W"]
+            try:
+                dealer_idx = directions.index(dealer.upper())
+            except ValueError:
+                dealer_idx = 0
+            # Seat 1 = dealer, seat 2 = next, etc.
+            direction = directions[(dealer_idx + seat - 1) % 4]
+            
+            failed = []
+            for crit in criteria_list:
+                crit_str = str(crit).strip()
+                if not crit_str:
+                    continue
+                
+                passed = True
+                fail_info = ""
+                try:
+                    # Parse HCP criteria: HCP >= N, HCP <= N
+                    if crit_str.startswith("HCP"):
+                        col_name = f"HCP_{direction}"
+                        hcp_val = deal.get(col_name)
+                        if hcp_val is None:
+                            failed.append(f"{crit_str} [NOT FOUND]")
+                            continue
+                        if ">=" in crit_str:
+                            threshold = int(crit_str.split(">=")[1].strip())
+                            passed = hcp_val >= threshold
+                            if not passed:
+                                fail_info = f"HCP({hcp_val}) >= {threshold}"
+                        elif "<=" in crit_str:
+                            threshold = int(crit_str.split("<=")[1].strip())
+                            passed = hcp_val <= threshold
+                            if not passed:
+                                fail_info = f"HCP({hcp_val}) <= {threshold}"
+                    
+                    # Parse SL (suit length) criteria: SL_S >= N, SL_H <= N, etc.
+                    elif crit_str.startswith("SL_"):
+                        # Column names are SL_{direction}_{suit} e.g. SL_N_H, SL_E_S
+                        suit_char = crit_str[3].upper()
+                        if suit_char in ("S", "H", "D", "C"):
+                            col_name = f"SL_{direction}_{suit_char}"
+                            sl_val = deal.get(col_name)
+                            if sl_val is None:
+                                failed.append(f"{crit_str} [NOT FOUND]")
+                                continue
+                            if ">=" in crit_str:
+                                threshold = int(crit_str.split(">=")[1].strip())
+                                passed = sl_val >= threshold
+                                if not passed:
+                                    fail_info = f"SL_{suit_char}({sl_val}) >= {threshold}"
+                            elif "<=" in crit_str:
+                                threshold = int(crit_str.split("<=")[1].strip())
+                                passed = sl_val <= threshold
+                                if not passed:
+                                    fail_info = f"SL_{suit_char}({sl_val}) <= {threshold}"
+                    
+                    # Parse Total_Points criteria
+                    elif crit_str.startswith("Total_Points"):
+                        col_name = f"Total_Points_{direction}"
+                        tp_val = deal.get(col_name)
+                        if tp_val is None:
+                            failed.append(f"{crit_str} [NOT FOUND]")
+                            continue
+                        if ">=" in crit_str:
+                            threshold = int(crit_str.split(">=")[1].strip())
+                            passed = tp_val >= threshold
+                            if not passed:
+                                fail_info = f"Total_Points({tp_val}) >= {threshold}"
+                        elif "<=" in crit_str:
+                            threshold = int(crit_str.split("<=")[1].strip())
+                            passed = tp_val <= threshold
+                            if not passed:
+                                fail_info = f"Total_Points({tp_val}) <= {threshold}"
+                    
+                    # For other criteria, we can't evaluate client-side - skip
+                    else:
+                        continue  # Unknown criteria - don't count as pass or fail
+                        
+                except (ValueError, TypeError, IndexError):
+                    continue  # Parse error - skip this criterion
+                
+                if not passed and fail_info:
+                    failed.append(fail_info)
+            
+            return len(failed) == 0, failed
+        
         summary_rows = []
+        pinned_all_pass = True  # Track if all steps pass for pinned deal
+        
         for i, step in enumerate(current_path):
             bid_num = i + 1
             seat_1_to_4 = ((bid_num - 1) % 4) + 1
-            criteria_str = "; ".join(step.get("agg_expr", [])[:8])
-            if len(step.get("agg_expr", [])) > 8:
-                criteria_str += "..."
+            # Store full Agg_Expr - display will handle truncation with tooltip
+            criteria_str = "; ".join(step.get("agg_expr", []))
             row = {
                 "Bid Num": bid_num,
                 "Seat": seat_1_to_4,
@@ -5474,6 +5829,19 @@ def render_auction_builder():
                 "Agg_Expr": criteria_str if criteria_str else "(none)",
                 "Complete": "✅" if step.get("is_complete") else "",
             }
+            
+            # Evaluate criteria against pinned deal if available
+            if pinned_deal:
+                dealer = pinned_deal.get("Dealer", "N")
+                criteria_list = step.get("agg_expr", [])
+                passes, failed = evaluate_criteria_for_pinned(criteria_list, seat_1_to_4, dealer, pinned_deal)
+                if passes:
+                    row["Pinned"] = "✅"
+                else:
+                    row["Pinned"] = "❌"
+                    row["Failed_Criteria"] = "; ".join(failed)  # Show all failures
+                    pinned_all_pass = False
+            
             # Add stats columns only on the last row (they apply to the full auction)
             # Use Rankings-style naming: Matches, Avg Par, EV at Bid, EV Std (with NV/V suffix)
             if cached_stats and i == len(current_path) - 1:
@@ -5495,6 +5863,13 @@ def render_auction_builder():
                 row["EV Std_NV"] = None
                 row["EV Std_V"] = None
             summary_rows.append(row)
+        
+        # Show pinned deal match summary
+        if pinned_deal and current_path:
+            if pinned_all_pass:
+                st.success("📌 Pinned deal matches ALL criteria in this auction path")
+            else:
+                st.warning("📌 Pinned deal FAILS some criteria - see 'Pinned' and 'Failed_Criteria' columns")
         
         summary_df = pl.DataFrame(summary_rows)
         render_aggrid(summary_df, key="auction_builder_summary", height=calc_grid_height(len(summary_df)), table_name="auction_builder_summary")

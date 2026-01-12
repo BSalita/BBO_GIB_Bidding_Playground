@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import polars as pl
 
 from bbo_bidding_queries_lib import normalize_auction_pattern, normalize_auction_input, normalize_auction_user_text, pattern_matches
-from mlBridgeLib.mlBridgeBiddingLib import DIRECTIONS
+from mlBridge.mlBridgeBiddingLib import DIRECTIONS
 
 
 # ===========================================================================
@@ -1494,7 +1494,7 @@ def _get_criteria_evaluator():
     """Get or create the CriteriaEvaluator singleton."""
     global _criteria_evaluator
     if _criteria_evaluator is None:
-        from mlBridgeLib.mlBridgeBiddingLib import CriteriaEvaluator
+        from mlBridge.mlBridgeBiddingLib import CriteriaEvaluator
         _criteria_evaluator = CriteriaEvaluator()
     return _criteria_evaluator
 

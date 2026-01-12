@@ -29,8 +29,8 @@ import pathlib
 
 import pyarrow.parquet as pq
 
-# Add mlBridgeLib to path so its internal imports work (append, not insert, to avoid shadowing the package)
-sys.path.append(str(pathlib.Path(__file__).parent / "mlBridgeLib"))
+# Add mlBridge to path so its internal imports work (append, not insert, to avoid shadowing the package)
+sys.path.append(str(pathlib.Path(__file__).parent / "mlBridge"))
 
 import psutil
 
@@ -65,7 +65,7 @@ from pydantic import BaseModel
 from endplay.types import Deal, Vul, Player
 from endplay.dds import calc_dd_table, par
 
-from mlBridgeLib.mlBridgeBiddingLib import (
+from mlBridge.mlBridgeBiddingLib import (
     DIRECTIONS,
     load_deal_df,
     load_execution_plan_data,
@@ -74,7 +74,7 @@ from mlBridgeLib.mlBridgeBiddingLib import (
 )
 
 # NOTE: imported as a module so static analysis doesn't get confused about symbol exports.
-import mlBridgeLib.mlBridgeBiddingLib as mlBridgeBiddingLib
+import mlBridge.mlBridgeBiddingLib as mlBridgeBiddingLib
 
 from bbo_bidding_queries_lib import (
     evaluate_criterion_for_hand,
@@ -350,6 +350,10 @@ bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 # New rules file: detailed rule discovery metrics (detailed view)
 new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
+# Precomputed deal-to-BT verified index (GPU pipeline output, optional)
+# Falls back to E: drive if not in local data/
+deal_to_bt_verified_file = dataPath.joinpath("bbo_deal_to_bt_verified.parquet")
+_deal_to_bt_verified_file_e_drive = pathlib.Path("E:/bridge/data/bbo/bidding/bbo_deal_to_bt_verified.parquet")
 
 # ---------------------------------------------------------------------------
 # Constants for hand criteria
@@ -1473,6 +1477,34 @@ def _heavy_init() -> None:
             except Exception as e:
                 print(f"[init] WARNING: Failed to load new rules from {new_rules_file}: {e}")
         _log_memory("after load new_rules")
+        
+        # Load precomputed deal-to-BT verified index (optional, from GPU pipeline)
+        # This enables O(1) lookup of which BT rows match each deal
+        deal_to_bt_index: dict[int, list[int]] | None = None
+        _verified_file = deal_to_bt_verified_file if deal_to_bt_verified_file.exists() else (
+            _deal_to_bt_verified_file_e_drive if _deal_to_bt_verified_file_e_drive.exists() else None
+        )
+        if _verified_file:
+            try:
+                print(f"[init] Loading precomputed deal-to-BT index from {_verified_file}...")
+                t0_idx = time.perf_counter()
+                _idx_df = pl.read_parquet(_verified_file, columns=["deal_idx", "Matched_BT_Indices"])
+                # Build dict for O(1) lookup by deal index
+                deal_to_bt_index = {
+                    int(row["deal_idx"]): list(row["Matched_BT_Indices"]) if row["Matched_BT_Indices"] else []
+                    for row in _idx_df.iter_rows(named=True)
+                }
+                elapsed_idx = time.perf_counter() - t0_idx
+                idx_info = f"{len(deal_to_bt_index):,} deals in {elapsed_idx:.1f}s"
+                _update_loading_status(5, "Loading deal-to-BT index...", "deal_to_bt_index", idx_info)
+                print(f"[init] deal_to_bt_index: {idx_info} (GPU-verified, enables instant lookups)")
+                del _idx_df
+            except Exception as e:
+                print(f"[init] WARNING: Failed to load deal-to-BT index from {_verified_file}: {e}")
+                deal_to_bt_index = None
+        else:
+            print("[init] No precomputed deal-to-BT index found (run bbo_bt_filter_by_bitmap.py)")
+        _log_memory("after load deal_to_bt_index")
 
         # Compute opening-bid candidates for all (dealer, seat) combinations
         _update_loading_status(6, "Processing opening bids (seat1-only)...", "bt_openings", "computing...")
@@ -1503,6 +1535,7 @@ def _heavy_init() -> None:
             STATE["custom_criteria_stats"] = custom_criteria_stats
             STATE["available_criteria_names"] = available_criteria_names
             STATE["new_rules_df"] = new_rules_df
+            STATE["deal_to_bt_index"] = deal_to_bt_index  # Precomputed deal→[bt_indices] (or None)
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None

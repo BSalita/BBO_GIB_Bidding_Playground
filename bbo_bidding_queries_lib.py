@@ -926,56 +926,45 @@ def add_suit_length_columns(df: pl.DataFrame, direction: str) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Criteria Evaluation
+# Criteria Evaluation (supports complex and suit-relational via shared helpers)
 # ---------------------------------------------------------------------------
 
 def evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, int]) -> bool:
     """
-    Evaluate a criterion string like 'SL_S >= SL_H' against specific hand values.
+    Evaluate a criterion string (including complex/suit relational) against specific hand values.
     
-    Args:
-        criterion: Criterion expression like 'HCP >= 15', 'SL_S >= SL_H'
-        hand_values: Dictionary with keys: HCP, SL_S, SL_H, SL_D, SL_C, Total_Points
-        
-    Returns:
-        True if the criterion is satisfied, False otherwise.
-        Returns True if criterion cannot be parsed (don't filter on unparseable criteria).
+    Delegates to evaluate_sl_criterion from plugins.bbo_handlers_common to keep
+    behavior consistent across frontend/backend and support expressions like
+    'SL_D >= SL_C & ((SL_D > SL_H & SL_D > SL_S) | (SL_H <= 4 & SL_S <= 4))'.
+    
+    Returns True if the criterion passes, False if it fails, and True for
+    unparseable criteria (maintains prior permissive behavior).
     """
-    pattern = r'(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+)'
-    match = re.match(pattern, criterion.strip())
-    if not match:
-        return True  # Can't parse, don't filter
-    
-    left, op, right = match.groups()
-    
-    # Get left value
-    left_val = hand_values.get(left)
-    if left_val is None:
-        return True  # Unknown column, don't filter
-    
-    # Get right value (either from hand_values or as a number)
+    from plugins.bbo_handlers_common import evaluate_sl_criterion
+
+    crit_s = str(criterion or "").strip()
+    if not crit_s:
+        return True
+
+    # Build a minimal deal_row for direction 'N' using provided hand values.
+    deal_row = {
+        "HCP_N": hand_values.get("HCP"),
+        "Total_Points_N": hand_values.get("Total_Points"),
+        "SL_N_S": hand_values.get("SL_S"),
+        "SL_N_H": hand_values.get("SL_H"),
+        "SL_N_D": hand_values.get("SL_D"),
+        "SL_N_C": hand_values.get("SL_C"),
+    }
+
     try:
-        right_val = float(right)
-    except ValueError:
-        right_val = hand_values.get(right)
-        if right_val is None:
-            return True  # Unknown column, don't filter
-    
-    # Evaluate
-    if op == '>=':
-        return left_val >= right_val
-    elif op == '<=':
-        return left_val <= right_val
-    elif op == '>':
-        return left_val > right_val
-    elif op == '<':
-        return left_val < right_val
-    elif op == '==':
-        return left_val == right_val
-    elif op == '!=':
-        return left_val != right_val
-    
-    return True
+        res = evaluate_sl_criterion(crit_s, dealer="N", seat=1, deal_row=deal_row, fail_on_missing=True)
+        if res is None:
+            # Not an SL/complex criterion; treat as pass to avoid over-filtering
+            return True
+        return bool(res)
+    except Exception:
+        # Preserve prior behavior: unparseable criteria do not filter out rows
+        return True
 
 
 # ---------------------------------------------------------------------------

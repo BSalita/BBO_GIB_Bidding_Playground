@@ -7,6 +7,9 @@ scikit-learn
 matplotlib
 endplay  # Bridge library (Deal, Vul, Player, dds, parsers)
 
+# GPU acceleration (optional - install with: pip install torch --index-url https://download.pytorch.org/whl/cu124)
+# torch
+
 # Expression evaluation
 asteval
 
@@ -25,7 +28,7 @@ psutil
 
 # Streamlit app
 streamlit
-streamlit-aggrid==1.1.7  # 1.2.1 gave object errors
+streamlit-aggrid  # Note: 1.2.1 gave object errors, 1.1.7 works
 requests
 
 # Web scraping

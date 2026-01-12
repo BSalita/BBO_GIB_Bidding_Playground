@@ -46,8 +46,8 @@ from bbo_bidding_queries_lib import (
     add_suit_length_columns,
 )
 
-from mlBridgeLib.mlBridgeBiddingLib import DIRECTIONS
-import mlBridgeLib.mlBridgeAugmentLib as mlBridgeAugmentLib
+from mlBridge.mlBridgeBiddingLib import DIRECTIONS
+import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
 
 # Import from common module (eliminates code duplication)
 from plugins.bbo_handlers_common import (
@@ -3377,11 +3377,48 @@ def handle_bidding_arena(
     analyzed_deals = sample_df.height
     
     # ---------------------------------------------------------------------------
+    # OPTIMIZATION: Pinned-Only Mode Detection
+    # ---------------------------------------------------------------------------
+    # If we're only processing pinned deals (no random samples), we can dramatically
+    # reduce the candidate pool by only loading BT rows for the specific auctions
+    # in those deals. This avoids the expensive 5,000-row Agg_Expr load.
+    pinned_only_mode = (
+        pinned_df is not None 
+        and pinned_df.height > 0 
+        and pinned_df.height == sample_df.height  # No random samples added
+    )
+    pinned_auction_bt_indices: set[int] = set()
+    
+    if pinned_only_mode and "_bid_str" in sample_df.columns:
+        # Extract unique auctions from pinned deals and resolve to bt_indices
+        t_pinned_resolve = time.perf_counter()
+        try:
+            pinned_auctions = sample_df["_bid_str"].unique().to_list()
+            for auc in pinned_auctions:
+                if not auc:
+                    continue
+                try:
+                    # Normalize to seat-1 view for lookup
+                    auc_seat1 = re.sub(r"(?i)^(p-)+", "", normalize_auction_input(str(auc)))
+                    bt_idx = _resolve_bt_index_by_traversal(state, auc_seat1)
+                    if bt_idx is not None:
+                        pinned_auction_bt_indices.add(int(bt_idx))
+                except Exception:
+                    pass
+            elapsed_resolve = (time.perf_counter() - t_pinned_resolve) * 1000
+            print(f"[bidding-arena] PINNED-ONLY MODE: {len(pinned_auctions)} auctions -> {len(pinned_auction_bt_indices)} bt_indices ({elapsed_resolve:.1f}ms)")
+        except Exception as e:
+            print(f"[bidding-arena] Pinned mode optimization failed: {e}, falling back to full candidate pool")
+            pinned_only_mode = False
+    
+    # ---------------------------------------------------------------------------
     # Rules Auction Matching Strategy
     # ---------------------------------------------------------------------------
-    # Deal-level precomputed candidates (Matched_BT_Indices) appear unreliable in this dataset,
-    # so we do NOT use them for Rules matching.
-    has_precomputed_matches = False
+    # Use GPU-verified deal-to-BT index when available (bbo_deal_to_bt_verified.parquet).
+    # This index is already bitmap-verified, so we can skip _deal_meets_all_seat_criteria.
+    deal_to_bt_index: dict[int, list[int]] | None = state.get("deal_to_bt_index")
+    has_verified_index = deal_to_bt_index is not None
+    has_precomputed_matches = has_verified_index  # Only trust the verified index
 
     # Rules candidate source:
     # - Default: use all completed BT rows (merged rules are pre-compiled)
@@ -3516,8 +3553,12 @@ def handle_bidding_arena(
         dealer: str,
         matched_indices: List[int] | None,
         deal_row: Dict[str, Any] | None = None,
+        skip_criteria_check: bool = False,
     ) -> tuple[list[dict[str, Any]], bool]:
-        """Return all matching BT candidates among the precomputed list (up to max returned)."""
+        """Return all matching BT candidates among the precomputed list (up to max returned).
+        
+        If skip_criteria_check is True (verified index), we trust the precomputed matches.
+        """
         if not matched_indices:
             return [], False
         out: list[dict[str, Any]] = []
@@ -3527,7 +3568,8 @@ def handle_bidding_arena(
             bt_row = bt_idx_to_row.get(bt_idx_i)
             if bt_row is None:
                 continue
-            if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
+            # When using verified index, skip expensive criteria check
+            if skip_criteria_check or _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
                 out.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction")})
                 if len(out) >= RULES_MATCHES_MAX_RETURNED:
                     truncated = True
@@ -3551,8 +3593,12 @@ def handle_bidding_arena(
         dealer: str,
         matched_indices: List[int] | None,
         deal_row: Dict[str, Any] | None = None,
+        skip_criteria_check: bool = False,
     ) -> str | None:
-        """Fast path: return first matching auction among the precomputed candidate list."""
+        """Fast path: return first matching auction among the precomputed candidate list.
+        
+        If skip_criteria_check is True (verified index), we trust the precomputed matches.
+        """
         if not matched_indices:
             return None
         for bt_idx in matched_indices:
@@ -3560,7 +3606,8 @@ def handle_bidding_arena(
             bt_row = bt_idx_to_row.get(bt_idx_i)
             if bt_row is None:
                 continue
-            if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
+            # When using verified index, skip expensive criteria check
+            if skip_criteria_check or _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
                 auc = bt_row.get("Auction")
                 return str(auc) if auc is not None else None
             return None
@@ -3627,9 +3674,12 @@ def handle_bidding_arena(
                 bt_idx_to_row_base = {}
                 bt_idx_to_auction = {}
 
-        def _find_rules_auction_precomputed(deal_idx: int, dealer: str, matched_indices: List[int] | None) -> Optional[str]:
-            """Pick the first precomputed candidate that satisfies (base + overlay) criteria for this deal."""
-            return _find_first_rules_match_precomputed(deal_idx, dealer, matched_indices)
+        def _find_rules_auction_precomputed(deal_idx: int, dealer: str, matched_indices: List[int] | None, skip_criteria_check: bool = False) -> Optional[str]:
+            """Pick the first precomputed candidate that satisfies (base + overlay) criteria for this deal.
+            
+            If skip_criteria_check is True (verified index), we trust the precomputed matches.
+            """
+            return _find_first_rules_match_precomputed(deal_idx, dealer, matched_indices, skip_criteria_check=skip_criteria_check)
     else:
         # Candidate pool(s) for criteria matching (no deal-level Matched_BT_Indices)
         if "is_completed_auction" in bt_seat1_df.columns:
@@ -3640,8 +3690,20 @@ def handle_bidding_arena(
         # Rules candidate pool: use completed auctions (merged rules are pre-compiled in BT)
         bt_rules_default = bt_completed
         
-        if not search_all_bt_rows:
-            # Limit pools for performance (default + fallback)
+        # -------------------------------------------------------------------
+        # PINNED-ONLY OPTIMIZATION: Use minimal candidate pool
+        # -------------------------------------------------------------------
+        # When only processing pinned deals, we only need BT rows for those
+        # specific auctions, not 5,000 random candidates.
+        if pinned_only_mode and pinned_auction_bt_indices:
+            t_pinned_pool = time.perf_counter()
+            pinned_idx_list = list(pinned_auction_bt_indices)
+            bt_rules_default = bt_completed.filter(pl.col("bt_index").is_in(pinned_idx_list))
+            bt_completed = bt_rules_default  # Same pool for pinned-only mode
+            elapsed_pool = (time.perf_counter() - t_pinned_pool) * 1000
+            print(f"[bidding-arena] Pinned pool: {bt_rules_default.height} rows ({elapsed_pool:.1f}ms)")
+        elif not search_all_bt_rows:
+            # Standard path: Limit pools for performance (default + fallback)
             if "matching_deal_count" in bt_rules_default.columns:
                 bt_rules_default = bt_rules_default.sort("matching_deal_count", descending=True).head(_CANDIDATE_POOL_LIMIT)
             elif "bt_index" in bt_rules_default.columns:
@@ -3668,21 +3730,30 @@ def handle_bidding_arena(
             if "bt_index" not in bt_rules_default.columns or "bt_index" not in bt_completed.columns:
                 raise ValueError("bt_index missing from BT candidate pool; cannot load Agg_Expr on-demand for bidding-arena")
 
-            needed_idxs = (
-                pl.concat(
-                    [
-                        bt_rules_default.select(pl.col("bt_index").cast(pl.Int64)),
-                        bt_completed.select(pl.col("bt_index").cast(pl.Int64)),
-                    ],
-                    how="vertical",
+            # For pinned-only mode, we already have the minimal set of indices
+            if pinned_only_mode and pinned_auction_bt_indices:
+                needed_idxs = list(pinned_auction_bt_indices)
+                print(f"[bidding-arena] Loading Agg_Expr for {len(needed_idxs)} pinned bt_indices (vs {_CANDIDATE_POOL_LIMIT} normally)")
+            else:
+                needed_idxs = (
+                    pl.concat(
+                        [
+                            bt_rules_default.select(pl.col("bt_index").cast(pl.Int64)),
+                            bt_completed.select(pl.col("bt_index").cast(pl.Int64)),
+                        ],
+                        how="vertical",
+                    )
+                    .unique()
+                    .to_series()
+                    .to_list()
                 )
-                .unique()
-                .to_series()
-                .to_list()
-            )
             needed_idxs = [int(x) for x in needed_idxs if x is not None]
+            
             if needed_idxs:
+                t_agg_load = time.perf_counter()
                 agg_data = _load_agg_expr_for_bt_indices(needed_idxs, bt_parquet_file)
+                elapsed_agg = (time.perf_counter() - t_agg_load) * 1000
+                print(f"[bidding-arena] Agg_Expr load: {len(needed_idxs)} indices in {elapsed_agg:.1f}ms")
                 agg_rows: list[dict[str, Any]] = []
                 for bt_idx, cols_dict in agg_data.items():
                     row: dict[str, Any] = {"bt_index": bt_idx}
@@ -4422,8 +4493,15 @@ def handle_bidding_arena(
         # Pick Rules_Base auction (original BT criteria)
         if need_rules_base:
             if has_precomputed_matches:
-                matched_indices = row.get("Matched_BT_Indices")
-                rules_base_auction = _find_first_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
+                # Use verified index if available (O(1) lookup, already bitmap-verified)
+                if has_verified_index and deal_to_bt_index is not None:
+                    matched_indices = deal_to_bt_index.get(int(deal_idx), [])
+                    rules_base_auction = _find_first_rules_match_precomputed(
+                        int(deal_idx), dealer, matched_indices, row, skip_criteria_check=True
+                    )
+                else:
+                    matched_indices = row.get("Matched_BT_Indices")
+                    rules_base_auction = _find_first_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
             else:
                 rules_base_auction = _find_first_rules_match_onthefly(int(deal_idx), dealer, row)
         else:
@@ -4435,7 +4513,11 @@ def handle_bidding_arena(
         rules_matches_truncated = False
         if need_rules_matches_list:
             if has_precomputed_matches:
-                matched_indices = row.get("Matched_BT_Indices")
+                # Use verified index if available
+                if has_verified_index and deal_to_bt_index is not None:
+                    matched_indices = deal_to_bt_index.get(int(deal_idx), [])
+                else:
+                    matched_indices = row.get("Matched_BT_Indices")
                 rules_matches, rules_matches_truncated = _find_merged_rules_matches_precomputed(deal_cache, matched_indices)
             else:
                 rules_matches, rules_matches_truncated = _find_merged_rules_matches_onthefly(deal_cache)
