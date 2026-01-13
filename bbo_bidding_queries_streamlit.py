@@ -5549,7 +5549,6 @@ def render_auction_builder():
                             {"indices": bt_indices, "max_rows": 500},
                             timeout=10,
                         )
-                        _st_info_elapsed("Auction Builder: categories lookup", cat_data)
                         rows = cat_data.get("rows") or []
                         tmp: dict[int, str] = {}
                         for r in rows:
@@ -5695,8 +5694,22 @@ def render_auction_builder():
             gb.configure_column("Bid Num", width=85, minWidth=85)
             gb.configure_column("Seat", width=60, minWidth=60)
             gb.configure_column("Bid", width=80, minWidth=80)
-            gb.configure_column("Criteria", flex=1, minWidth=100, wrapText=True, autoHeight=True)
-            gb.configure_column("Categories", flex=1, minWidth=140, wrapText=True, autoHeight=True)
+            gb.configure_column(
+                "Criteria",
+                flex=1,
+                minWidth=100,
+                wrapText=True,
+                autoHeight=True,
+                tooltipField="Criteria",  # Show full content on hover
+            )
+            gb.configure_column(
+                "Categories",
+                flex=1,
+                minWidth=140,
+                wrapText=True,
+                autoHeight=True,
+                tooltipField="Categories",  # Show full content on hover
+            )
             if show_failed_criteria:
                 gb.configure_column("Failed_Criteria", flex=1, minWidth=120, headerName="Failed Criteria", wrapText=True, autoHeight=True)
             
@@ -5714,6 +5727,7 @@ def render_auction_builder():
                         }
                     """)
                 )
+            gb.configure_grid_options(tooltipShowDelay=300)  # Tooltips after 300ms hover
             
             grid_options = gb.build()
             
