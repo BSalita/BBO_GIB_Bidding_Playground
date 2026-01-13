@@ -806,69 +806,23 @@ LIMIT {sample_n}"""
         else:
             sql_seq = "-- index column not available for sequence SQL preview"
 
-        # Get deal count and wrong bid rate for this auction
-        deal_df = state.get("deal_df")
-        deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+        # -------------------------------------------------------------------
+        # PERFORMANCE NOTE:
+        # The Random Auction Samples endpoint is a UI convenience. It must stay fast.
+        # Computing per-auction deal_count and wrong_bid_rate by scanning deal_df is
+        # extremely expensive (can be 10+ seconds) and duplicates work done by other
+        # endpoints. Instead:
+        # - Use precomputed `matching_deal_count` from BT stats when available.
+        # - Do NOT compute wrong_bid_rate here (set to 0.0).
+        # -------------------------------------------------------------------
         deal_count = 0
+        try:
+            if "matching_deal_count" in base_df.columns and row.get("matching_deal_count") is not None:
+                deal_count = int(row.get("matching_deal_count") or 0)
+        except Exception:
+            deal_count = 0
         wrong_bid_count = 0
         wrong_bid_rate = 0.0
-        
-        if deal_df is not None and matched_auction:
-            # Apply merged rules + overlay to get final criteria
-            row_with_rules = _apply_all_rules_to_bt_row(dict(row), state)
-            # Build bt_info for wrong bid checking
-            bt_info = {
-                "Agg_Expr_Seat_1": row_with_rules.get("Agg_Expr_Seat_1"),
-                "Agg_Expr_Seat_2": row_with_rules.get("Agg_Expr_Seat_2"),
-                "Agg_Expr_Seat_3": row_with_rules.get("Agg_Expr_Seat_3"),
-                "Agg_Expr_Seat_4": row_with_rules.get("Agg_Expr_Seat_4"),
-            }
-            
-            auction_lower = matched_auction.lower()
-            auction_variations = [auction_lower]
-            for prefix in ["p-", "p-p-", "p-p-p-"]:
-                auction_variations.append(prefix + auction_lower)
-            
-            # Get bid column as string
-            bid_dtype = deal_df.schema.get("bid")
-            if bid_dtype == pl.List(pl.Utf8):
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").list.join("-").alias("_bid_str"))
-            elif bid_dtype == pl.Utf8:
-                deal_df_with_str = deal_df.with_columns(pl.col("bid").fill_null("").alias("_bid_str"))
-            else:
-                deal_df_with_str = deal_df.with_columns(
-                    pl.col("bid").map_elements(
-                        lambda x: "-".join(map(str, x)) if isinstance(x, list) else (str(x) if x is not None else ""),
-                        return_dtype=pl.Utf8,
-                    ).alias("_bid_str")
-                )
-            
-            deal_df_with_str = deal_df_with_str.with_row_index("_row_idx")
-            matching_deals = deal_df_with_str.filter(
-                pl.col("_bid_str").str.to_lowercase().is_in(auction_variations)
-            )
-            deal_count = matching_deals.height
-            
-            # Sample for wrong bid calculation
-            if deal_count > 0:
-                sample_n = min(100, deal_count)
-                if sample_n < deal_count:
-                    sample_deals = matching_deals.sample(n=sample_n, seed=42)
-                else:
-                    sample_deals = matching_deals
-                
-                for deal_row in sample_deals.iter_rows(named=True):
-                    deal_idx = deal_row.get("_row_idx", 0)
-                    dealer = deal_row.get("Dealer", "N")
-                    bid_str = deal_row.get("_bid_str", "")
-                    
-                    conformance = _check_deal_criteria_conformance_bitmap(
-                        int(deal_idx), bt_info, dealer, deal_criteria_by_seat_dfs, auction=bid_str
-                    )
-                    if conformance["first_wrong_seat"] is not None:
-                        wrong_bid_count += 1
-                
-                wrong_bid_rate = wrong_bid_count / sample_n if sample_n > 0 else 0.0
 
         out_samples.append({
             "auction": matched_auction, 
@@ -1921,6 +1875,7 @@ def handle_bidding_table_statistics(
     sorted_shape: Optional[str],
     dist_seat: int,
     allow_initial_passes: bool = True,
+    include_categories: bool = False,
 ) -> Dict[str, Any]:
     """Handle /bidding-table-statistics endpoint.
     
@@ -1933,6 +1888,8 @@ def handle_bidding_table_statistics(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded (pipeline error): missing bbo_bt_seat1.parquet")
     bt_stats_df = state.get("bt_stats_df")
+    bt_categories_df = state.get("bt_categories_df")
+    bt_category_cols = state.get("bt_category_cols") or []
 
     # New architecture: bt_seat1_df has only core bidding columns; criteria/aggregates
     # for completed auctions live in bt_stats_df, keyed by bt_index.
@@ -1994,6 +1951,27 @@ def handle_bidding_table_statistics(
     sample_n = min(sample_size, total_matches)
     effective_seed = None if (seed is None or seed == 0) else seed
     sampled_df = matched_df.sample(n=sample_n, seed=effective_seed).sort("_idx")
+
+    # Optional: attach bid-category flags (Phase 4) on bt_index.
+    # Join AFTER sampling for performance (keeps join size small).
+    if (
+        include_categories
+        and bt_categories_df is not None
+        and "bt_index" in sampled_df.columns
+        and isinstance(bt_category_cols, list)
+        and bt_category_cols
+    ):
+        try:
+            cat_cols_present = [c for c in bt_category_cols if c in bt_categories_df.columns]
+            if cat_cols_present:
+                sampled_df = sampled_df.join(
+                    bt_categories_df.select(["bt_index"] + cat_cols_present),
+                    on="bt_index",
+                    how="left",
+                )
+        except Exception:
+            # Categories are optional; never fail the endpoint due to category join issues.
+            pass
     sampled_indices = sampled_df["_idx"].to_list()
     
     # Start result_df with index + Auction, then join all other sampled columns.
@@ -2665,6 +2643,7 @@ def handle_wrong_bid_stats(
     deal_df = state["deal_df"]
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
     bt_seat1_df = state.get("bt_seat1_df")
+    bt_stats_df = state.get("bt_stats_df")
     
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
@@ -2672,17 +2651,19 @@ def handle_wrong_bid_stats(
     # Add row index for bitmap lookups
     deal_df = deal_df.with_row_index("_row_idx")
     
-    # Prepare for join: add _bid_str and _auction_key
-    deals_prepared = prepare_deals_with_bid_str(deal_df)
-    
-    # Filter deals by auction pattern if provided
+    # PERFORMANCE: Defer expensive string processing until after sampling if possible.
+    # If filtering by pattern, we MUST compute _bid_str for all rows.
+    # But we only need _auction_key (regex replaces) for the join on the small sample.
     if auction_pattern:
+        deals_prepared = prepare_deals_with_bid_str(deal_df, include_auction_key=False)
         try:
             regex_pattern = f"(?i){normalize_auction_user_text(auction_pattern)}"
             deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
-    
+    else:
+        deals_prepared = deal_df
+
     total_deals = deals_prepared.height
     
     # Sample deals to analyze (for performance, limit to 10000)
@@ -2692,10 +2673,18 @@ def handle_wrong_bid_stats(
     else:
         sample_df = deals_prepared
     
+    # Fully prepare the small sample (including _auction_key for the join)
+    sample_df = prepare_deals_with_bid_str(sample_df, include_auction_key=True)
+
     analyzed_deals = sample_df.height
     
     # Prepare BT for join and join once (instead of per-row lookups)
-    bt_prepared = prepare_bt_for_join(bt_seat1_df)
+    # PERFORMANCE: Prefer joining against bt_stats_df (completed auctions, ~2.1M rows)
+    # instead of bt_seat1_df (461M rows). We still load Agg_Expr on-demand by bt_index.
+    bt_join_src = bt_seat1_df
+    if bt_stats_df is not None and "Auction" in bt_stats_df.columns and "bt_index" in bt_stats_df.columns:
+        bt_join_src = bt_stats_df
+    bt_prepared = prepare_bt_for_join(bt_join_src)
     joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
     
     # Batch check wrong bids (still loops but no per-row filter operations)
@@ -2814,28 +2803,38 @@ def handle_failed_criteria_summary(
     Uses vectorized join instead of per-row BT lookups for performance.
     """
     t0 = time.perf_counter()
+    timings_ms: dict[str, float] = {}
+    _t_last = t0
+    def _mark(name: str) -> None:
+        nonlocal _t_last
+        now = time.perf_counter()
+        timings_ms[name] = round((now - _t_last) * 1000, 1)
+        _t_last = now
     
     deal_df = state["deal_df"]
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
     bt_seat1_df = state.get("bt_seat1_df")
+    bt_stats_df = state.get("bt_stats_df")
     
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
     
     # Add row index for bitmap lookups
     deal_df = deal_df.with_row_index("_row_idx")
+    _mark("add_row_index")
     
-    # Prepare for join: add _bid_str and _auction_key
-    deals_prepared = prepare_deals_with_bid_str(deal_df)
-    
-    # Filter deals by auction pattern if provided
+    # PERFORMANCE: Defer expensive string processing until after sampling.
     if auction_pattern:
+        deals_prepared = prepare_deals_with_bid_str(deal_df, include_auction_key=False)
         try:
             regex_pattern = f"(?i){normalize_auction_user_text(auction_pattern)}"
             deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
-    
+    else:
+        deals_prepared = deal_df
+    _mark("pattern_filter")
+
     total_deals = deals_prepared.height
     
     # Sample for performance
@@ -2844,12 +2843,48 @@ def handle_failed_criteria_summary(
         sample_df = deals_prepared.sample(n=sample_size, seed=42)
     else:
         sample_df = deals_prepared
+    _mark("sample")
     
+    # Fully prepare the small sample
+    sample_df = prepare_deals_with_bid_str(sample_df, include_auction_key=True)
+    _mark("prepare_sample")
+
     analyzed_deals = sample_df.height
     
     # Prepare BT for join and join once (eliminates per-row filter operations)
-    bt_prepared = prepare_bt_for_join(bt_seat1_df)
+    # PERFORMANCE: Prefer joining against bt_stats_df (completed auctions, ~2.1M rows)
+    # instead of bt_seat1_df (461M rows). We still load Agg_Expr on-demand by bt_index.
+    bt_join_src = bt_seat1_df
+    if bt_stats_df is not None and "Auction" in bt_stats_df.columns and "bt_index" in bt_stats_df.columns:
+        bt_join_src = bt_stats_df
+    bt_prepared = prepare_bt_for_join(bt_join_src)
+    _mark("prepare_bt")
     joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
+    _mark("join")
+
+    # PERFORMANCE: Precompute (overlay+deduped) criteria lists per bt_index once.
+    bt_criteria_by_bt_index: dict[int, dict[int, list[Any]]] = {}
+    if "bt_index" in joined_df.columns:
+        bt_cols = ["bt_index", "Auction"] + [agg_expr_col(s) for s in SEAT_RANGE if agg_expr_col(s) in joined_df.columns]
+        try:
+            uniq_bt = joined_df.select([c for c in bt_cols if c in joined_df.columns]).unique(subset=["bt_index"])
+            for r in uniq_bt.iter_rows(named=True):
+                try:
+                    bt_idx_raw = r.get("bt_index")
+                    if bt_idx_raw is None:
+                        continue
+                    bt_idx = int(bt_idx_raw)
+                except Exception:
+                    continue
+                processed = _apply_all_rules_to_bt_row(dict(r), state)
+                bt_criteria_by_bt_index[bt_idx] = {
+                    s: (processed.get(agg_expr_col(s)) or [])
+                    for s in SEAT_RANGE
+                    if agg_expr_col(s) in processed
+                }
+        except Exception:
+            bt_criteria_by_bt_index = {}
+    _mark("precompute_bt_criteria")
     
     # Track criteria failures
     criteria_fail_counts: Dict[str, int] = {}
@@ -2858,39 +2893,61 @@ def handle_failed_criteria_summary(
     
     # Process each deal - now without per-row BT lookups (already joined)
     seats_to_check = [seat] if seat else list(range(1, 5))
+    # Cache columns sets per seat+dealer once
+    colset_cache: dict[tuple[int, str], set[str]] = {}
+
+    t_loop0 = time.perf_counter()
     for row in joined_df.iter_rows(named=True):
-        # Canonical: ensure Agg_Expr is available + overlay + dedupe
-        row = _apply_all_rules_to_bt_row(dict(row), state)
-        deal_idx = row.get("_row_idx", 0)
-        dealer = row.get("Dealer", "N")
+        deal_idx_raw = row.get("_row_idx", 0)
+        deal_idx = int(deal_idx_raw) if deal_idx_raw is not None else 0
+        dealer = str(row.get("Dealer", "N") or "N").upper()
+        bt_idx = None
+        try:
+            bt_idx_val = row.get("bt_index")
+            bt_idx = int(bt_idx_val) if bt_idx_val is not None else None
+        except Exception:
+            bt_idx = None
         
         # Check each seat's criteria
         for s in seats_to_check:
             if s is None:
                 continue
-            criteria_list = row.get(f"Agg_Expr_Seat_{s}")
+            s_i = int(s)
+            # Pull from bt_index cache when possible (overlay+dedupe already applied)
+            if bt_idx is not None and bt_idx in bt_criteria_by_bt_index:
+                criteria_list = bt_criteria_by_bt_index[bt_idx].get(s_i)
+            else:
+                criteria_list = row.get(f"Agg_Expr_Seat_{s_i}")
             if not criteria_list:
                 continue
             
-            seat_dfs = deal_criteria_by_seat_dfs.get(s, {})
+            seat_dfs = deal_criteria_by_seat_dfs.get(s_i, {})
             criteria_df = seat_dfs.get(dealer)
             if criteria_df is None or criteria_df.is_empty():
                 continue
+
+            key = (s_i, dealer)
+            cols = colset_cache.get(key)
+            if cols is None:
+                cols = set(criteria_df.columns)
+                colset_cache[key] = cols
             
             for criterion in criteria_list:
-                if criterion not in criteria_df.columns:
+                if str(criterion) not in cols:
                     continue
                 
                 # Track check count
                 criteria_check_counts[criterion] = criteria_check_counts.get(criterion, 0) + 1
                 
                 try:
-                    bitmap_value = criteria_df[criterion][deal_idx]
+                    bitmap_value = criteria_df[str(criterion)][deal_idx]
                     if not bitmap_value:
                         criteria_fail_counts[criterion] = criteria_fail_counts.get(criterion, 0) + 1
-                        criteria_by_seat[s][criterion] = criteria_by_seat[s].get(criterion, 0) + 1
+                        criteria_by_seat[s_i][criterion] = criteria_by_seat[s_i].get(criterion, 0) + 1
                 except (IndexError, KeyError):
                     continue
+    timings_ms["loop"] = round((time.perf_counter() - t_loop0) * 1000, 1)
+    _t_last = time.perf_counter()
     
     # Build results sorted by fail count
     criteria_results = []
@@ -2915,9 +2972,15 @@ def handle_failed_criteria_summary(
     for s in range(1, 5):
         seat_top = sorted(criteria_by_seat[s].items(), key=lambda x: -x[1])[:10]
         seat_breakdown[f"seat_{s}"] = [{"criterion": c, "fail_count": cnt} for c, cnt in seat_top]
+    _mark("build_results")
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"[failed-criteria-summary] {format_elapsed(elapsed_ms)} ({analyzed_deals} analyzed)")
+    try:
+        parts = ", ".join(f"{k}={v}ms" for k, v in timings_ms.items())
+        print(f"[failed-criteria-summary] TIMING: {parts}, total_ms={round(elapsed_ms,1)}")
+    except Exception:
+        pass
     
     return {
         "total_deals": total_deals,
@@ -2949,20 +3012,31 @@ def handle_wrong_bid_leaderboard(
     Uses vectorized join instead of per-row BT lookups for performance.
     """
     t0 = time.perf_counter()
+    timings_ms: dict[str, float] = {}
+    _t_last = t0
+    def _mark(name: str) -> None:
+        nonlocal _t_last
+        now = time.perf_counter()
+        timings_ms[name] = round((now - _t_last) * 1000, 1)
+        _t_last = now
     
     deal_df = state["deal_df"]
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
     bt_seat1_df = state.get("bt_seat1_df")
+    bt_stats_df = state.get("bt_stats_df")
     
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded")
     
     # Add row index
     deal_df = deal_df.with_row_index("_row_idx")
+    _mark("add_row_index")
     
-    # Prepare for join: add _bid_str and _auction_key
-    deals_prepared = prepare_deals_with_bid_str(deal_df)
-    
+    # PERFORMANCE: Defer expensive string processing until after sampling.
+    # No auction pattern filter here, so we always defer.
+    deals_prepared = deal_df
+    _mark("pattern_filter")
+
     # Sample for performance
     total_deals = deals_prepared.height
     sample_size = min(10000, total_deals)
@@ -2970,12 +3044,50 @@ def handle_wrong_bid_leaderboard(
         sample_df = deals_prepared.sample(n=sample_size, seed=42)
     else:
         sample_df = deals_prepared
+    _mark("sample")
     
+    # Fully prepare the small sample
+    sample_df = prepare_deals_with_bid_str(sample_df, include_auction_key=True)
+    _mark("prepare_sample")
+
     analyzed_deals = sample_df.height
     
     # Prepare BT for join and join once (eliminates per-row filter operations)
-    bt_prepared = prepare_bt_for_join(bt_seat1_df)
+    # PERFORMANCE: Prefer joining against bt_stats_df (completed auctions, ~2.1M rows)
+    # instead of bt_seat1_df (461M rows). We still load Agg_Expr on-demand by bt_index.
+    bt_join_src = bt_seat1_df
+    if bt_stats_df is not None and "Auction" in bt_stats_df.columns and "bt_index" in bt_stats_df.columns:
+        bt_join_src = bt_stats_df
+    bt_prepared = prepare_bt_for_join(bt_join_src)
+    _mark("prepare_bt")
     joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
+    _mark("join")
+
+    # PERFORMANCE: Precompute (overlay+deduped) criteria lists per bt_index once.
+    bt_criteria_by_bt_index: dict[int, dict[int, list[Any]]] = {}
+    if "bt_index" in joined_df.columns:
+        bt_cols = ["bt_index", "Auction"] + [agg_expr_col(s) for s in SEAT_RANGE if agg_expr_col(s) in joined_df.columns]
+        try:
+            uniq_bt = joined_df.select([c for c in bt_cols if c in joined_df.columns]).unique(subset=["bt_index"])
+            for r in uniq_bt.iter_rows(named=True):
+                try:
+                    bt_idx_raw = r.get("bt_index")
+                    if bt_idx_raw is None:
+                        continue
+                    bt_idx = int(bt_idx_raw)
+                except Exception:
+                    continue
+                processed = _apply_all_rules_to_bt_row(dict(r), state)
+                bt_criteria_by_bt_index[bt_idx] = {
+                    s: (processed.get(agg_expr_col(s)) or [])
+                    for s in SEAT_RANGE
+                    if agg_expr_col(s) in processed
+                }
+        except Exception:
+            bt_criteria_by_bt_index = {}
+    _mark("precompute_bt_criteria")
+
+    colset_cache: dict[tuple[int, str], set[str]] = {}
     
     # Track wrong bids by (bid, seat)
     bid_seat_wrong: Dict[Tuple[str, int], int] = {}
@@ -2984,40 +3096,56 @@ def handle_wrong_bid_leaderboard(
     
     # Process each deal - now without per-row BT lookups (already joined)
     seats_to_check = [seat] if seat else list(range(1, 5))
+    t_loop0 = time.perf_counter()
     for row in joined_df.iter_rows(named=True):
-        # Canonical: ensure Agg_Expr is available + overlay + dedupe
-        row = _apply_all_rules_to_bt_row(dict(row), state)
-        deal_idx = row.get("_row_idx", 0)
-        dealer = row.get("Dealer", "N")
+        deal_idx_raw = row.get("_row_idx", 0)
+        deal_idx = int(deal_idx_raw) if deal_idx_raw is not None else 0
+        dealer = str(row.get("Dealer", "N") or "N").upper()
         bid_str = row.get("_bid_str", "")
+        bt_idx = None
+        try:
+            bt_idx_val = row.get("bt_index")
+            bt_idx = int(bt_idx_val) if bt_idx_val is not None else None
+        except Exception:
+            bt_idx = None
         
         # For each seat, track the bid and whether it's wrong
         for s in seats_to_check:
             if s is None:
                 continue
-            bid_at_seat = _extract_bid_at_seat(bid_str, s)
+            s_i = int(s)
+            bid_at_seat = _extract_bid_at_seat(bid_str, s_i)
             if not bid_at_seat:
                 continue
             
-            key = (bid_at_seat.upper(), s)
+            key = (bid_at_seat.upper(), s_i)
             bid_seat_total[key] = bid_seat_total.get(key, 0) + 1
             
             # Check this seat's criteria (from joined data)
-            criteria_list = row.get(f"Agg_Expr_Seat_{s}")
+            if bt_idx is not None and bt_idx in bt_criteria_by_bt_index:
+                criteria_list = bt_criteria_by_bt_index[bt_idx].get(s_i)
+            else:
+                criteria_list = row.get(f"Agg_Expr_Seat_{s_i}")
             if not criteria_list:
                 continue
             
-            seat_dfs = deal_criteria_by_seat_dfs.get(s, {})
+            seat_dfs = deal_criteria_by_seat_dfs.get(s_i, {})
             criteria_df = seat_dfs.get(dealer)
             if criteria_df is None or criteria_df.is_empty():
                 continue
+
+            key_sd = (s_i, dealer)
+            cols = colset_cache.get(key_sd)
+            if cols is None:
+                cols = set(criteria_df.columns)
+                colset_cache[key_sd] = cols
             
             seat_failed = []
             for criterion in criteria_list:
-                if criterion not in criteria_df.columns:
+                if str(criterion) not in cols:
                     continue
                 try:
-                    bitmap_value = criteria_df[criterion][deal_idx]
+                    bitmap_value = criteria_df[str(criterion)][deal_idx]
                     if not bitmap_value:
                         seat_failed.append(criterion)
                 except (IndexError, KeyError):
@@ -3029,6 +3157,8 @@ def handle_wrong_bid_leaderboard(
                     bid_failed_criteria[key] = {}
                 for c in seat_failed:
                     bid_failed_criteria[key][c] = bid_failed_criteria[key].get(c, 0) + 1
+    timings_ms["loop"] = round((time.perf_counter() - t_loop0) * 1000, 1)
+    _t_last = time.perf_counter()
     
     # Build leaderboard sorted by wrong rate (with minimum occurrences)
     min_occurrences = 10
@@ -3057,9 +3187,15 @@ def handle_wrong_bid_leaderboard(
     # Sort by wrong_rate descending
     leaderboard.sort(key=lambda x: -x["wrong_rate"])
     top_leaderboard = leaderboard[:top_n]
+    _mark("build_results")
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"[wrong-bid-leaderboard] {format_elapsed(elapsed_ms)} ({analyzed_deals} analyzed)")
+    try:
+        parts = ", ".join(f"{k}={v}ms" for k, v in timings_ms.items())
+        print(f"[wrong-bid-leaderboard] TIMING: {parts}, total_ms={round(elapsed_ms,1)}")
+    except Exception:
+        pass
     
     return {
         "analyzed_deals": analyzed_deals,
@@ -3291,6 +3427,15 @@ def handle_bidding_arena(
                    Supports .parquet and .csv files. If None, uses deal_df.
     """
     t0 = time.perf_counter()
+    # Console timings to pinpoint slow phases (also returned in payload as timings_ms).
+    _t_last = t0
+    timings_ms: dict[str, float] = {}
+
+    def _mark(label: str) -> None:
+        nonlocal _t_last
+        now = time.perf_counter()
+        timings_ms[label] = round((now - _t_last) * 1000, 1)
+        _t_last = now
     
     # Load deals from URI or use default
     deals_source = "default"
@@ -3303,9 +3448,11 @@ def handle_bidding_arena(
             raise ValueError(f"Failed to load deals from URI: {e}")
     else:
         deal_df = state["deal_df"]
+    _mark("load_deals")
     
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
     bt_seat1_df = state.get("bt_seat1_df")
+    _mark("read_state_refs")
     
     # Validate models
     # Note: Merged rules are pre-compiled into BT, so all models are available
@@ -3323,18 +3470,23 @@ def handle_bidding_arena(
     
     # Add row index
     deal_df = deal_df.with_row_index("_row_idx")
+    _mark("add_row_index")
     
-    # Prepare deals: add _bid_str (for Actual auction display)
-    deals_prepared = prepare_deals_with_bid_str(deal_df)
-    
-    # Filter deals by auction pattern if provided (filters on ACTUAL auction)
+    # PERFORMANCE: Defer expensive string processing until after sampling if possible.
+    # If filtering by pattern, we MUST compute _bid_str for all rows.
+    # But we NEVER need _auction_key in the Bidding Arena (it's for joins).
     if auction_pattern:
+        deals_prepared = prepare_deals_with_bid_str(deal_df, include_auction_key=False)
         try:
             regex_pattern = f"(?i){normalize_auction_user_text(auction_pattern)}"
             deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
-    
+    else:
+        # If no pattern, we can sample FIRST, then prepare ONLY the samples.
+        deals_prepared = deal_df
+    _mark("prepare_and_filter_deals")
+
     total_deals = deals_prepared.height
     
     # Sample deals (optionally force-include pinned deal indexes)
@@ -3349,31 +3501,73 @@ def handle_bidding_arena(
                 pinned_list.append(int(x))
             except (ValueError, TypeError):
                 continue
-        if pinned_list and "index" in deals_prepared.columns:
+        if pinned_list and "index" in deal_df.columns:
             pinned_set = set(pinned_list)
-            order_df = pl.DataFrame({"index": pinned_list, "_pin_rank": list(range(len(pinned_list)))})
-            pinned_df = (
-                deals_prepared
-                .join(order_df, on="index", how="inner")
-                .sort("_pin_rank")
-                .drop("_pin_rank")
-            )
+            # Optimization (Invariant B: monotonic `index`):
+            # If the deals file preserves row order and `index` is monotonic, map
+            # deal `index` -> row position via binary search, then take rows directly.
+            # This avoids scanning/joining the full deal_df for pinned-only workflows.
+            if not auction_pattern:
+                try:
+                    idx_arr = state.get("deal_index_arr")
+                    is_mono = bool(state.get("deal_index_monotonic", False))
+                    if is_mono and idx_arr is not None:
+                        import numpy as np
+                        row_positions: list[int] = []
+                        for idx_val in pinned_list:
+                            pos = int(np.searchsorted(idx_arr, int(idx_val)))
+                            if 0 <= pos < len(idx_arr) and int(idx_arr[pos]) == int(idx_val):
+                                row_positions.append(pos)
+                        if row_positions:
+                            # Take rows from the full deal_df (keeps order of pinned_list)
+                            pinned_df = _take_rows_by_index(deal_df, row_positions)
+                except Exception:
+                    pinned_df = None
+
+            # Fallback: join on index (works for pattern-filtered deals_prepared)
+            if pinned_df is None and pinned_list and "index" in deals_prepared.columns:
+                order_df = pl.DataFrame({"index": pinned_list, "_pin_rank": list(range(len(pinned_list)))})
+                pinned_df = (
+                    deals_prepared
+                    .join(order_df, on="index", how="inner")
+                    .sort("_pin_rank")
+                    .drop("_pin_rank")
+                )
 
     if pinned_df is not None and pinned_df.height > 0:
-        remaining_df = deals_prepared.filter(~pl.col("index").is_in(list(pinned_set)))
         remaining_n = max(0, int(sample_size) - int(pinned_df.height))
-        if remaining_n > 0 and remaining_df.height > 0:
-            remaining_n = min(remaining_n, remaining_df.height)
-            sampled_rest = remaining_df.sample(n=remaining_n, seed=effective_seed) if remaining_n < remaining_df.height else remaining_df
-            sample_df = pl.concat([pinned_df, sampled_rest], how="vertical")
-        else:
+        if remaining_n <= 0:
             sample_df = pinned_df
+        else:
+            if auction_pattern:
+                # Pattern-filtered mode: remaining_df is already a filtered view.
+                remaining_df = deals_prepared.filter(~pl.col("index").is_in(list(pinned_set)))
+                if remaining_df.height > 0:
+                    remaining_n = min(remaining_n, remaining_df.height)
+                    sampled_rest = remaining_df.sample(n=remaining_n, seed=effective_seed) if remaining_n < remaining_df.height else remaining_df
+                    sample_df = pl.concat([pinned_df, sampled_rest], how="vertical")
+                else:
+                    sample_df = pinned_df
+            else:
+                # Fast path: avoid filtering the full deal_df. Sample a slightly larger batch,
+                # then drop pinned indices in the *small* sample.
+                oversample_n = min(total_deals, remaining_n + len(pinned_set))
+                sampled = deal_df.sample(n=oversample_n, seed=effective_seed) if oversample_n < total_deals else deal_df
+                sampled = sampled.filter(~pl.col("index").is_in(list(pinned_set)))
+                if sampled.height > remaining_n:
+                    sampled = sampled.head(remaining_n)
+                sample_df = pl.concat([pinned_df, sampled], how="vertical")
     else:
         if sample_size < total_deals:
             sample_df = deals_prepared.sample(n=sample_size, seed=effective_seed)
         else:
             sample_df = deals_prepared
     
+    # If we deferred preparation, do it now on the small sample_df.
+    if not auction_pattern:
+        sample_df = prepare_deals_with_bid_str(sample_df, include_auction_key=False)
+    _mark("sample_and_prepare")
+
     analyzed_deals = sample_df.height
     
     # ---------------------------------------------------------------------------
@@ -3410,15 +3604,74 @@ def handle_bidding_arena(
         except Exception as e:
             print(f"[bidding-arena] Pinned mode optimization failed: {e}, falling back to full candidate pool")
             pinned_only_mode = False
+    _mark("pinned_only_resolve")
     
     # ---------------------------------------------------------------------------
     # Rules Auction Matching Strategy
     # ---------------------------------------------------------------------------
     # Use GPU-verified deal-to-BT index when available (bbo_deal_to_bt_verified.parquet).
     # This index is already bitmap-verified, so we can skip _deal_meets_all_seat_criteria.
-    deal_to_bt_index: dict[int, list[int]] | None = state.get("deal_to_bt_index")
-    has_verified_index = deal_to_bt_index is not None
+    deal_to_bt_index_df: Optional[pl.DataFrame] = state.get("deal_to_bt_index_df")
+    has_verified_index = deal_to_bt_index_df is not None and deal_to_bt_index_df.height > 0
     has_precomputed_matches = has_verified_index  # Only trust the verified index
+    
+    # Build fast O(log n) lookup using numpy arrays (DataFrame is pre-sorted by deal_idx)
+    import numpy as np
+    # IMPORTANT: do NOT rebuild numpy/list materializations per-request.
+    # This was costing ~16-17s every Arena run. Cache in module globals.
+    global _BIDDING_ARENA_VERIFIED_INDEX_CACHE  # type: ignore[declared-but-unused]
+    try:
+        _BIDDING_ARENA_VERIFIED_INDEX_CACHE  # type: ignore[name-defined]
+    except Exception:
+        _BIDDING_ARENA_VERIFIED_INDEX_CACHE = {}  # type: ignore[name-defined]
+
+    _deal_idx_arr: Optional[np.ndarray] = None
+    _matched_bt_series: Optional[pl.Series] = None
+    if has_verified_index and deal_to_bt_index_df is not None:
+        cache = _BIDDING_ARENA_VERIFIED_INDEX_CACHE  # type: ignore[name-defined]
+        df_id = id(deal_to_bt_index_df)
+        cached = cache.get("df_id")
+        if cached != df_id:
+            # Refresh cache (one-time per process / per new df object)
+            cache["df_id"] = df_id
+            cache["deal_idx_arr"] = deal_to_bt_index_df["deal_idx"].to_numpy()
+            # Keep as Series to avoid huge Python list materialization.
+            cache["matched_series"] = deal_to_bt_index_df.get_column("Matched_BT_Indices")
+        _deal_idx_arr = cache.get("deal_idx_arr")
+        _matched_bt_series = cache.get("matched_series")
+    _mark("verified_index_setup")
+    
+    def _get_verified_matches(deal_idx: int) -> list[int]:
+        """Get verified BT matches for a deal using O(log n) binary search."""
+        if _deal_idx_arr is None or _matched_bt_series is None:
+            return []
+        idx = np.searchsorted(_deal_idx_arr, deal_idx)
+        if idx < len(_deal_idx_arr) and _deal_idx_arr[idx] == deal_idx:
+            # IMPORTANT: Polars Series indexing wants a Python int, not numpy.int64.
+            try:
+                idx_i = int(idx)
+            except Exception:
+                return []
+            try:
+                matches = _matched_bt_series[idx_i]
+            except Exception:
+                return []
+            if matches is None:
+                return []
+            # Polars list element may be returned as a Python list or as a Series.
+            try:
+                if isinstance(matches, pl.Series):
+                    return [int(x) for x in matches.to_list() if x is not None]
+            except Exception:
+                pass
+            if isinstance(matches, (list, tuple)):
+                return [int(x) for x in matches if x is not None]
+            # Fallback: try to iterate
+            try:
+                return [int(x) for x in list(matches) if x is not None]
+            except Exception:
+                return []
+        return []
 
     # Rules candidate source:
     # - Default: use all completed BT rows (merged rules are pre-compiled)
@@ -3624,17 +3877,30 @@ def handle_bidding_arena(
         # Use precomputed candidate indices but re-check against (base + overlay) criteria so the CSV can override.
         overlay = state.get("custom_criteria_overlay") or []
 
-        try:
-            matched_series = sample_df.get_column("Matched_BT_Indices")
-            needed_idxs = (
-                matched_series
-                .explode()
-                .drop_nulls()
-                .unique()
-                .to_list()
-            )
-        except Exception:
-            needed_idxs = []
+        # Collect all needed bt_indices from verified index for the sampled deals
+        needed_idxs: list[int] = []
+        if has_verified_index:
+            # Get deal indices from sample_df and look up in verified index
+            try:
+                sample_deal_idxs = sample_df["_row_idx"].to_list() if "_row_idx" in sample_df.columns else []
+                for deal_idx in sample_deal_idxs:
+                    needed_idxs.extend(_get_verified_matches(int(deal_idx)))
+                needed_idxs = list(set(needed_idxs))  # Dedupe
+            except Exception:
+                needed_idxs = []
+        else:
+            # Fallback: try to get from sample_df column
+            try:
+                matched_series = sample_df.get_column("Matched_BT_Indices")
+                needed_idxs = (
+                    matched_series
+                    .explode()
+                    .drop_nulls()
+                    .unique()
+                    .to_list()
+                )
+            except Exception:
+                needed_idxs = []
 
         bt_idx_to_auction: dict[int, str] = {}
         # Keyed by a seat-1 normalized, lowercased auction string (leading passes stripped).
@@ -3680,6 +3946,7 @@ def handle_bidding_arena(
             If skip_criteria_check is True (verified index), we trust the precomputed matches.
             """
             return _find_first_rules_match_precomputed(deal_idx, dealer, matched_indices, skip_criteria_check=skip_criteria_check)
+        _mark("candidate_pool_precomputed")
     else:
         # Candidate pool(s) for criteria matching (no deal-level Matched_BT_Indices)
         if "is_completed_auction" in bt_seat1_df.columns:
@@ -3764,6 +4031,7 @@ def handle_bidding_arena(
                     agg_df = pl.DataFrame(agg_rows)
                     bt_rules_default = bt_rules_default.join(agg_df, on="bt_index", how="left")
                     bt_completed = bt_completed.join(agg_df, on="bt_index", how="left")
+        _mark("candidate_pool_load_agg_expr")
         
         # Convert pools to list of dicts for iteration
         bt_cols = ["Auction", "bt_index", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
@@ -3793,6 +4061,7 @@ def handle_bidding_arena(
         bt_completed_rows_base = _fully_pre_process_rows(
             bt_completed.select(bt_cols).to_dicts()
         )
+        _mark("candidate_pool_preprocess")
 
         # Build Auction->row caches for fast lookup.
         # - default: merged-rules pool only (preferred when searching candidates)
@@ -3877,11 +4146,23 @@ def handle_bidding_arena(
             if cached is not None:
                 return cached
 
-            # Dynamic SL evaluation (correct seat-direction mapping)
-            sl_res = evaluate_sl_criterion(crit_s, self.dealer, s, self.deal_row, fail_on_missing=False)
-            if sl_res is not None:
-                self.results[s][crit_s] = bool(sl_res)
-                return bool(sl_res)
+            # Dynamic SL/complex evaluation is expensive; only attempt for SL_* or logical expressions.
+            crit_up = crit_s.upper()
+            maybe_dynamic = (
+                ("SL_" in crit_up)
+                or ("&" in crit_s)
+                or ("|" in crit_s)
+                or ("(" in crit_s)
+                or (")" in crit_s)
+                or (" AND " in crit_up)
+                or (" OR " in crit_up)
+                or (" NOT " in crit_up)
+            )
+            if maybe_dynamic:
+                sl_res = evaluate_sl_criterion(crit_s, self.dealer, s, self.deal_row, fail_on_missing=False)
+                if sl_res is not None:
+                    self.results[s][crit_s] = bool(sl_res)
+                    return bool(sl_res)
 
             # Bitmap evaluation
             df = self.criteria_df_by_seat.get(s)
@@ -4051,6 +4332,7 @@ def handle_bidding_arena(
     diag_rules_none = 0
     diag_dd_a_none = 0
     diag_dd_b_none = 0
+    diag_dd_b_examples: list[str] = []
     diag_first_failure_reasons: list[str] = []
     
     # Contract agreement
@@ -4123,6 +4405,11 @@ def handle_bidding_arena(
     # Limit sample output to min(sample_size, 200) to avoid excessive memory usage
     max_sample_output = min(sample_size, 200)
     sample_deals = sample_df.to_dicts()
+    _mark("materialize_sample_rows")
+    t_loop0 = time.perf_counter()
+    # Cap expensive "actual auction lookup" debug work; otherwise it can dominate runtime.
+    _actual_lookup_budget = 2
+    _actual_lookup_used = 0
     for row in sample_deals:
         deal_idx = row.get("_row_idx", 0)
         # Robustly handle Dealer (could be string or int)
@@ -4255,12 +4542,20 @@ def handle_bidding_arena(
 
         # Pick a single Rules auction (learned criteria) for scoring
         # Pass `row` as deal_row for dynamic SL evaluation
-        matched_indices = row.get("Matched_BT_Indices") if has_precomputed_matches else None
+        # Use verified index if available (O(log n) lookup, already bitmap-verified)
+        matched_indices = _get_verified_matches(int(deal_idx)) if has_precomputed_matches else None
         # Always define these for the sample-deals output schema (even if Rules model not requested).
         rules_actual_lead_passes: int | None = None
         rules_actual_opener_seat: int | None = None
         rules_learned_auction: str | None = None
         if need_rules_final:
+            # Avoid the expensive "actual auction lookup" path in candidate-pool-only mode.
+            # When caches are limited (top N candidates), attempting exact lookup can
+            # devolve into per-deal traversal + per-deal parquet reads.
+            allow_actual_lookup = bool(
+                (pinned_only_mode or search_all_bt_rows)
+                and (_actual_lookup_used < _actual_lookup_budget)
+            )
             # PRIORITIZE: Try actual auction first if it's in BT
             rules_auction = None
             rules_actual_bt_lookup: str = ""
@@ -4271,7 +4566,8 @@ def handle_bidding_arena(
             rules_actual_base_criteria_by_seat: str = ""
             rules_actual_merged_criteria_by_seat: str = ""
             rules_actual_merged_only_criteria_by_seat: str = ""
-            if bid_str:
+            if bid_str and allow_actual_lookup:
+                _actual_lookup_used += 1
                 # Normalize the deal's auction to the BT's seat-1 view for lookup.
                 bid_norm_full = normalize_auction_input(str(bid_str))
                 bid_str_seat1 = re.sub(r"(?i)^(P-)+", "", bid_norm_full)
@@ -4449,6 +4745,8 @@ def handle_bidding_arena(
                         rules_actual_bt_lookup = "not_in_bt"
                     if len(diag_first_failure_reasons) < 5:
                         diag_first_failure_reasons.append(f"NOT IN BT [{bid_str}]")
+            elif bid_str and not allow_actual_lookup:
+                rules_actual_bt_lookup = "skipped_actual_lookup"
             
             # If actual auction didn't match (or isn't in BT), search other candidates:
             # 1) default: merged-rules candidate pool
@@ -4483,7 +4781,7 @@ def handle_bidding_arena(
         # Compute Rules_Learned auction (stage 2/3) only if requested.
         if need_rules_learned:
             if has_precomputed_matches:
-                mi2 = row.get("Matched_BT_Indices") if has_precomputed_matches else None
+                mi2 = _get_verified_matches(int(deal_idx))
                 rules_learned_auction = _find_first_learned_rules_match_precomputed(deal_cache, mi2)
             else:
                 rules_learned_auction = _find_first_learned_rules_match_default(deal_cache)
@@ -4493,15 +4791,11 @@ def handle_bidding_arena(
         # Pick Rules_Base auction (original BT criteria)
         if need_rules_base:
             if has_precomputed_matches:
-                # Use verified index if available (O(1) lookup, already bitmap-verified)
-                if has_verified_index and deal_to_bt_index is not None:
-                    matched_indices = deal_to_bt_index.get(int(deal_idx), [])
-                    rules_base_auction = _find_first_rules_match_precomputed(
-                        int(deal_idx), dealer, matched_indices, row, skip_criteria_check=True
-                    )
-                else:
-                    matched_indices = row.get("Matched_BT_Indices")
-                    rules_base_auction = _find_first_rules_match_precomputed(int(deal_idx), dealer, matched_indices, row)
+                # Use verified index (O(1) lookup, already bitmap-verified)
+                matched_indices = _get_verified_matches(int(deal_idx))
+                rules_base_auction = _find_first_rules_match_precomputed(
+                    int(deal_idx), dealer, matched_indices, row, skip_criteria_check=True
+                )
             else:
                 rules_base_auction = _find_first_rules_match_onthefly(int(deal_idx), dealer, row)
         else:
@@ -4513,11 +4807,7 @@ def handle_bidding_arena(
         rules_matches_truncated = False
         if need_rules_matches_list:
             if has_precomputed_matches:
-                # Use verified index if available
-                if has_verified_index and deal_to_bt_index is not None:
-                    matched_indices = deal_to_bt_index.get(int(deal_idx), [])
-                else:
-                    matched_indices = row.get("Matched_BT_Indices")
+                matched_indices = _get_verified_matches(int(deal_idx))
                 rules_matches, rules_matches_truncated = _find_merged_rules_matches_precomputed(deal_cache, matched_indices)
             else:
                 rules_matches, rules_matches_truncated = _find_merged_rules_matches_onthefly(deal_cache)
@@ -4575,7 +4865,7 @@ def handle_bidding_arena(
             # Add a small diagnostic for the common confusion case: Rules has no match.
             rules_debug = ""
             if (model_a != MODEL_ACTUAL and auction_a is None) or (model_b != MODEL_ACTUAL and auction_b is None):
-                mi = row.get("Matched_BT_Indices") if has_precomputed_matches else None
+                mi = _get_verified_matches(int(deal_idx)) if has_precomputed_matches else None
                 rules_debug = _rules_no_match_debug(int(deal_idx), dealer, mi)
 
             auctions_match = (auction_a == auction_b) if auction_a and auction_b else False
@@ -4632,6 +4922,18 @@ def handle_bidding_arena(
 
         # Skip if we don't have scores for both models
         if dd_score_a is None or dd_score_b is None:
+            if dd_score_a is None:
+                diag_dd_a_none += 1
+            if dd_score_b is None:
+                diag_dd_b_none += 1
+                if len(diag_dd_b_examples) < 3:
+                    try:
+                        dd_cols = [k for k in row.keys() if str(k).startswith("DD_Score_")]
+                        diag_dd_b_examples.append(
+                            f"rules_auction={rules_auction!r}, dealer={dealer!r}, dd_cols_preview={dd_cols[:5]}"
+                        )
+                    except Exception:
+                        diag_dd_b_examples.append("dd_score_b None (failed to inspect row keys)")
             continue
         
         contracts_compared += 1
@@ -4767,6 +5069,8 @@ def handle_bidding_arena(
                     else:
                         quality_b["partscores_fail"] += 1
     
+    timings_ms["deal_loop_ms"] = round((time.perf_counter() - t_loop0) * 1000, 1)
+
     # Calculate derived metrics
     def calc_rates(q: Dict[str, int]) -> Dict[str, Any]:
         total = q["contracts_with_result"]
@@ -4897,8 +5201,21 @@ def handle_bidding_arena(
     }
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
+    timings_ms["total_ms"] = round(elapsed_ms, 1)
     print(f"[bidding-arena] {format_elapsed(elapsed_ms)} ({contracts_compared}/{analyzed_deals} compared)")
-    print(f"[bidding-arena] DIAG: no_matched_indices={diag_no_matched_indices}, rules_none={diag_rules_none}")
+    print(
+        f"[bidding-arena] DIAG: no_matched_indices={diag_no_matched_indices}, rules_none={diag_rules_none}, "
+        f"dd_a_none={diag_dd_a_none}, dd_b_none={diag_dd_b_none}"
+    )
+    if diag_dd_b_examples:
+        for i, ex in enumerate(diag_dd_b_examples[:3]):
+            print(f"[bidding-arena] DIAG dd_b_none[{i+1}]: {ex[:250]}")
+    try:
+        # One-liner breakdown for quick perf comparisons.
+        parts = ", ".join(f"{k}={v}ms" for k, v in timings_ms.items())
+        print(f"[bidding-arena] TIMING: {parts}")
+    except Exception:
+        pass
     # Show actual auctions from sampled deals
     actual_auctions_sample = [d.get("Auction_Actual", d.get("_bid_str", "?"))[:30] for d in sample_deals_output[:10]]
     print(f"[bidding-arena] DIAG actual auctions (first 10): {actual_auctions_sample}")
@@ -4933,6 +5250,7 @@ def handle_bidding_arena(
         "analyzed_deals": analyzed_deals,
         "deals_compared": contracts_compared,
         "auction_pattern": auction_pattern,
+        "timings_ms": timings_ms,
         "summary": summary,
         "head_to_head": head_to_head,
         "contract_agreement": {

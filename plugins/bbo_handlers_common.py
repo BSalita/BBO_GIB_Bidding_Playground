@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -904,7 +905,7 @@ def get_bt_info_from_match(bt_match: pl.DataFrame) -> Dict[str, Any] | None:
 # Vectorized Deal-to-BT Join Helpers (performance optimization)
 # ===========================================================================
 
-def prepare_deals_with_bid_str(deal_df: pl.DataFrame) -> pl.DataFrame:
+def prepare_deals_with_bid_str(deal_df: pl.DataFrame, include_auction_key: bool = True) -> pl.DataFrame:
     """Add _bid_str and _auction_key columns to deal DataFrame for joining.
     
     _auction_key is normalized: UPPERCASE (canonical), leading passes stripped, trailing -P-P-P removed.
@@ -925,13 +926,14 @@ def prepare_deals_with_bid_str(deal_df: pl.DataFrame) -> pl.DataFrame:
         )
     
     # Add normalized auction key for joining (canonical UPPERCASE)
-    df = df.with_columns(
-        pl.col("_bid_str")
-        .str.to_uppercase()
-        .str.replace(r"^(P-)+", "")  # Strip leading passes
-        .str.replace(r"-P-P-P$", "")  # Strip trailing passes for matching
-        .alias("_auction_key")
-    )
+    if include_auction_key:
+        df = df.with_columns(
+            pl.col("_bid_str")
+            .str.to_uppercase()
+            .str.replace(r"^(P-)+", "")  # Strip leading passes
+            .str.replace(r"-P-P-P$", "")  # Strip trailing passes for matching
+            .alias("_auction_key")
+        )
     
     return df
 
@@ -1069,56 +1071,106 @@ def batch_check_wrong_bids(
     Returns:
         DataFrame with Wrong_Bid_S1-4, first_wrong_seat columns added
     """
+    t0 = time.perf_counter()
     # Prepare result columns
     wrong_cols = {wrong_bid_col(s): [] for s in SEAT_RANGE}
     first_wrong_list: List[int | None] = []
-    
+
     seats_to_check = [seat_filter] if seat_filter else list(SEAT_RANGE)
 
-    from plugins.bbo_bt_custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_overlay
-    
-    # Process rows - still a loop but without per-row DataFrame filters
+    # -----------------------------------------------------------------------
+    # PERFORMANCE: Precompute BT seat-criteria by bt_index once per request.
+    # joined_df may contain thousands of deals but many repeated bt_index values.
+    # Applying overlay+dedupe per deal is extremely expensive; do it per bt_index.
+    # -----------------------------------------------------------------------
+    bt_criteria_by_bt_index: dict[int, dict[int, list[Any]]] = {}
+    if state is not None and "bt_index" in joined_df.columns:
+        bt_cols = ["bt_index", "Auction"] + [agg_expr_col(s) for s in SEAT_RANGE if agg_expr_col(s) in joined_df.columns]
+        # Use unique bt_index rows only
+        try:
+            uniq_bt = joined_df.select([c for c in bt_cols if c in joined_df.columns]).unique(subset=["bt_index"])
+            for r in uniq_bt.iter_rows(named=True):
+                try:
+                    bt_idx = int(r.get("bt_index"))
+                except Exception:
+                    continue
+                # Apply overlay+dedupe once
+                processed = apply_overlay_and_dedupe(dict(r), state)
+                bt_criteria_by_bt_index[bt_idx] = {
+                    s: (processed.get(agg_expr_col(s)) or [])
+                    for s in SEAT_RANGE
+                    if agg_expr_col(s) in processed
+                }
+        except Exception:
+            bt_criteria_by_bt_index = {}
+
+    # Cache column sets per seat+dealer for O(1) membership checks
+    colset_cache: dict[tuple[int, str], set[str]] = {}
+
+    # Process rows - loop, but much less per-row work.
     for row in joined_df.iter_rows(named=True):
-        if state is not None:
-            # Canonical path: enrich (if needed) + overlay + dedupe
-            row = apply_overlay_and_dedupe(dict(row), state)
-        elif criteria_overlay:
-            # Backwards-compat path
-            row = _apply_overlay(dict(row), criteria_overlay)
         deal_idx = row.get("_row_idx", 0)
-        dealer = row.get("Dealer", "N")
-        
+        dealer = str(row.get("Dealer", "N") or "N").upper()
+        try:
+            bt_idx = int(row.get("bt_index")) if row.get("bt_index") is not None else None
+        except Exception:
+            bt_idx = None
+
         first_wrong_seat: int | None = None
         row_wrong = {s: False for s in SEAT_RANGE}
-        
+
         for seat in seats_to_check:
             if seat is None:
                 continue
-            criteria_list = row.get(agg_expr_col(seat)) or []
+
+            # Pull criteria from cached per-bt_index structure when available
+            if bt_idx is not None and bt_idx in bt_criteria_by_bt_index:
+                criteria_list = bt_criteria_by_bt_index[bt_idx].get(int(seat)) or []
+            else:
+                criteria_list = row.get(agg_expr_col(seat)) or []
+                # Back-compat: only apply overlay if we weren't able to cache by bt_index
+                if state is not None and criteria_list:
+                    try:
+                        processed = apply_overlay_and_dedupe(dict(row), state)
+                        criteria_list = processed.get(agg_expr_col(seat)) or criteria_list
+                    except Exception:
+                        pass
+
             if not criteria_list:
                 continue
-            
-            seat_dfs = deal_criteria_by_seat_dfs.get(seat, {})
+
+            seat_dfs = deal_criteria_by_seat_dfs.get(int(seat), {})
             criteria_df = seat_dfs.get(dealer)
             if criteria_df is None or criteria_df.is_empty():
                 continue
-            
+
+            key = (int(seat), dealer)
+            cols = colset_cache.get(key)
+            if cols is None:
+                cols = set(criteria_df.columns)
+                colset_cache[key] = cols
+
             for criterion in criteria_list:
-                if criterion not in criteria_df.columns:
+                crit_s = str(criterion)
+                if crit_s not in cols:
                     continue
                 try:
-                    bitmap_value = criteria_df[criterion][deal_idx]
-                    if not bitmap_value:
-                        row_wrong[seat] = True
+                    if not bool(criteria_df[crit_s][int(deal_idx)]):
+                        row_wrong[int(seat)] = True
                         if first_wrong_seat is None:
-                            first_wrong_seat = seat
-                        break  # One failed criterion is enough
-                except (IndexError, KeyError):
+                            first_wrong_seat = int(seat)
+                        break
+                except Exception:
                     continue
-        
+
         for s in SEAT_RANGE:
             wrong_cols[wrong_bid_col(s)].append(row_wrong[s])
         first_wrong_list.append(first_wrong_seat)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    # Keep this quiet unless it is slow; but in practice this is a key perf signal.
+    if elapsed_ms > 2000:
+        print(f"[wrong-bid] batch_check_wrong_bids: {elapsed_ms:.1f}ms for {joined_df.height} deals")
     
     # Add columns to DataFrame
     result = joined_df.with_columns([

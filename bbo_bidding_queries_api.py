@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import gc
+import logging
 import operator
 import os
 import re
@@ -26,12 +27,7 @@ import traceback
 from functools import wraps
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple, TypeVar
 import pathlib
-
 import pyarrow.parquet as pq
-
-# Add mlBridge to path so its internal imports work (append, not insert, to avoid shadowing the package)
-sys.path.append(str(pathlib.Path(__file__).parent / "mlBridge"))
-
 import psutil
 
 
@@ -182,7 +178,39 @@ else:
 
 
 def _attach_hot_reload_info(resp: Dict[str, Any], reload_info: dict[str, object]) -> Dict[str, Any]:
-    """Attach hot-reload info to a JSON response payload."""
+    """Attach hot-reload info to a JSON response payload.
+    
+    Also enforces a UI-friendly invariant: lists of deal-like dict rows are
+    returned sorted by `index` unless the endpoint explicitly implements a
+    different ordering (in which case rows typically do not include `index`).
+    """
+    def _safe_int(x: Any) -> int:
+        try:
+            # Handle numpy scalars, strings, etc.
+            return int(x)  # type: ignore[arg-type]
+        except Exception:
+            return 2**31 - 1
+
+    def _sort_lists_by_index(obj: Any) -> Any:
+        # Recursively sort list[dict] by "index" when present.
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                obj[k] = _sort_lists_by_index(v)
+            return obj
+        if isinstance(obj, list):
+            # Recurse first so nested structures get normalized.
+            for i in range(len(obj)):
+                obj[i] = _sort_lists_by_index(obj[i])
+            if obj and all(isinstance(e, dict) for e in obj):
+                has_any_index = any(("index" in e) for e in obj)  # type: ignore[operator]
+                if has_any_index:
+                    # Stable, deterministic ordering for display.
+                    obj.sort(key=lambda d: (0 if "index" in d else 1, _safe_int(d.get("index"))))  # type: ignore[call-arg]
+            return obj
+        return obj
+
+    # Apply sorting normalization before attaching metadata.
+    resp = _sort_lists_by_index(resp)
     # Always include the boolean so callers can cheaply display a message.
     resp["hot_reload"] = bool(reload_info.get("reloaded", False))
     if resp["hot_reload"]:
@@ -269,6 +297,35 @@ def _prepare_handler_call() -> Tuple[Dict[str, Any], dict, Any]:
     return state, reload_info, handler_module
 
 
+def _resolve_deal_row_idx_from_index(state: Dict[str, Any], deal_index: int) -> int:
+    """Resolve user-facing deal `index` -> row position used by bitmaps (Invariant B).
+    
+    Requires STATE["deal_index_monotonic"] and STATE["deal_index_arr"] built at startup.
+    """
+    if not bool(state.get("deal_index_monotonic", False)):
+        raise HTTPException(status_code=400, detail="deal_index lookup requires deal_index_monotonic=True at startup")
+    idx_arr = state.get("deal_index_arr")
+    if idx_arr is None:
+        raise HTTPException(status_code=500, detail="deal_index_arr missing from state (startup cache not built)")
+    import numpy as np
+    pos = int(np.searchsorted(idx_arr, int(deal_index)))
+    if pos < 0 or pos >= len(idx_arr) or int(idx_arr[pos]) != int(deal_index):
+        raise HTTPException(status_code=404, detail=f"Deal index {int(deal_index)} not found")
+    return int(pos)
+
+
+def _resolve_deal_row_indices_from_indices(state: Dict[str, Any], indices: list[int]) -> list[int]:
+    """Resolve a list of deal `index` -> row positions, preserving order (skips missing)."""
+    out: list[int] = []
+    for x in indices:
+        try:
+            out.append(_resolve_deal_row_idx_from_index(state, int(x)))
+        except HTTPException:
+            # Skip missing indices for batch use-cases; caller can decide how to report.
+            continue
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Data directory resolution (supports --data-dir command line arg)
 # ---------------------------------------------------------------------------
@@ -347,6 +404,7 @@ bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented_matches.parquet"
 bt_seat1_file = dataPath.joinpath("bbo_bt_compiled.parquet")  # Pre-compiled BT with learned rules baked in
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
+bt_categories_file = dataPath.joinpath("bbo_bt_categories.parquet")  # 103 bid-category boolean flags (Phase 4)
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 # New rules file: detailed rule discovery metrics (detailed view)
 new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
@@ -354,6 +412,7 @@ new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
 # Falls back to E: drive if not in local data/
 deal_to_bt_verified_file = dataPath.joinpath("bbo_deal_to_bt_verified.parquet")
 _deal_to_bt_verified_file_e_drive = pathlib.Path("E:/bridge/data/bbo/bidding/bbo_deal_to_bt_verified.parquet")
+_bt_categories_file_e_drive = pathlib.Path("E:/bridge/data/bbo/bidding/bbo_bt_categories.parquet")
 
 # ---------------------------------------------------------------------------
 # Constants for hand criteria
@@ -766,6 +825,53 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="BBO Bidding Queries API", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def _access_log_with_elapsed(request, call_next):
+    """Access log with elapsed time (replaces uvicorn access log).
+    
+    We intentionally disable uvicorn's built-in access_log and emit our own line
+    that includes elapsed seconds.
+    """
+    t0 = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        try:
+            elapsed_s = time.perf_counter() - t0
+            client = getattr(request, "client", None)
+            client_host = getattr(client, "host", "?")
+            client_port = getattr(client, "port", "?")
+            method = getattr(request, "method", "?")
+            http_version = request.scope.get("http_version", "1.1")
+            path = request.url.path
+            if request.url.query:
+                path = f"{path}?{request.url.query}"
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            try:
+                from http import HTTPStatus
+                phrase = HTTPStatus(status_code).phrase
+            except Exception:
+                phrase = ""
+            logger = logging.getLogger("uvicorn.access")
+            # Match uvicorn's default shape but add elapsed at the end.
+            logger.info(
+                '%s:%s - "%s %s HTTP/%s" %s %s (%.2fs)',
+                client_host,
+                client_port,
+                method,
+                path,
+                http_version,
+                status_code,
+                phrase,
+                elapsed_s,
+            )
+        except Exception:
+            # Never fail the request because logging failed.
+            pass
+
+
 class StatusResponse(BaseModel):
     initialized: bool
     initializing: bool
@@ -777,18 +883,29 @@ class StatusResponse(BaseModel):
     loaded_files: Optional[Dict[str, Any]] = None  # File name -> info string (e.g., "1,234 rows × 45 cols (100.5 MB)")
 
 
+def _format_bytes(size_bytes: int | float) -> str:
+    """Format bytes to human-readable string (KB/MB/GB)."""
+    if size_bytes >= 1024 ** 3:
+        return f"{size_bytes / (1024 ** 3):.1f} GB"
+    elif size_bytes >= 1024 ** 2:
+        return f"{size_bytes / (1024 ** 2):.1f} MB"
+    else:
+        return f"{size_bytes / 1024:.1f} KB"
+
+
 def _format_file_info(
     df: pl.DataFrame | None = None,
     file_path: pathlib.Path | None = None,
     row_count: int | str | None = None,
     col_count: int | None = None,
     elapsed_secs: float | None = None,
+    rss_delta_bytes: int | None = None,
 ) -> str:
-    """Format file loading info showing shape, file size, and load time.
+    """Format file loading info showing shape, file size, memory size, and load time.
     
     Examples:
-        "16,234,567 rows × 45 cols (1.2 GB) [5.3s]"
-        "123,456 entries (50.3 MB) [1.2s]"
+        "16,234,567 rows × 45 cols | disk: 1.2 GB | mem(est): 5.3 GB | rssΔ: 5.1 GB | 5.3s"
+        "123,456 entries | disk: 50.3 MB | mem: 200.1 MB | 1.2s"
     """
     parts = []
     
@@ -803,22 +920,28 @@ def _format_file_info(
         else:
             parts.append(str(row_count))
     
-    # Get file size if path provided
+    # Get file size on disk if path provided
     if file_path is not None and file_path.exists():
-        size_bytes = file_path.stat().st_size
-        if size_bytes >= 1024 ** 3:
-            size_str = f"{size_bytes / (1024 ** 3):.1f} GB"
-        elif size_bytes >= 1024 ** 2:
-            size_str = f"{size_bytes / (1024 ** 2):.1f} MB"
-        else:
-            size_str = f"{size_bytes / 1024:.1f} KB"
-        parts.append(f"({size_str})")
+        disk_size = file_path.stat().st_size
+        parts.append(f"disk: {_format_bytes(disk_size)}")
+    
+    # Get memory size if DataFrame provided
+    if df is not None:
+        mem_size = df.estimated_size()
+        parts.append(f"mem(est): {_format_bytes(mem_size)}")
+
+    # Include actual process RSS delta if available (ground truth-ish on Windows)
+    if rss_delta_bytes is not None:
+        try:
+            parts.append(f"rssΔ: {_format_bytes(rss_delta_bytes)}")
+        except Exception:
+            pass
     
     # Add elapsed time if provided
     if elapsed_secs is not None:
-        parts.append(f"in {elapsed_secs:.1f}s")
+        parts.append(f"{elapsed_secs:.1f}s")
     
-    return " ".join(parts) if parts else "loaded"
+    return " | ".join(parts) if parts else "loaded"
 
 
 class InitResponse(BaseModel):
@@ -866,9 +989,33 @@ class DealCriteriaEvalBatchRequest(BaseModel):
 
     Returns per-seat: passed, failed, untracked.
     """
+    # Primary key used by criteria bitmaps and deal_to_bt indices (row position in deals file).
     deal_row_idx: int
+    # Optional deal `index` (user-facing). If provided, server maps it to deal_row_idx using
+    # the monotonic index cache built at startup.
+    deal_index: Optional[int] = None
     dealer: str  # N/E/S/W
     checks: List[DealCriteriaCheck]
+
+
+class DealsByIndexRequest(BaseModel):
+    """Fetch deals by user-facing `index` values (monotonic fast-path).
+    
+    Returns rows in the same order as the input list.
+    """
+    indices: List[int]
+    max_rows: int = 200  # safety cap
+    # Optional list of columns to return (None = default subset)
+    columns: Optional[List[str]] = None
+
+
+class BTCategoriesByIndexRequest(BaseModel):
+    """Fetch bid-category flags (Phase 4) by bt_index values.
+
+    Returns rows in the same order as the input list.
+    """
+    indices: List[int]
+    max_rows: int = 500  # safety cap
 
 
 class DealsMatchingAuctionRequest(BaseModel):
@@ -895,6 +1042,8 @@ class BiddingTableStatisticsRequest(BaseModel):
     dist_pattern: Optional[str] = None  # Ordered distribution (S-H-D-C), e.g., "5-4-3-1"
     sorted_shape: Optional[str] = None  # Sorted shape (any suit), e.g., "5431"
     dist_seat: int = 1  # Which seat to filter (1-4)
+    # Optional: include 100+ bid-category boolean flags (from bbo_bt_categories.parquet)
+    include_categories: bool = False
 
 
 class ProcessPBNRequest(BaseModel):
@@ -1073,6 +1222,9 @@ STATE: Dict[str, Any] = {
     # Criteria / aggregate statistics for completed auctions (seat-1 view).
     # Built from bbo_bt_criteria.parquet + bbo_bt_aggregate.parquet and keyed by bt_index.
     "bt_stats_df": None,
+    # Optional: bid-category boolean flags from bbo_bt_categories.parquet (Phase 4).
+    "bt_categories_df": None,
+    "bt_category_cols": None,  # list[str]
     "duckdb_conn": None,
     # Hot-reloadable overlay rules loaded from bbo_custom_auction_criteria.csv.
     # These rules are applied on-the-fly to BT rows when serving responses and when building criteria masks.
@@ -1365,6 +1517,28 @@ def _heavy_init() -> None:
         bid_dtype = deal_df.schema.get("bid")
         if bid_dtype == pl.List(pl.Utf8):
             deal_df = deal_df.with_columns(pl.col('bid').list.join('-'))
+
+        # -------------------------------------------------------------------
+        # Deal index monotonic optimization (Invariant B)
+        # -------------------------------------------------------------------
+        # Many pipelines preserve the deal file row order and keep `index` monotonic.
+        # If so, we can map deal `index` -> row position via binary search, which
+        # enables fast pinned-deal lookups without scanning/joining the full deal_df.
+        #
+        # WARNING: We do NOT assume `index == row_position`. We only leverage
+        # monotonicity for O(log n) lookup.
+        try:
+            if "index" in deal_df.columns:
+                import numpy as np
+                idx_arr = deal_df.get_column("index").to_numpy()
+                # Best-effort monotonic check (non-decreasing). This is O(n) but done once at startup.
+                is_mono = bool(np.all(idx_arr[1:] >= idx_arr[:-1])) if len(idx_arr) > 1 else True
+                with _STATE_LOCK:
+                    STATE["deal_index_arr"] = idx_arr
+                    STATE["deal_index_monotonic"] = is_mono
+                print(f"[init] deal_df index monotonic: {is_mono} (n={len(idx_arr):,})")
+        except Exception as e:
+            print(f"[init] WARNING: failed to build deal index monotonic cache: {e}")
         
         # Load criteria bitmaps (must be pre-built by pipeline)
         # Bitmap file is named based on deal file: {stem}_criteria_bitmaps.parquet
@@ -1426,15 +1600,24 @@ def _heavy_init() -> None:
         _log_memory("after gc.collect (criteria cleanup)")
 
         # Load clean seat-1-only table (used for pattern matching - no p- prefix issues)
+        _proc = psutil.Process()
+        rss0_bt = _proc.memory_info().rss
         t0_bt = time.perf_counter()
         bt_seat1_df = _load_bt_seat1_df()
         elapsed_bt = time.perf_counter() - t0_bt
+        rss1_bt = _proc.memory_info().rss
+        rss_delta_bt = int(rss1_bt - rss0_bt)
         
         # IMPORTANT:
         # Do NOT strip leading 'p-' prefixes here.
         # Those prefixes encode seat/turn order and are required for correct declarer/contract logic
         # (AI/DD/IMP computations). Matching code strips prefixes at query time instead.
-        bt_seat1_info = _format_file_info(df=bt_seat1_df, file_path=bt_seat1_file, elapsed_secs=elapsed_bt)
+        bt_seat1_info = _format_file_info(
+            df=bt_seat1_df,
+            file_path=bt_seat1_file,
+            elapsed_secs=elapsed_bt,
+            rss_delta_bytes=rss_delta_bt,
+        )
         _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_info)
         print(f"[init] bt_seat1_df: {bt_seat1_info} (clean seat-1 data)")
         
@@ -1461,6 +1644,45 @@ def _heavy_init() -> None:
             raise
         _log_memory("after load bt_stats_df")
 
+        # Load bid-category flags (optional, Phase 4 output).
+        bt_categories_df = None
+        bt_category_cols: list[str] | None = None
+        _cats_file = bt_categories_file if bt_categories_file.exists() else (
+            _bt_categories_file_e_drive if _bt_categories_file_e_drive.exists() else None
+        )
+        if _cats_file is not None:
+            try:
+                print(f"[init] Loading bt_categories_df from {_cats_file} (category flags)...")
+                t0_cats = time.perf_counter()
+                scan = pl.scan_parquet(_cats_file)
+                cols = scan.collect_schema().names()
+                # Category flags are named like is_Preempt, is_Artificial, ...
+                bt_category_cols = sorted([c for c in cols if c.startswith("is_")])
+                cols_to_load = (["bt_index"] if "bt_index" in cols else []) + bt_category_cols
+                if not cols_to_load:
+                    raise ValueError(f"{_cats_file} is missing required join key column 'bt_index'")
+                bt_categories_df = (
+                    scan.select(cols_to_load)
+                    .with_columns(pl.col("bt_index").cast(pl.UInt32))
+                    .unique(subset=["bt_index"])
+                    .collect()
+                )
+                elapsed_cats = time.perf_counter() - t0_cats
+                cats_info = _format_file_info(
+                    df=bt_categories_df,
+                    file_path=pathlib.Path(_cats_file),
+                    elapsed_secs=elapsed_cats,
+                )
+                _update_loading_status(5, "Loading bt_categories_df...", "bt_categories_df", cats_info)
+                print(f"[init] bt_categories_df: {cats_info} ({len(bt_category_cols):,} category flags)")
+            except Exception as e:
+                print(f"[init] WARNING: Failed to load bt_categories_df: {e}")
+                bt_categories_df = None
+                bt_category_cols = None
+        else:
+            print("[init] bt_categories_df not found (optional): bbo_bt_categories.parquet")
+        _log_memory("after load bt_categories_df")
+
         # Load new rules detailed metrics (optional)
         new_rules_df = None
         if new_rules_file.exists():
@@ -1480,7 +1702,7 @@ def _heavy_init() -> None:
         
         # Load precomputed deal-to-BT verified index (optional, from GPU pipeline)
         # This enables O(1) lookup of which BT rows match each deal
-        deal_to_bt_index: dict[int, list[int]] | None = None
+        deal_to_bt_index_df: Optional[pl.DataFrame] = None
         _verified_file = deal_to_bt_verified_file if deal_to_bt_verified_file.exists() else (
             _deal_to_bt_verified_file_e_drive if _deal_to_bt_verified_file_e_drive.exists() else None
         )
@@ -1488,20 +1710,18 @@ def _heavy_init() -> None:
             try:
                 print(f"[init] Loading precomputed deal-to-BT index from {_verified_file}...")
                 t0_idx = time.perf_counter()
-                _idx_df = pl.read_parquet(_verified_file, columns=["deal_idx", "Matched_BT_Indices"])
-                # Build dict for O(1) lookup by deal index
-                deal_to_bt_index = {
-                    int(row["deal_idx"]): list(row["Matched_BT_Indices"]) if row["Matched_BT_Indices"] else []
-                    for row in _idx_df.iter_rows(named=True)
-                }
+                # Load DataFrame and sort by deal_idx for binary search lookups
+                deal_to_bt_index_df = (
+                    pl.read_parquet(_verified_file, columns=["deal_idx", "Matched_BT_Indices"])
+                    .sort("deal_idx")
+                )
                 elapsed_idx = time.perf_counter() - t0_idx
-                idx_info = f"{len(deal_to_bt_index):,} deals in {elapsed_idx:.1f}s"
+                idx_info = f"{deal_to_bt_index_df.height:,} deals in {elapsed_idx:.1f}s"
                 _update_loading_status(5, "Loading deal-to-BT index...", "deal_to_bt_index", idx_info)
-                print(f"[init] deal_to_bt_index: {idx_info} (GPU-verified, enables instant lookups)")
-                del _idx_df
+                print(f"[init] deal_to_bt_index: {idx_info} (GPU-verified, sorted for fast lookup)")
             except Exception as e:
                 print(f"[init] WARNING: Failed to load deal-to-BT index from {_verified_file}: {e}")
-                deal_to_bt_index = None
+                deal_to_bt_index_df = None
         else:
             print("[init] No precomputed deal-to-BT index found (run bbo_bt_filter_by_bitmap.py)")
         _log_memory("after load deal_to_bt_index")
@@ -1531,11 +1751,13 @@ def _heavy_init() -> None:
             STATE["deal_criteria_by_direction_dfs"] = deal_criteria_by_direction_dfs
             STATE["results"] = results
             STATE["bt_stats_df"] = bt_stats_df
+            STATE["bt_categories_df"] = bt_categories_df
+            STATE["bt_category_cols"] = bt_category_cols
             STATE["custom_criteria_overlay"] = overlay
             STATE["custom_criteria_stats"] = custom_criteria_stats
             STATE["available_criteria_names"] = available_criteria_names
             STATE["new_rules_df"] = new_rules_df
-            STATE["deal_to_bt_index"] = deal_to_bt_index  # Precomputed deal→[bt_indices] (or None)
+            STATE["deal_to_bt_index_df"] = deal_to_bt_index_df  # Precomputed deal→[bt_indices] DataFrame (or None)
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
@@ -1948,6 +2170,11 @@ def deal_criteria_eval_batch(req: DealCriteriaEvalBatchRequest) -> Dict[str, Any
     _ensure_ready()
     with _STATE_LOCK:
         state = dict(STATE)
+    # Allow callers to pass the user-facing deal `index` instead of deal_row_idx.
+    # This is fast iff STATE["deal_index_monotonic"] is True.
+    deal_row_idx = int(req.deal_row_idx)
+    if req.deal_index is not None:
+        deal_row_idx = _resolve_deal_row_idx_from_index(state, int(req.deal_index))
     try:
         handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
         if not handler_module:
@@ -1955,13 +2182,115 @@ def deal_criteria_eval_batch(req: DealCriteriaEvalBatchRequest) -> Dict[str, Any
 
         resp = handler_module.handle_deal_criteria_failures_batch(
             state=state,
-            deal_row_idx=int(req.deal_row_idx),
+            deal_row_idx=deal_row_idx,
             dealer=str(req.dealer),
             checks=[c.model_dump() for c in req.checks],
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("deal-criteria-eval-batch", e)
+
+
+@app.post("/deals-by-index")
+def deals_by_index(req: DealsByIndexRequest) -> Dict[str, Any]:
+    """Fetch deal rows by user-facing `index` values using monotonic fast-path."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    deal_df = state.get("deal_df")
+    if not isinstance(deal_df, pl.DataFrame):
+        raise HTTPException(status_code=500, detail="deal_df not loaded")
+
+    # Safety caps
+    want = [int(x) for x in (req.indices or []) if x is not None]
+    want = want[: max(0, int(req.max_rows or 0))]
+    if not want:
+        return _attach_hot_reload_info({"rows": [], "count": 0}, reload_info)
+
+    row_positions = _resolve_deal_row_indices_from_indices(state, want)
+    if not row_positions:
+        return _attach_hot_reload_info({"rows": [], "count": 0}, reload_info)
+
+    # Select columns
+    default_cols = ["index", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W", "ParScore", "Contract", "Score", "Result", "bid"]
+    cols = req.columns or default_cols
+    cols = [c for c in cols if c in deal_df.columns]
+    if not cols:
+        cols = ["index"]
+
+    # Take rows by row position, then include _row_idx for downstream callers.
+    out_df = deal_df.select(cols)
+    out_df = out_df.with_row_index("_row_idx")
+    from plugins.bbo_handlers_common import take_rows_by_index as _take  # avoid polars version issues
+    out_df = _take(out_df, row_positions)
+
+    rows = out_df.to_dicts()
+    resp = {"rows": rows, "count": len(rows)}
+    return _attach_hot_reload_info(resp, reload_info)
+
+
+@app.post("/bt-categories-by-index")
+def bt_categories_by_index(req: BTCategoriesByIndexRequest) -> Dict[str, Any]:
+    """Fetch bid-category flags (Phase 4) for bt_index values.
+
+    Returns `categories_true` as a list of category names (without the `is_` prefix).
+    """
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    t0 = time.perf_counter()
+
+    with _STATE_LOCK:
+        state = dict(STATE)
+
+    bt_categories_df: pl.DataFrame | None = state.get("bt_categories_df")
+    bt_category_cols: list[str] = state.get("bt_category_cols") or []
+    if bt_categories_df is None or not bt_category_cols:
+        raise HTTPException(
+            status_code=400,
+            detail="bt_categories_df not loaded (generate bbo_bt_categories.parquet via bbo_bt_classify_bids.py)",
+        )
+
+    indices = [int(x) for x in (req.indices or []) if x is not None]
+    indices = indices[: max(0, int(req.max_rows or 0))]
+    if not indices:
+        return _attach_hot_reload_info({"rows": [], "missing_indices": [], "elapsed_ms": 0.0}, reload_info)
+
+    try:
+        present_df = bt_categories_df.filter(pl.col("bt_index").is_in(indices))
+
+        rows_by_idx: dict[int, dict[str, Any]] = {}
+        for r in present_df.select(["bt_index"] + bt_category_cols).iter_rows(named=True):
+            try:
+                bt_idx_raw = r.get("bt_index")
+                if bt_idx_raw is None:
+                    continue
+                bt_idx = int(bt_idx_raw)
+            except Exception:
+                continue
+            cats_true: list[str] = []
+            for c in bt_category_cols:
+                try:
+                    if bool(r.get(c)) is True:
+                        cats_true.append(c[3:] if c.startswith("is_") else c)
+                except Exception:
+                    continue
+            rows_by_idx[bt_idx] = {"bt_index": bt_idx, "categories_true": cats_true}
+
+        out_rows: list[dict[str, Any]] = []
+        missing: list[int] = []
+        for idx in indices:
+            rr = rows_by_idx.get(int(idx))
+            if rr is None:
+                missing.append(int(idx))
+            else:
+                out_rows.append(rr)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        out = {"rows": out_rows, "missing_indices": missing, "elapsed_ms": round(elapsed_ms, 1)}
+        return _attach_hot_reload_info(out, reload_info)
+    except Exception as e:
+        _log_and_raise("bt-categories-by-index", e)
 
 
 # ---------------------------------------------------------------------------
@@ -2028,6 +2357,7 @@ def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, An
             dist_pattern=req.dist_pattern,
             sorted_shape=req.sorted_shape,
             dist_seat=req.dist_seat,
+            include_categories=req.include_categories,
         )
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
@@ -2721,4 +3051,5 @@ if __name__ == "__main__":  # pragma: no cover
         print(f"[init] Source file: {source_file.name} (modified: {source_date})")
     except Exception:
         pass
-    uvicorn.run(app, host=args.host, port=args.port, reload=False)
+    # Disable uvicorn's built-in access log; we emit our own line with elapsed seconds.
+    uvicorn.run(app, host=args.host, port=args.port, reload=False, access_log=False)

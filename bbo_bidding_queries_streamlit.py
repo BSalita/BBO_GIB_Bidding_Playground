@@ -34,8 +34,6 @@ import re
 from typing import Any, Dict, List, Set
 
 from bbo_bidding_queries_lib import (
-    normalize_auction_pattern,
-    normalize_auction_pattern_to_seat1,
     normalize_auction_input,
     normalize_auction_user_text,
     format_elapsed,
@@ -757,13 +755,21 @@ DEFAULT_API_TIMEOUT = 60  # seconds; prevents Streamlit from hanging indefinitel
 
 def api_get(path: str, timeout: int | None = None) -> Dict[str, Any]:
     """GET from API with a default timeout to prevent hanging."""
+    t0 = time.perf_counter()
     resp = requests.get(f"{API_BASE}{path}", timeout=timeout or DEFAULT_API_TIMEOUT)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    try:
+        if isinstance(data, dict):
+            data["_client_elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    except Exception:
+        pass
+    return data
 
 
 def api_post(path: str, payload: Dict[str, Any], timeout: int | None = None) -> Dict[str, Any]:
     """POST to API with a default timeout to prevent hanging."""
+    t0 = time.perf_counter()
     resp = requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout or DEFAULT_API_TIMEOUT)
     try:
         resp.raise_for_status()
@@ -774,7 +780,28 @@ def api_post(path: str, payload: Dict[str, Any], timeout: int | None = None) -> 
         except Exception:
             detail = resp.text
         raise requests.HTTPError(f"{e}\nServer detail: {detail}", response=resp) from e
-    return resp.json()
+    data = resp.json()
+    try:
+        if isinstance(data, dict):
+            data["_client_elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    except Exception:
+        pass
+    return data
+
+
+def _st_info_elapsed(label: str, data: Dict[str, Any] | None) -> None:
+    """Show elapsed time (server elapsed_ms preferred, client fallback)."""
+    if not isinstance(data, dict):
+        return
+    elapsed_ms = data.get("elapsed_ms")
+    if elapsed_ms is None:
+        elapsed_ms = data.get("_client_elapsed_ms")
+    if elapsed_ms is None:
+        return
+    try:
+        st.info(f"⏱️ {label} completed in {format_elapsed(float(elapsed_ms))}")
+    except Exception:
+        pass
 
 
 def generate_passthrough_sql(df: pl.DataFrame, table_name: str) -> str:
@@ -1294,10 +1321,11 @@ def render_opening_bids_by_deal():
 
     deals = data.get("deals", [])
     elapsed_ms = data.get("elapsed_ms", 0)
+    _st_info_elapsed("Opening Bids by Deal", data)
     if not deals:
         st.info(f"No deals matched the specified filters. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(deals)} deal(s) in {format_elapsed(elapsed_ms)}")
+        st.success(f"Found {len(deals)} deal(s)")
         for d in deals:
             st.subheader(f"Dealer {d['dealer']} – Deal Index {d['index']}")
             st.write(f"Opening seat: {d.get('opening_seat')}")
@@ -1379,10 +1407,11 @@ def render_random_auction_samples():
 
     samples = data.get("samples", [])
     elapsed_ms = data.get("elapsed_ms", 0)
+    _st_info_elapsed("Random Auction Samples", data)
     if not samples:
         st.info(f"No completed auctions found. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(samples)} matching auction(s) in {format_elapsed(elapsed_ms)}")
+        st.success(f"Found {len(samples)} matching auction(s)")
         
         # Build combined DataFrame from all samples for comparison
         all_rows = []
@@ -1439,6 +1468,7 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
         payload = {"indices": [int(x) for x in indices], "allow_initial_passes": bool(allow_initial_passes)}
         with st.spinner("Fetching auctions by bt_index from server. Takes about 10-60 seconds."):
             data = api_post("/auction-sequences-by-index", payload)
+        _st_info_elapsed("Find Auction Sequences", data)
         missing = data.get("missing_indices") or []
         if missing:
             st.warning(f"{len(missing)} bt_index values were not found (or not completed auctions).")
@@ -1451,6 +1481,7 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
         payload = {"pattern": pattern, "allow_initial_passes": bool(allow_initial_passes), "n_samples": int(n_samples), "seed": seed}
         with st.spinner("Fetching auctions from server. Takes about 10-60 seconds."):
             data = api_post("/auction-sequences-matching", payload)
+        _st_info_elapsed("Find Auction Sequences", data)
 
     # Show the effective pattern including (p-)* prefix when matching all seats
     effective_pattern = data.get('pattern', pattern)
@@ -1466,7 +1497,7 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
     if not samples:
         st.info(f"No auctions matched the pattern. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(samples)} matching auction(s) in {format_elapsed(elapsed_ms)}")
+        st.success(f"Found {len(samples)} matching auction(s)")
         
         def _to_int_or_default(x: Any, default: int = 1) -> int:
             try:
@@ -1630,6 +1661,7 @@ def render_deals_by_auction_pattern(pattern: str | None):
 
     with st.spinner("Fetching Deals Matching Auction from server. Takes about 15-30s seconds."):
         data = api_post("/deals-matching-auction", payload)
+    _st_info_elapsed("Deals by Auction Pattern", data)
 
     elapsed_ms = data.get("elapsed_ms", 0)
     # Show the effective pattern including (p-)* prefix when matching all seats
@@ -1652,7 +1684,7 @@ def render_deals_by_auction_pattern(pattern: str | None):
     if not auctions:
         st.info(f"No auctions matched the pattern. ({format_elapsed(elapsed_ms)})")
     else:
-        st.success(f"Found {len(auctions)} matching auction(s) in {format_elapsed(elapsed_ms)}")
+        st.success(f"Found {len(auctions)} matching auction(s)")
         for i, a in enumerate(auctions, start=1):
             bt_idx = a.get("bt_index")
             bt_suffix = f" (bt_index={bt_idx})" if bt_idx is not None else ""
@@ -1814,6 +1846,14 @@ def render_bidding_table_explorer():
     
     sample_size = st.sidebar.number_input("Sample Size", value=25, min_value=1, max_value=10000, key="bt_explorer_sample")
     min_matches = st.sidebar.number_input("Min Matching Deals (0=all)", value=0, min_value=0, max_value=100000)
+
+    st.sidebar.divider()
+    show_categories = st.sidebar.checkbox(
+        "Show bid category flags (Phase 4)",
+        value=False,
+        help="Includes ~100 boolean is_* columns from bbo_bt_categories.parquet (can be wide).",
+        key="bt_explorer_show_categories",
+    )
     
     st.sidebar.divider()
     st.sidebar.subheader("Distribution Filter")
@@ -1871,10 +1911,12 @@ def render_bidding_table_explorer():
         "dist_pattern": dist_pattern if dist_pattern else None,
         "sorted_shape": sorted_shape if sorted_shape else None,
         "dist_seat": dist_seat,
+        "include_categories": bool(show_categories),
     }
     
     with st.spinner("Fetching Bidding Table Statistics from server..."):
         data = api_post("/bidding-table-statistics", payload)
+    _st_info_elapsed("Bidding Table Explorer", data)
     
     has_criteria = data.get("has_criteria", False)
     has_aggregates = data.get("has_aggregates", False)
@@ -1890,14 +1932,29 @@ def render_bidding_table_explorer():
     actual_pattern = data.get("pattern", auction_pattern)
     
     if total_matches == 0:
-        st.warning(f"No auctions match pattern: `{actual_pattern}` ({format_elapsed(elapsed_ms)})")
+        st.warning(f"No auctions match pattern: `{actual_pattern}`")
         if data.get("message"):
             st.info(data["message"])
     else:
-        st.success(f"Found {total_matches:,} auctions matching pattern: `{actual_pattern}` ({format_elapsed(elapsed_ms)})")
+        st.success(f"Found {total_matches:,} auctions matching pattern: `{actual_pattern}`")
         
         if rows:
             display_df = pl.DataFrame(rows)
+
+            # If category flags are present, add a compact summary column.
+            if show_categories:
+                cat_cols = [c for c in display_df.columns if isinstance(c, str) and c.startswith("is_")]
+                if cat_cols:
+                    try:
+                        # For small samples, Python per-row is simplest + fast enough.
+                        dcts = display_df.select(["row_idx"] + cat_cols).to_dicts()
+                        summaries: list[str] = []
+                        for r in dcts:
+                            trues = [c for c in cat_cols if bool(r.get(c)) is True]
+                            summaries.append(", ".join(trues[:25]) + ("..." if len(trues) > 25 else ""))
+                        display_df = display_df.with_columns(pl.Series("Categories_True", summaries))
+                    except Exception:
+                        pass
             
             dist_sql_query = data.get("dist_sql_query")
             if dist_sql_query:
@@ -1930,6 +1987,7 @@ def render_bidding_table_explorer():
             st.subheader("Bidding Table with Statistics")
             display_df = order_columns(display_df, priority_cols=[
                 "row_idx", "original_idx", "Auction", "matching_deal_count",
+                "Categories_True",
                 "Expr", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
                 "HCP_min_S1", "HCP_max_S1", "HCP_min_S2", "HCP_max_S2",
                 "HCP_min_S3", "HCP_max_S3", "HCP_min_S4", "HCP_max_S4",
@@ -2019,6 +2077,7 @@ def render_analyze_deal():
                 "vul": vul_option,
             }
             pbn_data = api_post("/process-pbn", pbn_payload)
+            _st_info_elapsed("Analyze Deal (parse PBN/LIN)", pbn_data)
         except Exception as e:
             st.error(f"Failed to process PBN/LIN: {e}")
             return
@@ -2031,7 +2090,7 @@ def render_analyze_deal():
     input_type = pbn_data.get("input_type", "unknown")
     input_source = pbn_data.get("input_source", "")
     type_emoji = {"LIN string": "📝", "PBN string": "📝", "LIN file": "📁", "PBN file": "📁", "LIN URL": "🌐", "PBN URL": "🌐"}.get(input_type, "❓")
-    st.success(f"{type_emoji} Detected **{input_type}** — Parsed {len(deals)} deal(s) in {pbn_data.get('elapsed_ms', 0)/1000:.1f}s")
+    st.success(f"{type_emoji} Detected **{input_type}** — Parsed {len(deals)} deal(s)")
     if input_source and len(input_source) < 200:
         st.caption(f"Source: `{input_source}`")
     
@@ -2105,6 +2164,7 @@ def render_analyze_deal():
                 "max_results": int(max_auctions),
             }
             match_data = api_post("/find-matching-auctions", match_payload)
+            _st_info_elapsed(f"Find Matching Auctions (deal {deal_idx + 1})", match_data)
         
         matches = match_data.get("matches", [])
         elapsed_ms = match_data.get("elapsed_ms", 0)
@@ -2112,7 +2172,7 @@ def render_analyze_deal():
         if not matches:
             st.warning(f"No matching auctions found for seat {match_seat}. ({format_elapsed(elapsed_ms)})")
         else:
-            st.success(f"Found {len(matches)} matching auction(s) for seat {match_seat} in {format_elapsed(elapsed_ms)}")
+            st.success(f"Found {len(matches)} matching auction(s) for seat {match_seat}")
             matches_df = pl.DataFrame(matches)
             matches_df = order_columns(matches_df, priority_cols=[
                 "Auction", "Rules_Auction", "Expr",
@@ -2159,6 +2219,7 @@ def render_pbn_database_lookup():
     with st.spinner("Looking up PBN in database..."):
         payload = {"pbn": pbn_input.strip()}
         data = api_post("/pbn-lookup", payload)
+    _st_info_elapsed("PBN Database Lookup", data)
     
     # Canonical API schema: {matches, count, total_in_df, pbn_searched, elapsed_ms}
     elapsed = data["elapsed_ms"]
@@ -2194,7 +2255,7 @@ def render_pbn_database_lookup():
     parsed_hands = parse_pbn_for_sql(pbn_input)
     
     if count > 0:
-        st.success(f"✅ PBN found in database! ({elapsed/1000:.1f}s, searched {total:,} rows)")
+        st.success(f"✅ PBN found in database! (searched {total:,} rows)")
         
         # Use first returned match as the primary deal info
         deal_info = matches[0] if matches and isinstance(matches[0], dict) else {}
@@ -2222,7 +2283,7 @@ def render_pbn_database_lookup():
             matches_df = pl.DataFrame(matches)
             render_aggrid(matches_df, key="pbn_lookup_matches", height=250, table_name="pbn_matches")
     else:
-        st.warning(f"❌ PBN not found in database ({elapsed/1000:.1f}s, searched {total:,} rows)")
+        st.warning(f"❌ PBN not found in database (searched {total:,} rows)")
         st.write("**Searched PBN:**")
         st.code(pbn_input)
 
@@ -2275,6 +2336,7 @@ def render_analyze_actual_auctions():
     with st.spinner("Grouping deals by bid..."):
         try:
             data = api_post("/group-by-bid", payload)
+            _st_info_elapsed("Analyze Actual Auctions", data)
         except requests.HTTPError as e:
             # Handle invalid/malformed regex with a friendly message
             if "Invalid regex pattern" in str(e) or "regular expression" in str(e):
@@ -2311,7 +2373,7 @@ def render_analyze_actual_auctions():
         return
     
     deals_msg = f", {total_matching_deals:,} deals" if isinstance(total_matching_deals, int) and total_matching_deals >= 0 else ""
-    st.success(f"Found {total_auctions:,} matching auctions{deals_msg}, showing {len(groups)} groups ({format_elapsed(elapsed_ms)})")
+    st.success(f"Found {total_auctions:,} matching auctions{deals_msg}, showing {len(groups)} groups")
     
     for i, group in enumerate(groups):
         bid_auction = group.get("auction")
@@ -2454,31 +2516,32 @@ def render_analyze_actual_auctions():
                 if checks:
                     blocking_data = []
                     with st.spinner("Evaluating criteria..."):
+                        t_eval0 = time.perf_counter()
                         for deal in deals:
-                            deal_row_idx = deal.get("_row_idx", deal.get("index", 0))
+                            deal_row_idx = deal.get("_row_idx")
+                            deal_index = deal.get("index")
                             dealer = deal.get("Dealer", "N")
                             
                             try:
-                                eval_resp = requests.post(
-                                    f"{API_BASE}/deal-criteria-eval-batch",
-                                    json={
-                                        "deal_row_idx": int(deal_row_idx),
+                                eval_data = api_post(
+                                    "/deal-criteria-eval-batch",
+                                    {
+                                        "deal_row_idx": int(deal_row_idx if deal_row_idx is not None else 0),
+                                        "deal_index": (int(deal_index) if deal_row_idx is None and deal_index is not None else None),
                                         "dealer": str(dealer),
                                         "checks": checks
                                     },
-                                    timeout=30
+                                    timeout=30,
                                 )
                                 
                                 failed_list = []
                                 untracked_list = []
-                                if eval_resp.status_code == 200:
-                                    eval_data = eval_resp.json()
-                                    for result in eval_data.get("results", []):
-                                        seat = result.get("seat")
-                                        for f in result.get("failed", []):
-                                            failed_list.append(f"S{seat}:{f}")
-                                        for u in result.get("untracked", []):
-                                            untracked_list.append(f"S{seat}:{u}")
+                                for result in eval_data.get("results", []):
+                                    seat = result.get("seat")
+                                    for f in result.get("failed", []):
+                                        failed_list.append(f"S{seat}:{f}")
+                                    for u in result.get("untracked", []):
+                                        untracked_list.append(f"S{seat}:{u}")
                                 
                                 blocking_data.append({
                                     "_idx": deal.get("index", deal_row_idx),
@@ -2495,6 +2558,9 @@ def render_analyze_actual_auctions():
                                     "Fail_Count": -1,
                                     "Untracked_Count": 0,
                                 })
+                        elapsed_eval_s = time.perf_counter() - t_eval0
+                        if elapsed_eval_s >= 0.5:
+                            st.info(f"⏱️ Blocking criteria evaluation completed in {elapsed_eval_s:.2f}s")
                     
                     # Merge blocking data into deals_df
                     if blocking_data:
@@ -2588,6 +2654,7 @@ def render_bt_seat_stats_tool():
                     "dist_seat": 1,
                 }
                 sample_data = api_post("/bidding-table-statistics", sample_payload)
+                _st_info_elapsed("BT Seat Stats (sample bt_index)", sample_data)
                 rows = sample_data.get("rows", [])
                 if not rows:
                     st.warning(
@@ -2612,6 +2679,7 @@ def render_bt_seat_stats_tool():
     with st.spinner("Computing on-the-fly stats from deals..."):
         try:
             data = api_post("/bt-seat-stats", payload)
+            _st_info_elapsed("BT Seat Stats (On-the-fly)", data)
         except Exception as e:
             st.error(f"Failed to compute stats: {e}")
             return
@@ -2722,24 +2790,13 @@ def render_auction_criteria_debugger():
     if submitted:
         with st.spinner(f"Analyzing why '{auction_pattern}' is rejected..."):
             try:
-                import time
-                
                 # Step 1: Get the BT row for this auction pattern
                 st.subheader(f"1️⃣ BT Row for '{auction_pattern}'")
                 
-                t0 = time.perf_counter()
                 # Normalize pattern for exact match
                 pattern_exact = f"^{auction_pattern.upper()}$"
-                bt_response = requests.post(
-                    f"{API_BASE}/auction-sequences-matching",
-                    json={"pattern": pattern_exact, "n_samples": 1, "seed": int(seed)},
-                    timeout=30
-                )
-                bt_response.raise_for_status()
-                bt_data = bt_response.json()
-                elapsed_bt = time.perf_counter() - t0
-                if elapsed_bt > 1.0:
-                    st.caption(f"⏱️ BT lookup: {elapsed_bt:.1f}s")
+                bt_data = api_post("/auction-sequences-matching", {"pattern": pattern_exact, "n_samples": 1, "seed": int(seed)}, timeout=30)
+                _st_info_elapsed("Auction Criteria Debugger: BT lookup", bt_data)
                 
                 bt_samples = bt_data.get("samples", [])
                 if not bt_samples:
@@ -2796,23 +2853,18 @@ def render_auction_criteria_debugger():
                 # Step 2: Get deals where actual auction matches this pattern
                 st.subheader(f"2️⃣ Deals with Actual Auction Matching '{auction_pattern}'")
                 
-                t0 = time.perf_counter()
-                arena_response = requests.post(
-                    f"{API_BASE}/bidding-arena",
-                    json={
+                arena_data = api_post(
+                    "/bidding-arena",
+                    {
                         "model_a": "Actual",
                         "model_b": "Rules",
                         "sample_size": int(sample_size),
                         "seed": int(seed),
-                        "auction_pattern": f"^{auction_pattern.upper()}"
+                        "auction_pattern": f"^{auction_pattern.upper()}",
                     },
-                    timeout=120
+                    timeout=120,
                 )
-                arena_response.raise_for_status()
-                arena_data = arena_response.json()
-                elapsed_arena = time.perf_counter() - t0
-                if elapsed_arena > 1.0:
-                    st.caption(f"⏱️ Bidding arena: {elapsed_arena:.1f}s")
+                _st_info_elapsed("Auction Criteria Debugger: sample deals", arena_data)
                 
                 sample_deals = arena_data.get("sample_deals", [])
                 if not sample_deals:
@@ -2826,46 +2878,44 @@ def render_auction_criteria_debugger():
                 # Step 3: Evaluate criteria for each deal
                 st.subheader("3️⃣ Criteria Failures Analysis")
                 
-                t0 = time.perf_counter()
                 results_data = []
                 checks = [{"seat": seat, "criteria": crits} for seat, crits in criteria_by_seat.items()]
                 
                 progress_bar = st.progress(0)
+                t_eval0 = time.perf_counter()
                 for i, deal in enumerate(sample_deals):
                     progress_bar.progress((i + 1) / len(sample_deals))
                     
                     deal_row_idx = deal.get("_row_idx")
-                    if deal_row_idx is None:
-                        deal_row_idx = deal.get("index", 0)
+                    deal_index = deal.get("index")
                     dealer = deal.get("Dealer", "N")
                     actual_auction = deal.get("Auction_Actual", "")
                     rules_auction = deal.get("Auction_Rules", "")
                     
                     # Evaluate criteria
-                    eval_response = requests.post(
-                        f"{API_BASE}/deal-criteria-eval-batch",
-                        json={
-                            "deal_row_idx": int(deal_row_idx),
+                    eval_data = api_post(
+                        "/deal-criteria-eval-batch",
+                        {
+                            "deal_row_idx": int(deal_row_idx if deal_row_idx is not None else 0),
+                            "deal_index": (int(deal_index) if deal_row_idx is None and deal_index is not None else None),
                             "dealer": str(dealer),
                             "checks": checks
                         },
-                        timeout=30
+                        timeout=30,
                     )
                     
                     failed_criteria = []
                     untracked_criteria = []
                     
-                    if eval_response.status_code == 200:
-                        eval_data = eval_response.json()
-                        for result in eval_data.get("results", []):
-                            seat = result.get("seat")
-                            seat_dir = result.get("seat_dir", "?")
-                            failed = result.get("failed", [])
-                            untracked = result.get("untracked", [])
-                            if failed:
-                                failed_criteria.extend([f"S{seat}({seat_dir}):{c}" for c in failed])
-                            if untracked:
-                                untracked_criteria.extend([f"S{seat}({seat_dir}):{c}" for c in untracked])
+                    for result in eval_data.get("results", []):
+                        seat = result.get("seat")
+                        seat_dir = result.get("seat_dir", "?")
+                        failed = result.get("failed", [])
+                        untracked = result.get("untracked", [])
+                        if failed:
+                            failed_criteria.extend([f"S{seat}({seat_dir}):{c}" for c in failed])
+                        if untracked:
+                            untracked_criteria.extend([f"S{seat}({seat_dir}):{c}" for c in untracked])
                     
                     # Combine failures
                     all_blocking = failed_criteria + [f"{c} (CSV)" for c in untracked_criteria]
@@ -2889,9 +2939,9 @@ def render_auction_criteria_debugger():
                     })
                 
                 progress_bar.empty()
-                elapsed_eval = time.perf_counter() - t0
-                if elapsed_eval > 1.0:
-                    st.caption(f"⏱️ Criteria evaluation: {elapsed_eval:.1f}s")
+                elapsed_eval = time.perf_counter() - t_eval0
+                if elapsed_eval > 0.5:
+                    st.info(f"⏱️ Criteria evaluation completed in {elapsed_eval:.2f}s")
                 
                 # Display results table
                 if results_data:
@@ -2986,9 +3036,8 @@ def render_bidding_arena():
     
     # Get available models
     try:
-        models_response = requests.get(f"{API_BASE}/bidding-models", timeout=30)
-        models_response.raise_for_status()
-        models_data = models_response.json()
+        models_data = api_get("/bidding-models", timeout=30)
+        _st_info_elapsed("Load bidding models", models_data)
         model_names = [m["name"] for m in models_data.get("models", [])]
     except Exception as e:
         st.error(f"Failed to get models: {e}")
@@ -3001,7 +3050,8 @@ def render_bidding_arena():
 
     # Add Rules variations (learned criteria) only if the server reports merged_rules loaded
     try:
-        status_resp = requests.get(f"{API_BASE}/status", timeout=10).json()
+        status_resp = api_get("/status", timeout=10)
+        _st_info_elapsed("Load server status", status_resp)
         loaded_files = status_resp.get("loaded_files") or {}
         merged_ok = ("merged_rules" in loaded_files) and (loaded_files.get("merged_rules") not in (None, 0, "0"))
         if merged_ok:
@@ -3115,6 +3165,7 @@ def render_bidding_arena():
             else:
                 bt_data = api_post("/auction-sequences-by-index", bt_payload)
                 bt_cache[bt_key] = bt_data
+            _st_info_elapsed("Arena Debug: BT sequence lookup", bt_data)
 
             bt_samples = bt_data.get("samples") or []
             if not bt_samples:
@@ -3167,6 +3218,7 @@ def render_bidding_arena():
             else:
                 eval_data = api_post("/deal-criteria-eval-batch", eval_payload)
                 eval_cache[eval_key] = eval_data
+            _st_info_elapsed("Arena Debug: deal-criteria-eval-batch", eval_data)
 
             res = eval_data.get("results") or []
             rows = []
@@ -3233,14 +3285,12 @@ def render_bidding_arena():
                 timeout_s = 600 if search_all_bt_rows else 300
                 if search_all_bt_rows:
                     st.warning("Searching all completed BT rows is enabled; this request may take minutes.")
-                response = requests.post(f"{API_BASE}/bidding-arena", json=payload, timeout=timeout_s)
-                response.raise_for_status()
-                data = response.json()
+                data = api_post("/bidding-arena", payload, timeout=timeout_s)
                 st.session_state["_arena_cache_key"] = cache_key
                 st.session_state["_arena_cache_data"] = data
             
             elapsed_ms = data.get("elapsed_ms", 0)
-            st.caption(f"Completed in {format_elapsed(elapsed_ms)}")
+            st.info(f"🏟️ Bidding Arena startup completed in {format_elapsed(elapsed_ms)}")
             rules_search = data.get("rules_search") or {}
             if rules_search:
                 st.caption(
@@ -4270,9 +4320,8 @@ def render_wrong_bid_analysis():
         # Auto-load overall stats when this tab is active.
         with st.spinner("Loading statistics..."):
             try:
-                response = requests.post(f"{API_BASE}/wrong-bid-stats", json={}, timeout=60)
-                response.raise_for_status()
-                data = response.json()
+                data = api_post("/wrong-bid-stats", {}, timeout=60)
+                _st_info_elapsed("Wrong Bid Statistics", data)
 
                 # Overall stats
                 stats = data.get("overall_stats", {})
@@ -4317,13 +4366,8 @@ def render_wrong_bid_analysis():
         # Auto-load failed criteria summary when this tab is active.
         with st.spinner("Analyzing failed criteria..."):
             try:
-                response = requests.post(
-                    f"{API_BASE}/failed-criteria-summary",
-                    json={"top_n": int(top_n)},
-                    timeout=60,
-                )
-                response.raise_for_status()
-                data = response.json()
+                data = api_post("/failed-criteria-summary", {"top_n": int(top_n)}, timeout=60)
+                _st_info_elapsed("Failed Criteria Summary", data)
 
                 if "criteria" in data and data["criteria"]:
                     criteria_df = pl.DataFrame(data["criteria"])
@@ -4372,13 +4416,8 @@ def render_wrong_bid_analysis():
         # Auto-load leaderboard when this page is active (no button).
         with st.spinner("Loading leaderboard..."):
             try:
-                response = requests.post(
-                    f"{API_BASE}/wrong-bid-leaderboard",
-                    json={"top_n": int(top_n_lb), "min_deals": int(min_deals)},
-                    timeout=60,
-                )
-                response.raise_for_status()
-                data = response.json()
+                data = api_post("/wrong-bid-leaderboard", {"top_n": int(top_n_lb), "min_deals": int(min_deals)}, timeout=60)
+                _st_info_elapsed("Wrong Bid Leaderboard", data)
 
                 if "leaderboard" in data and data["leaderboard"]:
                     lb_df = pl.DataFrame(data["leaderboard"])
@@ -4494,7 +4533,7 @@ def render_rank_by_ev():
     
     # Use st.status for better loading UX with expandable details
     with st.status(f"🔍 Analyzing {desc}...", expanded=True) as status:
-        status.write("⏳ Matching deals to bid criteria (this may take 1-3 minutes for opening bids)...")
+        status.write("⏳ Matching deals to bid criteria (30 seconds for opening bids)...")
         try:
             data = fetch_rank_data(payload)
             status.update(label="✅ Analysis complete!", state="complete", expanded=False)
@@ -4509,6 +4548,7 @@ def render_rank_by_ev():
     auction_display = auction_normalized if auction_normalized else "Opening Bids"
     
     elapsed_ms = data.get("elapsed_ms", 0)
+    _st_info_elapsed("Rank Next Bids by EV", data)
     total_bids = data.get("total_next_bids", 0)
     total_matches = data.get("total_matches", 0)
     returned_count = data.get("returned_count", 0)
@@ -4522,7 +4562,7 @@ def render_rank_by_ev():
         st.info(data["message"])
     
     opening_seat = data.get("opening_seat", "Dealer (Seat 1)")
-    st.success(f"✅ Analyzed {total_bids} bids, {total_matches:,} matched deals ({format_elapsed(elapsed_ms)}) — Opener: {opening_seat}")
+    st.success(f"✅ Analyzed {total_bids} bids, {total_matches:,} matched deals — Opener: {opening_seat}")
     
     # -------------------------------------------------------------------------
     # Bid Rankings Table (with row selection)
@@ -5241,15 +5281,12 @@ def render_auction_builder():
         else:
             try:
                 if input_stripped.isdigit():
-                    # Fetch deal by index using SQL query
+                    # Fetch deal by index (fast-path: monotonic index cache in API)
                     idx = int(input_stripped)
                     resp = requests.post(
-                        f"{API_BASE}/execute-sql",
-                        json={
-                            "sql": f"SELECT * FROM deals WHERE index = {idx} LIMIT 1",
-                            "max_rows": 1
-                        },
-                        timeout=10
+                        f"{API_BASE}/deals-by-index",
+                        json={"indices": [idx], "max_rows": 1},
+                        timeout=10,
                     )
                     if resp.ok:
                         data = resp.json()
@@ -5812,6 +5849,32 @@ def render_auction_builder():
             
             return len(failed) == 0, failed
         
+        # Optional: attach bid-category flags (Phase 4) for each bt_index in the path.
+        bt_idx_to_categories: dict[int, str] = {}
+        try:
+            bt_indices = []
+            for step in current_path:
+                bt_idx = step.get("bt_index")
+                if bt_idx is None:
+                    continue
+                try:
+                    bt_indices.append(int(bt_idx))
+                except Exception:
+                    continue
+            if bt_indices:
+                cat_data = api_post("/bt-categories-by-index", {"indices": bt_indices, "max_rows": 500}, timeout=10)
+                rows = cat_data.get("rows") or []
+                for r in rows:
+                    try:
+                        bti = int(r.get("bt_index"))
+                    except Exception:
+                        continue
+                    cats = r.get("categories_true") or []
+                    # Render as a compact comma-separated string.
+                    bt_idx_to_categories[bti] = ", ".join(str(x) for x in cats if x)
+        except Exception:
+            bt_idx_to_categories = {}
+
         summary_rows = []
         pinned_all_pass = True  # Track if all steps pass for pinned deal
         
@@ -5825,6 +5888,7 @@ def render_auction_builder():
                 "Seat": seat_1_to_4,
                 "Bid": step["bid"],
                 "BT Index": step.get("bt_index"),
+                "Categories": bt_idx_to_categories.get(int(step.get("bt_index") or 0), "") if step.get("bt_index") is not None else "",
                 "Criteria Count": len(step.get("agg_expr", [])),
                 "Agg_Expr": criteria_str if criteria_str else "(none)",
                 "Complete": "✅" if step.get("is_complete") else "",
@@ -5872,6 +5936,19 @@ def render_auction_builder():
                 st.warning("📌 Pinned deal FAILS some criteria - see 'Pinned' and 'Failed_Criteria' columns")
         
         summary_df = pl.DataFrame(summary_rows)
+        summary_df = order_columns(
+            summary_df,
+            priority_cols=[
+                "Bid Num",
+                "Seat",
+                "Bid",
+                "BT Index",
+                "Categories",
+                "Criteria Count",
+                "Agg_Expr",
+                "Complete",
+            ],
+        )
         render_aggrid(summary_df, key="auction_builder_summary", height=calc_grid_height(len(summary_df)), table_name="auction_builder_summary")
         
         # Matching Deals section - on-demand loading via button
