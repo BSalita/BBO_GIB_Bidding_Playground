@@ -5283,40 +5283,26 @@ def render_auction_builder():
                 if input_stripped.isdigit():
                     # Fetch deal by index (fast-path: monotonic index cache in API)
                     idx = int(input_stripped)
-                    resp = requests.post(
-                        f"{API_BASE}/deals-by-index",
-                        json={"indices": [idx], "max_rows": 1},
-                        timeout=10,
-                    )
-                    if resp.ok:
-                        data = resp.json()
-                        rows = data.get("rows", [])
-                        if rows:
-                            deal_data = dict(rows[0])
-                            deal_data["_source"] = f"index:{idx}"
-                            pinned_deal = deal_data
-                        else:
-                            pinned_deal_error = f"Deal index {idx} not found"
+                    data = api_post("/deals-by-index", {"indices": [idx], "max_rows": 1}, timeout=10)
+                    _st_info_elapsed("Auction Builder: pin deal (by index)", data)
+                    rows = data.get("rows", [])
+                    if rows:
+                        deal_data = dict(rows[0])
+                        deal_data["_source"] = f"index:{idx}"
+                        pinned_deal = deal_data
                     else:
-                        pinned_deal_error = f"API error: {resp.status_code}"
+                        pinned_deal_error = f"Deal index {idx} not found"
                 else:
                     # Process as PBN
-                    resp = requests.post(
-                        f"{API_BASE}/process-pbn",
-                        json={"pbn": input_stripped, "include_par": True, "vul": "None"},
-                        timeout=10
-                    )
-                    if resp.ok:
-                        data = resp.json()
-                        deals = data.get("deals", [])
-                        if deals:
-                            deal_data = dict(deals[0])
-                            deal_data["_source"] = "pbn"
-                            pinned_deal = deal_data
-                        else:
-                            pinned_deal_error = "Invalid PBN format"
+                    data = api_post("/process-pbn", {"pbn": input_stripped, "include_par": True, "vul": "None"}, timeout=10)
+                    _st_info_elapsed("Auction Builder: pin deal (parse PBN/LIN)", data)
+                    deals = data.get("deals", [])
+                    if deals:
+                        deal_data = dict(deals[0])
+                        deal_data["_source"] = "pbn"
+                        pinned_deal = deal_data
                     else:
-                        pinned_deal_error = f"API error: {resp.status_code}"
+                        pinned_deal_error = "Invalid PBN format"
                 
                 if pinned_deal:
                     st.session_state[cache_key] = pinned_deal
@@ -5433,22 +5419,17 @@ def render_auction_builder():
                 # Try to get bid info from API
                 bid_info = {"bid": bid.upper(), "bt_index": None, "agg_expr": [], "is_complete": False}
                 try:
-                    resp = requests.post(
-                        f"{API_BASE}/list-next-bids",
-                        json={"auction": prefix},
-                        timeout=5
-                    )
-                    if resp.ok:
-                        data = resp.json()
-                        for nb in data.get("next_bids", []):
-                            if nb.get("bid", "").upper() == bid.upper():
-                                bid_info = {
-                                    "bid": bid.upper(),
-                                    "bt_index": nb.get("bt_index"),
-                                    "agg_expr": nb.get("agg_expr", []),
-                                    "is_complete": nb.get("is_completed_auction", False),
-                                }
-                                break
+                    data = api_post("/list-next-bids", {"auction": prefix}, timeout=10)
+                    # Don't spam elapsed here; manual edit can include many steps.
+                    for nb in data.get("next_bids", []):
+                        if nb.get("bid", "").upper() == bid.upper():
+                            bid_info = {
+                                "bid": bid.upper(),
+                                "bt_index": nb.get("bt_index"),
+                                "agg_expr": nb.get("agg_expr", []),
+                                "is_complete": nb.get("is_completed_auction", False),
+                            }
+                            break
                 except Exception:
                     pass  # Use default empty info
                 
@@ -5482,14 +5463,8 @@ def render_auction_builder():
         
         try:
             # Use fast /list-next-bids endpoint which uses next_bid_indices for O(1) lookup
-            response = requests.post(
-                f"{API_BASE}/list-next-bids",
-                json={"auction": prefix or ""},
-                # list-next-bids can legitimately take >10s on cold caches; use the global timeout.
-                timeout=DEFAULT_API_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = api_post("/list-next-bids", {"auction": prefix or ""}, timeout=DEFAULT_API_TIMEOUT)
+            _st_info_elapsed("Auction Builder: list next bids", data)
             
             next_bids = data.get("next_bids", [])
             
@@ -5546,6 +5521,51 @@ def render_auction_builder():
                     return (3, bid)
             
             sorted_options = sorted(options, key=bid_sort_key)
+
+            # -----------------------------------------------------------------
+            # Bid Categories (Phase 4): attach category names per bt_index.
+            # Do this once per options list (batched), and cache for this prefix.
+            # -----------------------------------------------------------------
+            bt_idx_to_categories: dict[int, str] = {}
+            try:
+                bt_indices: list[int] = []
+                for opt in sorted_options:
+                    bt_idx = opt.get("bt_index")
+                    if bt_idx is None:
+                        continue
+                    try:
+                        bt_indices.append(int(bt_idx))
+                    except Exception:
+                        continue
+                bt_indices = sorted(set(bt_indices))
+                if bt_indices:
+                    cache = st.session_state.setdefault("auction_builder_bt_categories_cache", {})
+                    cache_key = (tuple(bt_indices),)
+                    if cache_key in cache:
+                        bt_idx_to_categories = cache[cache_key]
+                    else:
+                        cat_data = api_post(
+                            "/bt-categories-by-index",
+                            {"indices": bt_indices, "max_rows": 500},
+                            timeout=10,
+                        )
+                        _st_info_elapsed("Auction Builder: categories lookup", cat_data)
+                        rows = cat_data.get("rows") or []
+                        tmp: dict[int, str] = {}
+                        for r in rows:
+                            try:
+                                bti_raw = r.get("bt_index")
+                                if bti_raw is None:
+                                    continue
+                                bti = int(bti_raw)
+                            except Exception:
+                                continue
+                            cats = r.get("categories_true") or []
+                            tmp[bti] = ", ".join(str(x) for x in cats if x)
+                        bt_idx_to_categories = tmp
+                        cache[cache_key] = bt_idx_to_categories
+            except Exception:
+                bt_idx_to_categories = {}
             
             # Helper to check if pinned deal matches criteria for a bid option
             def check_pinned_match_with_failures(criteria_list: list, seat: int) -> tuple[bool, list[str]]:
@@ -5651,7 +5671,15 @@ def render_auction_builder():
                     "Seat": seat_1_to_4,
                     "Bid": f"{opt['bid']}{complete_marker}",
                     "Criteria": criteria_str if criteria_str else "(none)",
+                    "Categories": "",
                 }
+                # Attach categories (true flags) for this candidate's bt_index (if available)
+                try:
+                    bt_idx = opt.get("bt_index")
+                    if bt_idx is not None:
+                        row_data["Categories"] = bt_idx_to_categories.get(int(bt_idx), "")
+                except Exception:
+                    pass
                 if show_failed_criteria:
                     row_data["Failed_Criteria"] = failed_criteria_str
                 bid_rows.append(row_data)
@@ -5668,6 +5696,7 @@ def render_auction_builder():
             gb.configure_column("Seat", width=60, minWidth=60)
             gb.configure_column("Bid", width=80, minWidth=80)
             gb.configure_column("Criteria", flex=1, minWidth=100, wrapText=True, autoHeight=True)
+            gb.configure_column("Categories", flex=1, minWidth=140, wrapText=True, autoHeight=True)
             if show_failed_criteria:
                 gb.configure_column("Failed_Criteria", flex=1, minWidth=120, headerName="Failed Criteria", wrapText=True, autoHeight=True)
             
@@ -5849,32 +5878,6 @@ def render_auction_builder():
             
             return len(failed) == 0, failed
         
-        # Optional: attach bid-category flags (Phase 4) for each bt_index in the path.
-        bt_idx_to_categories: dict[int, str] = {}
-        try:
-            bt_indices = []
-            for step in current_path:
-                bt_idx = step.get("bt_index")
-                if bt_idx is None:
-                    continue
-                try:
-                    bt_indices.append(int(bt_idx))
-                except Exception:
-                    continue
-            if bt_indices:
-                cat_data = api_post("/bt-categories-by-index", {"indices": bt_indices, "max_rows": 500}, timeout=10)
-                rows = cat_data.get("rows") or []
-                for r in rows:
-                    try:
-                        bti = int(r.get("bt_index"))
-                    except Exception:
-                        continue
-                    cats = r.get("categories_true") or []
-                    # Render as a compact comma-separated string.
-                    bt_idx_to_categories[bti] = ", ".join(str(x) for x in cats if x)
-        except Exception:
-            bt_idx_to_categories = {}
-
         summary_rows = []
         pinned_all_pass = True  # Track if all steps pass for pinned deal
         
@@ -5888,7 +5891,6 @@ def render_auction_builder():
                 "Seat": seat_1_to_4,
                 "Bid": step["bid"],
                 "BT Index": step.get("bt_index"),
-                "Categories": bt_idx_to_categories.get(int(step.get("bt_index") or 0), "") if step.get("bt_index") is not None else "",
                 "Criteria Count": len(step.get("agg_expr", [])),
                 "Agg_Expr": criteria_str if criteria_str else "(none)",
                 "Complete": "✅" if step.get("is_complete") else "",
@@ -5943,7 +5945,6 @@ def render_auction_builder():
                 "Seat",
                 "Bid",
                 "BT Index",
-                "Categories",
                 "Criteria Count",
                 "Agg_Expr",
                 "Complete",
