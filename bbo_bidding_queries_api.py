@@ -397,9 +397,8 @@ if _cli_deal_rows is not None:
 dataPath = _cli_data_dir if _cli_data_dir is not None else pathlib.Path("data")
 
 if not dataPath.exists():
-    print(f"WARNING: Data directory does not exist: {dataPath}")
-else:
-    print(f"dataPath: {dataPath} (exists)")
+    raise FileNotFoundError(f"Data directory does not exist: {dataPath}")
+print(f"dataPath: {dataPath} (exists)")
 
 
 # ---------------------------------------------------------------------------
@@ -416,10 +415,7 @@ auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 # New rules file: detailed rule discovery metrics (detailed view)
 new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
 # Precomputed deal-to-BT verified index (GPU pipeline output, optional)
-# Falls back to E: drive if not in local data/
 deal_to_bt_verified_file = dataPath.joinpath("bbo_deal_to_bt_verified.parquet")
-_deal_to_bt_verified_file_e_drive = pathlib.Path("E:/bridge/data/bbo/bidding/bbo_deal_to_bt_verified.parquet")
-_bt_categories_file_e_drive = pathlib.Path("E:/bridge/data/bbo/bidding/bbo_bt_categories.parquet")
 
 # ---------------------------------------------------------------------------
 # Constants for hand criteria
@@ -794,6 +790,11 @@ def _check_required_files() -> list[str]:
         bbo_mldf_augmented_file,
         bt_seat1_file,
         bt_criteria_seat1_file,
+        bt_categories_file,
+        bt_completed_agg_file,
+        deal_to_bt_verified_file,
+        new_rules_file,
+        auction_criteria_file,
     ]
 
     missing: list[str] = []
@@ -1338,7 +1339,6 @@ bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
 bt_criteria_seat1_file = dataPath.joinpath("bbo_bt_criteria_seat1_df.parquet")
 # Completed auctions with Agg_Expr only (63MB, ~975K rows) for fast wrong-bid-stats lookups
 bt_completed_agg_file = dataPath.joinpath("bbo_bt_completed_agg_expr.parquet")
-_bt_completed_agg_file_e_drive = pathlib.Path("E:/bridge/data/bbo/bidding/bbo_bt_completed_agg_expr.parquet")
 
 _STATE_LOCK = threading.Lock()
 
@@ -1808,14 +1808,11 @@ def _heavy_init() -> None:
         # Load completed-auctions Agg_Expr lookup (optional, for fast wrong-bid-stats)
         # This is a 63MB file with ~975K rows - much faster than querying 46GB Parquet
         bt_completed_agg_df: Optional[pl.DataFrame] = None
-        _completed_agg_file = bt_completed_agg_file if bt_completed_agg_file.exists() else (
-            _bt_completed_agg_file_e_drive if _bt_completed_agg_file_e_drive.exists() else None
-        )
-        if _completed_agg_file is not None:
+        if bt_completed_agg_file.exists():
             try:
-                print(f"[init] Loading bt_completed_agg_df from {_completed_agg_file}...")
+                print(f"[init] Loading bt_completed_agg_df from {bt_completed_agg_file}...")
                 t0_agg = time.perf_counter()
-                bt_completed_agg_df = pl.read_parquet(_completed_agg_file)
+                bt_completed_agg_df = pl.read_parquet(bt_completed_agg_file)
                 elapsed_agg = time.perf_counter() - t0_agg
                 agg_info = f"{bt_completed_agg_df.height:,} rows in {elapsed_agg:.1f}s"
                 print(f"[init] bt_completed_agg_df: {agg_info} (for fast wrong-bid-stats)")
@@ -1829,20 +1826,17 @@ def _heavy_init() -> None:
         # Load bid-category flags (optional, Phase 4 output).
         bt_categories_df = None
         bt_category_cols: list[str] | None = None
-        _cats_file = bt_categories_file if bt_categories_file.exists() else (
-            _bt_categories_file_e_drive if _bt_categories_file_e_drive.exists() else None
-        )
-        if _cats_file is not None:
+        if bt_categories_file.exists():
             try:
-                print(f"[init] Loading bt_categories_df from {_cats_file} (category flags)...")
+                print(f"[init] Loading bt_categories_df from {bt_categories_file} (category flags)...")
                 t0_cats = time.perf_counter()
-                scan = pl.scan_parquet(_cats_file)
+                scan = pl.scan_parquet(bt_categories_file)
                 cols = scan.collect_schema().names()
                 # Category flags are named like is_Preempt, is_Artificial, ...
                 bt_category_cols = sorted([c for c in cols if c.startswith("is_")])
                 cols_to_load = (["bt_index"] if "bt_index" in cols else []) + bt_category_cols
                 if not cols_to_load:
-                    raise ValueError(f"{_cats_file} is missing required join key column 'bt_index'")
+                    raise ValueError(f"{bt_categories_file} is missing required join key column 'bt_index'")
                 bt_categories_df = (
                     scan.select(cols_to_load)
                     .drop_nulls(subset=["bt_index"])
@@ -1854,7 +1848,7 @@ def _heavy_init() -> None:
                 elapsed_cats = time.perf_counter() - t0_cats
                 cats_info = _format_file_info(
                     df=bt_categories_df,
-                    file_path=pathlib.Path(_cats_file),
+                    file_path=pathlib.Path(bt_categories_file),
                     elapsed_secs=elapsed_cats,
                 )
                 _update_loading_status(5, "Loading bt_categories_df...", "bt_categories_df", cats_info)
@@ -1887,16 +1881,13 @@ def _heavy_init() -> None:
         # Load precomputed deal-to-BT verified index (optional, from GPU pipeline)
         # This enables O(1) lookup of which BT rows match each deal
         deal_to_bt_index_df: Optional[pl.DataFrame] = None
-        _verified_file = deal_to_bt_verified_file if deal_to_bt_verified_file.exists() else (
-            _deal_to_bt_verified_file_e_drive if _deal_to_bt_verified_file_e_drive.exists() else None
-        )
-        if _verified_file:
+        if deal_to_bt_verified_file.exists():
             try:
-                print(f"[init] Loading precomputed deal-to-BT index from {_verified_file}...")
+                print(f"[init] Loading precomputed deal-to-BT index from {deal_to_bt_verified_file}...")
                 t0_idx = time.perf_counter()
                 # Load DataFrame and sort by deal_idx for binary search lookups
                 deal_to_bt_index_df = (
-                    pl.read_parquet(_verified_file, columns=["deal_idx", "Matched_BT_Indices"])
+                    pl.read_parquet(deal_to_bt_verified_file, columns=["deal_idx", "Matched_BT_Indices"])
                     .sort("deal_idx")
                 )
                 elapsed_idx = time.perf_counter() - t0_idx
@@ -1904,7 +1895,7 @@ def _heavy_init() -> None:
                 _update_loading_status(5, "Loading deal-to-BT index...", "deal_to_bt_index", idx_info)
                 print(f"[init] deal_to_bt_index: {idx_info} (GPU-verified, sorted for fast lookup)")
             except Exception as e:
-                print(f"[init] WARNING: Failed to load deal-to-BT index from {_verified_file}: {e}")
+                print(f"[init] WARNING: Failed to load deal-to-BT index from {deal_to_bt_verified_file}: {e}")
                 deal_to_bt_index_df = None
         else:
             print("[init] No precomputed deal-to-BT index found (run bbo_bt_filter_by_bitmap.py)")

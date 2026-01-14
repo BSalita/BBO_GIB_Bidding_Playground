@@ -61,49 +61,68 @@ def load_agg_expr_for_bt_indices(
     # Use DuckDB for efficient lookup - it can use Parquet row group pruning and bloom filters
     # which is MUCH faster than Polars' full scan for small IN lists.
     #
-    # NOTE: We intentionally do NOT provide a Polars fallback here; if DuckDB is unavailable,
-    # we'd rather fail loudly than silently reintroduce multi-second timeouts.
-    import duckdb
-
-    # Create a fresh connection for thread safety
-    conn = duckdb.connect(":memory:")
-
-    # Build the IN list as comma-separated values
-    in_list = ", ".join(str(x) for x in uniq)
-
-    # Escape backslashes in the file path for SQL
-    file_path = str(bt_parquet_file).replace("\\", "/")
-
-    query = f"""
-        SELECT bt_index, Agg_Expr_Seat_1, Agg_Expr_Seat_2, Agg_Expr_Seat_3, Agg_Expr_Seat_4
-        FROM read_parquet('{file_path}')
-        WHERE bt_index IN ({in_list})
-    """
-
-    t1_query = time.perf_counter()
+    # NOTE: If DuckDB fails, we fall back to a Polars scan which is slower but more stable on some systems.
     try:
-        result_rel = conn.execute(query)
-        rows = result_rel.fetchall()
-        col_names = [desc[0] for desc in result_rel.description]
-    finally:
-        conn.close()
-    query_ms = (time.perf_counter() - t1_query) * 1000
-    if query_ms > 1000:  # Log if >1s
-        print(f"[load_agg_expr] DuckDB query took {query_ms:.1f}ms for {len(uniq)} indices")
+        import duckdb
 
-    result: Dict[int, Dict[str, List[str]]] = {}
-    for row in rows:
-        row_dict = dict(zip(col_names, row))
-        bt_idx = row_dict["bt_index"]
-        result[bt_idx] = {}
-        for seat in range(1, 5):
-            col = f"Agg_Expr_Seat_{seat}"
-            if col in row_dict:
-                val = row_dict[col]
-                # DuckDB may return list or None
-                result[bt_idx][col] = list(val) if val else []
+        # Create a fresh connection for thread safety
+        conn = duckdb.connect(":memory:")
 
-    return result
+        # Build the IN list as comma-separated values
+        in_list = ", ".join(str(x) for x in uniq)
+
+        # Escape backslashes in the file path for SQL
+        file_path = str(bt_parquet_file).replace("\\", "/")
+
+        query = f"""
+            SELECT bt_index, Agg_Expr_Seat_1, Agg_Expr_Seat_2, Agg_Expr_Seat_3, Agg_Expr_Seat_4
+            FROM read_parquet('{file_path}')
+            WHERE bt_index IN ({in_list})
+        """
+
+        t1_query = time.perf_counter()
+        try:
+            result_rel = conn.execute(query)
+            rows = result_rel.fetchall()
+            col_names = [desc[0] for desc in result_rel.description]
+        finally:
+            conn.close()
+        query_ms = (time.perf_counter() - t1_query) * 1000
+        if query_ms > 1000:  # Log if >1s
+            print(f"[load_agg_expr] DuckDB query took {query_ms:.1f}ms for {len(uniq)} indices")
+
+        result: Dict[int, Dict[str, List[str]]] = {}
+        for row in rows:
+            row_dict = dict(zip(col_names, row))
+            bt_idx = row_dict["bt_index"]
+            result[bt_idx] = {}
+            for seat in range(1, 5):
+                col = f"Agg_Expr_Seat_{seat}"
+                if col in row_dict:
+                    val = row_dict[col]
+                    # DuckDB may return list or None
+                    result[bt_idx][col] = list(val) if val else []
+        return result
+
+    except Exception as e:
+        print(f"[load_agg_expr] WARNING: DuckDB lookup failed ({e}), falling back to Polars scan...")
+        # Polars scan fallback
+        try:
+            df = (
+                pl.scan_parquet(bt_parquet_file)
+                .filter(pl.col("bt_index").is_in(uniq))
+                .select(["bt_index", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"])
+                .collect()
+            )
+            
+            result = {}
+            for row in df.to_dicts():
+                bt_idx = row["bt_index"]
+                result[bt_idx] = {k: (v if v is not None else []) for k, v in row.items() if k != "bt_index"}
+            return result
+        except Exception as e2:
+            print(f"[load_agg_expr] FATAL: Polars fallback also failed: {e2}")
+            return {}
 
 
 def enrich_bt_row_with_agg_expr(

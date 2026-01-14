@@ -1513,43 +1513,33 @@ def build_opening_bids_table_from_bt_seat1(
     - Agg_Expr_Seat_1..4: lists, with exactly one populated (the seat being modeled)
     """
     # Check if we need to load Agg_Expr from Parquet
-    if "Agg_Expr_Seat_1" not in bt_seat1_df.columns and bt_parquet_file:
-        # Memory-efficient load: ONLY opening bid rows and ONLY required columns
-        # Uses DuckDB for efficient lookup (predicate pushdown) instead of Polars full scan
-        print(f"Building opening bids table from {bt_parquet_file} (on-demand load)...")
-        
-        # IMPORTANT: Do NOT build a massive `IN (...)` list here. Opening bids can be millions
-        # of rows; instead query directly by the boolean predicate.
-        import duckdb
-
-        conn = duckdb.connect(":memory:")
-        try:
-            file_path = str(bt_parquet_file).replace("\\", "/")
-            query = f"""
-                SELECT bt_index, Auction, is_opening_bid, Agg_Expr_Seat_1, Expr
-                FROM read_parquet('{file_path}')
-                WHERE is_opening_bid = TRUE
-            """
-            bt_df_for_build = conn.execute(query).pl()
-        finally:
-            conn.close()
-
-        if bt_df_for_build.is_empty():
-            # No opening bids found - return empty table
-            return pl.DataFrame({
-                "index": pl.Series([], dtype=pl.UInt32),
-                "bt_index": pl.Series([], dtype=pl.UInt32),
-                "seat": pl.Series([], dtype=pl.UInt8),
-                "Auction": pl.Series([], dtype=pl.Utf8),
-                "Agg_Expr_Seat_1": pl.Series([], dtype=pl.List(pl.Utf8)),
-                "Agg_Expr_Seat_2": pl.Series([], dtype=pl.List(pl.Utf8)),
-                "Agg_Expr_Seat_3": pl.Series([], dtype=pl.List(pl.Utf8)),
-                "Agg_Expr_Seat_4": pl.Series([], dtype=pl.List(pl.Utf8)),
-            })
-
-        print(f"  Loaded {bt_df_for_build.height:,} opening bid rows with Agg_Expr (DuckDB)")
+    if "Agg_Expr_Seat_1" not in bt_seat1_df.columns:
+        # PERFORMANCE: If bt_seat1_df lacks Agg_Expr_Seat_1 but HAS Expr, use Expr as fallback
+        # for opening bids (they are usually identical for the first bid).
+        # This avoids a heavy Parquet scan/DuckDB hit on 461M rows.
+        if "Expr" in bt_seat1_df.columns:
+            print("Building opening bids table from in-memory 'Expr' (skipping Parquet scan)...")
+            bt_df_for_build = (
+                bt_seat1_df
+                .filter(pl.col("is_opening_bid") == True)
+                .select([c for c in ["bt_index", "Auction", "is_opening_bid", "Expr"] if c in bt_seat1_df.columns])
+                .with_columns(pl.col("Expr").alias("Agg_Expr_Seat_1"))
+            )
+        elif bt_parquet_file:
+            # Memory-efficient load: ONLY opening bid rows and ONLY required columns
+            # Uses Polars scan with predicate pushdown (usually more stable/memory-efficient than DuckDB for this)
+            print(f"Building opening bids table from {bt_parquet_file} (on-demand scan)...")
+            bt_df_for_build = (
+                pl.scan_parquet(bt_parquet_file)
+                .filter(pl.col("is_opening_bid") == True)
+                .select(["bt_index", "Auction", "is_opening_bid", "Agg_Expr_Seat_1", "Expr"])
+                .collect()
+            )
+        else:
+            # Fallback to provided DataFrame
+            bt_df_for_build = bt_seat1_df
     else:
-        # Use provided DataFrame (may be full or already filtered)
+        # Use provided DataFrame
         bt_df_for_build = bt_seat1_df
 
     required_cols = {"bt_index", "Auction", "is_opening_bid", "Agg_Expr_Seat_1"}
