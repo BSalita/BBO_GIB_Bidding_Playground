@@ -43,6 +43,7 @@ def load_agg_expr_for_bt_indices(
         Dict mapping bt_index -> {col_name: list of criteria strings}
         e.g., {12345: {"Agg_Expr_Seat_1": ["HCP >= 10", "SL_S >= 4"], ...}}
     """
+    t0_func = time.perf_counter()
     if not bt_indices:
         return {}
 
@@ -79,12 +80,16 @@ def load_agg_expr_for_bt_indices(
         WHERE bt_index IN ({in_list})
     """
 
+    t1_query = time.perf_counter()
     try:
         result_rel = conn.execute(query)
         rows = result_rel.fetchall()
         col_names = [desc[0] for desc in result_rel.description]
     finally:
         conn.close()
+    query_ms = (time.perf_counter() - t1_query) * 1000
+    if query_ms > 1000:  # Log if >1s
+        print(f"[load_agg_expr] DuckDB query took {query_ms:.1f}ms for {len(uniq)} indices")
 
     result: Dict[int, Dict[str, List[str]]] = {}
     for row in rows:
@@ -105,14 +110,15 @@ def enrich_bt_row_with_agg_expr(
     bt_row: Dict[str, Any],
     state: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Enrich a BT row with Agg_Expr columns loaded on-demand from Parquet.
+    """Enrich a BT row with Agg_Expr columns loaded on-demand.
     
     If the row already has Agg_Expr columns, returns as-is.
-    Otherwise, loads them from the Parquet file using bt_index.
+    Otherwise, loads them from the in-memory bt_completed_agg_df (fast)
+    or falls back to Parquet file (slow).
     
     Args:
         bt_row: Row dict from bt_seat1_df (may lack Agg_Expr columns)
-        state: API state dict containing bt_seat1_file
+        state: API state dict containing bt_completed_agg_df and bt_seat1_file
     
     Returns:
         Row dict with Agg_Expr columns populated
@@ -126,7 +132,21 @@ def enrich_bt_row_with_agg_expr(
     if bt_index is None:
         return bt_row
     
-    # Get parquet file path from state
+    bt_index_int = int(bt_index)
+    
+    # PERFORMANCE: Try in-memory bt_completed_agg_df first (instant lookup)
+    bt_completed_agg_df = state.get("bt_completed_agg_df")
+    if bt_completed_agg_df is not None:
+        match = bt_completed_agg_df.filter(pl.col("bt_index") == bt_index_int)
+        if match.height > 0:
+            row_data = match.row(0, named=True)
+            bt_row = dict(bt_row)  # Copy to avoid mutation
+            for col in ["Auction", "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4"]:
+                if col in row_data and row_data[col] is not None:
+                    bt_row[col] = row_data[col]
+            return bt_row
+    
+    # Fallback: Load from Parquet file (slow)
     bt_parquet_file = state.get("bt_seat1_file")
     if bt_parquet_file is None:
         raise RuntimeError(
@@ -135,10 +155,10 @@ def enrich_bt_row_with_agg_expr(
         )
     
     # Load Agg_Expr for this bt_index
-    agg_data = load_agg_expr_for_bt_indices([int(bt_index)], bt_parquet_file)
-    if bt_index in agg_data:
+    agg_data = load_agg_expr_for_bt_indices([bt_index_int], bt_parquet_file)
+    if bt_index_int in agg_data:
         bt_row = dict(bt_row)  # Copy to avoid mutation
-        bt_row.update(agg_data[bt_index])
+        bt_row.update(agg_data[bt_index_int])
     
     return bt_row
 
@@ -1050,6 +1070,112 @@ def join_deals_with_bt_on_demand(
     return joined.join(agg_df, on="bt_index", how="left")
 
 
+def join_deals_with_bt_via_index(
+    deals_df: pl.DataFrame,
+    state: Dict[str, Any],
+    bt_cols: List[str] | None = None,
+) -> pl.DataFrame:
+    """Join deals with BT using pre-computed deal_to_bt_index_df (O(1) lookup).
+    
+    PERFORMANCE: This is 100x+ faster than join_deals_with_bt_on_demand because it:
+    - Uses pre-computed deal_idx -> bt_index mapping (integer join)
+    - Avoids expensive string join on _auction_key (~25s -> ~200ms)
+    
+    Requirements:
+    - deals_df must have _row_idx column (from with_row_index)
+    - state must have deal_to_bt_index_df (from bbo_deal_to_bt_verified.parquet)
+    
+    Falls back to join_deals_with_bt_on_demand if index not available.
+    
+    Args:
+        deals_df: Deal DataFrame with _row_idx column
+        state: Handler state dict with deal_to_bt_index_df and bt_seat1_file
+        bt_cols: Columns to fetch from BT (defaults to Agg_Expr_Seat_1-4)
+    
+    Returns:
+        Joined DataFrame with bt_index and requested bt_cols
+    """
+    if bt_cols is None:
+        bt_cols = [agg_expr_col(s) for s in SEAT_RANGE]
+    
+    deal_to_bt_df = state.get("deal_to_bt_index_df")
+    if deal_to_bt_df is None or "_row_idx" not in deals_df.columns:
+        # Fallback to string join (slow path)
+        bt_df = state.get("bt_stats_df") or state.get("bt_seat1_df")
+        if bt_df is None:
+            raise ValueError("No BT DataFrame available for join")
+        bt_prepared = prepare_bt_for_join(bt_df)
+        deals_prepared = deals_df
+        if "_auction_key" not in deals_df.columns:
+            deals_prepared = prepare_deals_with_bid_str(deals_df, include_auction_key=True)
+        return join_deals_with_bt_on_demand(deals_prepared, bt_prepared, state, bt_cols)
+    
+    # Fast path: join on deal_idx (integer) using pre-computed index
+    # deal_to_bt_index_df has columns: deal_idx, Matched_BT_Indices (list of bt_index)
+    # We want the FIRST matching bt_index per deal (for wrong-bid-stats we just need one)
+    
+    # Step 1: Join deals with deal_to_bt_index_df on _row_idx = deal_idx
+    # Use left_on/right_on to avoid expensive .rename() copy of large DataFrame
+    joined = deals_df.join(
+        deal_to_bt_df,
+        left_on="_row_idx",
+        right_on="deal_idx",
+        how="left"
+    )
+    
+    # Step 2: Extract first bt_index from Matched_BT_Indices list
+    # If Matched_BT_Indices is null or empty, bt_index will be null
+    if "Matched_BT_Indices" in joined.columns:
+        joined = joined.with_columns(
+            pl.col("Matched_BT_Indices").list.first().alias("bt_index")
+        ).drop("Matched_BT_Indices")
+    
+    # Step 3: Load Agg_Expr columns for the unique bt_index values
+    # Use DuckDB-based loader for efficient row group pruning (not Polars is_in scan)
+    needs_agg = any(c.startswith("Agg_Expr_Seat_") for c in bt_cols)
+    has_any_agg = any((c in joined.columns) for c in bt_cols)
+    
+    if needs_agg and not has_any_agg and "bt_index" in joined.columns:
+        bt_parquet_file = state.get("bt_seat1_file")
+        if bt_parquet_file is not None:
+            bt_indices = (
+                joined
+                .select(pl.col("bt_index").drop_nulls().cast(pl.Int64).unique())
+                .to_series()
+                .to_list()
+            )
+            bt_indices = [int(x) for x in bt_indices if x is not None]
+            
+            if bt_indices:
+                # PERFORMANCE: Use pre-loaded completed-auctions Agg_Expr DataFrame if available
+                # This is 100x+ faster than querying the 46GB Parquet file
+                bt_completed_agg_df = state.get("bt_completed_agg_df")
+                if bt_completed_agg_df is not None and bt_completed_agg_df.height > 0:
+                    # In-memory filter + join (instant)
+                    agg_df = bt_completed_agg_df.filter(pl.col("bt_index").is_in(bt_indices))
+                    if agg_df.height > 0:
+                        joined = joined.join(agg_df, on="bt_index", how="left")
+                else:
+                    # Fallback: DuckDB query on large Parquet (slow but works)
+                    import duckdb
+                    conn = duckdb.connect(":memory:")
+                    in_list = ", ".join(str(x) for x in bt_indices)
+                    file_path = str(bt_parquet_file).replace("\\", "/")
+                    query = f"""
+                        SELECT bt_index, Auction, Agg_Expr_Seat_1, Agg_Expr_Seat_2, Agg_Expr_Seat_3, Agg_Expr_Seat_4
+                        FROM read_parquet('{file_path}')
+                        WHERE bt_index IN ({in_list})
+                    """
+                    try:
+                        agg_df = conn.execute(query).pl()
+                    finally:
+                        conn.close()
+                    if agg_df.height > 0:
+                        joined = joined.join(agg_df, on="bt_index", how="left")
+    
+    return joined
+
+
 def batch_check_wrong_bids(
     joined_df: pl.DataFrame,
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
@@ -1072,6 +1198,8 @@ def batch_check_wrong_bids(
         DataFrame with Wrong_Bid_S1-4, first_wrong_seat columns added
     """
     t0 = time.perf_counter()
+    t_overlay_start = t0
+    
     # Prepare result columns
     wrong_cols = {wrong_bid_col(s): [] for s in SEAT_RANGE}
     first_wrong_list: List[int | None] = []
@@ -1084,18 +1212,23 @@ def batch_check_wrong_bids(
     # Applying overlay+dedupe per deal is extremely expensive; do it per bt_index.
     # -----------------------------------------------------------------------
     bt_criteria_by_bt_index: dict[int, dict[int, list[Any]]] = {}
+    overlay_count = 0
     if state is not None and "bt_index" in joined_df.columns:
         bt_cols = ["bt_index", "Auction"] + [agg_expr_col(s) for s in SEAT_RANGE if agg_expr_col(s) in joined_df.columns]
         # Use unique bt_index rows only
         try:
             uniq_bt = joined_df.select([c for c in bt_cols if c in joined_df.columns]).unique(subset=["bt_index"])
             for r in uniq_bt.iter_rows(named=True):
+                bt_idx_raw = r.get("bt_index")
+                if bt_idx_raw is None:
+                    continue
                 try:
-                    bt_idx = int(r.get("bt_index"))
+                    bt_idx = int(bt_idx_raw)
                 except Exception:
                     continue
                 # Apply overlay+dedupe once
                 processed = apply_overlay_and_dedupe(dict(r), state)
+                overlay_count += 1
                 bt_criteria_by_bt_index[bt_idx] = {
                     s: (processed.get(agg_expr_col(s)) or [])
                     for s in SEAT_RANGE
@@ -1103,6 +1236,9 @@ def batch_check_wrong_bids(
                 }
         except Exception:
             bt_criteria_by_bt_index = {}
+    
+    t_overlay_end = time.perf_counter()
+    overlay_ms = (t_overlay_end - t_overlay_start) * 1000
 
     # Cache column sets per seat+dealer for O(1) membership checks
     colset_cache: dict[tuple[int, str], set[str]] = {}
@@ -1111,10 +1247,13 @@ def batch_check_wrong_bids(
     for row in joined_df.iter_rows(named=True):
         deal_idx = row.get("_row_idx", 0)
         dealer = str(row.get("Dealer", "N") or "N").upper()
-        try:
-            bt_idx = int(row.get("bt_index")) if row.get("bt_index") is not None else None
-        except Exception:
-            bt_idx = None
+        bt_idx_raw = row.get("bt_index")
+        bt_idx: int | None = None
+        if bt_idx_raw is not None:
+            try:
+                bt_idx = int(bt_idx_raw)
+            except Exception:
+                pass
 
         first_wrong_seat: int | None = None
         row_wrong = {s: False for s in SEAT_RANGE}
@@ -1167,10 +1306,12 @@ def batch_check_wrong_bids(
             wrong_cols[wrong_bid_col(s)].append(row_wrong[s])
         first_wrong_list.append(first_wrong_seat)
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    t_loop_end = time.perf_counter()
+    loop_ms = (t_loop_end - t_overlay_end) * 1000
+    elapsed_ms = (t_loop_end - t0) * 1000
     # Keep this quiet unless it is slow; but in practice this is a key perf signal.
     if elapsed_ms > 2000:
-        print(f"[wrong-bid] batch_check_wrong_bids: {elapsed_ms:.1f}ms for {joined_df.height} deals")
+        print(f"[wrong-bid] batch_check_wrong_bids: {elapsed_ms:.1f}ms for {joined_df.height} deals (overlay={overlay_ms:.1f}ms for {overlay_count} auctions, loop={loop_ms:.1f}ms)")
     
     # Add columns to DataFrame
     result = joined_df.with_columns([

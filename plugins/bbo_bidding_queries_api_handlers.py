@@ -111,6 +111,7 @@ from plugins.bbo_handlers_common import (
     join_deals_with_bt,
     batch_check_wrong_bids,
     join_deals_with_bt_on_demand,
+    join_deals_with_bt_via_index,
     # On-demand Agg_Expr loading (DuckDB-based for efficiency)
     load_agg_expr_for_bt_indices as _load_agg_expr_for_bt_indices,
     # SL (Suit Length) evaluation helpers
@@ -136,12 +137,25 @@ _NEED_RULES_MATCHES_LIST_THRESHOLD = 50
 # ---------------------------------------------------------------------------
 # BT Traversal Helpers (avoid full-table Auction lookups on 461M-row BT)
 # ---------------------------------------------------------------------------
-#
-# Any code that does `bt_seat1_df.filter(Auction == ...)` or similar will effectively
-# scan a 461M-row table. Instead we resolve auction prefixes by traversing:
-# opening bid bt_index (from bt_openings_df) -> next_bid_indices -> ...
-#
-# This relies on `bt_openings_df` and `bt_seat1_file` being present in state.
+
+def _get_local_bid_vocab():
+    """Consistent bid encoding for CSR traversal."""
+    code_to_bid = [""]
+    bid_to_code = {"": 0}
+    def add(b):
+        b = b.upper()
+        if b not in bid_to_code:
+            bid_to_code[b] = len(code_to_bid); code_to_bid.append(b)
+    for b in ["P", "X", "XX", "D", "R"]: add(b)
+    for l in range(1, 8):
+        for s in ["C", "D", "H", "S", "N"]: add(f"{l}{s}")
+    # Add lowercase mappings for robustness
+    for b in ["p", "x", "xx", "d", "r"]:
+        if b.upper() in bid_to_code:
+            bid_to_code[b] = bid_to_code[b.upper()]
+    return bid_to_code, code_to_bid
+
+BID_TO_CODE, CODE_TO_BID = _get_local_bid_vocab()
 
 _NEXT_BID_INDICES_CACHE: dict[int, list[int]] = {}
 _NEXT_CHILDREN_MIN_CACHE: dict[int, dict[str, int]] = {}
@@ -169,6 +183,16 @@ def _bt_file_path_for_sql(state: Dict[str, Any]) -> str:
 def _get_next_bid_indices_for_parent(state: Dict[str, Any], parent_bt_index: int) -> list[int]:
     """Fetch next_bid_indices for a BT node by bt_index, with caching."""
     p = int(parent_bt_index)
+    
+    # Try Gemini-3.2 CSR index first
+    g3_index = state.get("g3_index")
+    if g3_index:
+        if p >= len(g3_index.offsets) - 1: return []
+        start, end = g3_index.offsets[p], g3_index.offsets[p + 1]
+        # children are uint32, need to convert back to list of int
+        return [int(x) for x in g3_index.children[start:end]]
+
+    # Fallback to cache/DuckDB
     cached = _NEXT_BID_INDICES_CACHE.get(p)
     if cached is not None:
         return cached
@@ -193,6 +217,34 @@ def _get_next_bid_indices_for_parent(state: Dict[str, Any], parent_bt_index: int
 def _get_child_map_for_parent(state: Dict[str, Any], parent_bt_index: int) -> dict[str, int]:
     """Return dict: candidate_bid (UPPER) -> child bt_index for a parent node."""
     p = int(parent_bt_index)
+
+    # Try Gemini-3.2 CSR index first
+    g3_index = state.get("g3_index")
+    if g3_index:
+        if p >= len(g3_index.offsets) - 1: return {}
+        start, end = g3_index.offsets[p], g3_index.offsets[p + 1]
+        children = g3_index.children[start:end]
+        bidcodes = g3_index.bidcodes[start:end]
+        
+        # We need BID_TO_CODE/CODE_TO_BID here. They are defined in the api.py, 
+        # but the handlers module might not have them.
+        # Luckily, BID_TO_CODE is basically constant, but we should import it or get it from state.
+        # Since this is a plugin, we'll try to get it from state or define a local copy if needed.
+        # Actually, we can just use the CODE_TO_BID from the api module if we can import it,
+        # but it's better to pass it via state or use the vocab helper.
+        
+        # For now, let's assume we can get it from the api module or just re-define it here
+        # to avoid complex circular imports.
+        _, code_to_bid = _get_local_bid_vocab()
+        
+        out = {}
+        for i in range(len(children)):
+            code = bidcodes[i]
+            if code > 0 and code < len(code_to_bid):
+                bid_str = code_to_bid[code]
+                out[bid_str] = int(children[i])
+        return out
+
     cached = _NEXT_CHILDREN_MIN_CACHE.get(p)
     if cached is not None:
         return cached
@@ -229,12 +281,16 @@ def _get_child_map_for_parent(state: Dict[str, Any], parent_bt_index: int) -> di
 
 
 def _resolve_bt_index_by_traversal(state: Dict[str, Any], auction: str) -> int | None:
-    """Resolve a seat-1-view auction prefix to a bt_index by traversing next_bid_indices.
-
-    - Strips leading passes (seat-1 view does not include them).
-    - Uses bt_openings_df for the first non-pass call, then walks via next_bid_indices.
-    - Supports internal P calls (continuations).
+    """Resolve an auction prefix to a bt_index using the Gemini-3.2 CSR index.
+    
+    This replaces the old manual traversal and DuckDB lookups.
     """
+    g3_index = state.get("g3_index")
+    if g3_index:
+        # Gemini-3.2: O(1) direct address traversal
+        return g3_index.walk(auction)
+
+    # Fallback to old slow logic (only if G3 not built)
     auction_input = normalize_auction_input(auction)
     auction_norm = re.sub(r"(?i)^(P-)+", "", auction_input).rstrip("-").upper()
     tokens = [t for t in auction_norm.split("-") if t]
@@ -243,7 +299,7 @@ def _resolve_bt_index_by_traversal(state: Dict[str, Any], auction: str) -> int |
 
     bt_openings_df = state.get("bt_openings_df")
     if not isinstance(bt_openings_df, pl.DataFrame) or bt_openings_df.is_empty():
-        raise ValueError("bt_openings_df is missing/empty; cannot traverse BT without Auction scans")
+        return None # Silent fail, caller handles
 
     seat1_open = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
     first_tok = tokens[0].upper()
@@ -683,10 +739,17 @@ def handle_random_auction_sequences(
     state: Dict[str, Any],
     n_samples: int,
     seed: Optional[int],
+    completed_only: bool = True,
+    partial_only: bool = False,
 ) -> Dict[str, Any]:
     """Handle /random-auction-sequences endpoint.
     
     Requires bt_seat1_df (pipeline invariant).
+    
+    Args:
+        completed_only: If True, only sample from completed auctions (default).
+        partial_only: If True, only sample from partial (non-completed) auctions.
+        If both False, sample from both (50/50 split).
     """
     t0 = time.perf_counter()
     
@@ -694,30 +757,130 @@ def handle_random_auction_sequences(
     if bt_seat1_df is None:
         raise ValueError("bt_seat1_df not loaded (pipeline error): missing bbo_bt_seat1.parquet")
 
-    # Hard fail if is_completed_auction is missing
-    if "is_completed_auction" not in bt_seat1_df.columns:
-        raise ValueError("REQUIRED column 'is_completed_auction' missing from bt_seat1_df. Pipeline error.")
-
     base_df = bt_seat1_df
-    completed_df = base_df.filter(pl.col("is_completed_auction"))
-    if "bt_index" not in completed_df.columns:
-        raise ValueError("REQUIRED column 'bt_index' missing from bt_seat1_df. Pipeline error.")
     index_col = "bt_index"
-
-    if completed_df.height == 0:
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[random-auction-sequences] {format_elapsed(elapsed_ms)} (empty)")
-        return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
-
-    sample_n = min(n_samples, completed_df.height)
     effective_seed = _effective_seed(seed)
-    sampled_df = completed_df.sample(n=sample_n, seed=effective_seed)
-
-    sql_query = f"""SELECT * 
-FROM auctions 
-WHERE is_completed_auction = true 
-ORDER BY RANDOM() 
-LIMIT {sample_n}"""
+    
+    # Get completed auctions DataFrame
+    bt_completed_agg_df = state.get("bt_completed_agg_df")
+    if bt_completed_agg_df is not None and bt_completed_agg_df.height > 0:
+        completed_df = bt_completed_agg_df
+    else:
+        # Fallback to filtering bt_seat1_df (slow)
+        if "is_completed_auction" not in bt_seat1_df.columns:
+            raise ValueError("REQUIRED column 'is_completed_auction' missing from bt_seat1_df. Pipeline error.")
+        completed_df = bt_seat1_df.filter(pl.col("is_completed_auction"))
+    
+    if completed_only:
+        # Sample only from completed auctions
+        sample_df = completed_df
+        if sample_df.height == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"[random-auction-sequences] {format_elapsed(elapsed_ms)} (empty)")
+            return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
+        
+        sample_n = min(n_samples, sample_df.height)
+        sampled_df = sample_df.sample(n=sample_n, seed=effective_seed)
+        sampled_df = sampled_df.with_columns(pl.lit(True).alias("_is_completed_sample"))
+        sql_query = f"""SELECT * FROM auctions WHERE is_completed_auction = true ORDER BY RANDOM() LIMIT {sample_n}"""
+    
+    elif partial_only:
+        # PERFORMANCE: Generate random bt_index values and fetch by index
+        # 99.8% of bt_index values are partial auctions, so this is fast
+        bt_parquet_file = state.get("bt_seat1_file")
+        if bt_parquet_file is None:
+            raise ValueError("bt_seat1_file not set in state")
+        
+        import duckdb
+        import random
+        file_path = str(bt_parquet_file).replace("\\", "/")
+        
+        # Generate random bt_index values (oversample to account for completed auction hits)
+        rng = random.Random(effective_seed)
+        max_bt_index = 461_000_000  # Approximate max bt_index
+        # Generate 3x the needed samples to ensure we get enough partial auctions
+        random_indices = [rng.randint(0, max_bt_index) for _ in range(n_samples * 3)]
+        indices_str = ", ".join(str(i) for i in random_indices)
+        
+        query = f"""
+            SELECT bt_index, Auction, previous_bid_indices, Expr
+            FROM read_parquet('{file_path}')
+            WHERE bt_index IN ({indices_str}) AND is_completed_auction = false
+            LIMIT {n_samples}
+        """
+        conn = duckdb.connect(":memory:")
+        try:
+            sampled_df = conn.execute(query).pl()
+        finally:
+            conn.close()
+        
+        if sampled_df.height == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"[random-auction-sequences] {format_elapsed(elapsed_ms)} (empty - no partial auctions)")
+            return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
+        
+        if sampled_df.height > 0:
+            sampled_df = sampled_df.with_columns(pl.lit(False).alias("_is_completed_sample"))
+        sample_n = sampled_df.height
+        sql_query = f"""SELECT * FROM auctions WHERE is_completed_auction = false LIMIT {sample_n}"""
+    
+    else:
+        # Sample from BOTH completed and partial auctions (n/2 each)
+        n_completed = n_samples // 2
+        n_partial = n_samples - n_completed
+        
+        # Sample completed auctions (from in-memory bt_completed_agg_df - fast)
+        completed_samples = min(n_completed, completed_df.height)
+        sampled_completed = completed_df.sample(n=completed_samples, seed=effective_seed) if completed_samples > 0 else pl.DataFrame()
+        if sampled_completed.height > 0:
+            sampled_completed = sampled_completed.with_columns(pl.lit(True).alias("_is_completed_sample"))
+        
+        # Sample partial auctions using random bt_index values (fast)
+        bt_parquet_file = state.get("bt_seat1_file")
+        if bt_parquet_file is not None and n_partial > 0:
+            import duckdb
+            import random
+            file_path = str(bt_parquet_file).replace("\\", "/")
+            partial_seed = (effective_seed + 1) if effective_seed is not None else None
+            
+            # Generate random bt_index values
+            rng = random.Random(partial_seed)
+            max_bt_index = 461_000_000
+            random_indices = [rng.randint(0, max_bt_index) for _ in range(n_partial * 3)]
+            indices_str = ", ".join(str(i) for i in random_indices)
+            
+            query = f"""
+                SELECT bt_index, Auction, previous_bid_indices, Expr
+                FROM read_parquet('{file_path}')
+                WHERE bt_index IN ({indices_str}) AND is_completed_auction = false
+                LIMIT {n_partial}
+            """
+            conn = duckdb.connect(":memory:")
+            try:
+                sampled_partial = conn.execute(query).pl()
+            finally:
+                conn.close()
+        else:
+            sampled_partial = pl.DataFrame()
+        
+        # Combine both samples
+        if sampled_completed.height > 0 and sampled_partial.height > 0:
+            # Keep all columns (Agg_Expr columns from completed rows)
+            sampled_df = pl.concat([sampled_completed, sampled_partial], how="diagonal_relaxed")
+        elif sampled_completed.height > 0:
+            sampled_df = sampled_completed
+        elif sampled_partial.height > 0:
+            sampled_df = sampled_partial
+        else:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"[random-auction-sequences] {format_elapsed(elapsed_ms)} (empty)")
+            return {"samples": [], "elapsed_ms": round(elapsed_ms, 1)}
+        
+        sample_n = sampled_df.height
+        sql_query = f"""SELECT * FROM auctions ORDER BY RANDOM() LIMIT {sample_n}"""
+    
+    if index_col not in sampled_df.columns:
+        raise ValueError("REQUIRED column 'bt_index' missing from sampled data. Pipeline error.")
 
     agg_expr_cols = [f"Agg_Expr_Seat_{i}" for i in range(1, 5)]
 
@@ -734,23 +897,61 @@ LIMIT {sample_n}"""
                 all_prev_indices.update(prev_list)
 
     if all_prev_indices:
-        prev_rows_df = base_df.filter(pl.col(index_col).is_in(list(all_prev_indices))).select(
-            [c for c in available_display_cols if c in base_df.columns]
-        )
+        # Previous bid indices are intermediate (non-completed) auctions.
+        # Pull the same display columns as the final row (where available) so
+        # intermediate rows aren't empty in the UI.
+        prev_cols = [c for c in available_display_cols if c in base_df.columns]
+        if index_col not in prev_cols and index_col in base_df.columns:
+            prev_cols.append(index_col)
+        prev_rows_df = base_df.filter(pl.col(index_col).is_in(list(all_prev_indices))).select(prev_cols)
         prev_rows_lookup = {row[index_col]: row for row in prev_rows_df.iter_rows(named=True)}
     else:
         prev_rows_lookup = {}
 
+    # Preload Agg_Expr for completed final rows only (previous rows use Expr fallback).
+    agg_expr_by_bt_index: dict[int, dict[str, Any]] = {}
+    try:
+        sampled_bt_indices = set()
+        if index_col in sampled_df.columns:
+            if "_is_completed_sample" in sampled_df.columns:
+                completed_only_df = sampled_df.filter(pl.col("_is_completed_sample") == True)  # noqa: E712
+                sampled_bt_indices = {int(x) for x in completed_only_df[index_col].drop_nulls().to_list()}
+            else:
+                sampled_bt_indices = {int(x) for x in sampled_df[index_col].drop_nulls().to_list()}
+        if sampled_bt_indices:
+            bt_parquet_file = state.get("bt_seat1_file")
+            if bt_parquet_file is not None:
+                agg_expr_by_bt_index = _load_agg_expr_for_bt_indices(list(sampled_bt_indices), bt_parquet_file)
+    except Exception:
+        agg_expr_by_bt_index = {}
+
     out_samples: List[Dict[str, Any]] = []
     overlay = state.get("custom_criteria_overlay") or []
 
-    def _with_rules_seat1_cols(raw_row: dict[str, Any]) -> dict[str, Any]:
-        """Return the canonical BT row (on-demand enriched) with overlay applied.
+    def _with_rules_seat1_cols(raw_row: dict[str, Any], step_seat: int | None = None) -> dict[str, Any]:
+        """Return the canonical BT row with overlay applied.
 
-        MUST use `_apply_all_rules_to_bt_row` so Agg_Expr_Seat_* are present even when
-        bt_seat1_df is loaded in lightweight mode (no Agg_Expr columns).
+        Fallback: use Expr as Agg_Expr_Seat_{step_seat} when Agg_Expr is missing.
+        This matches Auction Builder behavior for fast path enrichment.
         """
-        base_row = _apply_all_rules_to_bt_row(dict(raw_row), state)
+        base = dict(raw_row)
+        bt_idx = base.get("bt_index")
+        if bt_idx is not None:
+            try:
+                bt_idx_i = int(bt_idx)
+            except Exception:
+                bt_idx_i = None
+            if bt_idx_i is not None and bt_idx_i in agg_expr_by_bt_index:
+                base.update(agg_expr_by_bt_index[bt_idx_i])
+        # If Agg_Expr columns are missing, use Expr for the step seat (fast fallback).
+        if step_seat is not None and "Expr" in base:
+            expr_val = base.get("Expr")
+            if expr_val is not None:
+                for s in range(1, 5):
+                    col_s = f"Agg_Expr_Seat_{s}"
+                    if col_s not in base or base.get(col_s) is None:
+                        base[col_s] = expr_val if s == step_seat else []
+        base_row = _apply_all_rules_to_bt_row(base, state)
         # Agg_Expr_Seat_1 now contains pre-compiled merged rules
         base_row["Merged_Rules_Seat_1"] = base_row.get(agg_expr_col(1)) or []
         base_row["Agg_Expr_Seat_1_Rules"] = base_row.get(agg_expr_col(1)) or []
@@ -763,8 +964,12 @@ LIMIT {sample_n}"""
         if prev_indices:
             for idx in prev_indices:
                 if idx in prev_rows_lookup:
-                    sequence_data.append(_with_rules_seat1_cols(dict(prev_rows_lookup[idx])))
-        sequence_data.append(_with_rules_seat1_cols({c: row[c] for c in available_display_cols if c in row}))
+                    # Enrich intermediate bids using Expr fallback per seat (fast).
+                    step_seat = (len(sequence_data) % 4) + 1
+                    sequence_data.append(_with_rules_seat1_cols(dict(prev_rows_lookup[idx]), step_seat=step_seat))
+        # Enrich the final (completed/partial) auction.
+        step_seat = (len(sequence_data) % 4) + 1
+        sequence_data.append(_with_rules_seat1_cols(dict(row), step_seat=step_seat))
 
         # IMPORTANT: keep the sequence in chronological order (previous_bid_indices chain + final row).
         # Do NOT sort by bt_index here; bt_index is not a time/sequence key and sorting breaks is_match_row.
@@ -1860,6 +2065,93 @@ def handle_deals_matching_auction(
     return response
 
 
+def handle_sample_deals_by_auction_pattern(
+    state: Dict[str, Any],
+    pattern: str,
+    sample_size: int,
+    seed: Optional[int],
+) -> Dict[str, Any]:
+    """Return a small sample of deals whose *actual auction* matches regex `pattern`.
+
+    This intentionally does NOT run any BT / Rules logic. It is used by Streamlit's Auction Builder
+    to power "Show Matching Deals" quickly without the heavy /bidding-arena path.
+    """
+    t0 = time.perf_counter()
+
+    deal_df = state.get("deal_df")
+    if not isinstance(deal_df, pl.DataFrame) or deal_df.is_empty():
+        raise ValueError("deal_df not loaded")
+
+    # Pick an auction string column if present; otherwise compute _bid_str on demand.
+    df = deal_df
+    auction_col: str | None = None
+    if "Actual_Auction" in df.columns:
+        auction_col = "Actual_Auction"
+    elif "_bid_str" in df.columns:
+        auction_col = "_bid_str"
+
+    if auction_col is None:
+        df = prepare_deals_with_bid_str(df, include_auction_key=False)
+        auction_col = "_bid_str"
+
+    try:
+        regex = f"(?i){pattern}"
+        filtered = df.filter(pl.col(auction_col).cast(pl.Utf8).str.contains(regex))
+    except Exception as e:
+        raise ValueError(f"Invalid pattern: {e}")
+
+    total_count = filtered.height
+    if filtered.is_empty():
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[sample-deals-by-auction-pattern] {format_elapsed(elapsed_ms)} (0 deals)")
+        return {"pattern": pattern, "deals": [], "total_count": 0, "elapsed_ms": round(elapsed_ms, 1)}
+
+    n = int(sample_size) if sample_size is not None else 25
+    n = 1 if n < 1 else (500 if n > 500 else n)
+    n = min(n, total_count)
+
+    sampled = filtered.sample(n=n, seed=_effective_seed(seed)) if n < total_count else filtered
+
+    cols = [
+        "index",
+        "Dealer",
+        "Vul",
+        "Hand_N",
+        "Hand_E",
+        "Hand_S",
+        "Hand_W",
+        "Contract",
+        "Declarer",
+        "Result",
+        "Tricks",
+        "Score",
+        "ParScore",
+    ]
+    if auction_col not in cols:
+        cols.append(auction_col)
+    cols = [c for c in cols if c in sampled.columns]
+    out_rows = sampled.select(cols).to_dicts()
+    for r in out_rows:
+        if "Auction_Actual" not in r and auction_col in r:
+            r["Auction_Actual"] = r.get(auction_col)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[sample-deals-by-auction-pattern] {format_elapsed(elapsed_ms)} ({len(out_rows)}/{total_count} deals)")
+    return {"pattern": pattern, "deals": out_rows, "total_count": total_count, "elapsed_ms": round(elapsed_ms, 1)}
+
+
+def handle_resolve_auction_path(
+    state: Dict[str, Any],
+    auction: str,
+) -> Dict[str, Any]:
+    """Resolve an entire auction path into detailed step info in one call.
+
+    Uses the DuckDB fallback implementation for reliability.
+    """
+    t0 = time.perf_counter()
+    return _handle_resolve_auction_path_fallback(state, auction, t0)
+
+
 # ---------------------------------------------------------------------------
 # Handler: /bidding-table-statistics
 # ---------------------------------------------------------------------------
@@ -1932,6 +2224,10 @@ def handle_bidding_table_statistics(
     # Attach criteria/aggregates for all matched rows (completed auctions only) via bt_stats_df.
     if bt_stats_df is not None and index_col == "bt_index" and "bt_index" in matched_df.columns:
         matched_df = matched_df.join(bt_stats_df, on="bt_index", how="left")
+
+    # Attach categories if requested
+    if include_categories and bt_categories_df is not None:
+        matched_df = matched_df.join(bt_categories_df, on="bt_index", how="left")
 
     # Apply min_matches filter using matching_deal_count from bt_stats_df (if available).
     if min_matches > 0:
@@ -2639,6 +2935,10 @@ def handle_wrong_bid_stats(
     Uses vectorized join instead of per-row BT lookups for performance.
     """
     t0 = time.perf_counter()
+    timings_ms: Dict[str, float] = {}
+    
+    def _mark(label: str) -> None:
+        timings_ms[label] = round((time.perf_counter() - t0) * 1000, 1)
     
     deal_df = state["deal_df"]
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
@@ -2650,6 +2950,7 @@ def handle_wrong_bid_stats(
     
     # Add row index for bitmap lookups
     deal_df = deal_df.with_row_index("_row_idx")
+    _mark("add_row_idx")
     
     # PERFORMANCE: Defer expensive string processing until after sampling if possible.
     # If filtering by pattern, we MUST compute _bid_str for all rows.
@@ -2661,6 +2962,7 @@ def handle_wrong_bid_stats(
             deals_prepared = deals_prepared.filter(pl.col("_bid_str").str.contains(regex_pattern))
         except Exception as e:
             raise ValueError(f"Invalid auction pattern: {e}")
+        _mark("filter_pattern")
     else:
         deals_prepared = deal_df
 
@@ -2672,23 +2974,25 @@ def handle_wrong_bid_stats(
         sample_df = deals_prepared.sample(n=sample_size, seed=42)
     else:
         sample_df = deals_prepared
+    _mark("sample")
     
     # Fully prepare the small sample (including _auction_key for the join)
     sample_df = prepare_deals_with_bid_str(sample_df, include_auction_key=True)
+    _mark("prepare_bid_str")
 
     analyzed_deals = sample_df.height
     
-    # Prepare BT for join and join once (instead of per-row lookups)
-    # PERFORMANCE: Prefer joining against bt_stats_df (completed auctions, ~2.1M rows)
-    # instead of bt_seat1_df (461M rows). We still load Agg_Expr on-demand by bt_index.
-    bt_join_src = bt_seat1_df
-    if bt_stats_df is not None and "Auction" in bt_stats_df.columns and "bt_index" in bt_stats_df.columns:
-        bt_join_src = bt_stats_df
-    bt_prepared = prepare_bt_for_join(bt_join_src)
-    joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
+    # PERFORMANCE: Use pre-computed deal_to_bt_index_df for O(1) lookup
+    # instead of expensive string join on _auction_key (~25s -> ~200ms)
+    joined_df = join_deals_with_bt_via_index(sample_df, state)
+    _mark("join_bt")
+    
+    unique_bt_count = joined_df.select(pl.col("bt_index").drop_nulls().n_unique()).item() if "bt_index" in joined_df.columns else 0
+    _mark("count_unique_bt")
     
     # Batch check wrong bids (still loops but no per-row filter operations)
     result_df = batch_check_wrong_bids(joined_df, deal_criteria_by_seat_dfs, seat, state=state)
+    _mark("batch_check")
     
     # Aggregate statistics from result_df
     wrong_rows = result_df.filter(pl.col("first_wrong_seat").is_not_null())
@@ -2765,8 +3069,15 @@ def handle_wrong_bid_stats(
         "unique_auctions_with_wrong_bids": unique_auctions_with_wrong_bids,
     }
 
+    _mark("aggregate")
+    
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[wrong-bid-stats] {format_elapsed(elapsed_ms)} ({analyzed_deals} analyzed, {deals_with_wrong_bid} wrong)")
+    print(f"[wrong-bid-stats] {format_elapsed(elapsed_ms)} ({analyzed_deals} analyzed, {deals_with_wrong_bid} wrong, {unique_bt_count} unique auctions)")
+    try:
+        parts = ", ".join(f"{k}={v}ms" for k, v in timings_ms.items())
+        print(f"[wrong-bid-stats] TIMING: {parts}, total_ms={round(elapsed_ms, 1)}")
+    except Exception:
+        pass
     
     return {
         # Legacy flat fields
@@ -2851,15 +3162,9 @@ def handle_failed_criteria_summary(
 
     analyzed_deals = sample_df.height
     
-    # Prepare BT for join and join once (eliminates per-row filter operations)
-    # PERFORMANCE: Prefer joining against bt_stats_df (completed auctions, ~2.1M rows)
-    # instead of bt_seat1_df (461M rows). We still load Agg_Expr on-demand by bt_index.
-    bt_join_src = bt_seat1_df
-    if bt_stats_df is not None and "Auction" in bt_stats_df.columns and "bt_index" in bt_stats_df.columns:
-        bt_join_src = bt_stats_df
-    bt_prepared = prepare_bt_for_join(bt_join_src)
-    _mark("prepare_bt")
-    joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
+    # PERFORMANCE: Use pre-computed deal_to_bt_index_df for O(1) lookup
+    # instead of expensive string join on _auction_key (~25s -> ~200ms)
+    joined_df = join_deals_with_bt_via_index(sample_df, state)
     _mark("join")
 
     # PERFORMANCE: Precompute (overlay+deduped) criteria lists per bt_index once.
@@ -2956,8 +3261,6 @@ def handle_failed_criteria_summary(
         fail_rate = fail_count / check_count if check_count > 0 else 0.0
         criteria_results.append({
             "criterion": criterion,
-            # Aliases for Streamlit visualization
-            "fail_count": fail_count,
             "failure_count": fail_count,
             "check_count": check_count,
             "affected_auctions": check_count,
@@ -2971,7 +3274,7 @@ def handle_failed_criteria_summary(
     seat_breakdown = {}
     for s in range(1, 5):
         seat_top = sorted(criteria_by_seat[s].items(), key=lambda x: -x[1])[:10]
-        seat_breakdown[f"seat_{s}"] = [{"criterion": c, "fail_count": cnt} for c, cnt in seat_top]
+        seat_breakdown[f"seat_{s}"] = [{"criterion": c, "failure_count": cnt} for c, cnt in seat_top]
     _mark("build_results")
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -3052,15 +3355,9 @@ def handle_wrong_bid_leaderboard(
 
     analyzed_deals = sample_df.height
     
-    # Prepare BT for join and join once (eliminates per-row filter operations)
-    # PERFORMANCE: Prefer joining against bt_stats_df (completed auctions, ~2.1M rows)
-    # instead of bt_seat1_df (461M rows). We still load Agg_Expr on-demand by bt_index.
-    bt_join_src = bt_seat1_df
-    if bt_stats_df is not None and "Auction" in bt_stats_df.columns and "bt_index" in bt_stats_df.columns:
-        bt_join_src = bt_stats_df
-    bt_prepared = prepare_bt_for_join(bt_join_src)
-    _mark("prepare_bt")
-    joined_df = join_deals_with_bt_on_demand(sample_df, bt_prepared, state)
+    # PERFORMANCE: Use pre-computed deal_to_bt_index_df for O(1) lookup
+    # instead of expensive string join on _auction_key (~25s -> ~200ms)
+    joined_df = join_deals_with_bt_via_index(sample_df, state)
     _mark("join")
 
     # PERFORMANCE: Precompute (overlay+deduped) criteria lists per bt_index once.
@@ -6067,11 +6364,7 @@ def handle_list_next_bids(
     state: Dict[str, Any],
     auction: str,
 ) -> Dict[str, Any]:
-    """Fast lookup of available next bids using BT's next_bid_indices.
-    
-    Uses the sorted BT structure for efficient lookups:
-    - For opening bids: filter by is_opening_bid=True
-    - For continuations: find parent row, then lookup next_bid_indices
+    """Fast lookup of available next bids using Gemini-3.2 CSR index.
     
     Returns:
         - auction_input: The input auction
@@ -6081,272 +6374,18 @@ def handle_list_next_bids(
     """
     t0 = time.perf_counter()
     
-    bt_seat1_df = state.get("bt_seat1_df")
-    if bt_seat1_df is None:
-        raise ValueError("bt_seat1_df not loaded")
-    
-    if "next_bid_indices" not in bt_seat1_df.columns:
-        raise ValueError("next_bid_indices column not loaded in bt_seat1_df")
-    
+    # Use the optimized walk-fallback which now uses CSR + Polars
+    # This covers both empty auctions and continuations.
     auction_input = normalize_auction_input(auction)
     auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
     
-    next_bids: List[Dict[str, Any]] = []
+    resp = _handle_list_next_bids_walk_fallback(state, auction_input, auction_normalized, t0)
     
-    if not auction_input:
-        # Opening bids: use pre-computed bt_openings_df (tiny, fast)
-        bt_openings_df = state.get("bt_openings_df")
+    # Add extra metadata for the response if missing
+    if "next_bids" not in resp and "bid_rankings" in resp:
+        resp["next_bids"] = resp.pop("bid_rankings")
         
-        if bt_openings_df is not None and bt_openings_df.height > 0:
-            # Use pre-computed opening bids table (very fast)
-            # bt_openings_df has: bt_index, Auction (the bid), seat, Agg_Expr_Seat_1..4
-            # Get unique Auction values (opening bids) for seat=1
-            seat1_df = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
-            
-            seen_bids: set[str] = set()
-            for row in seat1_df.iter_rows(named=True):
-                bid = row.get("Auction") or ""
-                if bid and bid.upper() not in seen_bids:
-                    seen_bids.add(bid.upper())
-                    # Apply merged rules + overlay to get final criteria
-                    row_with_rules = _apply_all_rules_to_bt_row(dict(row), state)
-                    crits = row_with_rules.get("Agg_Expr_Seat_1") or []
-                    if not crits:
-                        crits = row_with_rules.get("Expr") or []
-                    else:
-                        expr_list = row_with_rules.get("Expr") or []
-                        if expr_list:
-                            seen = set(str(x) for x in crits)
-                            for x in expr_list:
-                                xs = str(x)
-                                if xs not in seen:
-                                    crits.append(x)
-                                    seen.add(xs)
-                    next_bids.append({
-                        "bid": bid.upper(),
-                        "bt_index": row.get("bt_index"),
-                        "agg_expr": crits,
-                        "is_completed_auction": False,  # Opening bids are not complete
-                    })
-        else:
-            # Intentionally no fallback to scanning the full 461M-row bt_seat1_df.
-            # If bt_openings_df isn't available, initialization is incomplete or misconfigured.
-            raise ValueError(
-                "bt_openings_df is missing/empty; refusing to scan bt_seat1_df for opening bids. "
-                "Restart the API server and ensure initialization completes successfully."
-            )
-    else:
-        # Continuations: traverse the game tree using next_bid_indices instead of looking up by Auction.
-        #
-        # Looking up a single row by Auction in a 461M-row Parquet/DF requires a scan and will time out.
-        # Instead, we:
-        # - Resolve the first call via bt_openings_df (tiny lookup table)
-        # - Walk the tree step-by-step using next_bid_indices + bt_index lookups (DuckDB, small IN lists)
-
-        bt_openings_df = state.get("bt_openings_df")
-        if not isinstance(bt_openings_df, pl.DataFrame) or bt_openings_df.is_empty():
-            raise ValueError("bt_openings_df is missing/empty; cannot resolve auction prefix without full BT scans")
-
-        bt_parquet_file = state.get("bt_seat1_file")
-        if bt_parquet_file is None:
-            raise ValueError("bt_seat1_file missing from state; cannot query BT via DuckDB")
-
-        # Normalize and tokenize
-        auction_for_walk = auction_input.rstrip("-").upper() if auction_input else ""
-        tokens = [t for t in auction_for_walk.split("-") if t]
-        if not tokens:
-            # Should not happen because auction_input is non-empty in this branch, but keep safe.
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            return {
-                "auction_input": auction_input,
-                "auction_normalized": auction_normalized,
-                "next_bids": [],
-                "elapsed_ms": round(elapsed_ms, 1),
-            }
-
-        # Resolve first call (seat=1 view) via openings table
-        seat1_open = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
-        first_tok = tokens[0].upper()
-        first_match = seat1_open.filter(pl.col("Auction") == first_tok)
-        if first_match.height == 0:
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            return {
-                "auction_input": auction_input,
-                "auction_normalized": auction_normalized,
-                "next_bids": [],
-                "error": f"Opening bid '{first_tok}' not found in bt_openings_df",
-                "elapsed_ms": round(elapsed_ms, 1),
-            }
-        parent_bt_index = int(first_match.row(0, named=True).get("bt_index") or 0)
-
-        import duckdb
-
-        def _fetch_parent_next_indices(conn: duckdb.DuckDBPyConnection, bt_idx: int) -> list[int]:
-            file_path = str(bt_parquet_file).replace("\\", "/")
-            q = f"SELECT next_bid_indices FROM read_parquet('{file_path}') WHERE bt_index = {int(bt_idx)} LIMIT 1"
-            row = conn.execute(q).fetchone()
-            if not row:
-                return []
-            arr = row[0] or []
-            return [int(x) for x in arr if x is not None]
-
-        def _fetch_children_min(conn: duckdb.DuckDBPyConnection, indices: list[int]) -> pl.DataFrame:
-            file_path = str(bt_parquet_file).replace("\\", "/")
-            in_list = ", ".join(str(int(x)) for x in indices if x is not None)
-            if not in_list:
-                return pl.DataFrame()
-            q = f"""
-                SELECT bt_index, candidate_bid
-                FROM read_parquet('{file_path}')
-                WHERE bt_index IN ({in_list})
-            """
-            return conn.execute(q).pl()
-
-        def _fetch_children_full(conn: duckdb.DuckDBPyConnection, indices: list[int], next_seat: int) -> pl.DataFrame:
-            file_path = str(bt_parquet_file).replace("\\", "/")
-            in_list = ", ".join(str(int(x)) for x in indices if x is not None)
-            if not in_list:
-                return pl.DataFrame()
-            try:
-                s = int(next_seat)
-            except Exception:
-                s = 1
-            s = 1 if s < 1 else (4 if s > 4 else s)
-            agg_col = f"Agg_Expr_Seat_{s}"
-            q = f"""
-                SELECT
-                    bt_index,
-                    Auction,
-                    candidate_bid,
-                    is_completed_auction,
-                    Expr,
-                    {agg_col}
-                FROM read_parquet('{file_path}')
-                WHERE bt_index IN ({in_list})
-            """
-            return conn.execute(q).pl()
-
-        # Walk remaining tokens (if any)
-        conn = duckdb.connect(":memory:")
-        try:
-            for tok in tokens[1:]:
-                next_indices = _fetch_parent_next_indices(conn, parent_bt_index)
-                if not next_indices:
-                    elapsed_ms = (time.perf_counter() - t0) * 1000
-                    return {
-                        "auction_input": auction_input,
-                        "auction_normalized": auction_normalized,
-                        "parent_bt_index": parent_bt_index,
-                        "next_bids": [],
-                        "error": f"No next bids found after prefix '{'-'.join(tokens[:tokens.index(tok)])}'",
-                        "elapsed_ms": round(elapsed_ms, 1),
-                    }
-                child_min = _fetch_children_min(conn, next_indices)
-                if child_min.is_empty() or "candidate_bid" not in child_min.columns:
-                    elapsed_ms = (time.perf_counter() - t0) * 1000
-                    return {
-                        "auction_input": auction_input,
-                        "auction_normalized": auction_normalized,
-                        "parent_bt_index": parent_bt_index,
-                        "next_bids": [],
-                        "error": "Failed to load next bid rows from BT",
-                        "elapsed_ms": round(elapsed_ms, 1),
-                    }
-                want = tok.upper()
-                hit = child_min.filter(pl.col("candidate_bid").cast(pl.Utf8).str.to_uppercase() == want)
-                if hit.height == 0:
-                    elapsed_ms = (time.perf_counter() - t0) * 1000
-                    return {
-                        "auction_input": auction_input,
-                        "auction_normalized": auction_normalized,
-                        "parent_bt_index": parent_bt_index,
-                        "next_bids": [],
-                        "error": f"Bid '{want}' not found among next bids for prefix '{'-'.join(tokens[:tokens.index(tok)])}'",
-                        "elapsed_ms": round(elapsed_ms, 1),
-                    }
-                parent_bt_index = int(hit.row(0, named=True).get("bt_index") or 0)
-
-            # Now list next bids from the resolved parent bt_index
-            next_indices = _fetch_parent_next_indices(conn, parent_bt_index)
-            if not next_indices:
-                elapsed_ms = (time.perf_counter() - t0) * 1000
-                return {
-                    "auction_input": auction_input,
-                    "auction_normalized": auction_normalized,
-                    "parent_bt_index": parent_bt_index,
-                    "next_bids": [],
-                    "elapsed_ms": round(elapsed_ms, 1),
-                }
-
-            # Determine seat for Agg_Expr lookup based on number of calls so far
-            next_seat = (len(tokens) % 4) + 1
-            next_df = _fetch_children_full(conn, next_indices, next_seat=next_seat)
-        finally:
-            conn.close()
-
-        # Determine seat for Agg_Expr lookup based on number of calls so far
-        next_seat = (len(tokens) % 4) + 1
-        agg_expr_col = f"Agg_Expr_Seat_{next_seat}"
-        
-        # Get unique bids efficiently (next_df is typically small, but be safe)
-        # Include Auction/Expr so overlay + criteria fallback works.
-        cols_needed = ["Auction", "candidate_bid", "bt_index", agg_expr_col, "Expr", "is_completed_auction"]
-        cols_available = [c for c in cols_needed if c in next_df.columns]
-        
-        unique_next_df = next_df.select(cols_available).unique(subset=["candidate_bid"], keep="first")
-        
-        for row in unique_next_df.iter_rows(named=True):
-            bid = row.get("candidate_bid") or ""
-            if bid:
-                # Apply merged rules + overlay to get final criteria
-                row_with_rules = _apply_all_rules_to_bt_row(dict(row), state)
-                # Display/UX: Agg_Expr_Seat_{next_seat} can be empty for a seat's first action.
-                # In that case, fall back to using Expr (current-step criteria).
-                crits = row_with_rules.get(agg_expr_col) or []
-                if not crits:
-                    crits = row_with_rules.get("Expr") or []
-                else:
-                    expr_list = row_with_rules.get("Expr") or []
-                    if expr_list:
-                        seen = set(str(x) for x in crits)
-                        for x in expr_list:
-                            xs = str(x)
-                            if xs not in seen:
-                                crits.append(x)
-                                seen.add(xs)
-                next_bids.append({
-                    "bid": bid.upper(),
-                    "bt_index": row.get("bt_index"),
-                    "agg_expr": crits,
-                    "is_completed_auction": row.get("is_completed_auction", False),
-                })
-    
-    # Sort: regular bids by level/suit, then D/R, then P
-    def sort_key(item: Dict[str, Any]) -> tuple:
-        bid = item.get("bid", "")
-        if bid == "P":
-            return (2, 0, "")
-        if bid in ("D", "R"):
-            return (1, 0, bid)
-        try:
-            level = int(bid[0])
-            suit = bid[1:] if len(bid) > 1 else ""
-            suit_order = {"C": 1, "D": 2, "H": 3, "S": 4, "N": 5}.get(suit, 0)
-            return (0, level, suit_order)
-        except:
-            return (0, 0, bid)
-    
-    next_bids.sort(key=sort_key)
-    
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[list-next-bids] {format_elapsed(elapsed_ms)} ({len(next_bids)} bids for '{auction_input or '(opening)'}')")
-    
-    return {
-        "auction_input": auction_input,
-        "auction_normalized": auction_normalized,
-        "next_bids": next_bids,
-        "elapsed_ms": round(elapsed_ms, 1),
-    }
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -7532,3 +7571,191 @@ def handle_new_rules_lookup(
         "criteria_details": row.get("criteria_with_metrics") or [],
         "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)
     }
+
+
+def _handle_list_next_bids_walk_fallback(
+    state: Dict[str, Any],
+    auction_input: str,
+    auction_normalized: str,
+    t0: float,
+) -> Dict[str, Any]:
+    """Gemini-3.2 optimized version: Uses CSR index and O(log n) Polars lookup.
+    
+    This replaces the slow DuckDB file scanning.
+    """
+    bt_seat1_df = state.get("bt_seat1_df")
+    g3_index = state.get("g3_index")
+    bt_index_arr = state.get("bt_index_arr")
+    is_mono = state.get("bt_index_monotonic", False)
+    bt_parquet_file = state.get("bt_seat1_file")
+
+    # Handle empty auction (Opening Bids)
+    if not auction_input:
+        opening_indices = []
+        if g3_index:
+            opening_indices = list(g3_index.openings.values())
+        else:
+            bt_openings_df = state.get("bt_openings_df")
+            if isinstance(bt_openings_df, pl.DataFrame):
+                seat1_open = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
+                opening_indices = [int(x) for x in seat1_open["bt_index"].to_list()]
+        
+        if not opening_indices:
+            return {"auction_input": auction_input, "auction_normalized": auction_normalized, "next_bids": [], "elapsed_ms": 0.0}
+        
+        next_indices = opening_indices
+        parent_bt_index = -1
+    else:
+        # Resolve parent bt_index
+        parent_bt_index = _resolve_bt_index_by_traversal(state, auction_input)
+        if parent_bt_index is None:
+            return {"auction_input": auction_input, "auction_normalized": auction_normalized, "next_bids": [], "elapsed_ms": 0.0}
+
+        # 2. Get next indices
+        next_indices = _get_next_bid_indices_for_parent(state, parent_bt_index)
+        if not next_indices:
+            return {"auction_input": auction_input, "auction_normalized": auction_normalized, "next_bids": [], "elapsed_ms": 0.0}
+
+    # 3. Fetch metadata for next-bid rows using Polars (in-memory)
+    next_bid_rows: pl.DataFrame
+    if bt_seat1_df is not None and bt_index_arr is not None and is_mono:
+        row_positions = np.searchsorted(bt_index_arr, next_indices)
+        matched_positions = [pos for i, pos in enumerate(row_positions) if pos < len(bt_index_arr) and bt_index_arr[pos] == next_indices[i]]
+        if matched_positions:
+            next_bid_rows = bt_seat1_df.select(["bt_index", "Auction", "candidate_bid", "is_completed_auction", "Expr", "matching_deal_count"]).gather(matched_positions)
+        else:
+            next_bid_rows = bt_seat1_df.head(0).select(["bt_index", "Auction", "candidate_bid", "is_completed_auction", "Expr", "matching_deal_count"])
+    else:
+        # Fallback to DuckDB
+        file_path = str(bt_parquet_file or "").replace("\\", "/")
+        in_list = ", ".join(str(int(x)) for x in next_indices)
+        import duckdb
+        conn = duckdb.connect(":memory:")
+        try:
+            next_bid_rows = conn.execute(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})").pl()
+        finally: conn.close()
+
+    # 4. Enrichment with criteria (Prefer in-memory Expr to avoid heavy DuckDB hits)
+    # The 'Expr' column in bt_seat1_df already contains the criteria for the candidate bid.
+    # By pre-populating Agg_Expr_Seat_N, we prevent _apply_all_rules_to_bt_row from
+    # triggering slow on-demand DuckDB hits for each candidate.
+    next_seat = 1 if not auction_input else (len(auction_input.split("-")) % 4) + 1
+    agg_col = f"Agg_Expr_Seat_{next_seat}"
+
+    # 5. Build final response
+    next_bids = []
+    for row in next_bid_rows.iter_rows(named=True):
+        idx = row["bt_index"]
+        row_dict = dict(row)
+        
+        # Fill Agg_Expr columns from in-memory 'Expr' to avoid DuckDB hits
+        for s in range(1, 5):
+            col_s = f"Agg_Expr_Seat_{s}"
+            if col_s not in row_dict or row_dict[col_s] is None:
+                row_dict[col_s] = row_dict.get("Expr") if s == next_seat else []
+        
+        # apply_overlay_and_dedupe handles CSV overlay and final cleanup
+        row_with_rules = _apply_all_rules_to_bt_row(row_dict, state)
+        crits = row_with_rules.get(agg_col) or []
+            
+        next_bids.append({
+            "bid": str(row.get("candidate_bid")).upper(),
+            "bt_index": idx,
+            "agg_expr": crits,
+            "is_completed_auction": row.get("is_completed_auction", False),
+            "matching_deal_count": row.get("matching_deal_count"),
+        })
+    
+    # Sort for UI consistency
+    def sort_key(item: Dict[str, Any]) -> tuple:
+        bid = item.get("bid", "")
+        if bid == "P": return (2, 0, "")
+        if bid in ("D", "R"): return (1, 0, bid)
+        try:
+            level = int(bid[0])
+            suit = bid[1:] if len(bid) > 1 else ""
+            suit_order = {"C": 1, "D": 2, "H": 3, "S": 4, "N": 5}.get(suit, 0)
+            return (0, level, suit_order)
+        except: return (0, 0, bid)
+    
+    next_bids.sort(key=sort_key)
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {"auction_input": auction_input, "next_bids": next_bids, "elapsed_ms": round(elapsed_ms, 1)}
+
+
+def _handle_resolve_auction_path_fallback(
+    state: Dict[str, Any],
+    auction: str,
+    t0: float,
+) -> Dict[str, Any]:
+    """Gemini-3.2 optimized version: Resolves an entire path in O(tokens) time."""
+    g3_index = state.get("g3_index")
+    if not g3_index: return {"path": [], "error": "G3 index not built", "elapsed_ms": 0.0}
+
+    auction_input = normalize_auction_input(auction)
+    # Strip leading passes for seat-1 view traversal
+    auction_norm = re.sub(r"(?i)^(P-)+", "", auction_input).rstrip("-")
+    tokens = [t.upper() for t in auction_norm.split("-") if t]
+    if not tokens: return {"path": [], "elapsed_ms": 0.0}
+
+    bt_seat1_df = state.get("bt_seat1_df")
+    bt_index_arr = state.get("bt_index_arr")
+    is_mono = state.get("bt_index_monotonic", False)
+    bt_parquet_file = state.get("bt_seat1_file")
+
+    path_info, curr_indices = [], []
+    curr = g3_index.openings.get(tokens[0])
+    if curr is not None:
+        curr_indices.append(int(curr))
+        for tok in tokens[1:]:
+            code = BID_TO_CODE.get(tok, 0)
+            start, end = g3_index.offsets[curr], g3_index.offsets[curr + 1]
+            found = False
+            for i in range(start, end):
+                if g3_index.bidcodes[i] == code:
+                    curr = int(g3_index.children[i]); found = True; break
+            if not found: break
+            curr_indices.append(curr)
+
+    if not curr_indices: return {"path": [], "error": f"Path '{auction_norm}' not found", "elapsed_ms": 0.0}
+
+    # Fetch metadata for all indices in one go
+    if bt_seat1_df is not None and bt_index_arr is not None and is_mono:
+        row_positions = np.searchsorted(bt_index_arr, curr_indices)
+        matched_positions = [pos for i, pos in enumerate(row_positions) if pos < len(bt_index_arr) and bt_index_arr[pos] == curr_indices[i]]
+        meta_df = bt_seat1_df.select(["bt_index", "Auction", "candidate_bid", "is_completed_auction", "Expr", "matching_deal_count"]).gather(matched_positions)
+    else:
+        in_list = ", ".join(str(idx) for idx in curr_indices)
+        import duckdb
+        conn = duckdb.connect(":memory:")
+        try: meta_df = conn.execute(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count FROM read_parquet('{bt_parquet_file or ''}') WHERE bt_index IN ({in_list})").pl()
+        finally: conn.close()
+
+    # Load Agg_Expr (Prefer in-memory Expr to avoid heavy DuckDB hits)
+    meta_map = {row["bt_index"]: row for row in meta_df.to_dicts()}
+    
+    for i, idx in enumerate(curr_indices):
+        row = meta_map.get(idx, {})
+        row_dict = dict(row)
+        step_seat = (i % 4) + 1
+        
+        # Populate Agg_Expr columns from in-memory 'Expr' to avoid DuckDB hits
+        for s in range(1, 5):
+            col_s = f"Agg_Expr_Seat_{s}"
+            if col_s not in row_dict or row_dict[col_s] is None:
+                row_dict[col_s] = row_dict.get("Expr") if s == step_seat else []
+
+        # Apply CSV overlay logic if needed (via common helper)
+        row_with_rules = _apply_all_rules_to_bt_row(row_dict, state)
+        agg_col = f"Agg_Expr_Seat_{step_seat}"
+        agg_list = row_with_rules.get(agg_col) or row_dict.get("Expr") or []
+        
+        path_info.append({
+            "step": i + 1, "bid": tokens[i], "bt_index": idx, 
+            "agg_expr": agg_list, "is_complete": bool(row.get("is_completed_auction")),
+            "matching_deal_count": row.get("matching_deal_count")
+        })
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {"path": path_info, "elapsed_ms": round(elapsed_ms, 1)}

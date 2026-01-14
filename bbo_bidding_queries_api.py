@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple, TypeVar
 import pathlib
@@ -53,6 +54,7 @@ def _log_memory(label: str) -> None:
 from contextlib import asynccontextmanager
 
 import polars as pl
+import numpy as np
 import duckdb  # pyright: ignore[reportMissingImports]
 import requests as http_requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -137,7 +139,12 @@ def _reload_plugins() -> dict[str, object]:
                 try:
                     if full_module_name in sys.modules:
                         print(f"  - Reloading {full_module_name}")
-                        module = importlib.reload(sys.modules[full_module_name])
+                        mod = sys.modules[full_module_name]
+                        if hasattr(mod, "__spec__") and mod.__spec__ is not None:
+                            module = importlib.reload(mod)
+                        else:
+                            # Fallback: if spec is missing, try to import again
+                            module = importlib.import_module(full_module_name)
                     else:
                         print(f"  - Importing {full_module_name}")
                         module = importlib.import_module(full_module_name)
@@ -957,9 +964,13 @@ class OpeningsByDealIndexRequest(BaseModel):
 
 
 class RandomAuctionSequencesRequest(BaseModel):
-    n_samples: int = 5
+    n_samples: int = 10
     # seed=0 means non-reproducible, any other value is reproducible
     seed: Optional[int] = 0
+    # If True, only sample from completed auctions (ended in final contract)
+    completed_only: bool = True
+    # If True, only sample from partial auctions (not completed)
+    partial_only: bool = False
 
 
 class AuctionSequencesMatchingRequest(BaseModel):
@@ -1018,6 +1029,14 @@ class BTCategoriesByIndexRequest(BaseModel):
     max_rows: int = 500  # safety cap
 
 
+class ResolveAuctionPathRequest(BaseModel):
+    """Resolve a full auction string into a path of detailed step info.
+
+    Used by Auction Builder to fetch criteria and metadata for an entire path in one call.
+    """
+    auction: str
+
+
 class DealsMatchingAuctionRequest(BaseModel):
     pattern: str
     n_auction_samples: int = 2
@@ -1030,6 +1049,18 @@ class DealsMatchingAuctionRequest(BaseModel):
     dist_direction: str = "N"  # Which hand to filter (N/E/S/W)
     # Wrong bid filter: "all" (default), "no_wrong" (only conforming bids), "only_wrong" (only non-conforming)
     wrong_bid_filter: str = "all"
+
+
+class SampleDealsByAuctionPatternRequest(BaseModel):
+    """Sample deals whose *actual auction* matches a regex pattern.
+
+    This is intentionally lightweight (no Rules matching / BT criteria work) and is used by
+    Streamlit's Auction Builder for fast "Show Matching Deals".
+    """
+
+    pattern: str
+    sample_size: int = 25
+    seed: Optional[int] = 42
 
 
 class BiddingTableStatisticsRequest(BaseModel):
@@ -1206,6 +1237,65 @@ from bbo_bidding_models import MODEL_REGISTRY
 #   - Polars DataFrames are immutable (operations return new DataFrames)
 #   - Handlers should NOT mutate nested dicts/lists in state
 # If mutation is needed, use deepcopy or redesign the data flow.
+# ---------------------------------------------------------------------------
+# Gemini-3.2 CSR Traversal Index (Direct-Address CSR)
+# ---------------------------------------------------------------------------
+
+def get_bid_vocab():
+    """Consistent bid encoding for Gemini-3.2 index."""
+    code_to_bid = [""]
+    bid_to_code = {"": 0}
+    def add(b):
+        b = b.upper()
+        if b not in bid_to_code:
+            bid_to_code[b] = len(code_to_bid); code_to_bid.append(b)
+    for b in ["P", "X", "XX", "D", "R"]: add(b)
+    for level in range(1, 8):
+        for strain in ["C", "D", "H", "S", "N"]:
+            add(f"{level}{strain}")
+    # Add lowercase mappings for robustness
+    for b in ["p", "x", "xx", "d", "r"]:
+        if b.upper() in bid_to_code:
+            bid_to_code[b] = bid_to_code[b.upper()]
+    return bid_to_code, code_to_bid
+
+BID_TO_CODE, CODE_TO_BID = get_bid_vocab()
+
+@dataclass
+class G3Index:
+    offsets: np.ndarray    # uint32: [bt_index] -> edges start
+    children: np.ndarray   # uint32: flat child indices
+    bidcodes: np.ndarray   # uint8: flat bid codes
+    openings: dict[str, int]
+    
+    def walk(self, auction: str) -> int | None:
+        """O(1) direct-address traversal of the bidding table."""
+        # Normalize: strip leading passes for seat-1 view traversal
+        auction_norm = re.sub(r"(?i)^(P-)+", "", auction).rstrip("-")
+        tokens = [t.upper() for t in auction_norm.split("-") if t]
+        if not tokens: return None
+        
+        curr = self.openings.get(tokens[0])
+        if curr is None: return None
+        
+        for tok in tokens[1:]:
+            code = BID_TO_CODE.get(tok, 0)
+            start, end = self.offsets[curr], self.offsets[curr + 1]
+            found = False
+            for i in range(start, end):
+                if self.bidcodes[i] == code:
+                    curr = int(self.children[i]); found = True; break
+            if not found: return None
+        return curr
+
+    def list_next_bids(self, bt_index: int) -> list[str]:
+        """Fetch all available next bids for a given bt_index."""
+        if bt_index >= len(self.offsets) - 1: return []
+        start, end = self.offsets[bt_index], self.offsets[bt_index + 1]
+        codes = self.bidcodes[start:end]
+        # Filter for unique codes and convert to bid strings
+        return sorted(list(set([CODE_TO_BID[c] for c in codes if c > 0])))
+
 STATE: Dict[str, Any] = {
     "initialized": False,
     "initializing": False,
@@ -1216,15 +1306,21 @@ STATE: Dict[str, Any] = {
     "deal_df": None,
     "bt_seat1_df": None,  # Pre-compiled BT table (bbo_bt_compiled.parquet)
     "bt_openings_df": None,  # Tiny opening-bid lookup table (built from bt_seat1_df)
+    "g3_index": None,       # Gemini-3.2 CSR Traversal Index (built on startup)
     "deal_criteria_by_seat_dfs": None,
     "deal_criteria_by_direction_dfs": None,
     "results": None,
     # Criteria / aggregate statistics for completed auctions (seat-1 view).
     # Built from bbo_bt_criteria.parquet + bbo_bt_aggregate.parquet and keyed by bt_index.
     "bt_stats_df": None,
+    # Completed auctions with Agg_Expr only (63MB, ~975K rows) for fast wrong-bid-stats
+    "bt_completed_agg_df": None,
     # Optional: bid-category boolean flags from bbo_bt_categories.parquet (Phase 4).
     "bt_categories_df": None,
     "bt_category_cols": None,  # list[str]
+    # Fast bt_index -> row position mapping for lightweight BT
+    "bt_index_arr": None,      # numpy array of UInt32
+    "bt_index_monotonic": False,
     "duckdb_conn": None,
     # Hot-reloadable overlay rules loaded from bbo_custom_auction_criteria.csv.
     # These rules are applied on-the-fly to BT rows when serving responses and when building criteria masks.
@@ -1240,6 +1336,9 @@ STATE: Dict[str, Any] = {
 bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
 # Pre-joined completed-auction criteria/aggregate table (preferred at runtime).
 bt_criteria_seat1_file = dataPath.joinpath("bbo_bt_criteria_seat1_df.parquet")
+# Completed auctions with Agg_Expr only (63MB, ~975K rows) for fast wrong-bid-stats lookups
+bt_completed_agg_file = dataPath.joinpath("bbo_bt_completed_agg_expr.parquet")
+_bt_completed_agg_file_e_drive = pathlib.Path("E:/bridge/data/bbo/bidding/bbo_bt_completed_agg_expr.parquet")
 
 _STATE_LOCK = threading.Lock()
 
@@ -1529,7 +1628,6 @@ def _heavy_init() -> None:
         # monotonicity for O(log n) lookup.
         try:
             if "index" in deal_df.columns:
-                import numpy as np
                 idx_arr = deal_df.get_column("index").to_numpy()
                 # Best-effort monotonic check (non-decreasing). This is O(n) but done once at startup.
                 is_mono = bool(np.all(idx_arr[1:] >= idx_arr[:-1])) if len(idx_arr) > 1 else True
@@ -1621,6 +1719,69 @@ def _heavy_init() -> None:
         _update_loading_status(5, "Loading bt_seat1_df...", "bt_seat1_df", bt_seat1_info)
         print(f"[init] bt_seat1_df: {bt_seat1_info} (clean seat-1 data)")
         
+        # -------------------------------------------------------------------
+        # Build Gemini-3.2 CSR Traversal Index (Invariant C)
+        # -------------------------------------------------------------------
+        # Since the build takes < 60s, we run it on every startup. This provides 
+        # sub-millisecond BT traversal (O(1) jumps) and replaces slow regex scans.
+        try:
+            _update_loading_status(6, "Building Gemini-3.2 CSR index...")
+            t0_g3 = time.perf_counter()
+            
+            # 1. Vectorized Bid Mapping
+            max_bt_index_opt = bt_seat1_df["bt_index"].max()
+            if max_bt_index_opt is None:
+                raise ValueError("bt_seat1_df is empty or missing bt_index")
+            max_idx = int(max_bt_index_opt) # type: ignore
+            
+            bid_codes_map = np.zeros(int(max_idx) + 1, dtype=np.uint8)
+            unique_candidate_bids = bt_seat1_df["candidate_bid"].unique().to_list()
+            for bid_val in unique_candidate_bids:
+                if not bid_val: continue
+                # Match code regardless of case
+                code = BID_TO_CODE.get(str(bid_val).upper()) or BID_TO_CODE.get(str(bid_val).lower())
+                if code:
+                    matching_indices = bt_seat1_df.filter(pl.col("candidate_bid") == bid_val)["bt_index"].to_numpy()
+                    bid_codes_map[matching_indices] = code
+
+            # 2. Vectorized CSR Build (Explode next_bid_indices)
+            parent_info = (
+                bt_seat1_df.filter(pl.col("next_bid_indices").list.len() > 0)
+                .select(["bt_index", "next_bid_indices"])
+                .explode("next_bid_indices")
+                .rename({"bt_index": "p", "next_bid_indices": "c"})
+                .sort("p")
+            )
+            p_indices = parent_info["p"].to_numpy().astype(np.uint32)
+            flat_children = parent_info["c"].to_numpy().astype(np.uint32)
+            flat_bidcodes = bid_codes_map[flat_children]
+            
+            unique_p, counts = np.unique(p_indices, return_counts=True)
+            degrees = np.zeros(int(max_idx) + 1, dtype=np.uint32)
+            degrees[unique_p] = counts.astype(np.uint32)
+            
+            offsets = np.zeros(int(max_idx) + 2, dtype=np.uint32)
+            offsets[1:] = np.cumsum(degrees, dtype=np.uint32)
+            
+            # 3. Map Openings (Using is_opening_bid column)
+            openings = {}
+            opening_df = bt_seat1_df.filter(pl.col("is_opening_bid") == True).select(["Auction", "bt_index"])
+            for row in opening_df.to_dicts():
+                auc = str(row["Auction"]).upper()
+                openings[auc] = int(row["bt_index"])
+            
+            g3_index = G3Index(offsets, flat_children, flat_bidcodes, openings)
+            with _STATE_LOCK:
+                STATE["g3_index"] = g3_index
+            
+            elapsed_g3 = time.perf_counter() - t0_g3
+            print(f"[init] Gemini-3.2 CSR index built in {elapsed_g3:.1f}s (openings={len(openings)})")
+            _update_loading_status(6, "Built Gemini-3.2 CSR index", "g3_index", f"{len(flat_children):,} edges in {elapsed_g3:.1f}s")
+            
+        except Exception as e:
+            print(f"[init] ERROR: Failed to build Gemini-3.2 index: {e}")
+            traceback.print_exc()
+
         # Load hot-reloadable criteria overlay (does NOT mutate bt_seat1_df)
         overlay, custom_criteria_stats = _build_custom_criteria_overlay(available_criteria_names)
         _log_memory("after load custom criteria overlay")
@@ -1644,6 +1805,27 @@ def _heavy_init() -> None:
             raise
         _log_memory("after load bt_stats_df")
 
+        # Load completed-auctions Agg_Expr lookup (optional, for fast wrong-bid-stats)
+        # This is a 63MB file with ~975K rows - much faster than querying 46GB Parquet
+        bt_completed_agg_df: Optional[pl.DataFrame] = None
+        _completed_agg_file = bt_completed_agg_file if bt_completed_agg_file.exists() else (
+            _bt_completed_agg_file_e_drive if _bt_completed_agg_file_e_drive.exists() else None
+        )
+        if _completed_agg_file is not None:
+            try:
+                print(f"[init] Loading bt_completed_agg_df from {_completed_agg_file}...")
+                t0_agg = time.perf_counter()
+                bt_completed_agg_df = pl.read_parquet(_completed_agg_file)
+                elapsed_agg = time.perf_counter() - t0_agg
+                agg_info = f"{bt_completed_agg_df.height:,} rows in {elapsed_agg:.1f}s"
+                print(f"[init] bt_completed_agg_df: {agg_info} (for fast wrong-bid-stats)")
+            except Exception as e:
+                print(f"[init] WARNING: Failed to load bt_completed_agg_df: {e} (will use slow fallback)")
+                bt_completed_agg_df = None
+        else:
+            print("[init] bt_completed_agg_df not found (run: create bbo_bt_completed_agg_expr.parquet)")
+        _log_memory("after load bt_completed_agg_df")
+
         # Load bid-category flags (optional, Phase 4 output).
         bt_categories_df = None
         bt_category_cols: list[str] | None = None
@@ -1663,8 +1845,10 @@ def _heavy_init() -> None:
                     raise ValueError(f"{_cats_file} is missing required join key column 'bt_index'")
                 bt_categories_df = (
                     scan.select(cols_to_load)
+                    .drop_nulls(subset=["bt_index"])
                     .with_columns(pl.col("bt_index").cast(pl.UInt32))
                     .unique(subset=["bt_index"])
+                    .sort("bt_index")  # Required for binary search in /bt-categories-by-index
                     .collect()
                 )
                 elapsed_cats = time.perf_counter() - t0_cats
@@ -1742,6 +1926,50 @@ def _heavy_init() -> None:
         _update_loading_status(6, "Preparing to serve...", "bt_openings", bt_openings_info)
         _log_memory("after process_opening_bids")
 
+        # Build fast bt_index lookup array
+        print("[init] Building bt_index lookup array...")
+        t0_bt_idx = time.perf_counter()
+        import numpy as np_local
+        bt_index_arr = bt_seat1_df["bt_index"].to_numpy()
+        # Avoid np.diff on 461M rows (it can allocate multi-GB temp arrays).
+        # Instead, check monotonicity in chunks with small, bounded temporaries.
+        def _is_monotonic_non_decreasing_uint32(arr: Any, chunk: int = 5_000_000) -> bool:
+            n = len(arr)
+            if n <= 1:
+                return True
+            prev = int(arr[0])
+            # Compare adjacent chunks: arr[i0:i1] >= arr[i0-1:i1-1]
+            for i0 in range(1, n, chunk):
+                i1 = min(n, i0 + chunk)
+                # First element in chunk must be >= prev
+                if int(arr[i0]) < prev:
+                    return False
+                # Check within the chunk
+                a = arr[i0:i1]
+                b = arr[i0 - 1 : i1 - 1]
+                if not bool((a >= b).all()):
+                    return False
+                prev = int(arr[i1 - 1])
+            return True
+
+        bt_index_monotonic = _is_monotonic_non_decreasing_uint32(bt_index_arr)
+        # If bt_index isn't monotonic in the source file, DO NOT sort bt_seat1_df (461M rows!).
+        # Instead, build a sorted bt_index array + a row-position permutation so we can still do
+        # O(log n) lookups via np.searchsorted.
+        bt_index_sorted_arr = bt_index_arr
+        bt_index_sorted_pos: Any = None
+        if not bt_index_monotonic:
+            print("[init] bt_index is NOT monotonic; building sorted index permutation (one-time cost)...")
+            t0_sort = time.perf_counter()
+            # argsort returns int64; cast to uint32 to save memory (461M fits in uint32)
+            order = np_local.argsort(bt_index_arr, kind="mergesort")
+            bt_index_sorted_arr = bt_index_arr[order]
+            bt_index_sorted_pos = order.astype(np_local.uint32, copy=False)
+            elapsed_sort = time.perf_counter() - t0_sort
+            print(f"[init] bt_index permutation built in {elapsed_sort:.1f}s")
+        elapsed_bt_idx = (time.perf_counter() - t0_bt_idx) * 1000
+        print(f"[init] bt_index lookup arrays built in {elapsed_bt_idx:.1f}ms (monotonic={bt_index_monotonic})")
+
         with _STATE_LOCK:
             STATE["deal_df"] = deal_df
             STATE["bt_seat1_df"] = bt_seat1_df
@@ -1751,8 +1979,13 @@ def _heavy_init() -> None:
             STATE["deal_criteria_by_direction_dfs"] = deal_criteria_by_direction_dfs
             STATE["results"] = results
             STATE["bt_stats_df"] = bt_stats_df
+            STATE["bt_completed_agg_df"] = bt_completed_agg_df  # For fast wrong-bid-stats (63MB in-memory)
             STATE["bt_categories_df"] = bt_categories_df
             STATE["bt_category_cols"] = bt_category_cols
+            STATE["bt_index_arr"] = bt_index_arr
+            STATE["bt_index_monotonic"] = bt_index_monotonic
+            STATE["bt_index_sorted_arr"] = bt_index_sorted_arr
+            STATE["bt_index_sorted_pos"] = bt_index_sorted_pos
             STATE["custom_criteria_overlay"] = overlay
             STATE["custom_criteria_stats"] = custom_criteria_stats
             STATE["available_criteria_names"] = available_criteria_names
@@ -2091,6 +2324,8 @@ def random_auction_sequences(req: RandomAuctionSequencesRequest) -> Dict[str, An
             state=state,
             n_samples=req.n_samples,
             seed=req.seed,
+            completed_only=req.completed_only,
+            partial_only=req.partial_only,
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
@@ -2257,25 +2492,27 @@ def bt_categories_by_index(req: BTCategoriesByIndexRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info({"rows": [], "missing_indices": [], "elapsed_ms": 0.0}, reload_info)
 
     try:
-        present_df = bt_categories_df.filter(pl.col("bt_index").is_in(indices))
-
+        # Optimization: Use binary search for fast bt_index lookup in giant 461M-row DF
+        import numpy as np_local
+        cat_idx_arr = bt_categories_df["bt_index"].to_numpy()
+        
         rows_by_idx: dict[int, dict[str, Any]] = {}
-        for r in present_df.select(["bt_index"] + bt_category_cols).iter_rows(named=True):
-            try:
-                bt_idx_raw = r.get("bt_index")
-                if bt_idx_raw is None:
-                    continue
-                bt_idx = int(bt_idx_raw)
-            except Exception:
-                continue
-            cats_true: list[str] = []
-            for c in bt_category_cols:
+        for idx_val in indices:
+            pos = int(np_local.searchsorted(cat_idx_arr, int(idx_val)))
+            if 0 <= pos < len(cat_idx_arr):
+                val_at_pos = cat_idx_arr[pos]
+                # Handle NaN/None (Polars/NumPy bridge sometimes produces floats with NaNs)
                 try:
-                    if bool(r.get(c)) is True:
-                        cats_true.append(c[3:] if c.startswith("is_") else c)
-                except Exception:
+                    if not np_local.isnan(val_at_pos) and int(val_at_pos) == int(idx_val):
+                        # Found it! Pluck categories efficiently.
+                        cats_true: list[str] = []
+                        for c in bt_category_cols:
+                            # Direct access by row position is much faster than filter()
+                            if bool(bt_categories_df[c][pos]):
+                                cats_true.append(c[3:] if c.startswith("is_") else c)
+                        rows_by_idx[int(idx_val)] = {"bt_index": int(idx_val), "categories_true": cats_true}
+                except (ValueError, TypeError):
                     continue
-            rows_by_idx[bt_idx] = {"bt_index": bt_idx, "categories_true": cats_true}
 
         out_rows: list[dict[str, Any]] = []
         missing: list[int] = []
@@ -2291,6 +2528,27 @@ def bt_categories_by_index(req: BTCategoriesByIndexRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(out, reload_info)
     except Exception as e:
         _log_and_raise("bt-categories-by-index", e)
+
+
+@app.post("/resolve-auction-path")
+def resolve_auction_path(req: ResolveAuctionPathRequest) -> Dict[str, Any]:
+    """Resolve a full auction string - delegated to hot-reloadable handler."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_resolve_auction_path(
+            state=state,
+            auction=req.auction,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("resolve-auction-path", e)
 
 
 # ---------------------------------------------------------------------------
@@ -2327,6 +2585,29 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("deals-matching-auction", e)
+
+
+@app.post("/sample-deals-by-auction-pattern")
+def sample_deals_by_auction_pattern(req: SampleDealsByAuctionPatternRequest) -> Dict[str, Any]:
+    """Fast sampling of deals by actual-auction regex (no BT / Rules)."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_sample_deals_by_auction_pattern(
+            state=state,
+            pattern=req.pattern,
+            sample_size=int(req.sample_size),
+            seed=req.seed,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("sample-deals-by-auction-pattern", e)
 
 
 # ---------------------------------------------------------------------------

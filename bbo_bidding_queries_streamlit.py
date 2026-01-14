@@ -994,19 +994,19 @@ def render_aggrid(
     # Width is max of target width and column name length (approx 8px per char)
     tight_cols = {
         # Matching Deals columns
-        "Score": 40, "ParScore": 40, "Result": 30, "Contract": 40,
-        "Dealer": 20, "Vul": 30, "index": 70,
+        "Score": 40, "ParScore": 40, "Result": 30, "Contract": 30,  # Contract reduced by 25%
+        "Dealer": 20, "Vul": 30, "index": 70, "Auction_Actual": 140,  # Auction_Actual reduced by 30%
         "Hand_N": 135, "Hand_E": 135, "Hand_S": 135, "Hand_W": 135,
         # Auction Summary columns
-        "Bid Num": 60, "Seat": 55, "Bid": 50, "BT Index": 60,
-        "Criteria Count": 36, "Complete": 30,
+        "Bid Num": 60, "Seat": 55, "Bid": 50, "BT Index": 60, "Deals": 70,
+        "Criteria Count": 25, "Complete": 25,
         # Rankings-style stats columns (NV/V split)
         "Matches_NV": 90, "Matches_V": 85,
         "Avg Par_NV": 95, "Avg Par_V": 90,
         "EV_NV": 70, "EV_V": 65,
         "EV Std_NV": 85, "EV Std_V": 80,
         # Wrong Bid Analysis columns
-        "criterion": 150, "fail_count": 85, "failure_count": 95,
+        "criterion": 150, "failure_count": 95,
         "check_count": 85, "affected_auctions": 115, "fail_rate": 85,
         "wrong_bid_rate": 105, "wrong_bid_rate_%": 115,
         "Wrong Bids": 95, "Wrong Bid Rate": 120,
@@ -1068,15 +1068,30 @@ def render_aggrid(
         # Best-effort only; grid still renders fine without these hints.
         pass
     
-    # Agg_Expr should flex to fill remaining space with word wrap and tooltip
+    # Agg_Expr: Use fixed width instead of flex to prevent resizing on grid rerender
     if "Agg_Expr" in df.columns:
+        tooltip_field = "Agg_Expr_full" if "Agg_Expr_full" in df.columns else "Agg_Expr"
         gb.configure_column(
             "Agg_Expr", 
-            flex=1, 
+            width=400,
             minWidth=200,
             wrapText=True,
             autoHeight=True,
-            tooltipField="Agg_Expr",  # Show full content on hover
+            suppressSizeToFit=True,  # Prevent width changes on rerender
+            tooltipField=tooltip_field,  # Show full content on hover
+        )
+
+    # Categories column: Use fixed width instead of flex to prevent resizing on grid rerender
+    if "Categories" in df.columns:
+        tooltip_field = "Categories_full" if "Categories_full" in df.columns else "Categories"
+        gb.configure_column(
+            "Categories",
+            width=300,
+            minWidth=200,
+            wrapText=True,
+            autoHeight=True,
+            suppressSizeToFit=True,  # Prevent width changes on rerender
+            tooltipField=tooltip_field,
         )
     
     # Auction column can be wide - constrain it
@@ -1088,6 +1103,7 @@ def render_aggrid(
         headerHeight=32,
         suppressCellFocus=True,
         tooltipShowDelay=300,  # Show tooltips after 300ms hover
+        suppressColumnVirtualisation=True,  # Prevent virtualization from affecting widths on rerender
     )
     grid_options = gb.build()
 
@@ -1395,13 +1411,24 @@ def render_opening_bids_by_deal():
 
 def render_random_auction_samples():
     """View random completed auction sequences from the bidding table."""
-    n_samples = st.sidebar.number_input("Number of Samples", value=5, min_value=1)
+    n_samples = st.sidebar.number_input("Number of Samples", value=10, min_value=1)
+    
+    auction_type = st.sidebar.radio(
+        "Auction Type",
+        options=["Completed Only", "Partial Only", "50-50 Mix"],
+        index=0,
+        help="Completed: auctions ending in final contract. Partial: intermediate sequences. 50-50: mix of both.",
+    )
+    
+    # Map radio selection to API parameters
+    completed_only = auction_type == "Completed Only"
+    partial_only = auction_type == "Partial Only"
 
     # Random seed at bottom of sidebar
     st.sidebar.divider()
     seed = int(st.sidebar.number_input("Random Seed (0=random)", value=0, min_value=0, key="seed_random"))
 
-    payload = {"n_samples": int(n_samples), "seed": seed}
+    payload = {"n_samples": int(n_samples), "seed": seed, "completed_only": completed_only, "partial_only": partial_only}
     with st.spinner("Fetching bidding sequences from server. Takes about 10 seconds."):
         data = api_post("/random-auction-sequences", payload)
 
@@ -1409,7 +1436,7 @@ def render_random_auction_samples():
     elapsed_ms = data.get("elapsed_ms", 0)
     _st_info_elapsed("Random Auction Samples", data)
     if not samples:
-        st.info(f"No completed auctions found. ({format_elapsed(elapsed_ms)})")
+        st.info(f"No auctions found. ({format_elapsed(elapsed_ms)})")
     else:
         st.success(f"Found {len(samples)} matching auction(s)")
         
@@ -2762,34 +2789,30 @@ def render_auction_criteria_debugger():
     by the Rules model for deals where it's the actual auction.
     """)
     
-    # Wrap inputs + submit in a form so pressing Enter triggers analysis (same as clicking button).
-    with st.form(key="auction_criteria_debugger_form", clear_on_submit=False):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            auction_pattern = st.text_input(
-                "Target Auction Pattern",
-                value="1S-p-p-p",
-                help="The auction you want to debug (e.g., 1S-p-p-p, 2H-p-p-p, 5N-p-p-p)",
-            )
-        with col2:
-            sample_size = st.number_input(
-                "Sample Size",
-                min_value=1,
-                max_value=10000,
-                value=25,
-                help="Number of deals to analyze",
-            )
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        auction_pattern = st.text_input(
+            "Target Auction Pattern",
+            value="1S-p-p-p",
+            help="The auction you want to debug (e.g., 1S-p-p-p, 2H-p-p-p, 5N-p-p-p)",
+        )
+    with col2:
+        sample_size = st.number_input(
+            "Sample Size",
+            min_value=1,
+            max_value=10000,
+            value=25,
+            help="Number of deals to analyze",
+        )
 
-        seed = st.number_input("Random Seed", min_value=0, value=42, help="For reproducibility")
-        submitted = st.form_submit_button("🔎 Analyze Auction", type="primary")
+    seed = st.number_input("Random Seed", min_value=0, value=42, help="For reproducibility")
     
     if not auction_pattern:
         st.info("Enter an auction pattern to begin.")
         return
     
-    if submitted:
-        with st.spinner(f"Analyzing why '{auction_pattern}' is rejected..."):
-            try:
+    with st.spinner(f"Analyzing why '{auction_pattern}' is rejected..."):
+        try:
                 # Step 1: Get the BT row for this auction pattern
                 st.subheader(f"1️⃣ BT Row for '{auction_pattern}'")
                 
@@ -3019,10 +3042,10 @@ LIMIT {sample_size};"""
                         ])
                         render_aggrid(common_df, key="common_blocking", height=calc_grid_height(len(common_df), max_height=300))
                 
-            except Exception as e:
-                st.error(f"Error: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+        except Exception as e:
+            st.error(f"Error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
@@ -5162,79 +5185,63 @@ def render_new_rules_metrics():
             with c3:
                 st.metric("Neg Count", f"{data['neg_count']:,}")
             
-            # Rule Sets
-            st.subheader("📋 Rule Sets")
+            # Criteria Details - Single table with boolean columns for each set
+            st.subheader("📊 Criteria Details")
             
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Base Rules", "Accepted Criteria", "Rejected Criteria", "Merged Rules", "Merged (Deduped)"])
-
-            def _render_rules_df(rules: list[Any], key: str, caption: str | None = None) -> None:
-                """Render a rule list as a DataFrame for easier scanning/filtering."""
-                if caption:
-                    st.caption(caption)
-                if not rules:
-                    st.info("No rules.")
-                    return
-                rows = [{"#": i + 1, "Rule": str(r)} for i, r in enumerate(rules)]
+            # Gather all criteria from all sets
+            base_rules = set(str(r) for r in (data.get("base_rules") or []))
+            accepted = set(str(r) for r in (data.get("accepted_criteria") or []))
+            rejected = set(str(r) for r in (data.get("rejected_criteria") or []))
+            merged = set(str(r) for r in (data.get("merged_rules") or []))
+            merged_deduped = set(str(r) for r in (data.get("merged_rules_deduped") or []))
+            
+            # Build lookup for metrics from criteria_details
+            details = data.get("criteria_details") or []
+            metrics_by_crit: dict[str, dict[str, float | None]] = {}
+            for d in details:
+                crit_key = str(d.get("criterion", ""))
+                metrics_by_crit[crit_key] = {
+                    "lift": d.get("lift"),
+                    "pos_rate": d.get("pos_rate"),
+                    "neg_rate": d.get("neg_rate"),
+                }
+            
+            # Collect all unique criteria
+            all_criteria = sorted(base_rules | accepted | rejected | merged | merged_deduped)
+            
+            if all_criteria:
+                rows = []
+                for crit in all_criteria:
+                    metrics = metrics_by_crit.get(crit, {})
+                    rows.append({
+                        "Criteria": crit,
+                        "Base": crit in base_rules,
+                        "Accepted": crit in accepted,
+                        "Rejected": crit in rejected,
+                        "Merged": crit in merged,
+                        "Merged (Deduped)": crit in merged_deduped,
+                        "lift": metrics.get("lift"),
+                        "pos_rate": metrics.get("pos_rate"),
+                        "neg_rate": metrics.get("neg_rate"),
+                    })
                 df_rules = pl.DataFrame(rows)
+                
+                # Show counts
+                st.caption(
+                    f"**{len(all_criteria)}** unique criteria | "
+                    f"Base: {len(base_rules)} | Accepted: {len(accepted)} | "
+                    f"Rejected: {len(rejected)} | Merged: {len(merged)} | "
+                    f"Merged (Deduped): {len(merged_deduped)}"
+                )
+                
                 render_aggrid(
                     df_rules,
-                    key=key,
-                    height=calc_grid_height(len(df_rules), max_height=350),
-                    table_name=key,
+                    key="new_rules_all_sets",
+                    height=calc_grid_height(len(df_rules), max_height=400),
+                    table_name="new_rules_all_sets",
                 )
-            
-            with tab1:
-                _render_rules_df(
-                    data.get("base_rules") or [],
-                    key="new_rules_base_rules",
-                )
-            
-            with tab2:
-                _render_rules_df(
-                    data.get("accepted_criteria") or [],
-                    key="new_rules_accepted",
-                )
-                    
-            with tab3:
-                _render_rules_df(
-                    data.get("rejected_criteria") or [],
-                    key="new_rules_rejected",
-                )
-                    
-            with tab4:
-                _render_rules_df(
-                    data.get("merged_rules") or [],
-                    key="new_rules_merged_raw",
-                    caption="Raw merged rules (base + accepted criteria)",
-                )
-                    
-            with tab5:
-                merged_deduped = data.get("merged_rules_deduped") or []
-                _render_rules_df(
-                    merged_deduped,
-                    key="new_rules_merged_deduped",
-                    caption="Deduplicated: keeps least restrictive bounds (e.g., HCP >= 3 instead of HCP >= 5)",
-                )
-            
-            # Detailed Metrics Table
-            st.subheader("📊 Criteria Details")
-            details = data.get("criteria_details", [])
-            if details:
-                # Add status column (Accepted/Rejected)
-                accepted_set = set(data["accepted_criteria"])
-                for d in details:
-                    d["status"] = "✅ Accepted" if d["criterion"] in accepted_set else "❌ Rejected"
-                
-                df_details = pl.DataFrame(details)
-                
-                # Reorder columns for better view
-                df_details = order_columns(df_details, priority_cols=[
-                    "status", "criterion", "lift", "pos_rate", "neg_rate", "pos_hits", "neg_hits"
-                ])
-                
-                render_aggrid(df_details, key="new_rules_details_grid", height=400)
             else:
-                st.info("No criteria details available.")
+                st.info("No rules found.")
                 
         except Exception as e:
             st.error(f"Error fetching new rules metrics: {e}")
@@ -5381,7 +5388,9 @@ def render_auction_builder():
     if "auction_builder_last_applied" not in st.session_state:
         st.session_state.auction_builder_last_applied = ""
     
-    col_auction, col_apply, col_undo, col_spacer = st.columns([3, 1, 1, 3])
+    # Keep the buttons visually tight: put them in a compact right column with 3 sub-columns.
+    # Auction textbox is narrow (2), buttons compact (2), rest is spacer (3)
+    col_auction, col_btns, col_spacer = st.columns([2, 2, 3])
     with col_auction:
         # Use dynamic key based on path length to force update when bids are added
         edit_key = f"auction_builder_edit_input_{len(current_path)}"
@@ -5392,58 +5401,85 @@ def render_auction_builder():
             label_visibility="collapsed",
             key=edit_key,
         )
-    with col_apply:
-        apply_edit = st.button("Apply", key="auction_builder_apply_edit")
-    with col_undo:
-        if current_path and st.button("⬅️ Undo", key="auction_builder_undo"):
-            st.session_state.auction_builder_path.pop()
-            st.session_state.auction_builder_last_applied = ""
-            st.rerun()
+
+    with col_btns:
+        # Tight button row - each button fills its narrow column
+        btn_cols = st.columns([2, 2, 2, 1], gap="small")
+        with btn_cols[0]:
+            apply_edit = st.button("Apply", key="auction_builder_apply_edit", use_container_width=True)
+        with btn_cols[1]:
+            append_ppp = st.button("Pass Out", key="auction_builder_append_ppp", help="Append '-P-P-P' and apply", use_container_width=True)
+        with btn_cols[2]:
+            if current_path and st.button("Undo", key="auction_builder_undo", use_container_width=True):
+                st.session_state.auction_builder_path.pop()
+                st.session_state.auction_builder_last_applied = ""
+                st.rerun()
+        # btn_cols[3] is minimal spacer
     
     # Handle manual auction edit - trigger on Enter (value change) OR button click
     # But skip if we just applied this same value (prevents render loop)
     edited_normalized = normalize_auction_input(edited_auction).upper() if edited_auction else ""
+
+    # Convenience: append trailing passes and apply immediately.
+    if append_ppp:
+        # Prefer current text box value; fall back to current_auction.
+        base = edited_normalized or (current_auction.upper() if current_auction else "")
+        if base and not base.endswith("-P-P-P"):
+            base = base + "-P-P-P"
+        # Update the input widget and trigger apply logic below.
+        try:
+            st.session_state[edit_key] = base
+        except Exception:
+            pass
+        edited_auction = base
+        edited_normalized = base
+        # Ensure we don't get blocked by the "already applied" guard.
+        st.session_state.auction_builder_last_applied = ""
+        apply_edit = True
     already_applied = edited_normalized == st.session_state.auction_builder_last_applied
     value_changed = edited_normalized != current_auction.upper()
     
     if (value_changed or apply_edit) and not already_applied:
         edited_normalized = normalize_auction_input(edited_auction).upper()
         if edited_normalized:
-            bids = [b.strip() for b in edited_normalized.split("-") if b.strip()]
-            new_path = []
-            
-            # Fetch bid data from API for each step to get proper agg_expr
-            for i, bid in enumerate(bids):
-                prefix = "-".join([b["bid"] for b in new_path]) if new_path else ""
-                
-                # Try to get bid info from API
-                bid_info = {"bid": bid.upper(), "bt_index": None, "agg_expr": [], "is_complete": False}
+            # Single batched call to resolve the entire path
+            with st.spinner(f"Resolving path: {edited_normalized}..."):
                 try:
-                    data = api_post("/list-next-bids", {"auction": prefix}, timeout=10)
-                    # Don't spam elapsed here; manual edit can include many steps.
-                    for nb in data.get("next_bids", []):
-                        if nb.get("bid", "").upper() == bid.upper():
-                            bid_info = {
-                                "bid": bid.upper(),
-                                "bt_index": nb.get("bt_index"),
-                                "agg_expr": nb.get("agg_expr", []),
-                                "is_complete": nb.get("is_completed_auction", False),
-                            }
-                            break
-                except Exception:
-                    pass  # Use default empty info
-                
-                new_path.append(bid_info)
+                    data = api_post("/resolve-auction-path", {"auction": edited_normalized}, timeout=30)
+                    _st_info_elapsed("Auction Builder: resolve path", data)
+                    new_path = data.get("path", [])
+                    if not new_path:
+                        # Fallback for manually entered path if API returns empty
+                        bids = [b.strip() for b in edited_normalized.split("-") if b.strip()]
+                        new_path = [{"bid": b.upper(), "bt_index": None, "agg_expr": [], "is_complete": False} for b in bids]
+                except Exception as e:
+                    st.error(f"Error resolving auction path: {e}")
+                    bids = [b.strip() for b in edited_normalized.split("-") if b.strip()]
+                    new_path = [{"bid": b.upper(), "bt_index": None, "agg_expr": [], "is_complete": False} for b in bids]
             
             st.session_state.auction_builder_path = new_path
             st.session_state.auction_builder_options = {}  # Clear cache
             st.session_state.auction_builder_last_applied = edited_normalized  # Prevent re-trigger
+            # Mark as already rehydrated (we just resolved the full path)
+            st.session_state[f"_rehydrated_{edited_normalized}"] = True
             st.rerun()
         else:
             # Clear auction
             st.session_state.auction_builder_path = []
             st.session_state.auction_builder_options = {}
             st.session_state.auction_builder_last_applied = ""  # Prevent re-trigger
+            # Clear rehydration tracking keys, deals counts cache, and categories cache
+            for key in list(st.session_state.keys()):
+                if isinstance(key, str) and key.startswith("_rehydrated_"):
+                    del st.session_state[key]
+            if "_deals_counts_all" in st.session_state:
+                del st.session_state["_deals_counts_all"]
+            if "_deals_counts_elapsed_ms" in st.session_state:
+                del st.session_state["_deals_counts_elapsed_ms"]
+            if "_deals_counts_steps" in st.session_state:
+                del st.session_state["_deals_counts_steps"]
+            if "auction_builder_bt_categories_cache" in st.session_state:
+                del st.session_state["auction_builder_bt_categories_cache"]
             st.rerun()
     
     if is_complete:
@@ -5464,7 +5500,8 @@ def render_auction_builder():
         try:
             # Use fast /list-next-bids endpoint which uses next_bid_indices for O(1) lookup
             data = api_post("/list-next-bids", {"auction": prefix or ""}, timeout=DEFAULT_API_TIMEOUT)
-            _st_info_elapsed("Auction Builder: list next bids", data)
+            # Store elapsed for display outside spinner
+            st.session_state["_auction_builder_bids_elapsed_ms"] = data.get("_client_elapsed_ms") or data.get("elapsed_ms")
             
             next_bids = data.get("next_bids", [])
             
@@ -5502,8 +5539,18 @@ def render_auction_builder():
         seat_1_to_4 = ((current_seat - 1) % 4) + 1
         st.markdown(f"**Select Bid for Seat {seat_1_to_4}**")
         
-        with st.spinner("Loading available bids..."):
-            options = get_next_bid_options(current_auction)
+        # Check cache first to avoid showing spinner when cached
+        cache_key = (current_auction or "__opening__", seed)
+        if cache_key in st.session_state.auction_builder_options:
+            options = st.session_state.auction_builder_options[cache_key]
+        else:
+            with st.spinner("Loading available bids..."):
+                options = get_next_bid_options(current_auction)
+        
+        # Show elapsed time for loading bids
+        bids_elapsed_ms = st.session_state.get("_auction_builder_bids_elapsed_ms")
+        if bids_elapsed_ms:
+            st.info(f"⏱️ Loaded {len(options)} bids in {bids_elapsed_ms/1000:.2f}s")
         
         if not options:
             st.warning("No more bids available in BT for this auction prefix.")
@@ -5524,33 +5571,33 @@ def render_auction_builder():
 
             # -----------------------------------------------------------------
             # Bid Categories (Phase 4): attach category names per bt_index.
-            # Do this once per options list (batched), and cache for this prefix.
+            # Batched lookup + session cache. No elapsed banner here (avoid duplicates).
             # -----------------------------------------------------------------
-            bt_idx_to_categories: dict[int, str] = {}
+            bt_idx_to_categories_opt: dict[int, str] = {}
             try:
-                bt_indices: list[int] = []
+                bt_indices_opt: list[int] = []
                 for opt in sorted_options:
                     bt_idx = opt.get("bt_index")
                     if bt_idx is None:
                         continue
                     try:
-                        bt_indices.append(int(bt_idx))
+                        bt_indices_opt.append(int(bt_idx))
                     except Exception:
                         continue
-                bt_indices = sorted(set(bt_indices))
-                if bt_indices:
+                bt_indices_opt = sorted(set(bt_indices_opt))
+                if bt_indices_opt:
                     cache = st.session_state.setdefault("auction_builder_bt_categories_cache", {})
-                    cache_key = (tuple(bt_indices),)
+                    cache_key = ("options", tuple(bt_indices_opt))
                     if cache_key in cache:
-                        bt_idx_to_categories = cache[cache_key]
+                        bt_idx_to_categories_opt = cache[cache_key]
                     else:
                         cat_data = api_post(
                             "/bt-categories-by-index",
-                            {"indices": bt_indices, "max_rows": 500},
+                            {"indices": bt_indices_opt, "max_rows": 500},
                             timeout=10,
                         )
                         rows = cat_data.get("rows") or []
-                        tmp: dict[int, str] = {}
+                        tmp_opt: dict[int, str] = {}
                         for r in rows:
                             try:
                                 bti_raw = r.get("bt_index")
@@ -5560,11 +5607,13 @@ def render_auction_builder():
                             except Exception:
                                 continue
                             cats = r.get("categories_true") or []
-                            tmp[bti] = ", ".join(str(x) for x in cats if x)
-                        bt_idx_to_categories = tmp
-                        cache[cache_key] = bt_idx_to_categories
+                            tmp_opt[bti] = ", ".join(str(x) for x in cats if x)
+                        bt_idx_to_categories_opt = tmp_opt
+                        # Only cache if we got results (avoid caching failures)
+                        if bt_idx_to_categories_opt:
+                            cache[cache_key] = bt_idx_to_categories_opt
             except Exception:
-                bt_idx_to_categories = {}
+                bt_idx_to_categories_opt = {}
             
             # Helper to check if pinned deal matches criteria for a bid option
             def check_pinned_match_with_failures(criteria_list: list, seat: int) -> tuple[bool, list[str]]:
@@ -5676,7 +5725,7 @@ def render_auction_builder():
                 try:
                     bt_idx = opt.get("bt_index")
                     if bt_idx is not None:
-                        row_data["Categories"] = bt_idx_to_categories.get(int(bt_idx), "")
+                        row_data["Categories"] = bt_idx_to_categories_opt.get(int(bt_idx), "")
                 except Exception:
                     pass
                 if show_failed_criteria:
@@ -5762,36 +5811,73 @@ def render_auction_builder():
     
     # Summary DataFrame
     if current_path:
-        # Rehydrate criteria for the stored path if any step has empty agg_expr.
-        # This prevents "Criteria Count = 0" when earlier API calls timed out or used older logic.
-        with st.spinner("Loading auction criteria..."):
+        def _truncate_60(s: Any) -> str:
+            """Return a string truncated to 60 chars (with ...)."""
+            txt = "" if s is None else str(s)
+            if len(txt) <= 60:
+                return txt
+            return txt[:57] + "..."
+
+        def _join_tooltip(values: Any, max_chars: int = 2000, max_items: int = 500) -> str:
+            """Join values for tooltips without creating megabyte strings.
+
+            AgGrid still serializes hidden columns to the browser, so we must cap tooltip payload size.
+            """
+            if not values:
+                return "(none)"
             try:
-                changed = False
-                prefix = ""
-                for i, step in enumerate(list(current_path)):
-                    bid = str(step.get("bid", "") or "").upper()
-                    if not bid:
-                        prefix = "-".join([str(x.get("bid", "")).upper() for x in current_path[: i + 1] if x.get("bid")])
-                        continue
-                    needs_refresh = (not step.get("agg_expr")) or (step.get("bt_index") is None)
-                    if needs_refresh:
-                        opts = get_next_bid_options(prefix, force_refresh=True)
-                        for opt in opts:
-                            if str(opt.get("bid", "")).upper() == bid:
-                                step["bt_index"] = opt.get("bt_index")
-                                step["agg_expr"] = opt.get("agg_expr", []) or []
-                                step["is_complete"] = opt.get("is_complete", False)
-                                changed = True
-                                break
-                    # Advance prefix for next iteration
-                    prefix = "-".join([str(x.get("bid", "")).upper() for x in current_path[: i + 1] if x.get("bid")])
-                if changed:
-                    st.session_state.auction_builder_path = current_path
+                items = list(values)
             except Exception:
-                # Never break the UI due to refresh issues; summary will still render.
-                pass
+                items = [values]
+            out_parts: list[str] = []
+            total = 0
+            n = 0
+            for v in items:
+                if v is None:
+                    continue
+                s = str(v)
+                if not s:
+                    continue
+                if n >= max_items:
+                    out_parts.append("… (truncated)")
+                    break
+                add = (2 if out_parts else 0) + len(s)
+                if total + add > max_chars:
+                    out_parts.append("… (truncated)")
+                    break
+                if out_parts:
+                    out_parts.append("; ")
+                    total += 2
+                out_parts.append(s)
+                total += len(s)
+                n += 1
+            return "".join(out_parts) if out_parts else "(none)"
+
+        # Rehydrate criteria for the stored path if any step has missing data.
+        # This prevents "Criteria Count = 0" when earlier API calls used older logic.
+        # Track rehydration attempts to avoid repeated slow API calls
+        rehydrate_key = f"_rehydrated_{current_auction}"
+        already_attempted = st.session_state.get(rehydrate_key, False)
+        # Note: agg_expr=[] is valid (no criteria), only rehydrate if agg_expr is None or bt_index is None
+        needs_rehydrate = any((step.get("agg_expr") is None or step.get("bt_index") is None) for step in current_path)
+        rehydrate_elapsed_ms: float | None = None
+        if needs_rehydrate and current_auction and not already_attempted:
+            st.session_state[rehydrate_key] = True  # Mark as attempted
+            with st.spinner("Loading auction criteria..."):
+                try:
+                    # Increased timeout: DuckDB fallback can take 5-7s per token
+                    data = api_post("/resolve-auction-path", {"auction": current_auction}, timeout=90)
+                    new_path = data.get("path", [])
+                    if new_path and len(new_path) == len(current_path):
+                        st.session_state.auction_builder_path = new_path
+                        current_path = new_path
+                    rehydrate_elapsed_ms = data.get("_client_elapsed_ms") or data.get("elapsed_ms")
+                except Exception:
+                    pass
 
         st.subheader("📋 Auction Summary")
+        if rehydrate_elapsed_ms is not None:
+            st.info(f"Loaded auction criteria in {rehydrate_elapsed_ms/1000:.2f}s")
         
         # Check for cached deal stats to include in summary
         deals_cache_key = f"auction_builder_deals_{current_auction}_{max_matching_deals}_{seed}"
@@ -5894,21 +5980,78 @@ def render_auction_builder():
         
         summary_rows = []
         pinned_all_pass = True  # Track if all steps pass for pinned deal
+
+        # Pre-fetch deal counts for all steps (cached globally, fetch only missing)
+        if "_deals_counts_all" not in st.session_state:
+            st.session_state["_deals_counts_all"] = {}
+        deals_counts: dict[str, int] = st.session_state["_deals_counts_all"]
         
+        # Find steps that need fetching
+        missing_partials: list[str] = []
+        for i in range(len(current_path)):
+            partial = "-".join([s["bid"] for s in current_path[: i + 1]])
+            if partial not in deals_counts:
+                missing_partials.append(partial)
+        
+        # Fetch missing counts
+        if missing_partials:
+            t0_counts = time.perf_counter()
+            for partial in missing_partials:
+                partial_upper = partial.upper()
+                # Build regex pattern for deals starting with this partial auction
+                if partial_upper.endswith("-P-P-P"):
+                    pattern = f"^{partial_upper}$"
+                else:
+                    pattern = f"^{partial_upper}.*-P-P-P$"
+                try:
+                    resp = api_post(
+                        "/sample-deals-by-auction-pattern",
+                        {"pattern": pattern, "sample_size": 1, "seed": int(seed)},  # Only need count, not deals
+                        timeout=10,
+                    )
+                    deals_counts[partial] = resp.get("total_count", 0)
+                except Exception:
+                    deals_counts[partial] = 0
+            # Cache elapsed time for display on subsequent renders
+            st.session_state["_deals_counts_elapsed_ms"] = (time.perf_counter() - t0_counts) * 1000
+            st.session_state["_deals_counts_steps"] = len(missing_partials)
+        
+        # Show cached elapsed time (persists across reruns)
+        if "_deals_counts_elapsed_ms" in st.session_state:
+            elapsed_ms = st.session_state["_deals_counts_elapsed_ms"]
+            steps = st.session_state.get("_deals_counts_steps", len(current_path))
+            st.info(f"⏱️ Loaded deal counts for {steps} steps in {elapsed_ms/1000:.2f}s")
+
         for i, step in enumerate(current_path):
             bid_num = i + 1
             seat_1_to_4 = ((bid_num - 1) % 4) + 1
-            # Store full Agg_Expr - display will handle truncation with tooltip
-            criteria_str = "; ".join(step.get("agg_expr", []))
+            # Store tooltip text but cap it (otherwise Auction Summary can take 20s+ to render/serialize).
+            criteria_str = _join_tooltip(step.get("agg_expr", []))
+            # Build partial auction up to this step for deals count lookup
+            partial_auction = "-".join([s["bid"] for s in current_path[:bid_num]])
+            # Use pre-fetched deals count
+            deals_count = deals_counts.get(partial_auction, 0)
             row = {
                 "Bid Num": bid_num,
                 "Seat": seat_1_to_4,
                 "Bid": step["bid"],
                 "BT Index": step.get("bt_index"),
+                "Deals": deals_count,
                 "Criteria Count": len(step.get("agg_expr", [])),
-                "Agg_Expr": criteria_str if criteria_str else "(none)",
+                # Display columns are truncated; *_full columns back tooltips.
+                "Agg_Expr_full": criteria_str,
+                "Agg_Expr": _truncate_60(criteria_str),
+                "Categories_full": "",
+                "Categories": "",
                 "Complete": "✅" if step.get("is_complete") else "",
             }
+
+            # Use categories from the step (populated by resolve-auction-path)
+            cats = step.get("categories", [])
+            if cats:
+                full = ", ".join(str(x) for x in cats if x)
+                row["Categories_full"] = full[:2000]
+                row["Categories"] = _truncate_60(full)
             
             # Evaluate criteria against pinned deal if available
             if pinned_deal:
@@ -5959,155 +6102,172 @@ def render_auction_builder():
                 "Seat",
                 "Bid",
                 "BT Index",
+                "Deals",
                 "Criteria Count",
                 "Agg_Expr",
+                "Categories",
                 "Complete",
             ],
         )
-        render_aggrid(summary_df, key="auction_builder_summary", height=calc_grid_height(len(summary_df)), table_name="auction_builder_summary")
+        # Make summary grid selectable to show deals for a specific auction step
+        # Use SELECTION_CHANGED to trigger rerun when row is selected
+        # Use fit_columns_to_view=False to prevent column width changes on rerender
+        from st_aggrid import GridUpdateMode as _GridUpdateMode
+        summary_selection = render_aggrid(
+            summary_df,
+            key="auction_builder_summary",
+            height=calc_grid_height(4),
+            table_name="auction_builder_summary",
+            hide_cols=["Agg_Expr_full", "Categories_full"],
+            update_mode=_GridUpdateMode.SELECTION_CHANGED,
+            fit_columns_to_view=False,
+        )
         
-        # Matching Deals section - on-demand loading via button
-        st.subheader("🎯 Matching Deals")
-        st.caption(f"Deals where the actual auction starts with: **{current_auction}**")
+        # Handle row selection - show matching deals for selected step
+        # render_aggrid returns a list of selected rows directly
+        selected_step_auction: str | None = None
+        if summary_selection and len(summary_selection) > 0:
+            sel_bid_num = summary_selection[0].get("Bid Num")
+            if sel_bid_num and sel_bid_num <= len(current_path):
+                # Build auction up to selected step
+                selected_step_auction = "-".join([s["bid"] for s in current_path[:sel_bid_num]])
         
-        # deals_cache_key already defined above for summary stats lookup
-        
-        if st.button("🔍 Show Matching Deals", type="secondary"):
-            st.session_state[deals_cache_key] = None  # Force refresh
-        
-        # Check if we have cached deals or need to load
-        if deals_cache_key in st.session_state and st.session_state[deals_cache_key] is not None:
-            # Show cached deals
-            cached_data = st.session_state[deals_cache_key]
-            sample_deals = cached_data.get("sample_deals", [])
-            if sample_deals:
-                elapsed = cached_data.get("elapsed_sec", 0)
-                st.success(f"Found **{len(sample_deals)}** matching deals ({elapsed:.2f}s)")
-                deals_df = pl.DataFrame(cached_data.get("display_rows", []))
-                render_aggrid(
-                    deals_df,
-                    key="auction_builder_deals",
-                    height=calc_grid_height(len(deals_df), max_height=400),
-                    table_name="auction_builder_deals",
-                )
-            else:
-                st.info("No deals found matching this auction pattern.")
-        elif deals_cache_key in st.session_state:
-            # Button was clicked, load deals
-            with st.spinner("Fetching matching deals..."):
-                try:
-                    import time as _time
-                    _t0 = _time.perf_counter()
-                    
-                    # Use bidding arena to get deals matching this auction
-                    # Use prefix match: auctions that START with the current path
-                    # e.g., "1D-1S-P" matches "1D-1S-P-2C-P-P-P", "1D-1S-P-P-P-P", etc.
-                    auction_upper = current_auction.upper()
-                    arena_response = requests.post(
-                        f"{API_BASE}/bidding-arena",
-                        json={
-                            "model_a": "Actual",
-                            "model_b": "Rules",
-                            "sample_size": int(max_matching_deals),
-                            "seed": int(seed),
-                            "auction_pattern": f"^{auction_upper}($|-.*)"  # Prefix match: exact OR followed by dash+anything
-                        },
-                        timeout=120
+        # Matching Deals section - only shown when a row in Auction Summary is clicked
+        if selected_step_auction is not None:
+            display_auction = selected_step_auction
+            st.subheader("🎯 Matching Deals")
+            st.caption(f"Deals where the actual auction starts with: **{display_auction}**")
+            
+            # Use display_auction for cache key (changes when row is selected)
+            display_deals_cache_key = f"auction_builder_deals_{display_auction}_{max_matching_deals}_{seed}"
+            
+            # Auto-load deals when row is selected (different from current cache)
+            if display_deals_cache_key not in st.session_state:
+                st.session_state[display_deals_cache_key] = None  # Trigger load
+            
+            # Check if we have cached deals or need to load
+            if display_deals_cache_key in st.session_state and st.session_state[display_deals_cache_key] is not None:
+                # Show cached deals
+                cached_data = st.session_state[display_deals_cache_key]
+                sample_deals = cached_data.get("sample_deals", [])
+                if sample_deals:
+                    elapsed = cached_data.get("elapsed_sec", 0)
+                    total_count = cached_data.get("total_count", len(sample_deals))
+                    st.success(f"Showing **{len(sample_deals)}** of **{total_count}** matching deals ({elapsed:.2f}s)")
+                    deals_df = pl.DataFrame(cached_data.get("display_rows", []))
+                    render_aggrid(
+                        deals_df,
+                        key="auction_builder_deals",
+                        height=calc_grid_height(len(deals_df), max_height=400),
+                        table_name="auction_builder_deals",
                     )
-                    arena_response.raise_for_status()
-                    arena_data = arena_response.json()
-                    
-                    sample_deals = arena_data.get("sample_deals", [])
-                    
-                    # Compute stats from matching deals, split by vulnerability
-                    # Use Rankings-style naming: Matches, Avg Par, EV (at Bid), EV Std
-                    scores_nv, scores_v = [], []
-                    par_scores_nv, par_scores_v = [], []
-                    
-                    for deal in sample_deals:
-                        vul = str(deal.get("Vul", "")).upper()
-                        is_vul = vul not in ("NONE", "-", "", "O")  # O = None in some formats
+                else:
+                    st.info("No deals found matching this auction pattern.")
+            elif display_deals_cache_key in st.session_state:
+                # Row was selected, load deals
+                with st.spinner("Fetching matching deals..."):
+                    try:
+                        # Lightweight: sample deals by actual-auction regex (no Rules/BT).
+                        auction_upper = display_auction.upper()
+                        if is_complete or auction_upper.endswith("-P-P-P"):
+                            arena_pattern = f"^{auction_upper}$"
+                        else:
+                            arena_pattern = f"^{auction_upper}.*-P-P-P$"
+                        deals_data = api_post(
+                            "/sample-deals-by-auction-pattern",
+                            {"pattern": arena_pattern, "sample_size": int(max_matching_deals), "seed": int(seed)},
+                            timeout=30,
+                        )
+                        _st_info_elapsed("Auction Builder: show matching deals", deals_data)
+                        sample_deals = deals_data.get("deals", []) or []
                         
-                        score = deal.get("Score")
-                        par = deal.get("ParScore")
+                        # Compute stats from matching deals, split by vulnerability
+                        # Use Rankings-style naming: Matches, Avg Par, EV (at Bid), EV Std
+                        scores_nv, scores_v = [], []
+                        par_scores_nv, par_scores_v = [], []
                         
-                        if score is not None:
-                            try:
-                                s = float(score)
-                                if is_vul:
-                                    scores_v.append(s)
-                                else:
-                                    scores_nv.append(s)
-                            except (ValueError, TypeError):
-                                pass
-                        if par is not None:
-                            try:
-                                p = float(par)
-                                if is_vul:
-                                    par_scores_v.append(p)
-                                else:
-                                    par_scores_nv.append(p)
-                            except (ValueError, TypeError):
-                                pass
-                    
-                    # Compute EV (average) and EV Std (standard deviation) for each vulnerability
-                    def calc_std(values: list) -> float | None:
-                        if len(values) < 2:
-                            return None
-                        mean = sum(values) / len(values)
-                        variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
-                        return round(variance ** 0.5, 1)
-                    
-                    stats = {
-                        "matches_nv": len(scores_nv) if scores_nv else None,
-                        "matches_v": len(scores_v) if scores_v else None,
-                        "avg_par_nv": round(sum(par_scores_nv) / len(par_scores_nv), 1) if par_scores_nv else None,
-                        "avg_par_v": round(sum(par_scores_v) / len(par_scores_v), 1) if par_scores_v else None,
-                        "ev_nv": round(sum(scores_nv) / len(scores_nv), 1) if scores_nv else None,
-                        "ev_v": round(sum(scores_v) / len(scores_v), 1) if scores_v else None,
-                        "ev_std_nv": calc_std(scores_nv),
-                        "ev_std_v": calc_std(scores_v),
-                    }
-                    
-                    # Build display DataFrame
-                    display_rows = []
-                    for deal in sample_deals:
-                        display_rows.append({
-                            "index": deal.get("index"),
-                            "Dealer": deal.get("Dealer"),
-                            "Vul": deal.get("Vul"),
-                            "Hand_N": deal.get("Hand_N", ""),
-                            "Hand_E": deal.get("Hand_E", ""),
-                            "Hand_S": deal.get("Hand_S", ""),
-                            "Hand_W": deal.get("Hand_W", ""),
-                            "Auction_Actual": deal.get("Auction_Actual", ""),
-                            "Contract": deal.get("Contract", ""),
-                            "Result": deal.get("Result", ""),
-                            "Score": deal.get("Score", ""),
-                            "ParScore": deal.get("ParScore", ""),
-                        })
-                    
-                    # Calculate elapsed time
-                    _elapsed_sec = round(_time.perf_counter() - _t0, 2)
-                    
-                    # Cache the results including stats and timing
-                    st.session_state[deals_cache_key] = {
-                        "sample_deals": sample_deals,
-                        "display_rows": display_rows,
-                        "stats": stats,
-                        "elapsed_sec": _elapsed_sec,
-                    }
-                    
-                    if sample_deals:
-                        # Rerun to update Auction Summary with the new stats
-                        st.rerun()
-                    else:
-                        st.info("No deals found matching this auction pattern.")
+                        for deal in sample_deals:
+                            vul = str(deal.get("Vul", "")).upper()
+                            is_vul = vul not in ("NONE", "-", "", "O")  # O = None in some formats
+                            
+                            score = deal.get("Score")
+                            par = deal.get("ParScore")
+                            
+                            if score is not None:
+                                try:
+                                    s = float(score)
+                                    if is_vul:
+                                        scores_v.append(s)
+                                    else:
+                                        scores_nv.append(s)
+                                except (ValueError, TypeError):
+                                    pass
+                            if par is not None:
+                                try:
+                                    p = float(par)
+                                    if is_vul:
+                                        par_scores_v.append(p)
+                                    else:
+                                        par_scores_nv.append(p)
+                                except (ValueError, TypeError):
+                                    pass
                         
-                except requests.exceptions.RequestException as e:
-                    st.error(f"API error: {e}")
-                except Exception as e:
-                    st.error(f"Error fetching deals: {e}")
+                        # Compute EV (average) and EV Std (standard deviation) for each vulnerability
+                        def calc_std(values: list) -> float | None:
+                            if len(values) < 2:
+                                return None
+                            mean = sum(values) / len(values)
+                            variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+                            return round(variance ** 0.5, 1)
+                        
+                        stats = {
+                            "matches_nv": len(scores_nv) if scores_nv else None,
+                            "matches_v": len(scores_v) if scores_v else None,
+                            "avg_par_nv": round(sum(par_scores_nv) / len(par_scores_nv), 1) if par_scores_nv else None,
+                            "avg_par_v": round(sum(par_scores_v) / len(par_scores_v), 1) if par_scores_v else None,
+                            "ev_nv": round(sum(scores_nv) / len(scores_nv), 1) if scores_nv else None,
+                            "ev_v": round(sum(scores_v) / len(scores_v), 1) if scores_v else None,
+                            "ev_std_nv": calc_std(scores_nv),
+                            "ev_std_v": calc_std(scores_v),
+                        }
+                        
+                        # Build display DataFrame
+                        display_rows = []
+                        for deal in sample_deals:
+                            display_rows.append({
+                                "index": deal.get("index"),
+                                "Dealer": deal.get("Dealer"),
+                                "Vul": deal.get("Vul"),
+                                "Hand_N": deal.get("Hand_N", ""),
+                                "Hand_E": deal.get("Hand_E", ""),
+                                "Hand_S": deal.get("Hand_S", ""),
+                                "Hand_W": deal.get("Hand_W", ""),
+                                "Auction_Actual": deal.get("Auction_Actual", ""),
+                                "Contract": deal.get("Contract", ""),
+                                "Result": deal.get("Result", ""),
+                                "Score": deal.get("Score", ""),
+                                "ParScore": deal.get("ParScore", ""),
+                            })
+                        
+                        # Cache the results including stats, timing, and total count
+                        st.session_state[display_deals_cache_key] = {
+                            "sample_deals": sample_deals,
+                            "display_rows": display_rows,
+                            "stats": stats,
+                            "total_count": deals_data.get("total_count", len(sample_deals)),
+                            "elapsed_sec": round((deals_data.get("_client_elapsed_ms") or deals_data.get("elapsed_ms") or 0) / 1000, 2),
+                        }
+                        
+                        if sample_deals:
+                            # Rerun to update Auction Summary with the new stats
+                            st.rerun()
+                        else:
+                            st.info("No deals found matching this auction pattern.")
+                            
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"API error: {e}")
+                    except Exception as e:
+                        st.error(f"Error fetching deals: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -6140,11 +6300,6 @@ func_choice = st.sidebar.selectbox(
 
 # Global settings
 st.sidebar.divider()
-show_custom_criteria = st.sidebar.checkbox(
-    "Show custom criteria info",
-    value=False,
-    help="Show info about custom auction criteria loaded from bbo_custom_auction_criteria.csv (hot-reloadable overlay)",
-)
 
 # Function descriptions (WIP)
 FUNC_DESCRIPTIONS = {
@@ -6162,34 +6317,31 @@ FUNC_DESCRIPTIONS = {
     "Find Auction Sequences": "Search for auction sequences matching a regex pattern. Shows criteria per seat.",
     "PBN Database Lookup": "Check if a specific PBN deal exists in the database. Returns game results if found.",
     "Random Auction Samples": "View random completed auction sequences from the bidding table.",
-    "Opening Bids by Deal": "Browse deals by index and see which opening bids match based on pre-computed criteria.",
+    "Opening Bids by Deal": "Randomly sample deals (with optional filters) and show which opening bids match based on pre-computed criteria.",
     "BT Seat Stats (On-the-fly)": "Compute HCP / suit-length / total-points stats per seat directly from deals, using the bidding table's criteria bitmaps.",
 }
 
 # Display function description
 st.info(f"**{func_choice}:** {FUNC_DESCRIPTIONS.get(func_choice, 'No description available.')}")
 
-# Show custom criteria info if checkbox is checked
-if show_custom_criteria:
-    try:
-        criteria_resp = requests.get(f"{API_BASE}/custom-criteria-info", timeout=10)
-        if criteria_resp.ok:
-            criteria_data = criteria_resp.json()
-            stats = criteria_data.get("stats", {})
-            if stats.get("criteria_file_exists"):
-                with st.expander("📋 Custom Auction Criteria (from CSV)", expanded=True):
-                    st.caption(f"File: `{criteria_data.get('criteria_file', 'N/A')}`")
-                    rules = stats.get("rules", [])
-                    if rules:
-                        st.markdown(f"**{len(rules)} rules applied** affecting {stats.get('auctions_modified', 0):,} auctions")
-                        rules_df = pl.DataFrame(rules)
-                        render_aggrid(rules_df, key="custom_criteria_rules", height=calc_grid_height(len(rules_df)), table_name="custom_criteria_rules")
-                    else:
-                        st.info("No rules defined in the CSV file.")
-            else:
-                st.caption("No custom criteria file found.")
-    except Exception:
-        pass  # Silently ignore errors fetching criteria info
+# Show custom criteria info by default
+try:
+    criteria_resp = requests.get(f"{API_BASE}/custom-criteria-info", timeout=10)
+    if criteria_resp.ok:
+        criteria_data = criteria_resp.json()
+        stats = criteria_data.get("stats", {})
+        if stats.get("criteria_file_exists"):
+            with st.expander("📋 Custom Auction Criteria (from CSV)", expanded=False):
+                st.caption(f"File: `{criteria_data.get('criteria_file', 'N/A')}`")
+                rules = stats.get("rules", [])
+                if rules:
+                    st.markdown(f"**{len(rules)} rules applied** affecting {stats.get('auctions_modified', 0):,} auctions")
+                    rules_df = pl.DataFrame(rules)
+                    render_aggrid(rules_df, key="custom_criteria_rules", height=calc_grid_height(len(rules_df)), table_name="custom_criteria_rules")
+                else:
+                    st.info("No rules defined in the CSV file.")
+except Exception:
+    pass  # Silently ignore errors fetching criteria info
 
 # Auction inputs for pattern-based functions
 pattern = None
