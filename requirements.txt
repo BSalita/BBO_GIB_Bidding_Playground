@@ -28,7 +28,7 @@ psutil
 
 # Streamlit app
 streamlit
-streamlit-aggrid  # Note: 1.2.1 gave object errors, 1.1.7 works
+streamlit-aggrid==1.1.8.post1
 requests
 altair  # Charts in Streamlit
 
