@@ -949,6 +949,30 @@ def render_aggrid(
                 # Best-effort: leave as-is if conversion fails
                 pass
 
+    # Generic stringification for any remaining list columns (prevents [object Object] in AgGrid).
+    # This catches "Failed Exprs", "Expr", "Agg_Expr_Seat", and others.
+    for c in df.columns:
+        dtype = df[c].dtype
+        if isinstance(dtype, pl.List):
+            try:
+                # Use a robust way to check for string inner type
+                is_string_list = False
+                try:
+                    # In some Polars versions, List.inner is accessible
+                    inner = getattr(dtype, "inner", None)
+                    if inner in (pl.Utf8, pl.String):
+                        is_string_list = True
+                except Exception:
+                    pass
+                
+                if is_string_list:
+                    df = df.with_columns(pl.col(c).list.join("; ").alias(c))
+                else:
+                    # Fallback for other list types (int, etc.): stringify
+                    df = df.with_columns(pl.col(c).cast(pl.Utf8).alias(c))
+            except Exception:
+                pass
+
     # Dynamic height based on explicit row/header heights set below.
     # rowHeight=28, headerHeight=32, plus border/scrollbar buffer.
     if height is None:
@@ -1135,14 +1159,22 @@ def render_aggrid(
         # unless specifically requested via update_mode.
         update_mode=update_mode,
         data_return_mode=DataReturnMode.AS_INPUT,
-        # For clickable grids (selection triggers actions), add a hover highlight + pointer cursor.
+        # For clickable grids (selection triggers actions), add a blue hover highlight + pointer.
+        # For read-only grids, add a very subtle gray hover to help eye tracking.
         custom_css=(
             {
-                ".ag-row": {"cursor": "pointer"},
-                ".ag-row-hover": {"background-color": "#E8F4FF !important"},
+                ".ag-row": {"cursor": "pointer", "transition": "background-color 0.1s"},
+                ".ag-row-hover": {
+                    "background-color": "#E8F4FF !important",
+                    "border-left": "3px solid #007BFF !important"
+                },
+                ".ag-row-selected": {"background-color": "#D1E9FF !important"},
             }
             if update_mode != GridUpdateMode.NO_UPDATE
-            else None
+            else {
+                ".ag-row": {"cursor": "default"},
+                ".ag-row-hover": {"background-color": "#F8F9FA !important"},
+            }
         ),
     )
     
@@ -1339,9 +1371,9 @@ def render_opening_bids_by_deal():
     elapsed_ms = data.get("elapsed_ms", 0)
     _st_info_elapsed("Opening Bids by Deal", data)
     if not deals:
-        st.info(f"No deals matched the specified filters. ({format_elapsed(elapsed_ms)})")
+        st.info("No deals matched the specified filters.")
     else:
-        st.success(f"Found {len(deals)} deal(s)")
+        st.info(f"Showing {len(deals)} deal(s) in {format_elapsed(elapsed_ms)}")
         for d in deals:
             st.subheader(f"Dealer {d['dealer']} – Deal Index {d['index']}")
             st.write(f"Opening seat: {d.get('opening_seat')}")
@@ -1436,9 +1468,9 @@ def render_random_auction_samples():
     elapsed_ms = data.get("elapsed_ms", 0)
     _st_info_elapsed("Random Auction Samples", data)
     if not samples:
-        st.info(f"No auctions found. ({format_elapsed(elapsed_ms)})")
+        st.info("No auctions found.")
     else:
-        st.success(f"Found {len(samples)} matching auction(s)")
+        st.info(f"Showing {len(samples)} matching auction(s) in {format_elapsed(elapsed_ms)}")
         
         # Build combined DataFrame from all samples for comparison
         all_rows = []
@@ -1522,9 +1554,9 @@ def render_find_auction_sequences(pattern: str | None, indices: list[int] | None
     samples = data.get("samples", [])
     elapsed_ms = data.get("elapsed_ms", 0)
     if not samples:
-        st.info(f"No auctions matched the pattern. ({format_elapsed(elapsed_ms)})")
+        st.info("No auctions matched the pattern.")
     else:
-        st.success(f"Found {len(samples)} matching auction(s)")
+        st.info(f"Showing {len(samples)} matching auction(s) in {format_elapsed(elapsed_ms)}")
         
         def _to_int_or_default(x: Any, default: int = 1) -> int:
             try:
@@ -1709,9 +1741,9 @@ def render_deals_by_auction_pattern(pattern: str | None):
     
     auctions = data.get("auctions", [])
     if not auctions:
-        st.info(f"No auctions matched the pattern. ({format_elapsed(elapsed_ms)})")
+        st.info("No auctions matched the pattern.")
     else:
-        st.success(f"Found {len(auctions)} matching auction(s)")
+        st.info(f"Showing {len(auctions)} matching auction(s) in {format_elapsed(elapsed_ms)}")
         for i, a in enumerate(auctions, start=1):
             bt_idx = a.get("bt_index")
             bt_suffix = f" (bt_index={bt_idx})" if bt_idx is not None else ""
@@ -1963,7 +1995,7 @@ def render_bidding_table_explorer():
         if data.get("message"):
             st.info(data["message"])
     else:
-        st.success(f"Found {total_matches:,} auctions matching pattern: `{actual_pattern}`")
+        st.info(f"Showing {total_matches:,} auctions matching pattern: `{actual_pattern}` in {format_elapsed(elapsed_ms)}")
         
         if rows:
             display_df = pl.DataFrame(rows)
@@ -2117,7 +2149,7 @@ def render_analyze_deal():
     input_type = pbn_data.get("input_type", "unknown")
     input_source = pbn_data.get("input_source", "")
     type_emoji = {"LIN string": "📝", "PBN string": "📝", "LIN file": "📁", "PBN file": "📁", "LIN URL": "🌐", "PBN URL": "🌐"}.get(input_type, "❓")
-    st.success(f"{type_emoji} Detected **{input_type}** — Parsed {len(deals)} deal(s)")
+    st.info(f"{type_emoji} Detected **{input_type}** — Showing {len(deals)} parsed deal(s) in {format_elapsed(pbn_data.get('elapsed_ms', 0))}")
     if input_source and len(input_source) < 200:
         st.caption(f"Source: `{input_source}`")
     
@@ -2197,15 +2229,15 @@ def render_analyze_deal():
         elapsed_ms = match_data.get("elapsed_ms", 0)
         
         if not matches:
-            st.warning(f"No matching auctions found for seat {match_seat}. ({format_elapsed(elapsed_ms)})")
+            st.warning(f"No matching auctions found for seat {match_seat}.")
         else:
-            st.success(f"Found {len(matches)} matching auction(s) for seat {match_seat}")
-            matches_df = pl.DataFrame(matches)
-            matches_df = order_columns(matches_df, priority_cols=[
-                "Auction", "Rules_Auction", "Expr",
-                "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
-            ])
-            render_aggrid(matches_df, key=f"matches_deal_{deal_idx}", height=calc_grid_height(len(matches)), table_name="auction_matches")
+            st.info(f"Showing {len(matches)} matching auction(s) for seat {match_seat} in {format_elapsed(elapsed_ms)}")
+        matches_df = pl.DataFrame(matches)
+        matches_df = order_columns(matches_df, priority_cols=[
+            "Auction", "Rules_Auction", "Expr",
+            "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
+        ])
+        render_aggrid(matches_df, key=f"matches_deal_{deal_idx}", height=calc_grid_height(len(matches)), table_name="auction_matches")
         
         st.divider()
         
@@ -2396,11 +2428,11 @@ def render_analyze_actual_auctions():
         return
     
     if not groups:
-        st.warning(f"No auctions matched pattern: `{effective_pattern}` ({format_elapsed(elapsed_ms)})")
+        st.warning(f"No auctions matched pattern: `{effective_pattern}`")
         return
     
     deals_msg = f", {total_matching_deals:,} deals" if isinstance(total_matching_deals, int) and total_matching_deals >= 0 else ""
-    st.success(f"Found {total_auctions:,} matching auctions{deals_msg}, showing {len(groups)} groups")
+    st.info(f"Showing {total_auctions:,} matching auctions{deals_msg}, showing {len(groups)} groups in {format_elapsed(elapsed_ms)}")
     
     for i, group in enumerate(groups):
         bid_auction = group.get("auction")
@@ -2843,7 +2875,7 @@ def render_auction_criteria_debugger():
                     return
                 
                 bt_index = target_row.get("index")
-                st.success(f"Found BT row: **bt_index={bt_index}**, Auction=**{target_row.get('Auction')}**")
+                st.info(f"Showing BT row: **bt_index={bt_index}**, Auction=**{target_row.get('Auction')}** in {format_elapsed(bt_data.get('elapsed_ms', 0))}")
                 
                 # Show criteria per seat as a DataFrame (BT row: raw/overlay)
                 criteria_by_seat = {}
@@ -2894,7 +2926,7 @@ def render_auction_criteria_debugger():
                     st.warning(f"No deals found with actual auction matching '{auction_pattern}'")
                     return
                 
-                st.success(f"Found **{len(sample_deals)}** sample deals")
+                st.info(f"Showing **{len(sample_deals)}** sample deals in {format_elapsed(arena_data.get('elapsed_ms', 0))}")
                 
                 st.divider()
                 
@@ -4585,7 +4617,7 @@ def render_rank_by_ev():
         st.info(data["message"])
     
     opening_seat = data.get("opening_seat", "Dealer (Seat 1)")
-    st.success(f"✅ Analyzed {total_bids} bids, {total_matches:,} matched deals — Opener: {opening_seat}")
+    st.info(f"✅ Showing {total_bids} bids, {total_matches:,} matched deals — Opener: {opening_seat} in {format_elapsed(elapsed_ms)}")
     
     # -------------------------------------------------------------------------
     # Bid Rankings Table (with row selection)
@@ -5016,7 +5048,7 @@ def render_rank_by_ev():
         
         shown_count = len(filtered_deals)
         if total_matches > shown_count and not has_selection:
-            st.warning(f"⚠️ Showing a random sample of {shown_count:,} out of {total_matches:,} total matches.")
+            st.info(f"Showing a random sample of {shown_count:,} out of {total_matches:,} total matches in {format_elapsed(elapsed_ms)}")
         
         dd_df = pl.DataFrame(filtered_deals)
         
@@ -5175,7 +5207,7 @@ def render_new_rules_metrics():
                 return
             
             # Display Header Info
-            st.success(f"Found metrics for: **{data['auction']}** (BT Index: {data['bt_index']})")
+            st.info(f"Showing metrics for: **{data['auction']}** (BT Index: {data['bt_index']}) in {format_elapsed(data.get('elapsed_ms', 0))}")
             
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -5790,8 +5822,16 @@ def render_auction_builder():
                 height=min(200, 35 + len(bid_rows) * 28),
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 key=f"auction_builder_bids_grid_{current_seat}",
-                theme="streamlit",
+                theme="balham",
                 allow_unsafe_jscode=True,  # Required for JsCode row styling
+                custom_css={
+                    ".ag-row": {"cursor": "pointer", "transition": "background-color 0.1s"},
+                    ".ag-row-hover": {
+                        "background-color": "#E8F4FF !important",
+                        "border-left": "3px solid #007BFF !important"
+                    },
+                    ".ag-row-selected": {"background-color": "#D1E9FF !important"},
+                },
             )
             
             selected_rows = grid_response.get("selected_rows")
@@ -6153,7 +6193,7 @@ def render_auction_builder():
                 if sample_deals:
                     elapsed = cached_data.get("elapsed_sec", 0)
                     total_count = cached_data.get("total_count", len(sample_deals))
-                    st.success(f"Showing **{len(sample_deals)}** of **{total_count}** matching deals ({elapsed:.2f}s)")
+                    st.info(f"Showing **{len(sample_deals)}** of **{total_count}** matching deals in {elapsed:.2f}s")
                     deals_df = pl.DataFrame(cached_data.get("display_rows", []))
                     render_aggrid(
                         deals_df,
@@ -6178,7 +6218,6 @@ def render_auction_builder():
                             {"pattern": arena_pattern, "sample_size": int(max_matching_deals), "seed": int(seed)},
                             timeout=30,
                         )
-                        _st_info_elapsed("Auction Builder: show matching deals", deals_data)
                         sample_deals = deals_data.get("deals", []) or []
                         
                         # Compute stats from matching deals, split by vulnerability
