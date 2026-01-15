@@ -4494,8 +4494,8 @@ def add_declarer_scores(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns([
         pl.when(pl.col('EV_Score_Col_Declarer').is_null()).then(None).otherwise(
             pl.struct(['EV_Score_Col_Declarer'] + EV_SCORE_COLUMNS
-            ).map_elements(lambda x: x[x['EV_Score_Col_Declarer']] if x['EV_Score_Col_Declarer'] is not None else None, return_dtype=pl.Float32)
-        ).alias('EV_Score_Declarer'),
+            ).map_elements(lambda x: x[x['EV_Score_Col_Declarer']] if x['EV_Score_Col_Declarer'] is not None else None, return_dtype=pl.Float64)
+        ).cast(pl.Float32).alias('EV_Score_Declarer'),
         # NOTE: This block intentionally uses a Python dict lookup for score computation.
         # Todo: replace with a Polars-native lookup/join on (BidLvl,BidSuit,Tricks,Vul_Declarer,Dbl) for performance.
         pl.struct(['BidLvl', 'BidSuit', 'Tricks', 'Vul_Declarer', 'Dbl']).map_elements(
