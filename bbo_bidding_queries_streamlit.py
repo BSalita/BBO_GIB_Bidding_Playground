@@ -836,7 +836,9 @@ def render_aggrid(
     hide_cols: list[str] | None = None,
     show_copy_panel: bool = False,
     copy_panel_default_col: str | None = None,
-    fit_columns_to_view: bool = True,
+    # IMPORTANT: default is FIT_CONTENTS (no squishing to force-fit page width).
+    # Set True only for small/compact tables where forcing all columns into view is desirable.
+    fit_columns_to_view: bool = False,
     show_sql_expander: bool = True,
 ) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
