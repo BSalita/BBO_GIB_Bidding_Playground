@@ -894,9 +894,9 @@ def generate_passthrough_sql(df: pl.DataFrame, table_name: str) -> str:
 
 
 def render_aggrid(
-    records: Any, 
-    key: str, 
-    height: int | None = None, 
+    records: Any,
+    key: str,
+    height: int | None = None,
     table_name: str | None = None,
     update_on: list[str] | None = None,
     sort_model: list[dict[str, Any]] | None = None,
@@ -907,6 +907,9 @@ def render_aggrid(
     # Set True only for small/compact tables where forcing all columns into view is desirable.
     fit_columns_to_view: bool = False,
     show_sql_expander: bool = True,
+    # Optional row styling based on a boolean column (e.g., "_passes")
+    # If set, rows will be colored green (True) or red (False)
+    row_pass_fail_col: str | None = None,
 ) -> list[dict[str, Any]]:
     """Render a list-of-dicts or DataFrame using AgGrid.
     
@@ -1241,6 +1244,52 @@ def render_aggrid(
     effective_update_on = update_on if update_on else []
     is_interactive = bool(effective_update_on)
     
+    # Row pass/fail styling: add getRowClass and hide the marker column
+    if row_pass_fail_col and row_pass_fail_col in df.columns:
+        # Hide the marker column
+        for col_def in grid_options.get("columnDefs", []):
+            if col_def.get("field") == row_pass_fail_col:
+                col_def["hide"] = True
+                break
+        # Add getRowClass for conditional styling
+        grid_options["getRowClass"] = JsCode(f"""
+            function(params) {{
+                if (params.data && params.data['{row_pass_fail_col}'] === true) {{
+                    return 'row-pass';
+                }} else if (params.data && params.data['{row_pass_fail_col}'] === false) {{
+                    return 'row-fail';
+                }}
+                return '';
+            }}
+        """)
+    
+    # Build custom CSS
+    if row_pass_fail_col and row_pass_fail_col in df.columns:
+        # Pass/fail row styling (same colors as valid/invalid bid grids)
+        custom_css = {
+            ".row-pass": {"background-color": "#d4edda"},  # Green
+            ".row-fail": {"background-color": "#f8d7da"},  # Red
+            ".row-pass.ag-row-hover": {"background-color": "#b8dfc4 !important", "border-left": "3px solid #28a745 !important"},
+            ".row-fail.ag-row-hover": {"background-color": "#f1b0b7 !important", "border-left": "3px solid #dc3545 !important"},
+            ".row-pass.ag-row-selected": {"background-color": "#a3d4af !important"},
+            ".row-fail.ag-row-selected": {"background-color": "#eb959f !important"},
+            ".ag-row": {"cursor": "pointer" if is_interactive else "default"},
+        }
+    elif is_interactive:
+        custom_css = {
+            ".ag-row": {"cursor": "pointer", "transition": "background-color 0.1s"},
+            ".ag-row-hover": {
+                "background-color": "#E8F4FF !important",
+                "border-left": "3px solid #007BFF !important"
+            },
+            ".ag-row-selected": {"background-color": "#D1E9FF !important"},
+        }
+    else:
+        custom_css = {
+            ".ag-row": {"cursor": "default"},
+            ".ag-row-hover": {"background-color": "#F8F9FA !important"},
+        }
+    
     response = AgGrid(
         df.to_pandas(),
         gridOptions=grid_options,
@@ -1253,23 +1302,8 @@ def render_aggrid(
         # unless specifically requested via update_on.
         update_on=effective_update_on,
         data_return_mode=DataReturnMode.AS_INPUT,
-        # For clickable grids (selection triggers actions), add a blue hover highlight + pointer.
-        # For read-only grids, add a very subtle gray hover to help eye tracking.
-        custom_css=(
-            {
-                ".ag-row": {"cursor": "pointer", "transition": "background-color 0.1s"},
-                ".ag-row-hover": {
-                    "background-color": "#E8F4FF !important",
-                    "border-left": "3px solid #007BFF !important"
-                },
-                ".ag-row-selected": {"background-color": "#D1E9FF !important"},
-            }
-            if is_interactive
-            else {
-                ".ag-row": {"cursor": "default"},
-                ".ag-row-hover": {"background-color": "#F8F9FA !important"},
-            }
-        ),
+        custom_css=custom_css,
+        allow_unsafe_jscode=True if row_pass_fail_col else False,
     )
     
     selected_rows: Any = response.get("selected_rows", [])
@@ -6046,6 +6080,25 @@ def render_auction_builder():
                 invalid_rows = [r for r in bid_rows if r.get("_matches") is False and not r.get("_rejected")]
                 other_rows = [r for r in bid_rows if r.get("_matches") is None and not r.get("_rejected")]
                 
+                # If no valid bids, ensure Pass is available (Pass is always legal in bridge)
+                if not valid_rows:
+                    # Find Pass row in any category and move it to valid
+                    pass_row = None
+                    for rows_list in [rejected_rows, invalid_rows, other_rows]:
+                        for r in rows_list:
+                            bid_str = str(r.get("Bid", "")).strip().upper()
+                            if bid_str in ("P", "P ✅", "PASS"):
+                                pass_row = r
+                                rows_list.remove(r)
+                                break
+                        if pass_row:
+                            break
+                    if pass_row:
+                        # Clear rejection status for Pass
+                        pass_row["_rejected"] = False
+                        pass_row["Failure"] = ""
+                        valid_rows.append(pass_row)
+                
                 # Valid bids grid
                 if valid_rows:
                     st.markdown(f"**✅ Valid Bids ({len(valid_rows)})**")
@@ -6366,12 +6419,15 @@ def render_auction_builder():
                 dealer = pinned_deal.get("Dealer", "N")
                 criteria_list = step.get("agg_expr", [])
                 passes, failed = evaluate_criteria_for_pinned(criteria_list, seat_1_to_4, dealer, pinned_deal)
+                row["_passes"] = passes  # Hidden column for row styling
                 if passes:
                     row["Pinned"] = "✅"
                 else:
                     row["Pinned"] = "❌"
                     row["Failed_Criteria"] = "; ".join(failed)  # Show all failures
                     pinned_all_pass = False
+            else:
+                row["_passes"] = True  # Default to pass when no pinned deal
             
             # Add stats columns only on the last row (they apply to the full auction)
             # Use Rankings-style naming: Matches, Avg Par, EV at Bid, EV Std (with NV/V suffix)
@@ -6429,14 +6485,16 @@ def render_auction_builder():
         # Make summary grid selectable to show deals for a specific auction step
         # Use selectionChanged to trigger rerun when row is selected
         # Use fit_columns_to_view=False to prevent column width changes on rerender
+        # Use row_pass_fail_col to colorize rows based on pinned deal criteria evaluation
         summary_selection = render_aggrid(
             summary_df,
             key="auction_builder_summary",
             height=calc_grid_height(4),
             table_name="auction_builder_summary",
-            hide_cols=["Agg_Expr_full", "Categories_full"],
+            hide_cols=["Agg_Expr_full", "Categories_full", "_passes"],
             update_on=["selectionChanged"],
             fit_columns_to_view=False,
+            row_pass_fail_col="_passes" if pinned_deal else None,
         )
         
         # Handle row selection - show matching deals for selected step
