@@ -7735,6 +7735,26 @@ def _handle_resolve_auction_path_fallback(
     # Load Agg_Expr (Prefer in-memory Expr to avoid heavy DuckDB hits)
     meta_map = {row["bt_index"]: row for row in meta_df.to_dicts()}
     
+    # Fetch categories for all indices in the path
+    bt_categories_df = state.get("bt_categories_df")
+    bt_category_cols = state.get("bt_category_cols") or []
+    categories_by_idx: Dict[int, List[str]] = {}
+    if bt_categories_df is not None and bt_category_cols:
+        cat_idx_arr = bt_categories_df["bt_index"].to_numpy()
+        for idx_val in curr_indices:
+            pos = int(np.searchsorted(cat_idx_arr, int(idx_val)))
+            if 0 <= pos < len(cat_idx_arr):
+                try:
+                    val_at_pos = cat_idx_arr[pos]
+                    if not np.isnan(val_at_pos) and int(val_at_pos) == int(idx_val):
+                        cats_true: List[str] = []
+                        for c in bt_category_cols:
+                            if bool(bt_categories_df[c][pos]):
+                                cats_true.append(c[3:] if c.startswith("is_") else c)
+                        categories_by_idx[int(idx_val)] = cats_true
+                except (ValueError, TypeError):
+                    continue
+
     for i, idx in enumerate(curr_indices):
         row = meta_map.get(idx, {})
         row_dict = dict(row)
@@ -7754,7 +7774,8 @@ def _handle_resolve_auction_path_fallback(
         path_info.append({
             "step": i + 1, "bid": tokens[i], "bt_index": idx, 
             "agg_expr": agg_list, "is_complete": bool(row.get("is_completed_auction")),
-            "matching_deal_count": row.get("matching_deal_count")
+            "matching_deal_count": row.get("matching_deal_count"),
+            "categories": categories_by_idx.get(int(idx), []),
         })
 
     elapsed_ms = (time.perf_counter() - t0) * 1000

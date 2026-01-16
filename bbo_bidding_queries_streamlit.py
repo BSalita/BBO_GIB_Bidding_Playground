@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, ColumnsAutoSizeMode, JsCode
-from st_aggrid.shared import GridUpdateMode, DataReturnMode
+from st_aggrid.shared import DataReturnMode
 import polars as pl
 import duckdb  # type: ignore[import-not-found]
 import pandas as pd
@@ -41,7 +41,6 @@ from bbo_bidding_queries_lib import (
 
 # Import criteria evaluation helpers from handlers
 from plugins.bbo_handlers_common import (
-    evaluate_sl_criterion,
     annotate_criterion_with_value,
 )
 
@@ -182,6 +181,74 @@ def prepend_all_seats_prefix(pattern: str) -> str:
 def calc_grid_height(n_rows: int, max_height: int = 400, row_height: int = 35, header_height: int = 50) -> int:
     """Calculate appropriate grid height based on row count."""
     return min(max_height, header_height + n_rows * row_height)
+
+
+def render_deal_diagram(
+    deal: dict[str, Any],
+    title: str | None = None,
+    show_header: bool = True,
+    width_ratio: tuple[int, int] = (3, 7),
+) -> None:
+    """Render a bridge deal in traditional cross/diagram layout.
+    
+    Args:
+        deal: Dict with keys Hand_N, Hand_E, Hand_S, Hand_W, and optionally
+              Dealer, Vul/Vulnerability, ParScore/Par_Score
+        title: Optional section title (e.g., "📋 Current Deal"). If None, no header shown.
+        show_header: Whether to show the Dealer/Vul/Par caption
+        width_ratio: Column ratio [deal_width, spacer_width] for layout (default 30%/70%)
+    """
+    def _format_hand_suits(hand_str: str) -> str:
+        """Format a hand string (e.g., 'AKQ.JT9.876.5432') into suit lines with symbols."""
+        if not hand_str:
+            return ""
+        suits = str(hand_str).split(".")
+        symbols = ["♠", "♥", "♦", "♣"]
+        lines = []
+        for i, sym in enumerate(symbols):
+            cards = suits[i] if i < len(suits) else ""
+            cards = cards if cards and cards != "-" else "—"
+            lines.append(f"{sym} {cards}")
+        return "\n".join(lines)
+    
+    if title:
+        st.subheader(title)
+    
+    hand_n = deal.get("Hand_N", "")
+    hand_e = deal.get("Hand_E", "")
+    hand_s = deal.get("Hand_S", "")
+    hand_w = deal.get("Hand_W", "")
+    
+    # Wrap the cross layout in a narrow bordered container
+    deal_col, _ = st.columns(list(width_ratio))
+    with deal_col:
+        with st.container(border=True):
+            if show_header:
+                dealer = deal.get("Dealer", "?")
+                vul = deal.get("Vul", deal.get("Vulnerability", "?"))
+                par = deal.get("ParScore", deal.get("Par_Score", "?"))
+                st.caption(f"Dealer: {dealer} | Vul: {vul} | Par: {par}")
+            
+            # Cross layout: North at top center
+            col_left, col_north, col_right = st.columns([1, 2, 1])
+            with col_north:
+                st.markdown("**North**")
+                st.text(_format_hand_suits(hand_n))
+            
+            # West on left, East on right
+            col_west, col_east = st.columns([1, 1])
+            with col_west:
+                st.markdown("**West**")
+                st.text(_format_hand_suits(hand_w))
+            with col_east:
+                st.markdown("**East**")
+                st.text(_format_hand_suits(hand_e))
+            
+            # South at bottom center
+            col_left2, col_south, col_right2 = st.columns([1, 2, 1])
+            with col_south:
+                st.markdown("**South**")
+                st.text(_format_hand_suits(hand_s))
 
 
 def order_columns(df: pl.DataFrame, priority_cols: list[str], drop_cols: list[str] | None = None) -> pl.DataFrame:
@@ -831,7 +898,7 @@ def render_aggrid(
     key: str, 
     height: int | None = None, 
     table_name: str | None = None,
-    update_mode: GridUpdateMode = GridUpdateMode.NO_UPDATE,
+    update_on: list[str] | None = None,
     sort_model: list[dict[str, Any]] | None = None,
     hide_cols: list[str] | None = None,
     show_copy_panel: bool = False,
@@ -848,7 +915,7 @@ def render_aggrid(
         key: Unique key for the AgGrid component
         height: Optional height in pixels
         table_name: Optional table name for SQL display (shows SQL expander if provided)
-        update_mode: GridUpdateMode (default: NO_UPDATE for performance)
+        update_on: List of events to trigger updates (e.g., ["selectionChanged"]). Default: [] (no updates)
     
     Returns:
         List of selected rows (dicts)
@@ -1120,6 +1187,27 @@ def render_aggrid(
             tooltipField=tooltip_field,
         )
     
+    # Add tooltips for columns with potentially long values
+    # These columns show full content on hover to handle truncation
+    tooltip_columns = [
+        "Exprs", "Expr", "Failed Exprs", "Failed_Exprs",
+        "Criteria", "Failed_Criteria", "Failed Criteria",
+        "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
+        "Invalid_Criteria_S1", "Invalid_Criteria_S2", "Invalid_Criteria_S3", "Invalid_Criteria_S4",
+        "Wrong_Bid_S1", "Wrong_Bid_S2", "Wrong_Bid_S3", "Wrong_Bid_S4",
+        "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+        "ParContracts", "EV_ParContracts", "Contract",
+        "Description", "Notes", "Comment",
+    ]
+    for col in tooltip_columns:
+        if col in df.columns:
+            # Check for a _full version first
+            full_col = f"{col}_full"
+            tooltip_field = full_col if full_col in df.columns else col
+            # Only configure if not already configured above
+            if col not in ("Agg_Expr", "Categories"):
+                gb.configure_column(col, tooltipField=tooltip_field)
+    
     # Auction column can be wide - constrain it
     if "Auction" in df.columns:
         gb.configure_column("Auction", maxWidth=200)
@@ -1149,6 +1237,10 @@ def render_aggrid(
     # Choose auto-size mode: FIT_ALL_COLUMNS_TO_VIEW for compact tables, FIT_CONTENTS for wide tables
     auto_size_mode = ColumnsAutoSizeMode.FIT_ALL_COLUMNS_TO_VIEW if fit_columns_to_view else ColumnsAutoSizeMode.FIT_CONTENTS
 
+    # Normalize update_on: None or empty list means no updates (read-only grid)
+    effective_update_on = update_on if update_on else []
+    is_interactive = bool(effective_update_on)
+    
     response = AgGrid(
         df.to_pandas(),
         gridOptions=grid_options,
@@ -1158,8 +1250,8 @@ def render_aggrid(
         columns_auto_size_mode=auto_size_mode,
         # Critical UX: clicking a row should only highlight it locally and NOT
         # emit selection/model updates back to Streamlit (which would cause a rerun)
-        # unless specifically requested via update_mode.
-        update_mode=update_mode,
+        # unless specifically requested via update_on.
+        update_on=effective_update_on,
         data_return_mode=DataReturnMode.AS_INPUT,
         # For clickable grids (selection triggers actions), add a blue hover highlight + pointer.
         # For read-only grids, add a very subtle gray hover to help eye tracking.
@@ -1172,7 +1264,7 @@ def render_aggrid(
                 },
                 ".ag-row-selected": {"background-color": "#D1E9FF !important"},
             }
-            if update_mode != GridUpdateMode.NO_UPDATE
+            if is_interactive
             else {
                 ".ag-row": {"cursor": "default"},
                 ".ag-row-hover": {"background-color": "#F8F9FA !important"},
@@ -3491,7 +3583,7 @@ def render_bidding_arena():
                             key="arena_deal_comparison",
                             height=calc_grid_height(len(comparison_df)),
                             table_name="deal_comparison",
-                            update_mode=GridUpdateMode.SELECTION_CHANGED,
+                            update_on=["selectionChanged"],
                             show_copy_panel=True,
                             copy_panel_default_col="index",
                             hide_cols=["_row_idx", "Rules_Matches", "Rules_Matches_Auctions", "Auction_Rules_Selected"],
@@ -3538,7 +3630,7 @@ def render_bidding_arena():
                             key="arena_no_bt_match",
                             height=calc_grid_height(len(no_match_df)),
                             table_name="no_bt_match",
-                            update_mode=GridUpdateMode.SELECTION_CHANGED,
+                            update_on=["selectionChanged"],
                             show_copy_panel=True,
                             copy_panel_default_col="index",
                             hide_cols=["_row_idx", "Rules_Matches", "Rules_Matches_Auctions", "Auction_Rules_Selected"],
@@ -3586,7 +3678,7 @@ def render_bidding_arena():
                     key="arena_sample_deals",
                     height=calc_grid_height(len(sample_df)),
                     table_name="arena_samples",
-                    update_mode=GridUpdateMode.SELECTION_CHANGED,
+                    update_on=["selectionChanged"],
                     show_copy_panel=True,
                     copy_panel_default_col="index",
                     hide_cols=["_row_idx", "Rules_Matches", "Rules_Matches_Auctions", "Auction_Rules_Selected"],
@@ -3671,7 +3763,7 @@ def render_bidding_arena():
                                 key=f"arena_rules_matches_{sel_idx}",
                                 height=calc_grid_height(len(rm_df), max_height=260),
                                 table_name="rules_matches",
-                                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                                update_on=["selectionChanged"],
                                 show_copy_panel=True,
                                 copy_panel_default_col="bt_index" if "bt_index" in rm_df.columns else None,
                             )
@@ -3963,7 +4055,7 @@ def render_bidding_arena():
                                 seq_df,
                                 key=f"arena_bt_seq_{label}_{sel_idx}",
                                 table_name="auction_sequences",
-                                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                                update_on=["selectionChanged"],
                                 show_copy_panel=True,
                                 copy_panel_default_col="index",
                             )
@@ -4665,7 +4757,7 @@ def render_rank_by_ev():
             key=f"rank_bids_rankings_ev_{CACHE_VERSION}",
             height=calc_grid_height(len(rankings_df), max_height=400), 
             table_name="bid_rankings",
-            update_mode=GridUpdateMode.SELECTION_CHANGED,
+            update_on=["selectionChanged"],
             sort_model=[{"colId": "EV at Bid", "sort": "desc"}],
         )
         
@@ -4787,7 +4879,7 @@ def render_rank_by_ev():
                         key=f"contract_ev_rankings_{selected_bid_name}",
                         height=400,
                         table_name="top_ev",
-                        update_mode=GridUpdateMode.SELECTION_CHANGED,
+                        update_on=["selectionChanged"],
                         hide_cols=["_level", "_strain"]
                     )
                     selected_contract_ev = selected_contract_ev_rows[0] if selected_contract_ev_rows else (ev_df.to_dicts()[0] if ev_df.height > 0 else None)
@@ -4929,7 +5021,7 @@ def render_rank_by_ev():
                 key="dd_analysis_recommendations", 
                 height=calc_grid_height(len(rec_df)), 
                 table_name="recommendations",
-                update_mode=GridUpdateMode.SELECTION_CHANGED
+                update_on=["selectionChanged"],
             )
             
             # Capture the selected contract if any
@@ -5332,7 +5424,12 @@ def render_auction_builder():
                         deal_data["_source"] = f"index:{idx}"
                         pinned_deal = deal_data
                     else:
-                        pinned_deal_error = f"Deal index {idx} not found"
+                        pinned_deal_error = (
+                            f"Deal index {idx} not found in the API server's loaded deals dataset. "
+                            "This can happen if the server was started with a limited `--deal-rows` subset "
+                            "or if that deal isn't present in the dataset (e.g., missing/partial auction data). "
+                            "Try pinning via PBN instead."
+                        )
                 else:
                     # Process as PBN
                     data = api_post("/process-pbn", {"pbn": input_stripped, "include_par": True, "vul": "None"}, timeout=10)
@@ -5350,25 +5447,9 @@ def render_auction_builder():
             except Exception as e:
                 pinned_deal_error = str(e)
     
-    # Show pinned deal info in sidebar
+    # Show pinned deal error in sidebar (success/hands moved to main area)
     if pinned_deal:
         st.sidebar.success("✅ Deal pinned")
-        # Show hands compactly
-        hands_str = []
-        for d in ["N", "E", "S", "W"]:
-            hand = pinned_deal.get(f"Hand_{d}", "")
-            if hand:
-                hands_str.append(f"**{d}:** {hand}")
-        if hands_str:
-            st.sidebar.markdown(" | ".join(hands_str[:2]))  # N, E
-            st.sidebar.markdown(" | ".join(hands_str[2:]))  # S, W
-        
-        # Show dealer/vul if available
-        dealer = pinned_deal.get("Dealer", "?")
-        vul = pinned_deal.get("Vul", pinned_deal.get("Vulnerability", "?"))
-        par = pinned_deal.get("ParScore", pinned_deal.get("Par_Score", "?"))
-        st.sidebar.caption(f"Dealer: {dealer} | Vul: {vul} | Par: {par}")
-        
         if st.sidebar.button("❌ Clear Pinned Deal"):
             # Clear all pinned deal caches
             keys_to_clear = [k for k in st.session_state if k.startswith("pinned_deal_")]
@@ -5378,14 +5459,9 @@ def render_auction_builder():
     elif pinned_deal_error:
         st.sidebar.error(pinned_deal_error)
     
-    # Checkbox to show/hide failed criteria coloring (only when deal is pinned)
-    show_failed_criteria = False
-    if pinned_deal:
-        show_failed_criteria = st.sidebar.checkbox(
-            "Color failed bidding candidates",
-            value=True,
-            help="Highlight bids that don't match the pinned deal's criteria"
-        )
+    # When a deal is pinned, always show failed criteria coloring and use 2 dataframes
+    show_failed_criteria = bool(pinned_deal)
+    use_two_dataframes = bool(pinned_deal)
     
     st.sidebar.divider()
     
@@ -5414,6 +5490,10 @@ def render_auction_builder():
     if current_path:
         last_step = current_path[-1]
         is_complete = last_step.get("is_complete", False)
+    
+    # Display pinned deal in main area (above Current Auction)
+    if pinned_deal:
+        render_deal_diagram(pinned_deal, title="📋 Current Deal")
     
     # Display current auction state with editable input
     st.subheader("Current Auction")
@@ -5567,19 +5647,76 @@ def render_auction_builder():
             st.error(f"Error fetching bid options: {e}")
             return []
     
+    def _is_auction_complete_after_next_bid(current_auction_text: str, next_bid: str) -> bool:
+        """Best-effort bridge completion rule for manual 'P' continuation.
+        
+        - Passed out: P-P-P-P
+        - Otherwise: 3 consecutive passes after any non-pass bid
+        """
+        try:
+            parts: list[str] = []
+            if current_auction_text:
+                parts = [p.strip().upper() for p in str(current_auction_text).split("-") if p.strip()]
+            parts.append(str(next_bid).strip().upper())
+            if not parts:
+                return False
+            # Passed out (4 passes)
+            if len(parts) >= 4 and all(p == "P" for p in parts):
+                return True
+            # 3 trailing passes after any non-pass bid
+            trailing = 0
+            for p in reversed(parts):
+                if p == "P":
+                    trailing += 1
+                else:
+                    break
+            if trailing >= 3 and any(p != "P" for p in parts):
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _strip_leading_passes(auction_text: str) -> tuple[str, int]:
+        """Return (bt_prefix, leading_passes) where bt_prefix omits leading passes before first non-pass.
+
+        This lets Auction Builder support opening passes:
+        - Display path can be "P-P-1C-..."
+        - BT lookup prefix should be "1C-..." (seat-1 canonical)
+        """
+        try:
+            if not auction_text:
+                return "", 0
+            toks = [t.strip().upper() for t in str(auction_text).split("-") if t.strip()]
+            n = 0
+            for t in toks:
+                if t == "P":
+                    n += 1
+                    continue
+                break
+            # If all passes so far, canonical BT prefix is still opening ("").
+            if n >= len(toks):
+                return "", int(n)
+            bt = "-".join(toks[n:])
+            return bt, int(n)
+        except Exception:
+            return str(auction_text or ""), 0
+
     # Display bid selection
     if not is_complete:
         # Seat cycles 1-4, Bid Num is always increasing
         seat_1_to_4 = ((current_seat - 1) % 4) + 1
         st.markdown(f"**Select Bid for Seat {seat_1_to_4}**")
         
+        # Allow opening passes: for BT lookups, strip leading passes (seat-1 canonical).
+        bt_prefix, leading_passes = _strip_leading_passes(current_auction)
+
         # Check cache first to avoid showing spinner when cached
-        cache_key = (current_auction or "__opening__", seed)
+        cache_key = (bt_prefix or "__opening__", seed)
         if cache_key in st.session_state.auction_builder_options:
             options = st.session_state.auction_builder_options[cache_key]
         else:
             with st.spinner("Loading available bids..."):
-                options = get_next_bid_options(current_auction)
+                options = get_next_bid_options(bt_prefix)
         
         # Show elapsed time for loading bids
         bids_elapsed_ms = st.session_state.get("_auction_builder_bids_elapsed_ms")
@@ -5588,7 +5725,24 @@ def render_auction_builder():
         
         if not options:
             st.warning("No more bids available in BT for this auction prefix.")
-        else:
+
+        # Opening-pass support:
+        # If we are still before the opening bid (canonical BT prefix is empty), always offer 'P' as an option.
+        # Selecting P advances the seat; BT prefix remains "" until the first non-pass bid is chosen.
+        if bt_prefix == "":
+            has_p = any(str(o.get("bid") or "").strip().upper() == "P" for o in (options or []))
+            if not has_p:
+                options = list(options or [])
+                options.append(
+                    {
+                        "bid": "P",
+                        "bt_index": None,
+                        "agg_expr": [],
+                        "is_complete": _is_auction_complete_after_next_bid(current_auction, "P"),
+                    }
+                )
+
+        if options:
             # Sort options: P first, then D, then R, then rest alphabetically
             def bid_sort_key(opt):
                 bid = opt.get("bid", "").upper()
@@ -5653,83 +5807,55 @@ def render_auction_builder():
             def check_pinned_match_with_failures(criteria_list: list, seat: int) -> tuple[bool, list[str]]:
                 """Check if pinned deal matches all criteria. Returns (matches, failed_list).
                 
-                Uses evaluate_sl_criterion from bbo_handlers_common which supports:
-                - Simple SL: 'SL_S >= 5'
-                - Relative SL: 'SL_S >= SL_H'
-                - Complex: 'SL_D >= SL_C & ((SL_D > SL_H & SL_D > SL_S) | (SL_H <= 4 & SL_S <= 4))'
-                
-                Also handles simple HCP/Total_Points criteria directly.
+                Uses server-side bitmap evaluation via /deal-criteria-eval-batch when the pinned
+                deal has _row_idx (fetched by index). PBN deals cannot be evaluated until
+                enrichment via mlBridgeAugmentationLib is implemented.
                 """
                 if not pinned_deal or not criteria_list:
                     return True, []
                 
-                dealer = pinned_deal.get("Dealer", "N")
-                directions = ["N", "E", "S", "W"]
+                dealer = str(pinned_deal.get("Dealer", "N")).upper()
+                row_idx = pinned_deal.get("_row_idx")
+                
+                # PBN deals don't have _row_idx - cannot evaluate criteria without enrichment
+                if row_idx is None:
+                    return True, ["(PBN deal - criteria evaluation not available)"]
+                
+                # Use server-side bitmap evaluation (accurate for all criteria)
                 try:
-                    dealer_idx = directions.index(dealer.upper())
-                except ValueError:
-                    dealer_idx = 0
-                direction = directions[(dealer_idx + seat - 1) % 4]
-                
-                # Capture pinned_deal in a local variable for type checker
-                deal_data = pinned_deal  # Already checked not None above
-                
-                def eval_simple_criterion(crit_str: str) -> bool | None:
-                    """Evaluate simple HCP/Total_Points criteria like 'HCP >= 12'."""
-                    import re as re_mod
-                    m = re_mod.match(r"^(HCP|Total_Points)\s*(>=|<=|>|<|==|!=)\s*(\d+)$", crit_str.strip())
-                    if not m:
-                        return None  # Not a simple criterion
-                    var_name, op, num_str = m.groups()
-                    threshold = int(num_str)
+                    # Use session cache to avoid repeated API calls
+                    cache_key = ("deal_criteria_eval", int(row_idx), dealer, seat, tuple(criteria_list))
+                    eval_cache = st.session_state.setdefault("_deal_criteria_eval_cache", {})
+                    if cache_key in eval_cache:
+                        cached = eval_cache[cache_key]
+                        return cached["passes"], cached["failed"]
                     
-                    # Get actual value
-                    if var_name == "HCP":
-                        val = deal_data.get(f"HCP_{direction}")
-                    else:  # Total_Points
-                        val = deal_data.get(f"Total_Points_{direction}")
-                    
-                    if val is None:
-                        return False  # Missing data = fail
-                    
-                    val = int(val)
-                    if op == ">=":
-                        return val >= threshold
-                    elif op == "<=":
-                        return val <= threshold
-                    elif op == ">":
-                        return val > threshold
-                    elif op == "<":
-                        return val < threshold
-                    elif op == "==":
-                        return val == threshold
-                    elif op == "!=":
-                        return val != threshold
-                    return None
+                    payload = {
+                        "deal_row_idx": int(row_idx),
+                        "dealer": dealer,
+                        "checks": [{"seat": seat, "criteria": list(criteria_list)}],
+                    }
+                    data = api_post("/deal-criteria-eval-batch", payload, timeout=10)
+                    results = data.get("results", [])
+                    if results:
+                        r = results[0]
+                        failed_list = r.get("failed", [])
+                        untracked = r.get("untracked", [])
+                        # Annotate failed criteria with actual values
+                        annotated_failed = []
+                        for f in failed_list:
+                            annotated = annotate_criterion_with_value(str(f), dealer, seat, pinned_deal)
+                            annotated_failed.append(annotated)
+                        # Include untracked criteria as warnings
+                        for u in untracked:
+                            annotated_failed.append(f"UNTRACKED: {u}")
+                        passes = len(failed_list) == 0 and len(untracked) == 0
+                        eval_cache[cache_key] = {"passes": passes, "failed": annotated_failed}
+                        return passes, annotated_failed
+                except Exception as e:
+                    return True, [f"(Server error: {e})"]
                 
-                failed = []
-                for crit in criteria_list:
-                    crit_str = str(crit).strip()
-                    if not crit_str:
-                        continue
-                    try:
-                        # Use the robust evaluator from bbo_handlers_common (handles SL and complex)
-                        result = evaluate_sl_criterion(crit_str, dealer, seat, pinned_deal, fail_on_missing=True)
-                        if result is False:
-                            # Annotate the failed criterion with actual values
-                            annotated = annotate_criterion_with_value(crit_str, dealer, seat, pinned_deal)
-                            failed.append(annotated)
-                        elif result is None:
-                            # Not an SL/complex criterion - try simple HCP/Total_Points
-                            simple_result = eval_simple_criterion(crit_str)
-                            if simple_result is False:
-                                annotated = annotate_criterion_with_value(crit_str, dealer, seat, pinned_deal)
-                                failed.append(annotated)
-                            # If simple_result is None or True, criterion passes (unrecognized = pass)
-                    except Exception:
-                        continue  # Skip unparseable criteria
-                
-                return len(failed) == 0, failed
+                return True, []
             
             # Build DataFrame for bid selection
             bid_rows = []
@@ -5746,15 +5872,29 @@ def render_auction_builder():
                     matches_pinned = matches
                     failed_criteria_str = "; ".join(failed_list) if failed_list else ""
                 
-                row_data = {
+                # Compute direction from dealer + seat when deal is pinned
+                seat_direction: str | None = None
+                if pinned_deal:
+                    dealer = pinned_deal.get("Dealer", "N")
+                    directions = ["N", "E", "S", "W"]
+                    try:
+                        dealer_idx = directions.index(str(dealer).upper())
+                    except ValueError:
+                        dealer_idx = 0
+                    seat_direction = directions[(dealer_idx + seat_1_to_4 - 1) % 4]
+                
+                row_data: dict[str, Any] = {
                     "_idx": i,
                     "_matches": matches_pinned,  # Hidden column for styling
                     "Bid Num": current_seat,
                     "Seat": seat_1_to_4,
-                    "Bid": f"{opt['bid']}{complete_marker}",
-                    "Criteria": criteria_str if criteria_str else "(none)",
-                    "Categories": "",
                 }
+                # Add Direction column only when deal is pinned
+                if seat_direction:
+                    row_data["Direction"] = seat_direction
+                row_data["Bid"] = f"{opt['bid']}{complete_marker}"
+                row_data["Criteria"] = criteria_str if criteria_str else "(none)"
+                row_data["Categories"] = ""
                 # Attach categories (true flags) for this candidate's bt_index (if available)
                 try:
                     bt_idx = opt.get("bt_index")
@@ -5768,88 +5908,190 @@ def render_auction_builder():
             
             bids_df = pl.DataFrame(bid_rows)
             
-            # Use AgGrid with row selection and conditional styling
-            pandas_df = bids_df.to_pandas()
-            gb = GridOptionsBuilder.from_dataframe(pandas_df)
-            gb.configure_selection(selection_mode="single", use_checkbox=False)
-            gb.configure_column("_idx", hide=True)
-            gb.configure_column("_matches", hide=True)
-            gb.configure_column("Bid Num", width=85, minWidth=85)
-            gb.configure_column("Seat", width=60, minWidth=60)
-            gb.configure_column("Bid", width=80, minWidth=80)
-            gb.configure_column(
-                "Criteria",
-                flex=1,
-                minWidth=100,
-                wrapText=True,
-                autoHeight=True,
-                tooltipField="Criteria",  # Show full content on hover
-            )
-            gb.configure_column(
-                "Categories",
-                flex=1,
-                minWidth=140,
-                wrapText=True,
-                autoHeight=True,
-                tooltipField="Categories",  # Show full content on hover
-            )
-            if show_failed_criteria:
-                gb.configure_column("Failed_Criteria", flex=1, minWidth=120, headerName="Failed Criteria", wrapText=True, autoHeight=True)
-            
-            # Add row styling based on pinned deal match
-            if show_failed_criteria:
-                gb.configure_grid_options(
-                    getRowStyle=JsCode("""
-                        function(params) {
-                            if (params.data._matches === true) {
-                                return {'backgroundColor': '#d4edda'};
-                            } else if (params.data._matches === false) {
-                                return {'backgroundColor': '#f8d7da'};
-                            }
-                            return null;
-                        }
-                    """)
-                )
-            gb.configure_grid_options(tooltipShowDelay=300)  # Tooltips after 300ms hover
-            
-            grid_options = gb.build()
-            
             # Track last selected to detect new clicks
             if "auction_builder_last_selected" not in st.session_state:
                 st.session_state.auction_builder_last_selected = None
             
-            grid_response = AgGrid(
-                pandas_df,
-                gridOptions=grid_options,
-                height=min(200, 35 + len(bid_rows) * 28),
-                update_mode=GridUpdateMode.SELECTION_CHANGED,
-                key=f"auction_builder_bids_grid_{current_seat}",
-                theme="balham",
-                allow_unsafe_jscode=True,  # Required for JsCode row styling
-                custom_css={
-                    ".ag-row": {"cursor": "pointer", "transition": "background-color 0.1s"},
-                    ".ag-row-hover": {
-                        "background-color": "#E8F4FF !important",
-                        "border-left": "3px solid #007BFF !important"
-                    },
-                    ".ag-row-selected": {"background-color": "#D1E9FF !important"},
-                },
-            )
-            
-            selected_rows = grid_response.get("selected_rows")
-            if selected_rows is not None and len(selected_rows) > 0:
-                selected_row = selected_rows[0] if isinstance(selected_rows, list) else selected_rows.iloc[0].to_dict()
-                selected_idx = int(selected_row.get("_idx", 0))
-                selected_bid = sorted_options[selected_idx]["bid"]
+            # Helper to build grid options for bid selection
+            def build_bid_grid_options(pdf: "pd.DataFrame", apply_row_styling: bool = True) -> dict:
+                gb = GridOptionsBuilder.from_dataframe(pdf)
+                gb.configure_selection(selection_mode="single", use_checkbox=False)
+                gb.configure_column("_idx", hide=True)
+                gb.configure_column("_matches", hide=True)
+                gb.configure_column("Bid Num", width=85, minWidth=85)
+                gb.configure_column("Seat", width=60, minWidth=60)
+                if pinned_deal:
+                    gb.configure_column("Direction", width=70, minWidth=70)
+                gb.configure_column("Bid", width=80, minWidth=80)
+                gb.configure_column(
+                    "Criteria",
+                    flex=1,
+                    minWidth=100,
+                    tooltipField="Criteria",
+                )
+                gb.configure_column(
+                    "Categories",
+                    flex=1,
+                    minWidth=140,
+                    tooltipField="Categories",
+                )
+                if show_failed_criteria and "Failed_Criteria" in pdf.columns:
+                    gb.configure_column("Failed_Criteria", flex=1, minWidth=120, headerName="Failed Criteria", tooltipField="Failed_Criteria")
                 
-                # Check if this is a new selection (different from last)
-                selection_key = f"{current_auction}-{selected_bid}"
-                if selection_key != st.session_state.auction_builder_last_selected:
-                    st.session_state.auction_builder_last_selected = selection_key
-                    selected_opt = sorted_options[selected_idx]
-                    st.session_state.auction_builder_path.append(selected_opt)
-                    st.session_state.auction_builder_last_applied = ""
-                    st.rerun()
+                # Add row styling based on pinned deal match
+                if apply_row_styling and show_failed_criteria:
+                    gb.configure_grid_options(
+                        getRowClass=JsCode("""
+                            function(params) {
+                                if (params.data._matches === true) {
+                                    return 'row-match-pass';
+                                } else if (params.data._matches === false) {
+                                    return 'row-match-fail';
+                                }
+                                return null;
+                            }
+                        """)
+                    )
+                gb.configure_grid_options(tooltipShowDelay=300)
+                return gb.build()
+            
+            # Custom CSS for row styling
+            grid_custom_css = {
+                ".ag-row": {"cursor": "pointer", "transition": "background-color 0.1s"},
+                ".ag-row-hover": {
+                    "background-color": "#E8F4FF !important",
+                    "border-left": "3px solid #007BFF !important",
+                },
+                ".row-match-pass": {"background-color": "#d4edda !important"},
+                ".row-match-pass.ag-row-hover": {
+                    "background-color": "#b8dfc4 !important",
+                    "border-left": "3px solid #28a745 !important",
+                },
+                ".row-match-pass.ag-row-selected": {"background-color": "#a3d4af !important"},
+                ".row-match-fail": {"background-color": "#f8d7da !important"},
+                ".row-match-fail.ag-row-hover": {
+                    "background-color": "#f1b0b7 !important",
+                    "border-left": "3px solid #dc3545 !important",
+                },
+                ".row-match-fail.ag-row-selected": {"background-color": "#eb959f !important"},
+            }
+            
+            # Helper to handle bid selection from any grid
+            def handle_bid_selection(grid_resp: Any) -> None:
+                sel_rows = grid_resp.get("selected_rows")
+                if sel_rows is not None and len(sel_rows) > 0:
+                    sel_row = sel_rows[0] if isinstance(sel_rows, list) else sel_rows.iloc[0].to_dict()
+                    sel_idx = int(sel_row.get("_idx", 0))
+                    sel_opt = dict(sorted_options[sel_idx])
+                    sel_bid = sel_opt.get("bid")
+                    sel_bid_s = str(sel_bid or "").strip().upper()
+                    
+                    selection_key = f"{current_auction}-{sel_bid_s}"
+                    if selection_key != st.session_state.auction_builder_last_selected:
+                        st.session_state.auction_builder_last_selected = selection_key
+                        computed_complete = _is_auction_complete_after_next_bid(current_auction, sel_bid_s)
+                        sel_opt["is_complete"] = bool(sel_opt.get("is_complete", False) or computed_complete)
+                        sel_opt["bid"] = sel_bid_s
+                        # Attach categories from the lookup cache
+                        bt_idx = sel_opt.get("bt_index")
+                        if bt_idx is not None:
+                            cats_str = bt_idx_to_categories_opt.get(int(bt_idx), "")
+                            if cats_str:
+                                sel_opt["categories"] = [c.strip() for c in cats_str.split(",") if c.strip()]
+                        st.session_state.auction_builder_path.append(sel_opt)
+                        st.session_state.auction_builder_last_applied = ""
+                        st.rerun()
+            
+            pandas_df = bids_df.to_pandas()
+            
+            # Count valid/invalid bids
+            valid_count = sum(1 for r in bid_rows if r.get("_matches") is True)
+            invalid_count = sum(1 for r in bid_rows if r.get("_matches") is False)
+            
+            if use_two_dataframes and show_failed_criteria:
+                # Split into valid and invalid DataFrames
+                valid_rows = [r for r in bid_rows if r.get("_matches") is True]
+                invalid_rows = [r for r in bid_rows if r.get("_matches") is False]
+                other_rows = [r for r in bid_rows if r.get("_matches") is None]
+                
+                # Valid bids grid
+                if valid_rows:
+                    st.markdown(f"**✅ Valid Bids ({len(valid_rows)})**")
+                    valid_pdf = pl.DataFrame(valid_rows).to_pandas()
+                    valid_opts = build_bid_grid_options(valid_pdf, apply_row_styling=False)
+                    # Height: header (45) + rows (35 each) + horizontal scrollbar allowance (25)
+                    valid_resp = AgGrid(
+                        valid_pdf,
+                        gridOptions=valid_opts,
+                        height=min(350, 70 + len(valid_rows) * 35),
+                        update_on=["selectionChanged"],
+                        key=f"auction_builder_valid_grid_{current_seat}",
+                        theme="balham",
+                        allow_unsafe_jscode=True,
+                        custom_css={
+                            ".ag-row": {"cursor": "pointer", "background-color": "#d4edda"},
+                            ".ag-row-hover": {"background-color": "#b8dfc4 !important", "border-left": "3px solid #28a745 !important"},
+                            ".ag-row-selected": {"background-color": "#a3d4af !important"},
+                        },
+                    )
+                    handle_bid_selection(valid_resp)
+                
+                # Invalid bids grid
+                if invalid_rows:
+                    st.markdown(f"**❌ Invalid Bids ({len(invalid_rows)})**")
+                    invalid_pdf = pl.DataFrame(invalid_rows).to_pandas()
+                    invalid_opts = build_bid_grid_options(invalid_pdf, apply_row_styling=False)
+                    # Height: header (45) + rows (30 each) + horizontal scrollbar allowance (17)
+                    invalid_resp = AgGrid(
+                        invalid_pdf,
+                        gridOptions=invalid_opts,
+                        height=min(350, 62 + len(invalid_rows) * 30),
+                        update_on=["selectionChanged"],
+                        key=f"auction_builder_invalid_grid_{current_seat}",
+                        theme="balham",
+                        allow_unsafe_jscode=True,
+                        custom_css={
+                            ".ag-row": {"cursor": "pointer", "background-color": "#f8d7da"},
+                            ".ag-row-hover": {"background-color": "#f1b0b7 !important", "border-left": "3px solid #dc3545 !important"},
+                            ".ag-row-selected": {"background-color": "#eb959f !important"},
+                        },
+                    )
+                    handle_bid_selection(invalid_resp)
+                
+                # Other rows (no match status - shouldn't happen when deal is pinned)
+                if other_rows:
+                    st.markdown(f"**Other Bids ({len(other_rows)})**")
+                    other_pdf = pl.DataFrame(other_rows).to_pandas()
+                    other_opts = build_bid_grid_options(other_pdf, apply_row_styling=False)
+                    other_resp = AgGrid(
+                        # Height: header (45) + rows (30 each) + horizontal scrollbar allowance (17)
+                        other_pdf,
+                        gridOptions=other_opts,
+                        height=min(300, 62 + len(other_rows) * 30),
+                        update_on=["selectionChanged"],
+                        key=f"auction_builder_other_grid_{current_seat}",
+                        theme="balham",
+                        allow_unsafe_jscode=True,
+                        custom_css=grid_custom_css,
+                    )
+                    handle_bid_selection(other_resp)
+            else:
+                # Single DataFrame mode
+                if show_failed_criteria and (valid_count > 0 or invalid_count > 0):
+                    st.caption(f"✅ Valid: {valid_count} | ❌ Invalid: {invalid_count}")
+                
+                grid_options = build_bid_grid_options(pandas_df)
+                grid_response = AgGrid(
+                    pandas_df,
+                    gridOptions=grid_options,
+                    height=min(400, 35 + len(bid_rows) * 28),
+                    update_on=["selectionChanged"],
+                    key=f"auction_builder_bids_grid_{current_seat}",
+                    theme="balham",
+                    allow_unsafe_jscode=True,
+                    custom_css=grid_custom_css,
+                )
+                handle_bid_selection(grid_response)
     
     # Summary DataFrame
     if current_path:
@@ -5929,96 +6171,53 @@ def render_auction_builder():
         
         # Helper to evaluate criteria against pinned deal
         def evaluate_criteria_for_pinned(criteria_list: list, seat: int, dealer: str, deal: dict) -> tuple[bool, list[str]]:
-            """Evaluate criteria against a pinned deal. Returns (all_pass, failed_criteria)."""
+            """Evaluate criteria against a pinned deal. Returns (all_pass, failed_criteria).
+            
+            Uses server-side bitmap evaluation when _row_idx is available for accurate
+            evaluation of all criteria types. PBN deals cannot be evaluated.
+            """
             if not criteria_list or not deal:
                 return True, []
             
-            # Map seat to direction based on dealer
-            directions = ["N", "E", "S", "W"]
+            dealer_s = str(dealer).upper()
+            row_idx = deal.get("_row_idx")
+            
+            # PBN deals don't have _row_idx - cannot evaluate criteria without enrichment
+            if row_idx is None:
+                return True, ["(PBN deal - criteria evaluation not available)"]
+            
+            # Use server-side bitmap evaluation (accurate for all criteria)
             try:
-                dealer_idx = directions.index(dealer.upper())
-            except ValueError:
-                dealer_idx = 0
-            # Seat 1 = dealer, seat 2 = next, etc.
-            direction = directions[(dealer_idx + seat - 1) % 4]
-            
-            failed = []
-            for crit in criteria_list:
-                crit_str = str(crit).strip()
-                if not crit_str:
-                    continue
+                cache_key = ("deal_criteria_eval_summary", int(row_idx), dealer_s, seat, tuple(criteria_list))
+                eval_cache = st.session_state.setdefault("_deal_criteria_eval_cache", {})
+                if cache_key in eval_cache:
+                    cached = eval_cache[cache_key]
+                    return cached["passes"], cached["failed"]
                 
-                passed = True
-                fail_info = ""
-                try:
-                    # Parse HCP criteria: HCP >= N, HCP <= N
-                    if crit_str.startswith("HCP"):
-                        col_name = f"HCP_{direction}"
-                        hcp_val = deal.get(col_name)
-                        if hcp_val is None:
-                            failed.append(f"{crit_str} [NOT FOUND]")
-                            continue
-                        if ">=" in crit_str:
-                            threshold = int(crit_str.split(">=")[1].strip())
-                            passed = hcp_val >= threshold
-                            if not passed:
-                                fail_info = f"HCP({hcp_val}) >= {threshold}"
-                        elif "<=" in crit_str:
-                            threshold = int(crit_str.split("<=")[1].strip())
-                            passed = hcp_val <= threshold
-                            if not passed:
-                                fail_info = f"HCP({hcp_val}) <= {threshold}"
-                    
-                    # Parse SL (suit length) criteria: SL_S >= N, SL_H <= N, etc.
-                    elif crit_str.startswith("SL_"):
-                        # Column names are SL_{direction}_{suit} e.g. SL_N_H, SL_E_S
-                        suit_char = crit_str[3].upper()
-                        if suit_char in ("S", "H", "D", "C"):
-                            col_name = f"SL_{direction}_{suit_char}"
-                            sl_val = deal.get(col_name)
-                            if sl_val is None:
-                                failed.append(f"{crit_str} [NOT FOUND]")
-                                continue
-                            if ">=" in crit_str:
-                                threshold = int(crit_str.split(">=")[1].strip())
-                                passed = sl_val >= threshold
-                                if not passed:
-                                    fail_info = f"SL_{suit_char}({sl_val}) >= {threshold}"
-                            elif "<=" in crit_str:
-                                threshold = int(crit_str.split("<=")[1].strip())
-                                passed = sl_val <= threshold
-                                if not passed:
-                                    fail_info = f"SL_{suit_char}({sl_val}) <= {threshold}"
-                    
-                    # Parse Total_Points criteria
-                    elif crit_str.startswith("Total_Points"):
-                        col_name = f"Total_Points_{direction}"
-                        tp_val = deal.get(col_name)
-                        if tp_val is None:
-                            failed.append(f"{crit_str} [NOT FOUND]")
-                            continue
-                        if ">=" in crit_str:
-                            threshold = int(crit_str.split(">=")[1].strip())
-                            passed = tp_val >= threshold
-                            if not passed:
-                                fail_info = f"Total_Points({tp_val}) >= {threshold}"
-                        elif "<=" in crit_str:
-                            threshold = int(crit_str.split("<=")[1].strip())
-                            passed = tp_val <= threshold
-                            if not passed:
-                                fail_info = f"Total_Points({tp_val}) <= {threshold}"
-                    
-                    # For other criteria, we can't evaluate client-side - skip
-                    else:
-                        continue  # Unknown criteria - don't count as pass or fail
-                        
-                except (ValueError, TypeError, IndexError):
-                    continue  # Parse error - skip this criterion
-                
-                if not passed and fail_info:
-                    failed.append(fail_info)
+                payload = {
+                    "deal_row_idx": int(row_idx),
+                    "dealer": dealer_s,
+                    "checks": [{"seat": seat, "criteria": list(criteria_list)}],
+                }
+                data = api_post("/deal-criteria-eval-batch", payload, timeout=10)
+                results = data.get("results", [])
+                if results:
+                    r = results[0]
+                    failed_list = r.get("failed", [])
+                    untracked = r.get("untracked", [])
+                    annotated_failed = []
+                    for f in failed_list:
+                        annotated = annotate_criterion_with_value(str(f), dealer_s, seat, deal)
+                        annotated_failed.append(annotated)
+                    for u in untracked:
+                        annotated_failed.append(f"UNTRACKED: {u}")
+                    passes = len(failed_list) == 0 and len(untracked) == 0
+                    eval_cache[cache_key] = {"passes": passes, "failed": annotated_failed}
+                    return passes, annotated_failed
+            except Exception as e:
+                return True, [f"(Server error: {e})"]
             
-            return len(failed) == 0, failed
+            return True, []
         
         summary_rows = []
         pinned_all_pass = True  # Track if all steps pass for pinned deal
@@ -6152,16 +6351,15 @@ def render_auction_builder():
             ],
         )
         # Make summary grid selectable to show deals for a specific auction step
-        # Use SELECTION_CHANGED to trigger rerun when row is selected
+        # Use selectionChanged to trigger rerun when row is selected
         # Use fit_columns_to_view=False to prevent column width changes on rerender
-        from st_aggrid import GridUpdateMode as _GridUpdateMode
         summary_selection = render_aggrid(
             summary_df,
             key="auction_builder_summary",
             height=calc_grid_height(4),
             table_name="auction_builder_summary",
             hide_cols=["Agg_Expr_full", "Categories_full"],
-            update_mode=_GridUpdateMode.SELECTION_CHANGED,
+            update_on=["selectionChanged"],
             fit_columns_to_view=False,
         )
         

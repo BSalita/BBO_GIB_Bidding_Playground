@@ -309,16 +309,35 @@ def _resolve_deal_row_idx_from_index(state: Dict[str, Any], deal_index: int) -> 
     
     Requires STATE["deal_index_monotonic"] and STATE["deal_index_arr"] built at startup.
     """
-    if not bool(state.get("deal_index_monotonic", False)):
-        raise HTTPException(status_code=400, detail="deal_index lookup requires deal_index_monotonic=True at startup")
     idx_arr = state.get("deal_index_arr")
     if idx_arr is None:
         raise HTTPException(status_code=500, detail="deal_index_arr missing from state (startup cache not built)")
     import numpy as np
-    pos = int(np.searchsorted(idx_arr, int(deal_index)))
-    if pos < 0 or pos >= len(idx_arr) or int(idx_arr[pos]) != int(deal_index):
-        raise HTTPException(status_code=404, detail=f"Deal index {int(deal_index)} not found")
-    return int(pos)
+    deal_index_i = int(deal_index)
+
+    # Fast-path: monotonic index enables O(log n) lookup via binary search.
+    if bool(state.get("deal_index_monotonic", False)):
+        pos = int(np.searchsorted(idx_arr, deal_index_i))
+        if pos < 0 or pos >= len(idx_arr) or int(idx_arr[pos]) != deal_index_i:
+            raise HTTPException(status_code=404, detail=f"Deal index {deal_index_i} not found")
+        return int(pos)
+
+    # Fallback: non-monotonic `index` column. Use a vectorized equality scan against the cached numpy array.
+    # This is O(n) but is typically fast in NumPy and only used for small pinned-deal lookups.
+    try:
+        matches = np.flatnonzero(idx_arr == deal_index_i)
+    except Exception:
+        # Some pipelines may produce an object/float array; try a best-effort cast for comparison.
+        try:
+            matches = np.flatnonzero(idx_arr.astype(np.int64, copy=False) == deal_index_i)
+        except Exception:
+            matches = np.array([], dtype=np.int64)
+
+    if matches.size == 0:
+        raise HTTPException(status_code=404, detail=f"Deal index {deal_index_i} not found")
+
+    # If duplicates exist, choose the first row position deterministically.
+    return int(matches[0])
 
 
 def _resolve_deal_row_indices_from_indices(state: Dict[str, Any], indices: list[int]) -> list[int]:
@@ -2438,8 +2457,14 @@ def deals_by_index(req: DealsByIndexRequest) -> Dict[str, Any]:
     if not row_positions:
         return _attach_hot_reload_info({"rows": [], "count": 0}, reload_info)
 
-    # Select columns
-    default_cols = ["index", "Dealer", "Vul", "Hand_N", "Hand_E", "Hand_S", "Hand_W", "ParScore", "Contract", "Score", "Result", "bid"]
+    # Select columns (include HCP/Total_Points for criteria evaluation)
+    default_cols = [
+        "index", "Dealer", "Vul",
+        "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+        "HCP_N", "HCP_E", "HCP_S", "HCP_W",
+        "Total_Points_N", "Total_Points_E", "Total_Points_S", "Total_Points_W",
+        "ParScore", "Contract", "Score", "Result", "bid",
+    ]
     cols = req.columns or default_cols
     cols = [c for c in cols if c in deal_df.columns]
     if not cols:
