@@ -226,44 +226,97 @@ def normalize_auction_user_text(text: str) -> str:
 
 def normalize_auction_pattern(pattern: str) -> str:
     """
-    Normalize an auction regex pattern by appending implied trailing passes.
+    Normalize an auction regex pattern by:
+    1. Uppercasing bid tokens (1n->1N, p->P, etc.) while preserving regex syntax
+    2. Appending only the passes needed to complete (not blindly adding 3)
 
     Bridge auctions end with 3 consecutive passes after any bid/double/redouble.
-    If the pattern doesn't end with '-p-p-p', append it (handling regex anchors).
 
     Examples:
-        '1n-p-3n' → '1n-p-3n-p-p-p'
-        '^1N-p-3N$' → '^1N-p-3N-p-p-p$'
-        '1c-p-p-d' → '1c-p-p-d-p-p-p'
-        'p-p-p-p' → 'p-p-p-p' (pass-out, already complete)
-        '1n-p-3n-p-p-p' → '1n-p-3n-p-p-p' (already complete)
-        '.*-3n' → '.*-3n-p-p-p' (wildcards supported)
+        '1n-p-3n' → '1N-P-3N-P-P-P' (uppercased, 3 passes needed)
+        '^1N-p-3N$' → '^1N-P-3N-P-P-P$'
+        '1c-p-p-d' → '1C-P-P-D-P-P-P' (3 passes after D)
+        '1N-p' → '1N-P-P-P' (2 more passes needed, already has 1)
+        '1N-p-p' → '1N-P-P-P' (1 more pass needed, already has 2)
+        'p-p-p-p' → 'P-P-P-P' (pass-out, already complete)
+        '1n-p-3n-p-p-p' → '1N-P-3N-P-P-P' (already complete, uppercased)
+        '.*-3n' → '.*-3N-P-P-P' (wildcards preserved, bids uppercased)
     """
     if not pattern or not pattern.strip():
         return pattern
 
     pattern = pattern.strip()
+    
+    # Uppercase bid tokens while preserving regex metacharacters
+    # Bid tokens: level+suit (1C-7N), P/pass, D/X/double, R/XX/redouble
+    def uppercase_bids(m: re.Match) -> str:
+        token = m.group(0)
+        tl = token.lower()
+        # Pass
+        if tl in ("p", "pass"):
+            return "P"
+        # Double
+        if tl in ("d", "x", "dbl", "double"):
+            return "X"
+        # Redouble
+        if tl in ("r", "xx", "rdbl", "redouble"):
+            return "XX"
+        # Level + strain (1C, 2H, 3N, etc.)
+        if len(tl) >= 2 and tl[0].isdigit():
+            level = tl[0]
+            strain = tl[1:]
+            if strain in ("n", "nt"):
+                return f"{level}N"
+            if strain and strain[0] in "cdhs":
+                return f"{level}{strain[0].upper()}"
+        # Fallback: uppercase the whole token
+        return token.upper()
+    
+    # Match bid-like tokens (word characters that look like bids) but not regex syntax
+    # This pattern matches: digits+letters sequences that could be bids
+    pattern = re.sub(r"\b([1-7]?[A-Za-z]+)\b", uppercase_bids, pattern)
 
     # Check for end anchor and temporarily remove it
     has_end_anchor = pattern.endswith("$")
     if has_end_anchor:
         pattern = pattern[:-1]
 
-    # Already ends with -p-p-p (case-insensitive)
-    if re.search(r"-[pP]-[pP]-[pP]$", pattern):
-        return pattern + ("$" if has_end_anchor else "")
-
-    # Pass-out pattern (p-p-p-p)
-    if re.search(r"^[\^]?[pP]-[pP]-[pP]-[pP]$", pattern):
-        return pattern + ("$" if has_end_anchor else "")
-
     # Don't append if pattern ends with open-ended wildcards that could match passes
     # e.g., '.*', '.+', '[^-]*' at the end
     if re.search(r"(\.\*|\.\+|\[[^\]]*\]\*|\[[^\]]*\]\+)$", pattern):
         return pattern + ("$" if has_end_anchor else "")
 
-    # Append trailing passes (canonical uppercase)
-    pattern = pattern + "-P-P-P"
+    # Check if the pattern contains any non-pass bid (opening bid exists)
+    # Strip start anchor for this check
+    pattern_no_anchor = pattern.lstrip("^")
+    tokens = pattern_no_anchor.split("-")
+    has_opening_bid = any(t.upper() not in ("P", "") for t in tokens if t and not re.search(r"[.*+?\[\](){}|\\]", t))
+    
+    if has_opening_bid:
+        # Auction with bids: need 3 trailing passes after the last non-pass action
+        if pattern.endswith("-P-P-P"):
+            return pattern + ("$" if has_end_anchor else "")
+        
+        # Count trailing passes
+        trailing_pass_match = re.search(r"(-P)+$", pattern)
+        trailing_passes = trailing_pass_match.group(0).count("-P") if trailing_pass_match else 0
+        
+        passes_needed = max(0, 3 - trailing_passes)
+        if passes_needed > 0:
+            pattern = pattern + "-P" * passes_needed
+    else:
+        # Pass-only auction: need exactly 4 passes for pass-out
+        # Count total passes (including leading P if present)
+        pass_match = re.match(r"^\^?(P-)*P?$", pattern)
+        if pass_match:
+            total_passes = pattern.count("P")
+            if total_passes < 4:
+                passes_needed = 4 - total_passes
+                if pattern.endswith("P"):
+                    pattern = pattern + "-P" * passes_needed
+                else:
+                    pattern = pattern + "P" + "-P" * (passes_needed - 1) if passes_needed > 0 else pattern
+    
     return pattern + ("$" if has_end_anchor else "")
 
 

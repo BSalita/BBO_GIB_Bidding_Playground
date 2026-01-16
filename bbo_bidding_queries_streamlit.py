@@ -1091,8 +1091,8 @@ def render_aggrid(
         "Dealer": 20, "Vul": 30, "index": 70, "Auction_Actual": 140,  # Auction_Actual reduced by 30%
         "Hand_N": 135, "Hand_E": 135, "Hand_S": 135, "Hand_W": 135,
         # Auction Summary columns
-        "Bid Num": 60, "Seat": 55, "Bid": 50, "BT Index": 60, "Deals": 70,
-        "Criteria Count": 25, "Complete": 25,
+        "Bid Num": 60, "Seat": 55, "Bid": 50, "BT Index": 60,
+        "Deals": 70, "Criteria Count": 10, "Complete": 16,
         # Rankings-style stats columns (NV/V split)
         "Matches_NV": 90, "Matches_V": 85,
         "Avg Par_NV": 95, "Avg Par_V": 90,
@@ -5596,8 +5596,8 @@ def render_auction_builder():
                 del st.session_state["auction_builder_bt_categories_cache"]
             st.rerun()
     
-    if is_complete:
-        st.success("✅ Auction Complete")
+    # "Auction Complete" status is shown in the Auction Summary section (after criteria evaluation)
+    # to ensure we know whether the pinned deal passes all criteria before displaying.
     
     # Fetch available next bids using fast /list-next-bids endpoint
     def get_next_bid_options(prefix: str, force_refresh: bool = False) -> list[dict]:
@@ -5634,6 +5634,8 @@ def render_auction_builder():
                     "bt_index": item.get("bt_index"),
                     "agg_expr": item.get("agg_expr", []) or [],
                     "is_complete": item.get("is_completed_auction", False),
+                    "is_dead_end": item.get("is_dead_end", False),
+                    "matching_deal_count": item.get("matching_deal_count"),
                 })
             
             # Already sorted by the API
@@ -5883,9 +5885,27 @@ def render_auction_builder():
                         dealer_idx = 0
                     seat_direction = directions[(dealer_idx + seat_1_to_4 - 1) % 4]
                 
+                # Check if this bid should be rejected
+                deal_count = opt.get("matching_deal_count")
+                is_dead_end = opt.get("is_dead_end", False)
+                has_empty_criteria = not criteria_list
+                has_zero_deals = deal_count == 0
+                is_rejected = is_dead_end or has_empty_criteria or has_zero_deals
+                
+                # Build failure reason for display
+                failure_reasons = []
+                if is_dead_end:
+                    failure_reasons.append("dead end")
+                if has_zero_deals:
+                    failure_reasons.append("no matching deals")
+                if has_empty_criteria:
+                    failure_reasons.append("missing criteria")
+                failure_str = "; ".join(failure_reasons) if failure_reasons else ""
+                
                 row_data: dict[str, Any] = {
                     "_idx": i,
                     "_matches": matches_pinned,  # Hidden column for styling
+                    "_rejected": is_rejected,  # Hidden column for categorization
                     "Bid Num": current_seat,
                     "Seat": seat_1_to_4,
                 }
@@ -5893,6 +5913,8 @@ def render_auction_builder():
                 if seat_direction:
                     row_data["Direction"] = seat_direction
                 row_data["Bid"] = f"{opt['bid']}{complete_marker}"
+                # Add deal count if available
+                row_data["Deals"] = deal_count if deal_count is not None else ""
                 row_data["Criteria"] = criteria_str if criteria_str else "(none)"
                 row_data["Categories"] = ""
                 # Attach categories (true flags) for this candidate's bt_index (if available)
@@ -5904,6 +5926,8 @@ def render_auction_builder():
                     pass
                 if show_failed_criteria:
                     row_data["Failed_Criteria"] = failed_criteria_str
+                if is_rejected:
+                    row_data["Failure"] = failure_str
                 bid_rows.append(row_data)
             
             bids_df = pl.DataFrame(bid_rows)
@@ -5918,11 +5942,13 @@ def render_auction_builder():
                 gb.configure_selection(selection_mode="single", use_checkbox=False)
                 gb.configure_column("_idx", hide=True)
                 gb.configure_column("_matches", hide=True)
+                gb.configure_column("_rejected", hide=True)
                 gb.configure_column("Bid Num", width=85, minWidth=85)
                 gb.configure_column("Seat", width=60, minWidth=60)
                 if pinned_deal:
                     gb.configure_column("Direction", width=70, minWidth=70)
                 gb.configure_column("Bid", width=80, minWidth=80)
+                gb.configure_column("Deals", width=80, minWidth=60)
                 gb.configure_column(
                     "Criteria",
                     flex=1,
@@ -5937,6 +5963,9 @@ def render_auction_builder():
                 )
                 if show_failed_criteria and "Failed_Criteria" in pdf.columns:
                     gb.configure_column("Failed_Criteria", flex=1, minWidth=120, headerName="Failed Criteria", tooltipField="Failed_Criteria")
+                # Hide Failure in valid/invalid grids (shown only in rejected grid)
+                if "Failure" in pdf.columns:
+                    gb.configure_column("Failure", hide=True)
                 
                 # Add row styling based on pinned deal match
                 if apply_row_styling and show_failed_criteria:
@@ -6004,15 +6033,18 @@ def render_auction_builder():
             
             pandas_df = bids_df.to_pandas()
             
-            # Count valid/invalid bids
-            valid_count = sum(1 for r in bid_rows if r.get("_matches") is True)
-            invalid_count = sum(1 for r in bid_rows if r.get("_matches") is False)
+            # Count valid/invalid/rejected bids
+            valid_count = sum(1 for r in bid_rows if r.get("_matches") is True and not r.get("_rejected"))
+            invalid_count = sum(1 for r in bid_rows if r.get("_matches") is False and not r.get("_rejected"))
+            rejected_count = sum(1 for r in bid_rows if r.get("_rejected"))
             
             if use_two_dataframes and show_failed_criteria:
-                # Split into valid and invalid DataFrames
-                valid_rows = [r for r in bid_rows if r.get("_matches") is True]
-                invalid_rows = [r for r in bid_rows if r.get("_matches") is False]
-                other_rows = [r for r in bid_rows if r.get("_matches") is None]
+                # Split into valid, rejected, and invalid DataFrames
+                # Rejected bids are separated first (dead ends, 0 deals, empty criteria)
+                valid_rows = [r for r in bid_rows if r.get("_matches") is True and not r.get("_rejected")]
+                rejected_rows = [r for r in bid_rows if r.get("_rejected")]
+                invalid_rows = [r for r in bid_rows if r.get("_matches") is False and not r.get("_rejected")]
+                other_rows = [r for r in bid_rows if r.get("_matches") is None and not r.get("_rejected")]
                 
                 # Valid bids grid
                 if valid_rows:
@@ -6035,6 +6067,41 @@ def render_auction_builder():
                         },
                     )
                     handle_bid_selection(valid_resp)
+                
+                # Rejected bids grid (dead ends, 0 deals, empty criteria)
+                if rejected_rows:
+                    st.markdown(f"**⚠️ Rejected Bids ({len(rejected_rows)})**")
+                    rejected_pdf = pl.DataFrame(rejected_rows).to_pandas()
+                    # Configure Failure column
+                    gb_rej = GridOptionsBuilder.from_dataframe(rejected_pdf)
+                    gb_rej.configure_selection(selection_mode="single", use_checkbox=False)
+                    gb_rej.configure_column("_idx", hide=True)
+                    gb_rej.configure_column("_matches", hide=True)
+                    gb_rej.configure_column("_rejected", hide=True)
+                    gb_rej.configure_column("Bid Num", width=85, minWidth=85)
+                    gb_rej.configure_column("Seat", width=60, minWidth=60)
+                    if pinned_deal:
+                        gb_rej.configure_column("Direction", width=70, minWidth=70)
+                    gb_rej.configure_column("Bid", width=80, minWidth=80)
+                    gb_rej.configure_column("Deals", width=80, minWidth=60)
+                    gb_rej.configure_column("Failure", width=140, minWidth=120)
+                    gb_rej.configure_column("Criteria", flex=1, minWidth=100, tooltipField="Criteria")
+                    rejected_opts = gb_rej.build()
+                    rejected_resp = AgGrid(
+                        rejected_pdf,
+                        gridOptions=rejected_opts,
+                        height=min(250, 62 + len(rejected_rows) * 30),
+                        update_on=["selectionChanged"],
+                        key=f"auction_builder_rejected_grid_{current_seat}",
+                        theme="balham",
+                        allow_unsafe_jscode=True,
+                        custom_css={
+                            ".ag-row": {"cursor": "pointer", "background-color": "#fff3cd"},
+                            ".ag-row-hover": {"background-color": "#ffe69c !important", "border-left": "3px solid #ffc107 !important"},
+                            ".ag-row-selected": {"background-color": "#ffda6a !important"},
+                        },
+                    )
+                    handle_bid_selection(rejected_resp)
                 
                 # Invalid bids grid
                 if invalid_rows:
@@ -6077,8 +6144,8 @@ def render_auction_builder():
                     handle_bid_selection(other_resp)
             else:
                 # Single DataFrame mode
-                if show_failed_criteria and (valid_count > 0 or invalid_count > 0):
-                    st.caption(f"✅ Valid: {valid_count} | ❌ Invalid: {invalid_count}")
+                if show_failed_criteria and (valid_count > 0 or invalid_count > 0 or rejected_count > 0):
+                    st.caption(f"✅ Valid: {valid_count} | ⚠️ Rejected: {rejected_count} | ❌ Invalid: {invalid_count}")
                 
                 grid_options = build_bid_grid_options(pandas_df)
                 grid_response = AgGrid(
@@ -6328,8 +6395,17 @@ def render_auction_builder():
                 row["EV Std_V"] = None
             summary_rows.append(row)
         
-        # Show pinned deal match summary
-        if pinned_deal and current_path:
+        # Show auction complete status and pinned deal match summary
+        if is_complete:
+            if pinned_deal:
+                if pinned_all_pass:
+                    st.success("✅ Auction Complete - Pinned deal matches ALL criteria")
+                else:
+                    st.error("❌ Auction Complete with Errors - Pinned deal FAILS some criteria")
+            else:
+                st.success("✅ Auction Complete")
+        elif pinned_deal and current_path:
+            # Auction not complete, but show pinned deal status
             if pinned_all_pass:
                 st.success("📌 Pinned deal matches ALL criteria in this auction path")
             else:

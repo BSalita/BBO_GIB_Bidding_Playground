@@ -324,6 +324,149 @@ def _resolve_bt_index_by_traversal(state: Dict[str, Any], auction: str) -> int |
 from plugins.bbo_bt_custom_criteria_overlay import apply_custom_criteria_overlay_to_bt_row as _apply_custom_criteria_overlay_to_bt_row
 
 
+def _compute_cumulative_deal_mask(
+    state: dict[str, Any],
+    bt_row: dict[str, Any],
+    up_to_seat: int,
+) -> "pl.Series | None":
+    """Build cumulative mask for all seats 1..up_to_seat using bt_row's Agg_Expr_Seat_N columns."""
+    deal_df = state.get("deal_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+    
+    if deal_df is None:
+        return None
+
+    dealer_series = deal_df["Dealer"]
+    global_mask: pl.Series | None = None
+    
+    # For each seat 1..up_to_seat, AND in the criteria
+    for seat_i in range(1, up_to_seat + 1):
+        criteria_list = bt_row.get(f"Agg_Expr_Seat_{seat_i}") or []
+        if not criteria_list:
+            continue
+            
+        seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat_i, {})
+        if not seat_criteria_for_seat:
+            continue
+
+        # Find valid criteria
+        sample_criteria_df = None
+        for dealer in DIRECTIONS:
+            sample_criteria_df = seat_criteria_for_seat.get(dealer)
+            if sample_criteria_df is not None and not sample_criteria_df.is_empty():
+                break
+        
+        if sample_criteria_df is None:
+            continue
+            
+        available_cols = set(sample_criteria_df.columns)
+        valid_criteria = [c for c in criteria_list if c in available_cols]
+        
+        if not valid_criteria:
+            continue
+
+        # Build per-dealer masks for this seat
+        seat_mask: pl.Series | None = None
+        for dealer in DIRECTIONS:
+            dealer_mask = dealer_series == dealer
+            if not dealer_mask.any():
+                continue
+
+            seat_criteria_df = seat_criteria_for_seat.get(dealer)
+            if seat_criteria_df is None or seat_criteria_df.is_empty():
+                continue
+
+            combined = dealer_mask
+            for crit in valid_criteria:
+                combined = combined & seat_criteria_df[crit]
+                if not combined.any():
+                    combined = None
+                    break
+
+            if combined is not None:
+                seat_mask = combined if seat_mask is None else (seat_mask | combined)
+        
+        # AND this seat's mask into global mask
+        if seat_mask is not None:
+            global_mask = seat_mask if global_mask is None else (global_mask & seat_mask)
+
+    return global_mask
+
+
+def _compute_deal_count_with_base_mask(
+    state: dict[str, Any],
+    base_mask: "pl.Series | None",
+    bt_row: dict[str, Any],
+    seat: int,
+) -> int:
+    """Compute deal count by intersecting base_mask with new seat's criteria."""
+    deal_df = state.get("deal_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+    
+    if deal_df is None:
+        return 0
+
+    seat_i = max(1, min(4, int(seat)))
+    criteria_list = bt_row.get(f"Agg_Expr_Seat_{seat_i}") or []
+    
+    # If no new criteria, just count the base mask
+    if not criteria_list:
+        return int(base_mask.sum()) if base_mask is not None else 0
+    
+    seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat_i, {})
+    if not seat_criteria_for_seat:
+        return int(base_mask.sum()) if base_mask is not None else 0
+
+    # Find valid criteria
+    sample_criteria_df = None
+    for dealer in DIRECTIONS:
+        sample_criteria_df = seat_criteria_for_seat.get(dealer)
+        if sample_criteria_df is not None and not sample_criteria_df.is_empty():
+            break
+    
+    if sample_criteria_df is None:
+        return int(base_mask.sum()) if base_mask is not None else 0
+        
+    available_cols = set(sample_criteria_df.columns)
+    valid_criteria = [c for c in criteria_list if c in available_cols]
+    
+    if not valid_criteria:
+        return int(base_mask.sum()) if base_mask is not None else 0
+
+    dealer_series = deal_df["Dealer"]
+    new_seat_mask: pl.Series | None = None
+    
+    for dealer in DIRECTIONS:
+        dealer_mask = dealer_series == dealer
+        if not dealer_mask.any():
+            continue
+
+        seat_criteria_df = seat_criteria_for_seat.get(dealer)
+        if seat_criteria_df is None or seat_criteria_df.is_empty():
+            continue
+
+        combined = dealer_mask
+        for crit in valid_criteria:
+            combined = combined & seat_criteria_df[crit]
+            if not combined.any():
+                combined = None
+                break
+
+        if combined is not None:
+            new_seat_mask = combined if new_seat_mask is None else (new_seat_mask | combined)
+
+    if new_seat_mask is None:
+        return 0
+    
+    # Intersect with base mask
+    if base_mask is not None:
+        final_mask = base_mask & new_seat_mask
+    else:
+        final_mask = new_seat_mask
+    
+    return int(final_mask.sum())
+
+
 def _compute_seat_stats_for_bt_row(
     state: dict[str, Any],
     bt_row: dict[str, Any],
@@ -7617,14 +7760,17 @@ def _handle_list_next_bids_walk_fallback(
             return {"auction_input": auction_input, "auction_normalized": auction_normalized, "next_bids": [], "elapsed_ms": 0.0}
 
     # 3. Fetch metadata for next-bid rows using Polars (in-memory)
+    # Include next_bid_indices to detect dead ends
     next_bid_rows: pl.DataFrame
+    select_cols = ["bt_index", "Auction", "candidate_bid", "is_completed_auction", "Expr", "matching_deal_count", "next_bid_indices"]
     if bt_seat1_df is not None and bt_index_arr is not None and is_mono:
         row_positions = np.searchsorted(bt_index_arr, next_indices)
         matched_positions = [pos for i, pos in enumerate(row_positions) if pos < len(bt_index_arr) and bt_index_arr[pos] == next_indices[i]]
+        available_cols = [c for c in select_cols if c in bt_seat1_df.columns]
         if matched_positions:
-            next_bid_rows = bt_seat1_df.select(["bt_index", "Auction", "candidate_bid", "is_completed_auction", "Expr", "matching_deal_count"]).gather(matched_positions)
+            next_bid_rows = bt_seat1_df.select(available_cols).gather(matched_positions)
         else:
-            next_bid_rows = bt_seat1_df.head(0).select(["bt_index", "Auction", "candidate_bid", "is_completed_auction", "Expr", "matching_deal_count"])
+            next_bid_rows = bt_seat1_df.head(0).select(available_cols)
     else:
         # Fallback to DuckDB
         file_path = str(bt_parquet_file or "").replace("\\", "/")
@@ -7632,7 +7778,7 @@ def _handle_list_next_bids_walk_fallback(
         import duckdb
         conn = duckdb.connect(":memory:")
         try:
-            next_bid_rows = conn.execute(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})").pl()
+            next_bid_rows = conn.execute(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count, next_bid_indices FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})").pl()
         finally: conn.close()
 
     # 4. Enrichment with criteria (Prefer in-memory Expr to avoid heavy DuckDB hits)
@@ -7641,8 +7787,23 @@ def _handle_list_next_bids_walk_fallback(
     # triggering slow on-demand DuckDB hits for each candidate.
     next_seat = 1 if not auction_input else (len(auction_input.split("-")) % 4) + 1
     agg_col = f"Agg_Expr_Seat_{next_seat}"
+    
+    # 4b. Build base mask from parent's cumulative criteria (for accurate deal counts)
+    base_mask: pl.Series | None = None
+    if parent_bt_index >= 0:
+        # Load parent row's Agg_Expr columns on-demand (they're not in bt_seat1_df)
+        bt_parquet_file = state.get("bt_seat1_file")
+        if bt_parquet_file:
+            agg_data = _load_agg_expr_for_bt_indices([parent_bt_index], bt_parquet_file)
+            if parent_bt_index in agg_data:
+                parent_row: Dict[str, Any] = {"bt_index": parent_bt_index}
+                parent_row.update(agg_data[parent_bt_index])
+                parent_row = _apply_all_rules_to_bt_row(parent_row, state)
+                # Build cumulative mask from ALL seats (criteria accumulate across rounds)
+                # The parent row's Agg_Expr_Seat_N columns contain cumulative criteria
+                base_mask = _compute_cumulative_deal_mask(state, parent_row, 4)
 
-    # 5. Build final response
+    # 5. Build final response with on-demand deal counts
     next_bids = []
     for row in next_bid_rows.iter_rows(named=True):
         idx = row["bt_index"]
@@ -7657,13 +7818,26 @@ def _handle_list_next_bids_walk_fallback(
         # apply_overlay_and_dedupe handles CSV overlay and final cleanup
         row_with_rules = _apply_all_rules_to_bt_row(row_dict, state)
         crits = row_with_rules.get(agg_col) or []
+        
+        # Compute matching_deal_count on-demand by intersecting base_mask with new bid's criteria
+        deal_count = None
+        try:
+            deal_count = _compute_deal_count_with_base_mask(state, base_mask, row_with_rules, next_seat)
+        except Exception:
+            deal_count = row.get("matching_deal_count")  # Fall back to pre-computed
+        
+        # Detect dead end: not complete but has no children
+        is_complete = bool(row.get("is_completed_auction", False))
+        next_indices_list = row.get("next_bid_indices") or []
+        is_dead_end = not is_complete and len(next_indices_list) == 0
             
         next_bids.append({
             "bid": str(row.get("candidate_bid")).upper(),
             "bt_index": idx,
             "agg_expr": crits,
-            "is_completed_auction": row.get("is_completed_auction", False),
-            "matching_deal_count": row.get("matching_deal_count"),
+            "is_completed_auction": is_complete,
+            "is_dead_end": is_dead_end,
+            "matching_deal_count": deal_count,
         })
     
     # Sort for UI consistency
@@ -7694,10 +7868,24 @@ def _handle_resolve_auction_path_fallback(
     if not g3_index: return {"path": [], "error": "G3 index not built", "elapsed_ms": 0.0}
 
     auction_input = normalize_auction_input(auction)
-    # Strip leading passes for seat-1 view traversal
+    
+    # Extract leading passes before stripping for seat-1 view traversal
+    leading_passes_match = re.match(r"(?i)^(P-)+", auction_input)
+    leading_passes: List[str] = []
+    if leading_passes_match:
+        leading_passes = [t.upper() for t in leading_passes_match.group(0).rstrip("-").split("-") if t]
+    
+    # Strip leading passes for seat-1 view traversal (BT is indexed from first non-pass bid)
     auction_norm = re.sub(r"(?i)^(P-)+", "", auction_input).rstrip("-")
     tokens = [t.upper() for t in auction_norm.split("-") if t]
-    if not tokens: return {"path": [], "elapsed_ms": 0.0}
+    
+    # Handle pass-out auction (all passes, no actual bids)
+    if not tokens:
+        if leading_passes:
+            # Return pass steps without BT info
+            pass_path = [{"step": i + 1, "bid": "P", "bt_index": None, "agg_expr": [], "is_complete": len(leading_passes) >= 4, "categories": []} for i in range(len(leading_passes))]
+            return {"path": pass_path, "elapsed_ms": (time.perf_counter() - t0) * 1000}
+        return {"path": [], "elapsed_ms": 0.0}
 
     bt_seat1_df = state.get("bt_seat1_df")
     bt_index_arr = state.get("bt_index_arr")
@@ -7755,10 +7943,19 @@ def _handle_resolve_auction_path_fallback(
                 except (ValueError, TypeError):
                     continue
 
+    # Prepend leading passes to path (no BT info for passes before opening)
+    num_leading = len(leading_passes)
+    for i in range(num_leading):
+        path_info.append({
+            "step": i + 1, "bid": "P", "bt_index": None, "agg_expr": [], 
+            "is_complete": False, "matching_deal_count": None, "categories": [],
+        })
+
     for i, idx in enumerate(curr_indices):
         row = meta_map.get(idx, {})
         row_dict = dict(row)
-        step_seat = (i % 4) + 1
+        # Seat calculation accounts for leading passes
+        step_seat = ((num_leading + i) % 4) + 1
         
         # Populate Agg_Expr columns from in-memory 'Expr' to avoid DuckDB hits
         for s in range(1, 5):
@@ -7772,7 +7969,7 @@ def _handle_resolve_auction_path_fallback(
         agg_list = row_with_rules.get(agg_col) or row_dict.get("Expr") or []
         
         path_info.append({
-            "step": i + 1, "bid": tokens[i], "bt_index": idx, 
+            "step": num_leading + i + 1, "bid": tokens[i], "bt_index": idx, 
             "agg_expr": agg_list, "is_complete": bool(row.get("is_completed_auction")),
             "matching_deal_count": row.get("matching_deal_count"),
             "categories": categories_by_idx.get(int(idx), []),

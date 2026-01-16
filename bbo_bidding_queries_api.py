@@ -13,6 +13,11 @@ Usage:
 
 from __future__ import annotations
 
+# Suppress Intel Fortran runtime's Ctrl+C handler (must be set before importing numpy/scipy)
+# This prevents the ugly "forrtl: error (200): program aborting due to control-C event" on Windows
+import os
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 import csv
 import gc
 import logging
@@ -378,7 +383,7 @@ def _parse_deal_rows_arg() -> int | None:
         if arg.startswith("--deal-rows="):
             val = int(arg.split("=", 1)[1])
             return None if val <= 0 else val
-    return None # Default to all rows if not specified
+    return 1000000  # Default to 1M rows for faster startup
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +430,9 @@ print(f"dataPath: {dataPath} (exists)")
 # ---------------------------------------------------------------------------
 
 exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
-bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented_matches.parquet")
+# Use source deals file (16M rows) instead of CPU-pipeline matches file (10K rows)
+# Deal→BT mapping comes from bbo_deal_to_bt_verified.parquet (GPU pipeline output)
+bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
 bt_seat1_file = dataPath.joinpath("bbo_bt_compiled.parquet")  # Pre-compiled BT with learned rules baked in
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
@@ -1681,6 +1688,20 @@ def _heavy_init() -> None:
             criteria_deal_dfs_directional, expr_map_by_direction
         )
         _log_memory("after directional_to_directionless")
+
+        # Slice bitmap DataFrames to match deal_df row count (for --deal-rows support)
+        n_deals = deal_df.height
+        for direction in list(deal_criteria_by_direction_dfs.keys()):
+            df = deal_criteria_by_direction_dfs[direction]
+            if df.height > n_deals:
+                deal_criteria_by_direction_dfs[direction] = df.head(n_deals)
+        for seat in list(deal_criteria_by_seat_dfs.keys()):
+            for direction in list(deal_criteria_by_seat_dfs[seat].keys()):
+                df = deal_criteria_by_seat_dfs[seat][direction]
+                if df.height > n_deals:
+                    deal_criteria_by_seat_dfs[seat][direction] = df.head(n_deals)
+        if _cli_deal_rows:
+            print(f"[init] Sliced criteria bitmaps to {n_deals:,} rows to match deal_df")
 
         # TEMPORARY FIX: Force unknown criteria columns to True until bitmaps are regenerated.
         # These criteria exist in BT data but weren't in the bitmap generation pipeline.
@@ -3335,8 +3356,8 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument(
         "--deal-rows",
         type=int,
-        default=0,
-        help="Limit deal_df rows for faster startup (default: 0, which means all rows)",
+        default=1000000,
+        help="Limit deal_df rows for faster startup (default: 1000000, use 0 for all rows)",
     )
     args = parser.parse_args()
 
