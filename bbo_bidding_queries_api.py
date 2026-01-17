@@ -437,6 +437,7 @@ bt_seat1_file = dataPath.joinpath("bbo_bt_compiled.parquet")  # Pre-compiled BT 
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 bt_categories_file = dataPath.joinpath("bbo_bt_categories.parquet")  # 103 bid-category boolean flags (Phase 4)
+bt_ev_stats_file = dataPath.joinpath("bt_ev_par_stats_gpu.parquet")  # Per-BT EV/Par stats (GPU pipeline output)
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 # New rules file: detailed rule discovery metrics (detailed view)
 new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
@@ -1088,6 +1089,16 @@ class SampleDealsByAuctionPatternRequest(BaseModel):
     pattern: str
     sample_size: int = 25
     seed: Optional[int] = 42
+
+
+class AuctionPatternCountsRequest(BaseModel):
+    """Return counts for multiple *actual auction* regex patterns.
+
+    This is the batch version of /sample-deals-by-auction-pattern when you only need counts.
+    It avoids N separate HTTP calls from Streamlit (less overhead, cleaner logs).
+    """
+
+    patterns: List[str]
 
 
 class BiddingTableStatisticsRequest(BaseModel):
@@ -1917,6 +1928,25 @@ def _heavy_init() -> None:
             except Exception as e:
                 print(f"[init] WARNING: Failed to load new rules from {new_rules_file}: {e}")
         _log_memory("after load new_rules")
+
+        # Load precomputed BT EV/Par stats (optional, GPU pipeline output)
+        # This provides Avg_EV_S{seat} and Avg_Par_S{seat} for each bt_index
+        bt_ev_stats_df: Optional[pl.DataFrame] = None
+        if bt_ev_stats_file.exists():
+            try:
+                print(f"[init] Loading BT EV/Par stats from {bt_ev_stats_file}...")
+                t0_ev = time.perf_counter()
+                bt_ev_stats_df = pl.read_parquet(bt_ev_stats_file)
+                elapsed_ev = time.perf_counter() - t0_ev
+                ev_info = _format_file_info(df=bt_ev_stats_df, file_path=bt_ev_stats_file, elapsed_secs=elapsed_ev)
+                _update_loading_status(5, "Loading BT EV stats...", "bt_ev_stats", ev_info)
+                print(f"[init] bt_ev_stats_df: {ev_info} (pre-computed Avg_EV/Avg_Par per seat)")
+            except Exception as e:
+                print(f"[init] WARNING: Failed to load BT EV stats from {bt_ev_stats_file}: {e}")
+                bt_ev_stats_df = None
+        else:
+            print("[init] No BT EV stats found (run bbo_bt_ev_gpu.py)")
+        _log_memory("after load bt_ev_stats")
         
         # Load precomputed deal-to-BT verified index (optional, from GPU pipeline)
         # This enables O(1) lookup of which BT rows match each deal
@@ -2022,6 +2052,7 @@ def _heavy_init() -> None:
             STATE["available_criteria_names"] = available_criteria_names
             STATE["new_rules_df"] = new_rules_df
             STATE["deal_to_bt_index_df"] = deal_to_bt_index_df  # Precomputed deal→[bt_indices] DataFrame (or None)
+            STATE["bt_ev_stats_df"] = bt_ev_stats_df  # Precomputed Avg_EV/Avg_Par per bt_index per seat (or None)
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
@@ -2645,6 +2676,27 @@ def sample_deals_by_auction_pattern(req: SampleDealsByAuctionPatternRequest) -> 
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("sample-deals-by-auction-pattern", e)
+
+
+@app.post("/auction-pattern-counts")
+def auction_pattern_counts(req: AuctionPatternCountsRequest) -> Dict[str, Any]:
+    """Batch counts for actual-auction regex patterns (no BT / Rules)."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_auction_pattern_counts(
+            state=state,
+            patterns=list(req.patterns),
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("auction-pattern-counts", e)
 
 
 # ---------------------------------------------------------------------------

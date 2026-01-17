@@ -1095,7 +1095,7 @@ def render_aggrid(
         "Hand_N": 135, "Hand_E": 135, "Hand_S": 135, "Hand_W": 135,
         # Auction Summary columns
         "Bid Num": 60, "Seat": 55, "Bid": 50, "BT Index": 60,
-        "Deals": 70, "Criteria Count": 10, "Complete": 16,
+        "Matches": 70, "Deals": 70, "Avg_EV": 60, "EV_NV": 60, "EV_V": 50, "Criteria Count": 10, "Complete": 16,
         # Rankings-style stats columns (NV/V split)
         "Matches_NV": 90, "Matches_V": 85,
         "Avg Par_NV": 95, "Avg Par_V": 90,
@@ -4772,6 +4772,8 @@ def render_rank_by_ev():
             ("avg_par", "Avg Par Contract"),
             ("ev_score", "EV at Bid"),
             ("ev_std", "EV Std"),
+            # Note: avg_ev_precomputed/avg_par_precomputed exist but are not displayed
+            # because they're not split by vulnerability (aggregate across NV/V is not useful)
         ]
         # Full Auction placed immediately after Bid above
         
@@ -5424,6 +5426,25 @@ def render_auction_builder():
         st.session_state.auction_builder_options = {}  # Cache of available options per prefix
     if "auction_builder_pinned_deal" not in st.session_state:
         st.session_state.auction_builder_pinned_deal = None  # Cached pinned deal data
+
+    def _clear_current_auction_state() -> None:
+        """Clear the current auction path + related caches (does not clear pinned deal)."""
+        st.session_state.auction_builder_path = []
+        st.session_state.auction_builder_options = {}
+        st.session_state.auction_builder_last_applied = ""
+        st.session_state.auction_builder_last_selected = ""
+        # Clear rehydration tracking keys, deals counts cache, and categories cache
+        for key in list(st.session_state.keys()):
+            if isinstance(key, str) and key.startswith("_rehydrated_"):
+                del st.session_state[key]
+        if "_deals_counts_all" in st.session_state:
+            del st.session_state["_deals_counts_all"]
+        if "_deals_counts_elapsed_ms" in st.session_state:
+            del st.session_state["_deals_counts_elapsed_ms"]
+        if "_deals_counts_steps" in st.session_state:
+            del st.session_state["_deals_counts_steps"]
+        if "auction_builder_bt_categories_cache" in st.session_state:
+            del st.session_state["auction_builder_bt_categories_cache"]
     
     # Sidebar controls
     st.sidebar.subheader("📌 Pinned Deal")
@@ -5432,7 +5453,19 @@ def render_auction_builder():
         value="",
         placeholder="e.g., 12345 or N:AKQ.xxx.xxx.xxxx ...",
         help="Enter a deal index number or PBN string to pin. Criteria will be evaluated against this deal.",
+        key="auction_builder_pinned_input",
     )
+
+    # If the pinned-deal textbox is cleared, also clear the current auction.
+    # This avoids stale "Current Auction" state being interpreted under a different (now absent) pin context.
+    last_pin_key = "_auction_builder_last_pinned_input"
+    prev_pin = str(st.session_state.get(last_pin_key, "") or "")
+    curr_pin = str(pinned_input or "")
+    if prev_pin.strip() and not curr_pin.strip():
+        _clear_current_auction_state()
+        st.session_state[last_pin_key] = curr_pin
+        st.rerun()
+    st.session_state[last_pin_key] = curr_pin
     
     # Parse and fetch pinned deal
     pinned_deal: dict | None = None
@@ -5450,7 +5483,39 @@ def render_auction_builder():
                 if input_stripped.isdigit():
                     # Fetch deal by index (fast-path: monotonic index cache in API)
                     idx = int(input_stripped)
-                    data = api_post("/deals-by-index", {"indices": [idx], "max_rows": 1}, timeout=10)
+                    # Request EV column if available (shown in pinned invariants table as EV)
+                    data = api_post(
+                        "/deals-by-index",
+                        {
+                            "indices": [idx],
+                            "max_rows": 1,
+                            "columns": [
+                                "index",
+                                "Dealer",
+                                "Vul",
+                                "Hand_N",
+                                "Hand_E",
+                                "Hand_S",
+                                "Hand_W",
+                                "HCP_N",
+                                "HCP_E",
+                                "HCP_S",
+                                "HCP_W",
+                                "Total_Points_N",
+                                "Total_Points_E",
+                                "Total_Points_S",
+                                "Total_Points_W",
+                                "ParContracts",
+                                "ParScore",
+                                "EV_Score_Declarer",
+                                "Contract",
+                                "Score",
+                                "Result",
+                                "bid",
+                            ],
+                        },
+                        timeout=10,
+                    )
                     _st_info_elapsed("Auction Builder: pin deal (by index)", data)
                     rows = data.get("rows", [])
                     if rows:
@@ -5489,13 +5554,20 @@ def render_auction_builder():
             keys_to_clear = [k for k in st.session_state if k.startswith("pinned_deal_")]
             for k in keys_to_clear:
                 del st.session_state[k]
+            # Also clear the input box for consistency (and trigger the "clear auction" behavior above).
+            try:
+                st.session_state["auction_builder_pinned_input"] = ""
+            except Exception:
+                pass
             st.rerun()
     elif pinned_deal_error:
         st.sidebar.error(pinned_deal_error)
     
     # When a deal is pinned, always show failed criteria coloring and use 2 dataframes
     show_failed_criteria = bool(pinned_deal)
-    use_two_dataframes = bool(pinned_deal)
+    # Also split Available vs Rejected even without a pinned deal, so rows are bucketed
+    # consistently (dead end / no matches / no deals / missing criteria).
+    use_two_dataframes = True
     
     st.sidebar.divider()
     
@@ -5527,10 +5599,29 @@ def render_auction_builder():
     
     # Display pinned deal in main area (above Current Auction)
     if pinned_deal:
-        render_deal_diagram(pinned_deal, title="📋 Current Deal")
+        deal_idx = pinned_deal.get("index")
+        deal_title = f"📋 Current Deal (deal_index: {deal_idx})" if deal_idx is not None else "📋 Current Deal"
+        render_deal_diagram(pinned_deal, title=deal_title)
+
+        # Show pinned-deal invariant values (single-row table)
+        inv = {
+            "ParContracts": pinned_deal.get("ParContracts"),
+            "ParScore": pinned_deal.get("ParScore", pinned_deal.get("Par_Score")),
+            "EV": pinned_deal.get("EV_Score_Declarer", pinned_deal.get("EV_Score")),
+        }
+        inv_df = pl.DataFrame([inv])
+        render_aggrid(
+            inv_df,
+            key=f"auction_builder_pinned_invariants_{deal_idx}",
+            height=95,
+            table_name="auction_builder_pinned_invariants",
+        )
     
     # Display current auction state with editable input
-    st.subheader("Current Auction")
+    # Include bt_index from last step if available (use 'is not None' since bt_index=0 is valid)
+    current_bt_index = current_path[-1].get("bt_index") if current_path else None
+    auction_header = f"Current Auction (bt_index: {current_bt_index})" if current_bt_index is not None else "Current Auction"
+    st.subheader(auction_header)
     
     # Track last applied auction to prevent render loops
     if "auction_builder_last_applied" not in st.session_state:
@@ -5552,7 +5643,7 @@ def render_auction_builder():
 
     with col_btns:
         # Tight button row - each button fills its narrow column
-        btn_cols = st.columns([2, 2, 2, 1], gap="small")
+        btn_cols = st.columns([2, 2, 2, 2], gap="small")
         with btn_cols[0]:
             apply_edit = st.button("Apply", key="auction_builder_apply_edit", use_container_width=True)
         with btn_cols[1]:
@@ -5561,8 +5652,12 @@ def render_auction_builder():
             if current_path and st.button("Undo", key="auction_builder_undo", use_container_width=True):
                 st.session_state.auction_builder_path.pop()
                 st.session_state.auction_builder_last_applied = ""
+                st.session_state.auction_builder_last_selected = ""  # Reset to allow re-selecting same bid
                 st.rerun()
-        # btn_cols[3] is minimal spacer
+        with btn_cols[3]:
+            if st.button("Clear", key="auction_builder_clear", help="Clear the current auction", use_container_width=True):
+                _clear_current_auction_state()
+                st.rerun()
     
     # Handle manual auction edit - trigger on Enter (value change) OR button click
     # But skip if we just applied this same value (prevents render loop)
@@ -5608,6 +5703,7 @@ def render_auction_builder():
             st.session_state.auction_builder_path = new_path
             st.session_state.auction_builder_options = {}  # Clear cache
             st.session_state.auction_builder_last_applied = edited_normalized  # Prevent re-trigger
+            st.session_state.auction_builder_last_selected = ""  # Reset to allow selecting any bid
             # Mark as already rehydrated (we just resolved the full path)
             st.session_state[f"_rehydrated_{edited_normalized}"] = True
             st.rerun()
@@ -5616,6 +5712,7 @@ def render_auction_builder():
             st.session_state.auction_builder_path = []
             st.session_state.auction_builder_options = {}
             st.session_state.auction_builder_last_applied = ""  # Prevent re-trigger
+            st.session_state.auction_builder_last_selected = ""  # Reset to allow selecting any bid
             # Clear rehydration tracking keys, deals counts cache, and categories cache
             for key in list(st.session_state.keys()):
                 if isinstance(key, str) and key.startswith("_rehydrated_"):
@@ -5670,6 +5767,9 @@ def render_auction_builder():
                     "is_complete": item.get("is_completed_auction", False),
                     "is_dead_end": item.get("is_dead_end", False),
                     "matching_deal_count": item.get("matching_deal_count"),
+                    # Precomputed EV split by vulnerability (optional, may be missing/None)
+                    "avg_ev_nv": item.get("avg_ev_nv"),
+                    "avg_ev_v": item.get("avg_ev_v"),
                 })
             
             # Already sorted by the API
@@ -5736,6 +5836,31 @@ def render_auction_builder():
             return bt, int(n)
         except Exception:
             return str(auction_text or ""), 0
+
+    def _rotate_dealer_by(dealer: str, offset: int) -> str:
+        """Rotate dealer direction by `offset` seats (N->E->S->W).
+
+        Auction Builder supports leading opening passes by stripping them for BT lookup.
+        BT paths are seat-1 canonical (opener acts as seat 1). To evaluate criteria against a
+        real deal (dealer-relative), we rotate the dealer by the number of leading passes.
+        """
+        try:
+            directions = ["N", "E", "S", "W"]
+            d = str(dealer or "N").upper()
+            i = directions.index(d) if d in directions else 0
+            k = int(offset or 0) % 4
+            return directions[(i + k) % 4]
+        except Exception:
+            return str(dealer or "N").upper()
+
+    def _bt_seat_from_display_seat(seat_1_to_4: int, leading_passes: int) -> int:
+        """Map dealer-relative seat (display) to BT-canonical seat when there are leading passes."""
+        try:
+            s = int(seat_1_to_4)
+        except Exception:
+            s = 1
+        k = int(leading_passes or 0) % 4
+        return ((s - 1 - k) % 4) + 1
 
     # Display bid selection
     if not is_complete:
@@ -5850,7 +5975,13 @@ def render_auction_builder():
                 if not pinned_deal or not criteria_list:
                     return True, []
                 
-                dealer = str(pinned_deal.get("Dealer", "N")).upper()
+                # IMPORTANT: When the displayed auction begins with leading passes ("P-P-..."),
+                # we strip those passes for BT lookup (seat-1 canonical). Criteria returned for
+                # those BT nodes are relative to that canonical seat ordering, not the real deal's
+                # dealer-relative seats. To evaluate correctly, rotate the dealer and map the seat.
+                dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
+                dealer = _rotate_dealer_by(dealer_actual, leading_passes)
+                seat = _bt_seat_from_display_seat(seat, leading_passes)
                 row_idx = pinned_deal.get("_row_idx")
                 
                 # PBN deals don't have _row_idx - cannot evaluate criteria without enrichment
@@ -5893,12 +6024,54 @@ def render_auction_builder():
                 
                 return True, []
             
+            # Fetch Matches (pattern-based count) for all bid options
+            # Build cache key for matches lookup
+            matches_cache_key = f"_bid_matches_{current_auction}_{seed}"
+            if matches_cache_key not in st.session_state:
+                st.session_state[matches_cache_key] = {}
+            bid_matches: dict[str, int] = st.session_state[matches_cache_key]
+            
+            # Find bids that need fetching
+            missing_bids = []
+            for opt in sorted_options:
+                bid_str = str(opt.get("bid", "")).upper()
+                next_auction = f"{current_auction}-{bid_str}" if current_auction else bid_str
+                if next_auction not in bid_matches:
+                    missing_bids.append((bid_str, next_auction))
+            
+            # Fetch missing matches (pattern-based counts)
+            if missing_bids:
+                # Batch request: one API call for all missing bid-options
+                next_to_pattern: dict[str, str] = {}
+                for _bid_str, next_auction in missing_bids:
+                    # Preserve legacy pattern semantics used here
+                    next_to_pattern[next_auction] = next_auction.replace("-", "-*") + "*" if next_auction else "*"
+
+                try:
+                    patterns = list(dict.fromkeys(next_to_pattern.values()))
+                    resp = api_post(
+                        "/auction-pattern-counts",
+                        {"patterns": patterns},
+                        timeout=15,
+                    )
+                    counts_by_pattern: dict[str, int] = resp.get("counts", {}) or {}
+                    for next_auction, pat in next_to_pattern.items():
+                        bid_matches[next_auction] = int(counts_by_pattern.get(pat, 0) or 0)
+                except Exception:
+                    for _, next_auction in missing_bids:
+                        bid_matches[next_auction] = 0
+            
             # Build DataFrame for bid selection
             bid_rows = []
             for i, opt in enumerate(sorted_options):
                 criteria_list = opt.get("agg_expr", [])
                 criteria_str = "; ".join(criteria_list)
                 complete_marker = " ✅" if opt.get("is_complete") else ""
+                
+                # Get Matches count for this bid
+                bid_str = str(opt.get("bid", "")).upper()
+                next_auction = f"{current_auction}-{bid_str}" if current_auction else bid_str
+                matches_count = bid_matches.get(next_auction, 0)
                 
                 # Check if pinned deal matches this bid's criteria
                 matches_pinned = None
@@ -5924,12 +6097,15 @@ def render_auction_builder():
                 is_dead_end = opt.get("is_dead_end", False)
                 has_empty_criteria = not criteria_list
                 has_zero_deals = deal_count == 0
-                is_rejected = is_dead_end or has_empty_criteria or has_zero_deals
+                has_zero_matches = matches_count == 0
+                is_rejected = is_dead_end or has_empty_criteria or has_zero_deals or has_zero_matches
                 
                 # Build failure reason for display
                 failure_reasons = []
                 if is_dead_end:
                     failure_reasons.append("dead end")
+                if has_zero_matches:
+                    failure_reasons.append("no matches")
                 if has_zero_deals:
                     failure_reasons.append("no matching deals")
                 if has_empty_criteria:
@@ -5947,8 +6123,31 @@ def render_auction_builder():
                 if seat_direction:
                     row_data["Direction"] = seat_direction
                 row_data["Bid"] = f"{opt['bid']}{complete_marker}"
-                # Add deal count if available
+                # Add Matches and Deals counts
+                row_data["Matches"] = matches_count
                 row_data["Deals"] = deal_count if deal_count is not None else ""
+                # Add Avg_EV with NV/V split from GPU pipeline
+                avg_ev_nv = opt.get("avg_ev_nv")
+                avg_ev_v = opt.get("avg_ev_v")
+                # IMPORTANT: Normalize EV sign by partnership (NS positive).
+                # BT seat-1 view: Seat 1/3 = NS, Seat 2/4 = EW. For EW seats, flip sign so values
+                # are comparable across seats/steps.
+                ev_sign = -1.0 if seat_1_to_4 in (2, 4) else 1.0
+                row_data["EV_NV"] = round(ev_sign * float(avg_ev_nv), 1) if avg_ev_nv is not None else None
+                row_data["EV_V"] = round(ev_sign * float(avg_ev_v), 1) if avg_ev_v is not None else None
+                # Avg_EV: when pinned deal is present, pick the correct vul for this bidder seat
+                row_data["Avg_EV"] = None
+                if pinned_deal and seat_direction:
+                    try:
+                        vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper()
+                        ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                        ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+                        is_vul = (seat_direction in ("N", "S") and ns_vul) or (seat_direction in ("E", "W") and ew_vul)
+                        chosen = avg_ev_v if is_vul else avg_ev_nv
+                        # Keep the same NS-positive convention as EV_NV/EV_V
+                        row_data["Avg_EV"] = round(ev_sign * float(chosen), 1) if chosen is not None else None
+                    except Exception:
+                        row_data["Avg_EV"] = None
                 row_data["Criteria"] = criteria_str if criteria_str else "(none)"
                 row_data["Categories"] = ""
                 # Attach categories (true flags) for this candidate's bt_index (if available)
@@ -5982,7 +6181,11 @@ def render_auction_builder():
                 if pinned_deal:
                     gb.configure_column("Direction", width=70, minWidth=70)
                 gb.configure_column("Bid", width=80, minWidth=80)
+                gb.configure_column("Matches", width=80, minWidth=60)
                 gb.configure_column("Deals", width=80, minWidth=60)
+                gb.configure_column("Avg_EV", width=65, minWidth=55, headerName="Avg EV")
+                gb.configure_column("EV_NV", width=65, minWidth=55, headerName="EV NV")
+                gb.configure_column("EV_V", width=55, minWidth=50, headerName="EV V")
                 gb.configure_column(
                     "Criteria",
                     flex=1,
@@ -6000,6 +6203,15 @@ def render_auction_builder():
                 # Hide Failure in valid/invalid grids (shown only in rejected grid)
                 if "Failure" in pdf.columns:
                     gb.configure_column("Failure", hide=True)
+
+                # Display rules:
+                # - Pinned deal: show Avg_EV, hide EV_NV/EV_V
+                # - No pinned deal: hide Avg_EV, show EV_NV/EV_V
+                if pinned_deal:
+                    gb.configure_column("EV_NV", hide=True)
+                    gb.configure_column("EV_V", hide=True)
+                else:
+                    gb.configure_column("Avg_EV", hide=True)
                 
                 # Add row styling based on pinned deal match
                 if apply_row_styling and show_failed_criteria:
@@ -6062,6 +6274,28 @@ def render_auction_builder():
                             if cats_str:
                                 sel_opt["categories"] = [c.strip() for c in cats_str.split(",") if c.strip()]
                         st.session_state.auction_builder_path.append(sel_opt)
+                        # Normalize the entire stored path immediately using /resolve-auction-path.
+                        # This prevents later "rehydration" from changing earlier rows (green->red)
+                        # because the path mixes per-selection criteria with server-resolved criteria.
+                        try:
+                            new_auction = "-".join([step.get("bid", "") for step in st.session_state.auction_builder_path if step.get("bid")])
+                            if new_auction:
+                                data = api_post("/resolve-auction-path", {"auction": new_auction}, timeout=30)
+                                new_path = data.get("path", []) or []
+                                if new_path and len(new_path) == len(st.session_state.auction_builder_path):
+                                    # Preserve any client-side completion inference for trailing passes
+                                    try:
+                                        if st.session_state.auction_builder_path and new_path:
+                                            new_path[-1]["is_complete"] = bool(
+                                                new_path[-1].get("is_complete", False)
+                                                or st.session_state.auction_builder_path[-1].get("is_complete", False)
+                                            )
+                                    except Exception:
+                                        pass
+                                    st.session_state.auction_builder_path = new_path
+                        except Exception:
+                            # Best-effort only; keep the appended selection as-is.
+                            pass
                         st.session_state.auction_builder_last_applied = ""
                         st.rerun()
             
@@ -6136,9 +6370,22 @@ def render_auction_builder():
                     if pinned_deal:
                         gb_rej.configure_column("Direction", width=70, minWidth=70)
                     gb_rej.configure_column("Bid", width=80, minWidth=80)
+                    gb_rej.configure_column("Matches", width=80, minWidth=60)
                     gb_rej.configure_column("Deals", width=80, minWidth=60)
-                    gb_rej.configure_column("Failure", width=140, minWidth=120)
+                    gb_rej.configure_column("Avg_EV", width=65, minWidth=55, headerName="Avg EV")
+                    gb_rej.configure_column("EV_NV", width=65, minWidth=55, headerName="EV NV")
+                    gb_rej.configure_column("EV_V", width=55, minWidth=50, headerName="EV V")
+                    gb_rej.configure_column("Failure", width=160, minWidth=140)
                     gb_rej.configure_column("Criteria", flex=1, minWidth=100, tooltipField="Criteria")
+
+                    # Display rules (match valid/invalid grids):
+                    # - Pinned deal: show Avg_EV, hide EV_NV/EV_V
+                    # - No pinned deal: hide Avg_EV, show EV_NV/EV_V
+                    if pinned_deal:
+                        gb_rej.configure_column("EV_NV", hide=True)
+                        gb_rej.configure_column("EV_V", hide=True)
+                    else:
+                        gb_rej.configure_column("Avg_EV", hide=True)
                     rejected_opts = gb_rej.build()
                     rejected_resp = AgGrid(
                         rejected_pdf,
@@ -6195,6 +6442,74 @@ def render_auction_builder():
                         custom_css=grid_custom_css,
                     )
                     handle_bid_selection(other_resp)
+            elif use_two_dataframes and not show_failed_criteria:
+                # No pinned deal: split into Available vs Rejected using the same rejection logic.
+                available_rows = [r for r in bid_rows if not r.get("_rejected")]
+                rejected_rows = [r for r in bid_rows if r.get("_rejected")]
+
+                if available_rows:
+                    st.markdown(f"**✅ Available Bids ({len(available_rows)})**")
+                    avail_pdf = pl.DataFrame(available_rows).to_pandas()
+                    avail_opts = build_bid_grid_options(avail_pdf, apply_row_styling=False)
+                    avail_resp = AgGrid(
+                        avail_pdf,
+                        gridOptions=avail_opts,
+                        height=min(350, 70 + len(available_rows) * 35),
+                        update_on=["selectionChanged"],
+                        key=f"auction_builder_available_grid_{current_seat}",
+                        theme="balham",
+                        allow_unsafe_jscode=True,
+                        custom_css={
+                            ".ag-row": {"cursor": "pointer", "background-color": "#d4edda"},
+                            ".ag-row-hover": {"background-color": "#b8dfc4 !important", "border-left": "3px solid #28a745 !important"},
+                            ".ag-row-selected": {"background-color": "#a3d4af !important"},
+                        },
+                    )
+                    handle_bid_selection(avail_resp)
+                else:
+                    st.warning("No available bids (all candidates are rejected by BT/matches/deals/criteria rules).")
+
+                if rejected_rows:
+                    st.markdown(f"**⚠️ Rejected Bids ({len(rejected_rows)})**")
+                    rejected_pdf = pl.DataFrame(rejected_rows).to_pandas()
+
+                    # Configure rejected grid with explicit Failure column visible
+                    gb_rej = GridOptionsBuilder.from_dataframe(rejected_pdf)
+                    gb_rej.configure_selection(selection_mode="single", use_checkbox=False)
+                    gb_rej.configure_column("_idx", hide=True)
+                    gb_rej.configure_column("_matches", hide=True)
+                    gb_rej.configure_column("_rejected", hide=True)
+                    gb_rej.configure_column("Bid Num", width=85, minWidth=85)
+                    gb_rej.configure_column("Seat", width=60, minWidth=60)
+                    gb_rej.configure_column("Bid", width=80, minWidth=80)
+                    gb_rej.configure_column("Matches", width=80, minWidth=60)
+                    gb_rej.configure_column("Deals", width=80, minWidth=60)
+                    gb_rej.configure_column("Avg_EV", width=65, minWidth=55, headerName="Avg EV")
+                    gb_rej.configure_column("EV_NV", width=65, minWidth=55, headerName="EV NV")
+                    gb_rej.configure_column("EV_V", width=55, minWidth=50, headerName="EV V")
+                    gb_rej.configure_column("Failure", width=160, minWidth=140)
+                    gb_rej.configure_column("Criteria", flex=1, minWidth=100, tooltipField="Criteria")
+                    gb_rej.configure_column("Categories", flex=1, minWidth=140, tooltipField="Categories")
+
+                    # No pinned deal: hide Avg_EV, show EV_NV/EV_V (same as main grid rules)
+                    gb_rej.configure_column("Avg_EV", hide=True)
+                    rejected_opts = gb_rej.build()
+
+                    rejected_resp = AgGrid(
+                        rejected_pdf,
+                        gridOptions=rejected_opts,
+                        height=min(300, 62 + len(rejected_rows) * 30),
+                        update_on=["selectionChanged"],
+                        key=f"auction_builder_rejected_grid_{current_seat}",
+                        theme="balham",
+                        allow_unsafe_jscode=True,
+                        custom_css={
+                            ".ag-row": {"cursor": "pointer", "background-color": "#fff3cd"},
+                            ".ag-row-hover": {"background-color": "#ffe69c !important", "border-left": "3px solid #ffc107 !important"},
+                            ".ag-row-selected": {"background-color": "#ffda6a !important"},
+                        },
+                    )
+                    handle_bid_selection(rejected_resp)
             else:
                 # Single DataFrame mode
                 if show_failed_criteria and (valid_count > 0 or invalid_count > 0 or rejected_count > 0):
@@ -6279,7 +6594,10 @@ def render_auction_builder():
                 except Exception:
                     pass
 
-        st.subheader("📋 Auction Summary")
+        # Include bt_index from last step in header (use 'is not None' since bt_index=0 is valid)
+        summary_bt_index = current_path[-1].get("bt_index") if current_path else None
+        summary_header = f"📋 Auction Summary (bt_index: {summary_bt_index})" if summary_bt_index is not None else "📋 Auction Summary"
+        st.subheader(summary_header)
         if rehydrate_elapsed_ms is not None:
             st.info(f"Loaded auction criteria in {rehydrate_elapsed_ms/1000:.2f}s")
         
@@ -6357,21 +6675,30 @@ def render_auction_builder():
         # Fetch missing counts
         if missing_partials:
             t0_counts = time.perf_counter()
+            # Batch request: one API call for all missing partials
+            partial_to_pattern: dict[str, str] = {}
             for partial in missing_partials:
                 partial_upper = partial.upper()
                 # Build regex pattern for deals starting with this partial auction
                 if partial_upper.endswith("-P-P-P"):
-                    pattern = f"^{partial_upper}$"
+                    partial_to_pattern[partial] = f"^{partial_upper}$"
                 else:
-                    pattern = f"^{partial_upper}.*-P-P-P$"
-                try:
-                    resp = api_post(
-                        "/sample-deals-by-auction-pattern",
-                        {"pattern": pattern, "sample_size": 1, "seed": int(seed)},  # Only need count, not deals
-                        timeout=10,
-                    )
-                    deals_counts[partial] = resp.get("total_count", 0)
-                except Exception:
+                    partial_to_pattern[partial] = f"^{partial_upper}.*-P-P-P$"
+
+            try:
+                # Deduplicate patterns to minimize server work
+                patterns = list(dict.fromkeys(partial_to_pattern.values()))
+                resp = api_post(
+                    "/auction-pattern-counts",
+                    {"patterns": patterns},
+                    timeout=15,
+                )
+                counts: dict[str, int] = resp.get("counts", {}) or {}
+                for partial, pat in partial_to_pattern.items():
+                    deals_counts[partial] = int(counts.get(pat, 0) or 0)
+            except Exception:
+                # Fallback: mark missing as 0 (avoid repeated calls during reruns)
+                for partial in missing_partials:
                     deals_counts[partial] = 0
             # Cache elapsed time for display on subsequent renders
             st.session_state["_deals_counts_elapsed_ms"] = (time.perf_counter() - t0_counts) * 1000
@@ -6390,14 +6717,43 @@ def render_auction_builder():
             criteria_str = _join_tooltip(step.get("agg_expr", []))
             # Build partial auction up to this step for deals count lookup
             partial_auction = "-".join([s["bid"] for s in current_path[:bid_num]])
-            # Use pre-fetched deals count
-            deals_count = deals_counts.get(partial_auction, 0)
+            # Matches = pattern-based count (deals where actual auction matches)
+            matches_count = deals_counts.get(partial_auction, 0)
+            # Deals = criteria-based count (deals that qualify based on hand evaluation)
+            deals_count = step.get("matching_deal_count")
+            if deals_count is None:
+                deals_count = matches_count  # Fall back to pattern-based if not available
+            # Get NV/V split EV from the step (populated at selection time)
+            avg_ev_nv = step.get("avg_ev_nv")
+            avg_ev_v = step.get("avg_ev_v")
+            deal_par = pinned_deal.get("ParScore", pinned_deal.get("Par_Score")) if pinned_deal else None
+            deal_ev = pinned_deal.get("EV_Score_Declarer", pinned_deal.get("EV_Score")) if pinned_deal else None
+            avg_ev: float | None = None
+            ev_sign = -1.0 if seat_1_to_4 in (2, 4) else 1.0
+            if pinned_deal:
+                try:
+                    dealer = str(pinned_deal.get("Dealer", "N")).upper()
+                    vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper()
+                    directions = ["N", "E", "S", "W"]
+                    dealer_idx = directions.index(dealer) if dealer in directions else 0
+                    bid_dir = directions[(dealer_idx + (seat_1_to_4 - 1)) % 4]
+                    ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                    ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+                    is_vul = (bid_dir in ("N", "S") and ns_vul) or (bid_dir in ("E", "W") and ew_vul)
+                    chosen = avg_ev_v if is_vul else avg_ev_nv
+                    avg_ev = round(ev_sign * float(chosen), 1) if chosen is not None else None
+                except Exception:
+                    avg_ev = None
             row = {
                 "Bid Num": bid_num,
                 "Seat": seat_1_to_4,
                 "Bid": step["bid"],
                 "BT Index": step.get("bt_index"),
+                "Matches": matches_count,
                 "Deals": deals_count,
+                "Avg_EV": avg_ev,
+                "EV_NV": round(ev_sign * float(avg_ev_nv), 1) if avg_ev_nv is not None else None,
+                "EV_V": round(ev_sign * float(avg_ev_v), 1) if avg_ev_v is not None else None,
                 "Criteria Count": len(step.get("agg_expr", [])),
                 # Display columns are truncated; *_full columns back tooltips.
                 "Agg_Expr_full": criteria_str,
@@ -6416,6 +6772,9 @@ def render_auction_builder():
             
             # Evaluate criteria against pinned deal if available
             if pinned_deal:
+                # Auction Summary uses the stored path. We normalize that path after each click
+                # via /resolve-auction-path, which aligns criteria to dealer-relative seats already.
+                # So evaluate using the actual dealer and the displayed seat.
                 dealer = pinned_deal.get("Dealer", "N")
                 criteria_list = step.get("agg_expr", [])
                 passes, failed = evaluate_criteria_for_pinned(criteria_list, seat_1_to_4, dealer, pinned_deal)
@@ -6427,7 +6786,9 @@ def render_auction_builder():
                     row["Failed_Criteria"] = "; ".join(failed)  # Show all failures
                     pinned_all_pass = False
             else:
-                row["_passes"] = True  # Default to pass when no pinned deal
+                # When no pinned deal, color based on bt_index presence
+                # Green = has bt_index (in BT), Red = no bt_index (e.g., leading passes)
+                row["_passes"] = step.get("bt_index") is not None
             
             # Add stats columns only on the last row (they apply to the full auction)
             # Use Rankings-style naming: Matches, Avg Par, EV at Bid, EV Std (with NV/V suffix)
@@ -6436,8 +6797,11 @@ def render_auction_builder():
                 row["Matches_V"] = cached_stats.get("matches_v")
                 row["Avg Par_NV"] = cached_stats.get("avg_par_nv")
                 row["Avg Par_V"] = cached_stats.get("avg_par_v")
-                row["EV_NV"] = cached_stats.get("ev_nv")
-                row["EV_V"] = cached_stats.get("ev_v")
+                # NOTE: Do NOT overwrite step EV_NV/EV_V (precomputed GPU stats).
+                # These cached stats are sample-based (from /sample-deals-by-auction-pattern),
+                # so store them in separate columns.
+                row["EV at Bid_NV"] = cached_stats.get("ev_nv")
+                row["EV at Bid_V"] = cached_stats.get("ev_v")
                 row["EV Std_NV"] = cached_stats.get("ev_std_nv")
                 row["EV Std_V"] = cached_stats.get("ev_std_v")
             elif cached_stats:
@@ -6445,21 +6809,99 @@ def render_auction_builder():
                 row["Matches_V"] = None
                 row["Avg Par_NV"] = None
                 row["Avg Par_V"] = None
-                row["EV_NV"] = None
-                row["EV_V"] = None
+                row["EV at Bid_NV"] = None
+                row["EV at Bid_V"] = None
                 row["EV Std_NV"] = None
                 row["EV Std_V"] = None
             summary_rows.append(row)
         
         # Show auction complete status and pinned deal match summary
         if is_complete:
+            def _final_contract_from_calls(calls: list[str]) -> str:
+                """Return final contract string like '4S', '4Sx', '4Sxx', or 'Passed out'."""
+                last_contract: str | None = None
+                dbl_state = 0  # 0=none, 1=x, 2=xx
+                for raw in calls:
+                    t = str(raw or "").strip().upper()
+                    if not t:
+                        continue
+                    # Contract bids
+                    if len(t) == 2 and t[0] in "1234567" and t[1] in "CDHSN":
+                        last_contract = t
+                        dbl_state = 0
+                        continue
+                    # Doubles / redoubles (this app uses D/R; accept X/XX too)
+                    if t in ("D", "X"):
+                        if last_contract and dbl_state == 0:
+                            dbl_state = 1
+                        continue
+                    if t in ("R", "XX"):
+                        if last_contract and dbl_state == 1:
+                            dbl_state = 2
+                        continue
+                    # Ignore P and other tokens
+                if not last_contract:
+                    return "Passed out"
+                if dbl_state == 1:
+                    return f"{last_contract}x"
+                if dbl_state == 2:
+                    return f"{last_contract}xx"
+                return last_contract
+
+            def _last_contract_step_index(calls: list[str]) -> int | None:
+                """Index of last non-pass action that defines the final contract (bid/double/redouble)."""
+                # Find the last contract bid, then include subsequent D/R up to the end.
+                last_bid_i: int | None = None
+                for i, raw in enumerate(calls):
+                    t = str(raw or "").strip().upper()
+                    if len(t) == 2 and t[0] in "1234567" and t[1] in "CDHSN":
+                        last_bid_i = i
+                if last_bid_i is None:
+                    return None
+                # Walk forward until next contract bid (none, since we picked last) – so last defining action
+                # is the last D/R after last_bid_i (if any).
+                last_def = last_bid_i
+                for j in range(last_bid_i + 1, len(calls)):
+                    t = str(calls[j] or "").strip().upper()
+                    if t in ("D", "X", "R", "XX"):
+                        last_def = j
+                return last_def
+
+            auction_calls = [str(s.get("bid", "")).strip().upper() for s in (current_path or []) if str(s.get("bid", "")).strip()]
+            final_contract = _final_contract_from_calls(auction_calls)
+            deal_ev_val = pinned_deal.get("EV_Score_Declarer", pinned_deal.get("EV_Score")) if pinned_deal else None
+            try:
+                deal_ev_num = float(deal_ev_val) if deal_ev_val is not None else None
+            except Exception:
+                deal_ev_num = None
+            # Avg_EV: use the step that sets the final contract (last bid/double/redouble), not the final pass.
+            avg_ev_final: float | None = None
+            try:
+                idx = _last_contract_step_index(auction_calls)
+                if idx is not None and 0 <= idx < len(summary_rows):
+                    v = summary_rows[idx].get("Avg_EV")
+                    avg_ev_final = float(v) if v is not None else None
+            except Exception:
+                avg_ev_final = None
+
             if pinned_deal:
                 if pinned_all_pass:
-                    st.success("✅ Auction Complete - Pinned deal matches ALL criteria")
+                    st.success(
+                        f"✅ Auction Complete — Final: **{final_contract}** | "
+                        f"Deal_EV: **{deal_ev_num:.1f}** | Avg_EV: **{avg_ev_final:.1f}**"
+                        if (deal_ev_num is not None and avg_ev_final is not None)
+                        else f"✅ Auction Complete — Final: **{final_contract}** | Deal_EV: {deal_ev_num} | Avg_EV: {avg_ev_final}"
+                    )
                 else:
-                    st.error("❌ Auction Complete with Errors - Pinned deal FAILS some criteria")
+                    st.error(
+                        f"❌ Auction Complete with Errors — Final: **{final_contract}** | "
+                        f"Deal_EV: **{deal_ev_num:.1f}** | Avg_EV: **{avg_ev_final:.1f}**"
+                        if (deal_ev_num is not None and avg_ev_final is not None)
+                        else f"❌ Auction Complete with Errors — Final: **{final_contract}** | Deal_EV: {deal_ev_num} | Avg_EV: {avg_ev_final}"
+                    )
             else:
-                st.success("✅ Auction Complete")
+                # Without a pinned deal, Deal_EV is unknown. Avg_EV is shown as NV/V on the grid.
+                st.success(f"✅ Auction Complete — Final: **{final_contract}**")
         elif pinned_deal and current_path:
             # Auction not complete, but show pinned deal status
             if pinned_all_pass:
@@ -6475,7 +6917,11 @@ def render_auction_builder():
                 "Seat",
                 "Bid",
                 "BT Index",
-                "Deals",
+                "Matches",  # Pattern-based: deals where actual auction matches
+                "Deals",    # Criteria-based: deals that qualify based on hand evaluation
+                "Avg_EV",   # Avg EV for this bid, chosen based on pinned vul (only meaningful when pinned)
+                "EV_NV",    # Pre-computed average EV (Not Vulnerable)
+                "EV_V",     # Pre-computed average EV (Vulnerable)
                 "Criteria Count",
                 "Agg_Expr",
                 "Categories",
@@ -6485,16 +6931,27 @@ def render_auction_builder():
         # Make summary grid selectable to show deals for a specific auction step
         # Use selectionChanged to trigger rerun when row is selected
         # Use fit_columns_to_view=False to prevent column width changes on rerender
-        # Use row_pass_fail_col to colorize rows based on pinned deal criteria evaluation
+        # Use row_pass_fail_col to colorize rows:
+        #   - With pinned deal: green=passes criteria, red=fails criteria
+        #   - Without pinned deal: green=has bt_index, red=no bt_index (e.g., leading passes)
+        # Hide/show columns depending on whether a deal is pinned:
+        # - pinned: hide EV_NV/EV_V (use Deal_* and Avg_EV)
+        # - not pinned: hide Deal_* and Avg_EV (use EV_NV/EV_V)
+        summary_hide_cols = ["Agg_Expr_full", "Categories_full", "_passes"]
+        if pinned_deal:
+            summary_hide_cols += ["EV_NV", "EV_V"]
+        else:
+            summary_hide_cols += ["Avg_EV"]
+
         summary_selection = render_aggrid(
             summary_df,
             key="auction_builder_summary",
             height=calc_grid_height(4),
             table_name="auction_builder_summary",
-            hide_cols=["Agg_Expr_full", "Categories_full", "_passes"],
+            hide_cols=summary_hide_cols,
             update_on=["selectionChanged"],
             fit_columns_to_view=False,
-            row_pass_fail_col="_passes" if pinned_deal else None,
+            row_pass_fail_col="_passes",
         )
         
         # Handle row selection - show matching deals for selected step

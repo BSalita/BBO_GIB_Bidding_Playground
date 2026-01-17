@@ -2283,6 +2283,85 @@ def handle_sample_deals_by_auction_pattern(
     return {"pattern": pattern, "deals": out_rows, "total_count": total_count, "elapsed_ms": round(elapsed_ms, 1)}
 
 
+def handle_auction_pattern_counts(
+    state: Dict[str, Any],
+    patterns: List[str],
+) -> Dict[str, Any]:
+    """Return counts for multiple *actual auction* regex patterns.
+
+    This is used by Streamlit Auction Summary to get per-step "Matches" counts in one HTTP call.
+    """
+    t0 = time.perf_counter()
+
+    deal_df = state.get("deal_df")
+    if not isinstance(deal_df, pl.DataFrame) or deal_df.is_empty():
+        raise ValueError("deal_df not loaded")
+
+    # Pick an auction string column if present; otherwise compute _bid_str on demand.
+    df = deal_df
+    auction_col: str | None = None
+    if "Actual_Auction" in df.columns:
+        auction_col = "Actual_Auction"
+    elif "_bid_str" in df.columns:
+        auction_col = "_bid_str"
+
+    if auction_col is None:
+        df = prepare_deals_with_bid_str(df, include_auction_key=False)
+        auction_col = "_bid_str"
+
+    # Deduplicate patterns but keep stable output mapping
+    patterns_in = [str(p) for p in (patterns or []) if p is not None]
+    unique_patterns: List[str] = list(dict.fromkeys(patterns_in))
+
+    counts_by_pattern: Dict[str, int] = {}
+    errors_by_pattern: Dict[str, str] = {}
+
+    if not unique_patterns:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[auction-pattern-counts] {format_elapsed(elapsed_ms)} (0 patterns)")
+        return {"counts": {}, "errors": {}, "elapsed_ms": round(elapsed_ms, 1)}
+
+    # Compute counts in one Polars select (avoids N HTTP calls; still N regex evals)
+    exprs: List[pl.Expr] = []
+    for pat in unique_patterns:
+        try:
+            regex = f"(?i){pat}"
+            exprs.append(
+                pl.col(auction_col)
+                .cast(pl.Utf8)
+                .str.contains(regex)
+                .cast(pl.Int32)
+                .sum()
+                .alias(pat)
+            )
+        except Exception as e:
+            errors_by_pattern[pat] = str(e)
+
+    if exprs:
+        try:
+            out = df.select(exprs).to_dicts()[0]
+            for k, v in out.items():
+                try:
+                    counts_by_pattern[str(k)] = int(v) if v is not None else 0
+                except Exception:
+                    counts_by_pattern[str(k)] = 0
+        except Exception as e:
+            # Fall back to per-pattern filtering (more robust)
+            for pat in unique_patterns:
+                if pat in errors_by_pattern:
+                    continue
+                try:
+                    regex = f"(?i){pat}"
+                    counts_by_pattern[pat] = int(df.filter(pl.col(auction_col).cast(pl.Utf8).str.contains(regex)).height)
+                except Exception as ee:
+                    errors_by_pattern[pat] = str(ee)
+                    counts_by_pattern[pat] = 0
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[auction-pattern-counts] {format_elapsed(elapsed_ms)} ({len(unique_patterns)} patterns)")
+    return {"counts": counts_by_pattern, "errors": errors_by_pattern, "elapsed_ms": round(elapsed_ms, 1)}
+
+
 def handle_resolve_auction_path(
     state: Dict[str, Any],
     auction: str,
@@ -3867,6 +3946,7 @@ def handle_bidding_arena(
                    Supports .parquet and .csv files. If None, uses deal_df.
     """
     t0 = time.perf_counter()
+    debug = bool(state.get("debug_bidding_arena", False))
     # Console timings to pinpoint slow phases (also returned in payload as timings_ms).
     _t_last = t0
     timings_ms: dict[str, float] = {}
@@ -3883,7 +3963,8 @@ def handle_bidding_arena(
         try:
             deal_df = _load_deals_from_uri(deals_uri)
             deals_source = deals_uri
-            print(f"[bidding-arena] Loaded {deal_df.height} deals from {deals_uri}")
+            if debug:
+                print(f"[bidding-arena] Loaded {deal_df.height} deals from {deals_uri}")
         except Exception as e:
             raise ValueError(f"Failed to load deals from URI: {e}")
     else:
@@ -4040,9 +4121,11 @@ def handle_bidding_arena(
                 except Exception:
                     pass
             elapsed_resolve = (time.perf_counter() - t_pinned_resolve) * 1000
-            print(f"[bidding-arena] PINNED-ONLY MODE: {len(pinned_auctions)} auctions -> {len(pinned_auction_bt_indices)} bt_indices ({elapsed_resolve:.1f}ms)")
+            if debug:
+                print(f"[bidding-arena] PINNED-ONLY MODE: {len(pinned_auctions)} auctions -> {len(pinned_auction_bt_indices)} bt_indices ({elapsed_resolve:.1f}ms)")
         except Exception as e:
-            print(f"[bidding-arena] Pinned mode optimization failed: {e}, falling back to full candidate pool")
+            if debug:
+                print(f"[bidding-arena] Pinned mode optimization failed: {e}, falling back to full candidate pool")
             pinned_only_mode = False
     _mark("pinned_only_resolve")
     
@@ -4460,7 +4543,8 @@ def handle_bidding_arena(
                 t_agg_load = time.perf_counter()
                 agg_data = _load_agg_expr_for_bt_indices(needed_idxs, bt_parquet_file)
                 elapsed_agg = (time.perf_counter() - t_agg_load) * 1000
-                print(f"[bidding-arena] Agg_Expr load: {len(needed_idxs)} indices in {elapsed_agg:.1f}ms")
+                if debug:
+                    print(f"[bidding-arena] Agg_Expr load: {len(needed_idxs)} indices in {elapsed_agg:.1f}ms")
                 agg_rows: list[dict[str, Any]] = []
                 for bt_idx, cols_dict in agg_data.items():
                     row: dict[str, Any] = {"bt_index": bt_idx}
@@ -5643,34 +5727,36 @@ def handle_bidding_arena(
     elapsed_ms = (time.perf_counter() - t0) * 1000
     timings_ms["total_ms"] = round(elapsed_ms, 1)
     print(f"[bidding-arena] {format_elapsed(elapsed_ms)} ({contracts_compared}/{analyzed_deals} compared)")
-    print(
-        f"[bidding-arena] DIAG: no_matched_indices={diag_no_matched_indices}, rules_none={diag_rules_none}, "
-        f"dd_a_none={diag_dd_a_none}, dd_b_none={diag_dd_b_none}"
-    )
-    if diag_dd_b_examples:
-        for i, ex in enumerate(diag_dd_b_examples[:3]):
-            print(f"[bidding-arena] DIAG dd_b_none[{i+1}]: {ex[:250]}")
-    try:
-        # One-liner breakdown for quick perf comparisons.
-        parts = ", ".join(f"{k}={v}ms" for k, v in timings_ms.items())
-        print(f"[bidding-arena] TIMING: {parts}")
-    except Exception:
-        pass
-    # Show actual auctions from sampled deals
-    actual_auctions_sample = [d.get("Auction_Actual", d.get("_bid_str", "?"))[:30] for d in sample_deals_output[:10]]
-    print(f"[bidding-arena] DIAG actual auctions (first 10): {actual_auctions_sample}")
-    # Show raw Matched_BT_Indices to check if data is correct
-    if sample_deals_output and len(sample_deals_output) >= 3:
-        for i in range(3):
-            deal = sample_deals_output[i]
-            matched = deal.get("Matched_BT_Indices", [])
-            matched_preview = matched[:3] if matched else "NONE"
-            auction = deal.get("Auction_Actual", "?")[:25]
-            print(f"[bidding-arena] DIAG deal[{i}] auction='{auction}', Matched_BT_Indices[:3]={matched_preview}")
-    if diag_first_failure_reasons:
-        print(f"[bidding-arena] DIAG first failures:")
-        for i, reason in enumerate(diag_first_failure_reasons[:3]):
-            print(f"  [{i+1}] {reason[:200]}")
+    # Diagnostic spam is debug-only (set STATE['debug_bidding_arena']=True to enable)
+    if debug:
+        print(
+            f"[bidding-arena] DIAG: no_matched_indices={diag_no_matched_indices}, rules_none={diag_rules_none}, "
+            f"dd_a_none={diag_dd_a_none}, dd_b_none={diag_dd_b_none}"
+        )
+        if diag_dd_b_examples:
+            for i, ex in enumerate(diag_dd_b_examples[:3]):
+                print(f"[bidding-arena] DIAG dd_b_none[{i+1}]: {ex[:250]}")
+        try:
+            # One-liner breakdown for quick perf comparisons.
+            parts = ", ".join(f"{k}={v}ms" for k, v in timings_ms.items())
+            print(f"[bidding-arena] TIMING: {parts}")
+        except Exception:
+            pass
+        # Show actual auctions from sampled deals
+        actual_auctions_sample = [d.get("Auction_Actual", d.get("_bid_str", "?"))[:30] for d in sample_deals_output[:10]]
+        print(f"[bidding-arena] DIAG actual auctions (first 10): {actual_auctions_sample}")
+        # Show raw Matched_BT_Indices to check if data is correct
+        if sample_deals_output and len(sample_deals_output) >= 3:
+            for i in range(3):
+                deal = sample_deals_output[i]
+                matched = deal.get("Matched_BT_Indices", [])
+                matched_preview = matched[:3] if matched else "NONE"
+                auction = deal.get("Auction_Actual", "?")[:25]
+                print(f"[bidding-arena] DIAG deal[{i}] auction='{auction}', Matched_BT_Indices[:3]={matched_preview}")
+        if diag_first_failure_reasons:
+            print(f"[bidding-arena] DIAG first failures:")
+            for i, reason in enumerate(diag_first_failure_reasons[:3]):
+                print(f"  [{i+1}] {reason[:200]}")
     
     return {
         "model_a": model_a,
@@ -6718,6 +6804,34 @@ def handle_rank_bids_by_ev(
                     next_bid_rows = next_bid_rows.join(agg_df, on="bt_index", how="left")
     
     # =========================================================================
+    # PRE-LOAD: EV stats from GPU pipeline (optional optimization) - NV/V split
+    # =========================================================================
+    # If bt_ev_stats_df is available, pre-load Avg_EV and Avg_Par for all next bids.
+    # This gives instant ranking without computing from deals.
+    bt_ev_stats_df = state.get("bt_ev_stats_df")
+    ev_stats_lookup: Dict[int, Dict[str, Any]] = {}
+    if bt_ev_stats_df is not None and next_bid_rows.height > 0:
+        bt_indices = next_bid_rows["bt_index"].unique().to_list()
+        bt_indices = [int(x) for x in bt_indices if x is not None]
+        if bt_indices:
+            ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_indices))
+            for ev_row in ev_subset.iter_rows(named=True):
+                ev_data: Dict[str, Any] = {}
+                for s in range(1, 5):
+                    # Try NV/V split columns first (new format)
+                    for vul in ["NV", "V"]:
+                        ev_key = f"Avg_EV_S{s}_{vul}"
+                        par_key = f"Avg_Par_S{s}_{vul}"
+                        if ev_key in ev_row:
+                            ev_data[ev_key] = ev_row.get(ev_key)
+                            ev_data[par_key] = ev_row.get(par_key)
+                    # Fall back to old aggregate columns
+                    if f"Avg_EV_S{s}_NV" not in ev_data:
+                        ev_data[f"Avg_EV_S{s}"] = ev_row.get(f"Avg_EV_S{s}")
+                        ev_data[f"Avg_Par_S{s}"] = ev_row.get(f"Avg_Par_S{s}")
+                ev_stats_lookup[int(ev_row["bt_index"])] = ev_data
+
+    # =========================================================================
     # PRE-FILTER: Opening seat alignment
     # =========================================================================
     # All matched deals MUST match the expected opening seat (based on leading passes).
@@ -6807,6 +6921,24 @@ def handle_rank_bids_by_ev(
         bt_index = row.get("bt_index")
         bid_auction = row.get("Auction", "")
         
+        # Get pre-computed EV/Par from GPU pipeline (if available) - used in all exit paths
+        # Now with NV/V splits matching the bid_rankings rows
+        precomputed = ev_stats_lookup.get(bt_index, {}) if bt_index is not None else {}
+        # Try NV/V split columns first
+        avg_ev_precomputed_nv = precomputed.get(f"Avg_EV_S{next_seat}_NV")
+        avg_ev_precomputed_v = precomputed.get(f"Avg_EV_S{next_seat}_V")
+        avg_par_precomputed_nv = precomputed.get(f"Avg_Par_S{next_seat}_NV")
+        avg_par_precomputed_v = precomputed.get(f"Avg_Par_S{next_seat}_V")
+        # Fall back to aggregate if NV/V not available
+        if avg_ev_precomputed_nv is None:
+            aggregate_ev = precomputed.get(f"Avg_EV_S{next_seat}")
+            avg_ev_precomputed_nv = aggregate_ev
+            avg_ev_precomputed_v = aggregate_ev
+        if avg_par_precomputed_nv is None:
+            aggregate_par = precomputed.get(f"Avg_Par_S{next_seat}")
+            avg_par_precomputed_nv = aggregate_par
+            avg_par_precomputed_v = aggregate_par
+        
         # Build criteria mask using optimized parent mask where possible
         global_mask = None
         
@@ -6845,7 +6977,6 @@ def handle_rank_bids_by_ev(
                 global_mask = current_dealer_mask if global_mask is None else (global_mask | current_dealer_mask)
         
         if global_mask is None or not global_mask.any():
-            # ... (no changes to continue block) ...
             bid_rankings.append({
                 "bid": bid_name,
                 "bt_index": bt_index,
@@ -6855,6 +6986,10 @@ def handle_rank_bids_by_ev(
                 "v_count": 0,
                 "avg_par_nv": None,
                 "avg_par_v": None,
+                "avg_ev_precomputed_nv": round(avg_ev_precomputed_nv, 1) if avg_ev_precomputed_nv is not None else None,
+                "avg_ev_precomputed_v": round(avg_ev_precomputed_v, 1) if avg_ev_precomputed_v is not None else None,
+                "avg_par_precomputed_nv": round(avg_par_precomputed_nv, 1) if avg_par_precomputed_nv is not None else None,
+                "avg_par_precomputed_v": round(avg_par_precomputed_v, 1) if avg_par_precomputed_v is not None else None,
             })
             continue
             
@@ -6863,7 +6998,6 @@ def handle_rank_bids_by_ev(
             global_mask = global_mask & opening_seat_mask
             
         if not global_mask.any():
-            # ... (no changes to continue block) ...
             bid_rankings.append({
                 "bid": bid_name,
                 "bt_index": bt_index,
@@ -6873,6 +7007,10 @@ def handle_rank_bids_by_ev(
                 "v_count": 0,
                 "avg_par_nv": None,
                 "avg_par_v": None,
+                "avg_ev_precomputed_nv": round(avg_ev_precomputed_nv, 1) if avg_ev_precomputed_nv is not None else None,
+                "avg_ev_precomputed_v": round(avg_ev_precomputed_v, 1) if avg_ev_precomputed_v is not None else None,
+                "avg_par_precomputed_nv": round(avg_par_precomputed_nv, 1) if avg_par_precomputed_nv is not None else None,
+                "avg_par_precomputed_v": round(avg_par_precomputed_v, 1) if avg_par_precomputed_v is not None else None,
             })
             continue
             
@@ -6896,7 +7034,7 @@ def handle_rank_bids_by_ev(
         matched_df = deal_df.filter(global_mask)
         
         if matched_df.height == 0:
-            # ... (already handled by mask.any() above, but kept for safety)
+            # (already handled by mask.any() above, but kept for safety)
             bid_rankings.append({
                 "bid": bid_name,
                 "bt_index": bt_index,
@@ -6906,6 +7044,10 @@ def handle_rank_bids_by_ev(
                 "v_count": 0,
                 "avg_par_nv": None,
                 "avg_par_v": None,
+                "avg_ev_precomputed_nv": round(avg_ev_precomputed_nv, 1) if avg_ev_precomputed_nv is not None else None,
+                "avg_ev_precomputed_v": round(avg_ev_precomputed_v, 1) if avg_ev_precomputed_v is not None else None,
+                "avg_par_precomputed_nv": round(avg_par_precomputed_nv, 1) if avg_par_precomputed_nv is not None else None,
+                "avg_par_precomputed_v": round(avg_par_precomputed_v, 1) if avg_par_precomputed_v is not None else None,
             })
             continue
         
@@ -7115,6 +7257,7 @@ def handle_rank_bids_by_ev(
         ev_all_combos_by_bid[bid_name] = ev_all_combos
 
         # Emit TWO rows per bid: one for NV, one for V (clearer UI, fewer columns)
+        # Use matching NV/V precomputed values for each row
         bid_rankings.append(
             {
                 "bid": bid_name,
@@ -7127,6 +7270,8 @@ def handle_rank_bids_by_ev(
                 "avg_par": avg_par_nv,
                 "ev_score": ev_score_nv,
                 "ev_std": ev_std_nv,
+                "avg_ev_precomputed": round(avg_ev_precomputed_nv, 1) if avg_ev_precomputed_nv is not None else None,
+                "avg_par_precomputed": round(avg_par_precomputed_nv, 1) if avg_par_precomputed_nv is not None else None,
             }
         )
         bid_rankings.append(
@@ -7141,6 +7286,8 @@ def handle_rank_bids_by_ev(
                 "avg_par": avg_par_v,
                 "ev_score": ev_score_v,
                 "ev_std": ev_std_v,
+                "avg_ev_precomputed": round(avg_ev_precomputed_v, 1) if avg_ev_precomputed_v is not None else None,
+                "avg_par_precomputed": round(avg_par_precomputed_v, 1) if avg_par_precomputed_v is not None else None,
             }
         )
     
@@ -7803,7 +7950,31 @@ def _handle_list_next_bids_walk_fallback(
                 # The parent row's Agg_Expr_Seat_N columns contain cumulative criteria
                 base_mask = _compute_cumulative_deal_mask(state, parent_row, 4)
 
-    # 5. Build final response with on-demand deal counts
+    # 5. Build EV stats lookup (if available) - now with NV/V splits
+    # Pre-load EV stats for all bt_indices in one go (O(n) filter is faster than repeated lookups)
+    bt_ev_stats_df = state.get("bt_ev_stats_df")
+    ev_lookup: Dict[int, Dict[str, Any]] = {}
+    if bt_ev_stats_df is not None and next_bid_rows.height > 0:
+        bt_indices = next_bid_rows["bt_index"].unique().to_list()
+        bt_indices = [int(x) for x in bt_indices if x is not None]
+        if bt_indices:
+            ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_indices))
+            for ev_row in ev_subset.iter_rows(named=True):
+                # Load NV/V split columns (new format) or fall back to aggregate (old format)
+                ev_data: Dict[str, Any] = {}
+                for s in range(1, 5):
+                    # Try new NV/V split columns first
+                    nv_col = f"Avg_EV_S{s}_NV"
+                    v_col = f"Avg_EV_S{s}_V"
+                    if nv_col in ev_row:
+                        ev_data[nv_col] = ev_row.get(nv_col)
+                        ev_data[v_col] = ev_row.get(v_col)
+                    else:
+                        # Fall back to old aggregate column (for backwards compatibility)
+                        ev_data[f"Avg_EV_S{s}"] = ev_row.get(f"Avg_EV_S{s}")
+                ev_lookup[int(ev_row["bt_index"])] = ev_data
+
+    # 6. Build final response with on-demand deal counts
     next_bids = []
     for row in next_bid_rows.iter_rows(named=True):
         idx = row["bt_index"]
@@ -7830,6 +8001,23 @@ def _handle_list_next_bids_walk_fallback(
         is_complete = bool(row.get("is_completed_auction", False))
         next_indices_list = row.get("next_bid_indices") or []
         is_dead_end = not is_complete and len(next_indices_list) == 0
+        
+        # Get Avg_EV for the next seat from precomputed stats (NV/V split)
+        avg_ev_nv = None
+        avg_ev_v = None
+        if idx is not None and idx in ev_lookup:
+            ev_data = ev_lookup[idx]
+            # Try NV/V split columns first (new format)
+            nv_key = f"Avg_EV_S{next_seat}_NV"
+            v_key = f"Avg_EV_S{next_seat}_V"
+            if nv_key in ev_data:
+                avg_ev_nv = ev_data.get(nv_key)
+                avg_ev_v = ev_data.get(v_key)
+            else:
+                # Fall back to aggregate (old format) - use for both NV and V
+                aggregate = ev_data.get(f"Avg_EV_S{next_seat}")
+                avg_ev_nv = aggregate
+                avg_ev_v = aggregate
             
         next_bids.append({
             "bid": str(row.get("candidate_bid")).upper(),
@@ -7838,6 +8026,8 @@ def _handle_list_next_bids_walk_fallback(
             "is_completed_auction": is_complete,
             "is_dead_end": is_dead_end,
             "matching_deal_count": deal_count,
+            "avg_ev_nv": avg_ev_nv,
+            "avg_ev_v": avg_ev_v,
         })
     
     # Sort for UI consistency
@@ -7922,6 +8112,19 @@ def _handle_resolve_auction_path_fallback(
 
     # Load Agg_Expr (Prefer in-memory Expr to avoid heavy DuckDB hits)
     meta_map = {row["bt_index"]: row for row in meta_df.to_dicts()}
+
+    # Pre-load precomputed EV stats (NV/V split) for the whole path (optional)
+    bt_ev_stats_df = state.get("bt_ev_stats_df")
+    ev_map: Dict[int, Dict[str, Any]] = {}
+    if bt_ev_stats_df is not None and curr_indices:
+        try:
+            bt_idx_list = [int(x) for x in curr_indices if x is not None]
+            if bt_idx_list:
+                ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_idx_list))
+                for ev_row in ev_subset.iter_rows(named=True):
+                    ev_map[int(ev_row["bt_index"])] = dict(ev_row)
+        except Exception:
+            ev_map = {}
     
     # Fetch categories for all indices in the path
     bt_categories_df = state.get("bt_categories_df")
@@ -7967,11 +8170,28 @@ def _handle_resolve_auction_path_fallback(
         row_with_rules = _apply_all_rules_to_bt_row(row_dict, state)
         agg_col = f"Agg_Expr_Seat_{step_seat}"
         agg_list = row_with_rules.get(agg_col) or row_dict.get("Expr") or []
+
+        # Attach precomputed Avg_EV (NV/V) if available for this bt_index/seat
+        avg_ev_nv = None
+        avg_ev_v = None
+        ev_row = ev_map.get(int(idx), {})
+        nv_key = f"Avg_EV_S{step_seat}_NV"
+        v_key = f"Avg_EV_S{step_seat}_V"
+        if nv_key in ev_row:
+            avg_ev_nv = ev_row.get(nv_key)
+            avg_ev_v = ev_row.get(v_key)
+        else:
+            # Backwards compatibility with old aggregate stats file
+            aggregate = ev_row.get(f"Avg_EV_S{step_seat}")
+            avg_ev_nv = aggregate
+            avg_ev_v = aggregate
         
         path_info.append({
             "step": num_leading + i + 1, "bid": tokens[i], "bt_index": idx, 
             "agg_expr": agg_list, "is_complete": bool(row.get("is_completed_auction")),
             "matching_deal_count": row.get("matching_deal_count"),
+            "avg_ev_nv": avg_ev_nv,
+            "avg_ev_v": avg_ev_v,
             "categories": categories_by_idx.get(int(idx), []),
         })
 
