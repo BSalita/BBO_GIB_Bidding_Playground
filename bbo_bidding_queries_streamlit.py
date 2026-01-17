@@ -37,6 +37,8 @@ from bbo_bidding_queries_lib import (
     normalize_auction_input,
     normalize_auction_user_text,
     format_elapsed,
+    get_dd_score_for_auction,
+    get_dd_tricks_for_auction,
 )
 
 # Import criteria evaluation helpers from handlers
@@ -1094,7 +1096,7 @@ def render_aggrid(
         "Dealer": 20, "Vul": 30, "index": 70, "Auction_Actual": 140,  # Auction_Actual reduced by 30%
         "Hand_N": 135, "Hand_E": 135, "Hand_S": 135, "Hand_W": 135,
         # Auction Summary columns
-        "Bid Num": 60, "Seat": 55, "Bid": 50, "BT Index": 60,
+        "Bid Num": 60, "Direction": 70, "Seat": 55, "Bid": 50, "BT Index": 60,
         "Matches": 70, "Deals": 70, "Avg_EV": 60, "EV_NV": 60, "EV_V": 50, "Criteria Count": 10, "Complete": 16,
         # Rankings-style stats columns (NV/V split)
         "Matches_NV": 90, "Matches_V": 85,
@@ -5484,35 +5486,47 @@ def render_auction_builder():
                     # Fetch deal by index (fast-path: monotonic index cache in API)
                     idx = int(input_stripped)
                     # Request EV column if available (shown in pinned invariants table as EV)
+                    # Build columns list including DD score columns for completion banner
+                    # Note: Raw trick columns (DD_{dir}_{strain}) don't exist in dataset.
+                    pinned_cols = [
+                        "index",
+                        "Dealer",
+                        "Vul",
+                        "Hand_N",
+                        "Hand_E",
+                        "Hand_S",
+                        "Hand_W",
+                        "HCP_N",
+                        "HCP_E",
+                        "HCP_S",
+                        "HCP_W",
+                        "Total_Points_N",
+                        "Total_Points_E",
+                        "Total_Points_S",
+                        "Total_Points_W",
+                        "ParContracts",
+                        "ParScore",
+                        "EV_Score_Declarer",
+                        "Contract",
+                        "Score",
+                        "Result",
+                        "bid",
+                    ]
+                    # DD score columns: DD_Score_{level}{strain}_{direction} (140 columns)
+                    for lvl in range(1, 8):
+                        for s in ["C", "D", "H", "S", "N"]:
+                            for d in ["N", "E", "S", "W"]:
+                                pinned_cols.append(f"DD_Score_{lvl}{s}_{d}")
+                    # Raw DD trick columns: DD_{direction}_{strain} (20 columns)
+                    for d in ["N", "E", "S", "W"]:
+                        for s in ["C", "D", "H", "S", "N"]:
+                            pinned_cols.append(f"DD_{d}_{s}")
                     data = api_post(
                         "/deals-by-index",
                         {
                             "indices": [idx],
                             "max_rows": 1,
-                            "columns": [
-                                "index",
-                                "Dealer",
-                                "Vul",
-                                "Hand_N",
-                                "Hand_E",
-                                "Hand_S",
-                                "Hand_W",
-                                "HCP_N",
-                                "HCP_E",
-                                "HCP_S",
-                                "HCP_W",
-                                "Total_Points_N",
-                                "Total_Points_E",
-                                "Total_Points_S",
-                                "Total_Points_W",
-                                "ParContracts",
-                                "ParScore",
-                                "EV_Score_Declarer",
-                                "Contract",
-                                "Score",
-                                "Result",
-                                "bid",
-                            ],
+                            "columns": pinned_cols,
                         },
                         timeout=10,
                     )
@@ -5663,12 +5677,33 @@ def render_auction_builder():
     # But skip if we just applied this same value (prevents render loop)
     edited_normalized = normalize_auction_input(edited_auction).upper() if edited_auction else ""
 
+    def _append_passes_to_complete(auction_text: str) -> str:
+        """Append the minimum number of passes needed to complete the auction.
+
+        - If there has been no non-pass bid yet: complete with 4 total passes (passed out).
+        - Otherwise: complete with 3 trailing passes after the last non-pass call.
+        """
+        toks = [t.strip().upper() for t in str(auction_text or "").split("-") if t.strip()]
+        trailing = 0
+        for t in reversed(toks):
+            if t == "P":
+                trailing += 1
+            else:
+                break
+        has_non_pass = any(t != "P" for t in toks)
+        if not has_non_pass:
+            needed = max(0, 4 - len(toks))
+        else:
+            needed = max(0, 3 - trailing)
+        if needed <= 0:
+            return "-".join(toks)
+        return "-".join(toks + ["P"] * needed)
+
     # Convenience: append trailing passes and apply immediately.
     if append_ppp:
         # Prefer current text box value; fall back to current_auction.
-        base = edited_normalized or (current_auction.upper() if current_auction else "")
-        if base and not base.endswith("-P-P-P"):
-            base = base + "-P-P-P"
+        base_in = edited_normalized or (current_auction.upper() if current_auction else "")
+        base = _append_passes_to_complete(base_in)
         # Update the input widget and trigger apply logic below.
         try:
             st.session_state[edit_key] = base
@@ -5685,20 +5720,35 @@ def render_auction_builder():
     if (value_changed or apply_edit) and not already_applied:
         edited_normalized = normalize_auction_input(edited_auction).upper()
         if edited_normalized:
+            # Build expected bids list for length comparison
+            expected_bids = [b.strip().upper() for b in edited_normalized.split("-") if b.strip()]
+            expected_len = len(expected_bids)
+            
             # Single batched call to resolve the entire path
             with st.spinner(f"Resolving path: {edited_normalized}..."):
                 try:
                     data = api_post("/resolve-auction-path", {"auction": edited_normalized}, timeout=30)
                     _st_info_elapsed("Auction Builder: resolve path", data)
                     new_path = data.get("path", [])
-                    if not new_path:
-                        # Fallback for manually entered path if API returns empty
-                        bids = [b.strip() for b in edited_normalized.split("-") if b.strip()]
-                        new_path = [{"bid": b.upper(), "bt_index": None, "agg_expr": [], "is_complete": False} for b in bids]
+                    # If API returns a shorter path (BT doesn't have all bids), fall back to user input
+                    if not new_path or len(new_path) < expected_len:
+                        new_path = [{"bid": b, "bt_index": None, "agg_expr": [], "is_complete": False} for b in expected_bids]
                 except Exception as e:
                     st.error(f"Error resolving auction path: {e}")
-                    bids = [b.strip() for b in edited_normalized.split("-") if b.strip()]
-                    new_path = [{"bid": b.upper(), "bt_index": None, "agg_expr": [], "is_complete": False} for b in bids]
+                    new_path = [{"bid": b, "bt_index": None, "agg_expr": [], "is_complete": False} for b in expected_bids]
+            
+            # Mark is_complete on final step if auction ends with 3 passes (or 4 passes for passed out)
+            if new_path:
+                all_bids = [step.get("bid", "").upper() for step in new_path]
+                trailing_p = 0
+                for b in reversed(all_bids):
+                    if b == "P":
+                        trailing_p += 1
+                    else:
+                        break
+                has_non_pass = any(b != "P" for b in all_bids)
+                is_complete = (trailing_p >= 3 and has_non_pass) or (not has_non_pass and len(all_bids) >= 4)
+                new_path[-1]["is_complete"] = is_complete
             
             st.session_state.auction_builder_path = new_path
             st.session_state.auction_builder_options = {}  # Clear cache
@@ -6098,16 +6148,16 @@ def render_auction_builder():
                 has_empty_criteria = not criteria_list
                 has_zero_deals = deal_count == 0
                 has_zero_matches = matches_count == 0
-                is_rejected = is_dead_end or has_empty_criteria or has_zero_deals or has_zero_matches
+                # IMPORTANT:
+                # - "Matches" (pattern-based) and "Deals" (criteria-based) can be 0 even for a valid bid.
+                #   Do NOT use those as rejection/invalid reasons.
+                # - Keep rejection for structural/data-quality issues only.
+                is_rejected = is_dead_end or has_empty_criteria
                 
                 # Build failure reason for display
                 failure_reasons = []
                 if is_dead_end:
                     failure_reasons.append("dead end")
-                if has_zero_matches:
-                    failure_reasons.append("no matches")
-                if has_zero_deals:
-                    failure_reasons.append("no matching deals")
                 if has_empty_criteria:
                     failure_reasons.append("missing criteria")
                 failure_str = "; ".join(failure_reasons) if failure_reasons else ""
@@ -6313,25 +6363,14 @@ def render_auction_builder():
                 rejected_rows = [r for r in bid_rows if r.get("_rejected")]
                 invalid_rows = [r for r in bid_rows if r.get("_matches") is False and not r.get("_rejected")]
                 other_rows = [r for r in bid_rows if r.get("_matches") is None and not r.get("_rejected")]
-                
-                # If no valid bids, ensure Pass is available (Pass is always legal in bridge)
+
                 if not valid_rows:
-                    # Find Pass row in any category and move it to valid
-                    pass_row = None
-                    for rows_list in [rejected_rows, invalid_rows, other_rows]:
-                        for r in rows_list:
-                            bid_str = str(r.get("Bid", "")).strip().upper()
-                            if bid_str in ("P", "P ✅", "PASS"):
-                                pass_row = r
-                                rows_list.remove(r)
-                                break
-                        if pass_row:
-                            break
-                    if pass_row:
-                        # Clear rejection status for Pass
-                        pass_row["_rejected"] = False
-                        pass_row["Failure"] = ""
-                        valid_rows.append(pass_row)
+                    st.warning(
+                        "No **pinned-deal-matching** next bids for this auction step. "
+                        "This does not mean there are no **legal** bridge bids — it means the pinned deal fails "
+                        "the criteria for all available BT continuations. "
+                        "You can still select from **Rejected** / **Invalid** bids to continue the auction."
+                    )
                 
                 # Valid bids grid
                 if valid_rows:
@@ -6730,6 +6769,7 @@ def render_auction_builder():
             deal_ev = pinned_deal.get("EV_Score_Declarer", pinned_deal.get("EV_Score")) if pinned_deal else None
             avg_ev: float | None = None
             ev_sign = -1.0 if seat_1_to_4 in (2, 4) else 1.0
+            bid_dir: str | None = None
             if pinned_deal:
                 try:
                     dealer = str(pinned_deal.get("Dealer", "N")).upper()
@@ -6746,6 +6786,7 @@ def render_auction_builder():
                     avg_ev = None
             row = {
                 "Bid Num": bid_num,
+                "Direction": bid_dir if pinned_deal else None,
                 "Seat": seat_1_to_4,
                 "Bid": step["bid"],
                 "BT Index": step.get("bt_index"),
@@ -6867,41 +6908,163 @@ def render_auction_builder():
                         last_def = j
                 return last_def
 
+            def _seat_dir_from_dealer(dealer: str, seat_1_to_4: int) -> str:
+                """Map seat 1..4 (relative to dealer) to absolute direction letter."""
+                directions = ["N", "E", "S", "W"]
+                d = str(dealer or "N").upper()
+                try:
+                    dealer_idx = directions.index(d)
+                except Exception:
+                    dealer_idx = 0
+                s = int(seat_1_to_4)
+                return directions[(dealer_idx + (s - 1)) % 4]
+
+            def _declarer_seat_from_calls(calls: list[str]) -> int | None:
+                """Compute declarer seat (1..4 relative to dealer) from auction calls.
+
+                Declarer is the first player from the declaring partnership who bid the final strain.
+                Returns None if no contract.
+                """
+                if not calls:
+                    return None
+                # Identify last contract bid (level+strain); doubles don't affect declarer.
+                last_contract_i: int | None = None
+                last_strain: str | None = None
+                for i, raw in enumerate(calls):
+                    t = str(raw or "").strip().upper()
+                    if len(t) == 2 and t[0] in "1234567" and t[1] in "CDHSN":
+                        last_contract_i = i
+                        last_strain = t[1]
+                if last_contract_i is None or not last_strain:
+                    return None
+                # Determine which partnership won (odd seats 1/3 vs even seats 2/4 relative to dealer)
+                contract_seat = (last_contract_i % 4) + 1
+                contract_parity = contract_seat % 2
+                # Find first bid of that strain by that partnership
+                declarer_seat: int | None = None
+                for i, raw in enumerate(calls[: last_contract_i + 1]):
+                    t = str(raw or "").strip().upper()
+                    if len(t) == 2 and t[0] in "1234567" and t[1] == last_strain:
+                        seat_i = (i % 4) + 1
+                        if (seat_i % 2) == contract_parity:
+                            declarer_seat = seat_i
+                            break
+                if declarer_seat is None:
+                    declarer_seat = contract_seat
+                return declarer_seat
+
+            def _declarer_direction_from_calls(calls: list[str], dealer: str | None) -> str | None:
+                """Compute declarer direction (N/E/S/W) from auction calls + dealer."""
+                if not dealer:
+                    return None
+                seat = _declarer_seat_from_calls(calls)
+                if seat is None:
+                    return None
+                return _seat_dir_from_dealer(str(dealer), int(seat))
+
             auction_calls = [str(s.get("bid", "")).strip().upper() for s in (current_path or []) if str(s.get("bid", "")).strip()]
+            auction_text = "-".join(auction_calls) if auction_calls else ""
             final_contract = _final_contract_from_calls(auction_calls)
             deal_ev_val = pinned_deal.get("EV_Score_Declarer", pinned_deal.get("EV_Score")) if pinned_deal else None
             try:
                 deal_ev_num = float(deal_ev_val) if deal_ev_val is not None else None
             except Exception:
                 deal_ev_num = None
+            declarer_dir: str | None = None
+            declarer_seat: int | None = _declarer_seat_from_calls(auction_calls)
+            declarer_pair: str | None = None
+            if declarer_seat is not None:
+                declarer_pair = "NS" if (int(declarer_seat) % 2) == 1 else "EW"
+            if pinned_deal:
+                declarer_dir = _declarer_direction_from_calls(auction_calls, str(pinned_deal.get("Dealer", "N")))
             # Avg_EV: use the step that sets the final contract (last bid/double/redouble), not the final pass.
             avg_ev_final: float | None = None
+            avg_ev_final_nv: float | None = None
+            avg_ev_final_v: float | None = None
             try:
                 idx = _last_contract_step_index(auction_calls)
                 if idx is not None and 0 <= idx < len(summary_rows):
                     v = summary_rows[idx].get("Avg_EV")
                     avg_ev_final = float(v) if v is not None else None
+                    v_nv = summary_rows[idx].get("EV_NV")
+                    v_v = summary_rows[idx].get("EV_V")
+                    avg_ev_final_nv = float(v_nv) if v_nv is not None else None
+                    avg_ev_final_v = float(v_v) if v_v is not None else None
             except Exception:
                 avg_ev_final = None
+                avg_ev_final_nv = None
+                avg_ev_final_v = None
+
+            def _fmt_num(x: float | None) -> str:
+                return f"{x:.1f}" if isinstance(x, (int, float)) else "—"
+
+            # Double-dummy score and tricks for the FINAL contract (when pinned deal is available)
+            dd_score_final: int | None = None
+            dd_tricks_final: int | None = None
+            if pinned_deal and auction_text and final_contract != "Passed out":
+                try:
+                    dealer = str(pinned_deal.get("Dealer", "N")).upper()
+                    # DD score: contract-level score columns are DD_Score_{level}{strain}_{dir}
+                    dd_score_val = get_dd_score_for_auction(auction_text, dealer, pinned_deal)
+                    dd_score_final = int(dd_score_val) if dd_score_val is not None else None
+                    # DD tricks: raw trick columns are DD_{dir}_{strain}
+                    dd_tricks_val = get_dd_tricks_for_auction(auction_text, dealer, pinned_deal)
+                    dd_tricks_final = int(dd_tricks_val) if dd_tricks_val is not None else None
+                except Exception:
+                    dd_score_final = None
+                    dd_tricks_final = None
 
             if pinned_deal:
+                status = "Auction Complete" if pinned_all_pass else "Auction Complete with Errors"
+                status_icon = "✅" if pinned_all_pass else "❌"
                 if pinned_all_pass:
-                    st.success(
-                        f"✅ Auction Complete — Final: **{final_contract}** | "
-                        f"Deal_EV: **{deal_ev_num:.1f}** | Avg_EV: **{avg_ev_final:.1f}**"
-                        if (deal_ev_num is not None and avg_ev_final is not None)
-                        else f"✅ Auction Complete — Final: **{final_contract}** | Deal_EV: {deal_ev_num} | Avg_EV: {avg_ev_final}"
-                    )
+                    st.success(f"{status_icon} {status}")
                 else:
-                    st.error(
-                        f"❌ Auction Complete with Errors — Final: **{final_contract}** | "
-                        f"Deal_EV: **{deal_ev_num:.1f}** | Avg_EV: **{avg_ev_final:.1f}**"
-                        if (deal_ev_num is not None and avg_ev_final is not None)
-                        else f"❌ Auction Complete with Errors — Final: **{final_contract}** | Deal_EV: {deal_ev_num} | Avg_EV: {avg_ev_final}"
-                    )
+                    st.error(f"{status_icon} {status}")
+
+                completion_row = {
+                    "Status": status,
+                    "Auction": auction_text or None,
+                    "Bid": final_contract,
+                    "Declarer": declarer_dir or None,
+                    "DD_Tricks": dd_tricks_final,
+                    "DD_Score": dd_score_final,
+                    "Deal_EV": deal_ev_num,
+                    "Avg_EV": avg_ev_final,
+                }
+                render_aggrid(
+                    pl.DataFrame([completion_row]),
+                    key="auction_builder_complete_summary",
+                    height=95,
+                    table_name="auction_builder_complete_summary",
+                    fit_columns_to_view=True,
+                    show_sql_expander=False,
+                )
             else:
-                # Without a pinned deal, Deal_EV is unknown. Avg_EV is shown as NV/V on the grid.
-                st.success(f"✅ Auction Complete — Final: **{final_contract}**")
+                # Without a pinned deal, show seat/pair (direction depends on dealer which we don't have).
+                decl = "—"
+                if declarer_seat is not None and declarer_pair is not None:
+                    decl = f"S{int(declarer_seat)} ({declarer_pair})"
+                st.success("✅ Auction Complete")
+                completion_row = {
+                    "Status": "Auction Complete",
+                    "Auction": auction_text or None,
+                    "Bid": final_contract,
+                    "Declarer": decl,
+                    "DD_Tricks": None,
+                    "DD_Score": None,
+                    "Deal_EV": None,
+                    "Avg_EV_NV": avg_ev_final_nv,
+                    "Avg_EV_V": avg_ev_final_v,
+                }
+                render_aggrid(
+                    pl.DataFrame([completion_row]),
+                    key="auction_builder_complete_summary",
+                    height=95,
+                    table_name="auction_builder_complete_summary",
+                    fit_columns_to_view=True,
+                    show_sql_expander=False,
+                )
         elif pinned_deal and current_path:
             # Auction not complete, but show pinned deal status
             if pinned_all_pass:
@@ -6914,6 +7077,7 @@ def render_auction_builder():
             summary_df,
             priority_cols=[
                 "Bid Num",
+                "Direction",
                 "Seat",
                 "Bid",
                 "BT Index",

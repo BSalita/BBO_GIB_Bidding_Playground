@@ -1439,6 +1439,12 @@ def _build_additional_deal_columns() -> List[str]:
         'ParScore', 'DD_Score_Declarer', 'EV_Score_Declarer', 'ParContracts'
     ]
     
+    # Add raw DD trick columns (4 directions × 5 strains = 20 columns)
+    # Format: DD_{direction}_{strain} e.g. DD_N_C, DD_E_S
+    for direction in DIRECTIONS_LIST:
+        for strain in DD_SCORE_STRAINS:
+            additional_cols.append(f"DD_{direction}_{strain}")
+    
     # Add DD_Score columns for all contracts (for DD_Score_AI computation)
     # Format: DD_Score_{level}{strain}_{direction} e.g. DD_Score_3N_N
     for level in DD_SCORE_LEVELS:

@@ -535,6 +535,38 @@ def get_dd_score_for_auction(auction: str, dealer: str, deal_row: dict) -> int |
     return deal_row.get(col_name)
 
 
+def get_dd_tricks_for_auction(auction: str, dealer: str, deal_row: dict) -> int | None:
+    """
+    Get the double-dummy trick count for a contract derived from an auction.
+    
+    Args:
+        auction: Auction string like "1N-p-3N-p-p-p"
+        dealer: Dealer direction
+        deal_row: Dictionary containing DD_{direction}_{strain} columns (raw trick counts)
+        
+    Returns:
+        The DD trick count (0-13) for the auction's contract, or None if cannot compute.
+    """
+    contract = parse_contract_from_auction(auction)
+    if not contract:
+        return None
+    
+    _, strain, _ = contract  # level not needed for trick lookup
+    declarer = get_declarer_for_auction(auction, dealer)
+    if not declarer:
+        return None
+    
+    # Look up the DD tricks column: DD_{direction}_{strain}
+    col_name = f"DD_{declarer}_{strain}"
+    val = deal_row.get(col_name)
+    if val is not None:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def get_ev_for_auction(auction: str, dealer: str, deal_row: dict) -> float | None:
     """
     Get the expected value (EV) for a contract derived from an auction.
