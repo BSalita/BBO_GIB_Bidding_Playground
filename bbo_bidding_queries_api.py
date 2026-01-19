@@ -57,6 +57,7 @@ def _log_memory(label: str) -> None:
     print(f"[mem] {label}: RSS={rss_gb:.1f}GB, VMS={vms_gb:.1f}GB")
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import polars as pl
 import numpy as np
@@ -1452,15 +1453,14 @@ def _build_additional_deal_columns() -> List[str]:
             for direction in DIRECTIONS_LIST:
                 additional_cols.append(f"DD_Score_{level}{strain}_{direction}")
     
-    # Add EV columns for all contracts (for EV_AI computation)
-    # Format: EV_{pair}_{declarer}_{strain}_{level}_{vul}
+    # Add EV columns for all contracts (for EV computation)
+    # Format: EV_{pair}_{declarer}_{strain}_{level} (no vulnerability suffix)
     for pair in ['NS', 'EW']:
         declarers = ['N', 'S'] if pair == 'NS' else ['E', 'W']
         for declarer in declarers:
             for strain in DD_SCORE_STRAINS:
                 for level in DD_SCORE_LEVELS:
-                    for vul in DD_SCORE_VULS:
-                        additional_cols.append(f"EV_{pair}_{declarer}_{strain}_{level}_{vul}")
+                    additional_cols.append(f"EV_{pair}_{declarer}_{strain}_{level}")
     
     return additional_cols
 
@@ -1512,6 +1512,90 @@ def _load_bt_seat1_df() -> pl.DataFrame:
     )
     
     return df
+
+
+def _load_or_build_bt_can_complete_sidecar(
+    bt_parquet_file: pathlib.Path,
+    out_file: pathlib.Path,
+    max_bt_index_inclusive: int,
+) -> np.ndarray:
+    """Sidecar build/load for BT reachability to a completed auction.
+
+    can_complete[bt_index] == 1 iff bt_index is on a path to any completed auction.
+
+    Build: iterate completed rows and mark each row + its previous_bid_indices chain.
+    Store: uint8 NumPy array (0/1) at `out_file` for fast mmap load.
+    """
+    if out_file.exists():
+        print(f"[init] Loading can_complete sidecar: {out_file}")
+        return np.load(out_file, mmap_mode="r")
+
+    t0 = time.perf_counter()
+    start_dt = datetime.now(timezone.utc)
+    print(f"[init] Building can_complete sidecar (start={start_dt.isoformat()})")
+    print(f"[init]   bt_parquet_file={bt_parquet_file}")
+    print(f"[init]   out_file={out_file}")
+    print(f"[init]   max_bt_index={max_bt_index_inclusive:,}")
+
+    can_complete = np.zeros(int(max_bt_index_inclusive) + 1, dtype=np.uint8)
+
+    file_path_sql = str(bt_parquet_file).replace("\\", "/")
+    conn = duckdb.connect(":memory:")
+    try:
+        rel = conn.execute(
+            f"""
+            SELECT bt_index, previous_bid_indices
+            FROM read_parquet('{file_path_sql}')
+            WHERE is_completed_auction = true
+            """
+        )
+
+        batch_size = 20_000
+        processed = 0
+        last_print = time.perf_counter()
+        while True:
+            rows = rel.fetchmany(batch_size)
+            if not rows:
+                break
+            processed += len(rows)
+            prev_accum: list[int] = []
+            for bt_idx, prev_list in rows:
+                if bt_idx is None:
+                    continue
+                try:
+                    bi = int(bt_idx)
+                except Exception:
+                    continue
+                if 0 <= bi <= max_bt_index_inclusive:
+                    can_complete[bi] = 1
+                if prev_list:
+                    try:
+                        prev_accum.extend(int(x) for x in prev_list if x is not None)
+                    except Exception:
+                        pass
+            if prev_accum:
+                try:
+                    arr = np.asarray(prev_accum, dtype=np.int64)
+                    arr = arr[(arr >= 0) & (arr <= max_bt_index_inclusive)]
+                    if arr.size:
+                        can_complete[arr] = 1
+                except Exception:
+                    pass
+            now = time.perf_counter()
+            if (now - last_print) > 5.0:
+                last_print = now
+                elapsed_s = now - t0
+                print(f"[init] can_complete progress: processed_completed={processed:,}, elapsed={elapsed_s:.1f}s")
+    finally:
+        conn.close()
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out_file, can_complete, allow_pickle=False)
+    end_dt = datetime.now(timezone.utc)
+    elapsed_s = time.perf_counter() - t0
+    print(f"[init] Built can_complete sidecar (end={end_dt.isoformat()}, elapsed={elapsed_s:.1f}s)")
+
+    return np.load(out_file, mmap_mode="r")
 
 
 def _prewarm_all_endpoints(bt_seat1_df: pl.DataFrame) -> None:
@@ -1837,6 +1921,28 @@ def _heavy_init() -> None:
             
         except Exception as e:
             print(f"[init] ERROR: Failed to build Gemini-3.2 index: {e}")
+            traceback.print_exc()
+
+        # -------------------------------------------------------------------
+        # Build/load can_complete sidecar (Reachability to completed auctions)
+        # -------------------------------------------------------------------
+        try:
+            _update_loading_status(7, "Building can_complete sidecar...")
+            t0_cc = time.perf_counter()
+            max_bt_index_opt = bt_seat1_df["bt_index"].max()
+            if max_bt_index_opt is None:
+                raise ValueError("bt_seat1_df missing bt_index max; cannot build can_complete")
+            max_idx_cc = int(max_bt_index_opt)  # type: ignore[arg-type]
+            cc_file = dataPath.joinpath("bt_can_complete_u8.npy")
+            cc_arr = _load_or_build_bt_can_complete_sidecar(bt_seat1_file, cc_file, max_idx_cc)
+            with _STATE_LOCK:
+                STATE["bt_can_complete"] = cc_arr
+                STATE["bt_can_complete_file"] = cc_file
+            elapsed_cc = time.perf_counter() - t0_cc
+            print(f"[init] can_complete loaded/built in {elapsed_cc:.1f}s ({cc_file})")
+            _update_loading_status(7, "Built can_complete sidecar", "bt_can_complete", f"{cc_file.name} in {elapsed_cc:.1f}s")
+        except Exception as e:
+            print(f"[init] ERROR: Failed to build/load can_complete sidecar: {e}")
             traceback.print_exc()
 
         # Load hot-reloadable criteria overlay (does NOT mutate bt_seat1_df)

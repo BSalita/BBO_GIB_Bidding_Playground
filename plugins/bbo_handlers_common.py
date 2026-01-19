@@ -10,6 +10,7 @@ from __future__ import annotations
 import pathlib
 import re
 import time
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -1638,6 +1639,84 @@ def annotate_criterion_with_value(
     
     # Can't parse or annotate - return original
     return criterion
+
+
+# ===========================================================================
+# Best Auction Selection (Primary Objective Function)
+# ===========================================================================
+
+def choose_best_auction_match(
+    matches: List[Dict[str, Any]],
+    deal_row: Dict[str, Any],
+    dealer: str,
+    bt_idx_to_row_lookup: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Choose the best auction from candidates.
+    
+    Primary objective ordering:
+    1) Criteria match quality (more/stronger criteria is better)
+    2) EV (higher is better)
+    3) Popularity (matching_deal_count; higher is better)
+    
+    Args:
+        matches: List of dicts with 'auction' and 'bt_index'
+        deal_row: Dictionary containing EV columns for this specific deal
+        dealer: Dealer direction (N/E/S/W)
+        bt_idx_to_row_lookup: Optional lookup for full BT rows (to get criteria and popularity)
+        
+    Returns:
+        The chosen auction string, or None if no valid matches.
+    """
+    if not matches:
+        return None
+    
+    from bbo_bidding_queries_lib import get_ev_for_auction
+    
+    scored_matches = []
+    for m in matches:
+        bt_idx = m.get("bt_index")
+        auction = m.get("auction")
+        if not auction:
+            continue
+        
+        # Get matching row to access popularity data
+        bt_row = None
+        if bt_idx is not None and bt_idx_to_row_lookup:
+            bt_row = bt_idx_to_row_lookup.get(int(bt_idx))
+        
+        # If no lookup, matches might already contain the row data
+        if bt_row is None:
+            bt_row = m
+            
+        # Criteria quality: use explicit score if provided, else compute from criteria density.
+        criteria_score = m.get("criteria_score")
+        if criteria_score is None:
+            criteria_score = 0
+            if bt_row is not None:
+                for seat in range(1, 5):
+                    crits = bt_row.get(f"Agg_Expr_Seat_{seat}") or []
+                    try:
+                        criteria_score += len(crits)
+                    except TypeError:
+                        pass
+        
+        # Get EV for this specific deal (bridge EV is usually -2000 to +2000)
+        ev = get_ev_for_auction(str(auction), dealer, deal_row)
+        if ev is None:
+            ev = -5000.0  # Penalty for missing EV
+        
+        # Get popularity (matching_deal_count: 0 to 10,000,000)
+        match_count = int(bt_row.get("matching_deal_count", 0) or 0)
+        
+        # PRIMARY OBJECTIVE FUNCTION: criteria quality, then EV, then popularity
+        scored_matches.append((float(criteria_score), float(ev), float(match_count), str(auction)))
+    
+    if not scored_matches:
+        return None
+    
+    # Sort by criteria, EV, popularity descending
+    scored_matches.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    return scored_matches[0][3]
 
 
 def evaluate_sl_criterion(

@@ -592,25 +592,10 @@ def get_ev_for_auction(auction: str, dealer: str, deal_row: dict) -> float | Non
     # Determine pair from declarer
     pair = 'NS' if declarer in ['N', 'S'] else 'EW'
     
-    # Get vulnerability and convert to column format
-    # Vul column values: 'None', 'Both', 'NS', 'EW' (or similar)
-    vul_raw = deal_row.get('Vul', 'None')
-    if vul_raw is None:
-        vul_raw = 'None'
-    vul_raw = str(vul_raw).strip()
-    
-    # Determine if declarer's side is vulnerable
-    if vul_raw in ['Both', 'All', 'b', 'B']:
-        vul = 'V'
-    elif vul_raw == pair or (vul_raw == 'NS' and pair == 'NS') or (vul_raw == 'EW' and pair == 'EW'):
-        vul = 'V'
-    elif vul_raw in ['None', 'O', 'o', '-', '']:
-        vul = 'NV'
-    else:
-        vul = 'NV'  # Default to not vulnerable
-    
-    # Look up the EV column: EV_{pair}_{declarer}_{strain}_{level}_{vul}
-    col_name = f"EV_{pair}_{declarer}_{strain}_{level}_{vul}"
+    # Look up the EV column: EV_{pair}_{declarer}_{strain}_{level}
+    # Note: EV columns do NOT have vulnerability suffix - they are computed
+    # from the deal's DD analysis for the specific contract
+    col_name = f"EV_{pair}_{declarer}_{strain}_{level}"
     return deal_row.get(col_name)
 
 

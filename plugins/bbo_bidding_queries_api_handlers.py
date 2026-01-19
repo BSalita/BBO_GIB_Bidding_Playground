@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import random
 import re
 import statistics
@@ -105,6 +106,8 @@ from plugins.bbo_handlers_common import (
     check_deal_criteria_conformance_bitmap as _check_deal_criteria_conformance_bitmap,
     # Suit Length evaluation
     evaluate_sl_criterion,
+    # Best Auction Selection
+    choose_best_auction_match,
     # Vectorized join helpers (performance optimization)
     prepare_deals_with_bid_str,
     prepare_bt_for_join,
@@ -2239,6 +2242,9 @@ def handle_sample_deals_by_auction_pattern(
 
     try:
         regex = f"(?i){pattern}"
+        # Polars str.contains() with regex should respect ^ and $ anchors
+        # For exact matches (^...$), str.contains() will match the full string
+        # For prefix matches (^...), str.contains() will match from the start
         filtered = df.filter(pl.col(auction_col).cast(pl.Utf8).str.contains(regex))
     except Exception as e:
         raise ValueError(f"Invalid pattern: {e}")
@@ -4324,59 +4330,17 @@ def handle_bidding_arena(
                     return False
         return True
         
-    def _find_rules_matches_precomputed(
-        deal_idx: int,
-        dealer: str,
-        matched_indices: List[int] | None,
-        deal_row: Dict[str, Any] | None = None,
-        skip_criteria_check: bool = False,
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """Return all matching BT candidates among the precomputed list (up to max returned).
-        
-        If skip_criteria_check is True (verified index), we trust the precomputed matches.
-        """
-        if not matched_indices:
-            return [], False
-        out: list[dict[str, Any]] = []
-        truncated = False
-        for bt_idx in matched_indices:
-            bt_idx_i = int(bt_idx)
-            bt_row = bt_idx_to_row.get(bt_idx_i)
-            if bt_row is None:
-                continue
-            # When using verified index, skip expensive criteria check
-            if skip_criteria_check or _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
-                out.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction")})
-                if len(out) >= RULES_MATCHES_MAX_RETURNED:
-                    truncated = True
-                    break
-        return out, truncated
-
-    def _find_rules_matches_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], bool]:
-        """Return matching BT candidates from the on-the-fly candidate pool (up to max returned)."""
-        out: list[dict[str, Any]] = []
-        truncated = False
-        for bt_row in bt_completed_rows:
-            if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
-                out.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction")})
-                if len(out) >= RULES_MATCHES_MAX_RETURNED:
-                    truncated = True
-                    break
-        return out, truncated
-
-    def _find_first_rules_match_precomputed(
+    def _find_best_rules_match_precomputed(
         deal_idx: int,
         dealer: str,
         matched_indices: List[int] | None,
         deal_row: Dict[str, Any] | None = None,
         skip_criteria_check: bool = False,
     ) -> str | None:
-        """Fast path: return first matching auction among the precomputed candidate list.
-        
-        If skip_criteria_check is True (verified index), we trust the precomputed matches.
-        """
+        """Pick the best matching auction among precomputed candidates."""
         if not matched_indices:
             return None
+        valid_matches = []
         for bt_idx in matched_indices:
             bt_idx_i = int(bt_idx)
             bt_row = bt_idx_to_row.get(bt_idx_i)
@@ -4384,17 +4348,28 @@ def handle_bidding_arena(
                 continue
             # When using verified index, skip expensive criteria check
             if skip_criteria_check or _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-            return None
+                valid_matches.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        
+        if not deal_row:
+            return str(valid_matches[0]["auction"]) if valid_matches else None
+            
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row)
 
-    def _find_first_rules_match_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
-        """Fast path: return first matching auction from the on-the-fly candidate pool."""
+    def _find_best_rules_match_onthefly(deal_idx: int, dealer: str, deal_row: Dict[str, Any] | None = None) -> str | None:
+        """Pick the best matching auction from the on-the-fly candidate pool."""
+        valid_matches = []
         for bt_row in bt_completed_rows:
             if _deal_meets_all_seat_criteria(deal_idx, dealer, bt_row, deal_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
+                valid_matches.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        
+        if not deal_row:
+            return str(valid_matches[0]["auction"]) if valid_matches else None
+
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row)
 
     if has_precomputed_matches:
         # Use precomputed candidate indices but re-check against (base + overlay) criteria so the CSV can override.
@@ -4430,7 +4405,7 @@ def handle_bidding_arena(
         # (Initialized above for type-checkers; populated here.)
         if needed_idxs:
             try:
-                cols = ["bt_index", "Auction", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
+                cols = ["bt_index", "Auction", "matching_deal_count", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
                 cols = [c for c in cols if c in bt_seat1_df.columns]
                 lookup_df = bt_seat1_df.select(cols).filter(pl.col("bt_index").is_in(needed_idxs))
                 lookup_rows_raw = lookup_df.to_dicts()
@@ -4468,7 +4443,7 @@ def handle_bidding_arena(
             
             If skip_criteria_check is True (verified index), we trust the precomputed matches.
             """
-            return _find_first_rules_match_precomputed(deal_idx, dealer, matched_indices, skip_criteria_check=skip_criteria_check)
+            return _find_best_rules_match_precomputed(deal_idx, dealer, matched_indices, skip_criteria_check=skip_criteria_check)
         _mark("candidate_pool_precomputed")
     else:
         # Candidate pool(s) for criteria matching (no deal-level Matched_BT_Indices)
@@ -4558,7 +4533,7 @@ def handle_bidding_arena(
         _mark("candidate_pool_load_agg_expr")
         
         # Convert pools to list of dicts for iteration
-        bt_cols = ["Auction", "bt_index", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
+        bt_cols = ["Auction", "bt_index", "matching_deal_count", agg_expr_col(1), agg_expr_col(2), agg_expr_col(3), agg_expr_col(4)]
         bt_cols = [c for c in bt_cols if c in bt_completed.columns]
 
         # NOTE: We intentionally do NOT build a global auction->bt_index map here.
@@ -4631,7 +4606,7 @@ def handle_bidding_arena(
         
         def _find_rules_auction_onthefly(deal_idx: int, dealer: str) -> Optional[str]:
             """Find the first completed auction whose criteria ALL match this deal."""
-            return _find_first_rules_match_onthefly(deal_idx, dealer)
+            return _find_best_rules_match_onthefly(deal_idx, dealer)
     
     # ---------------------------------------------------------------------------
     # Optimization: Deal-Level Criteria Cache (LAZY)
@@ -4738,60 +4713,100 @@ def handle_bidding_arena(
         """Check if a deal meets criteria. bt_row is already pre-processed."""
         return _deal_meets_all_seat_criteria_cached(cache, bt_row)
 
-    def _find_first_learned_rules_match_precomputed(
+    def _find_best_learned_rules_match_precomputed(
         cache: DealCriteriaCache,
         matched_indices: List[int] | None,
+        deal_row: dict[str, Any],
+        dealer: str
     ) -> str | None:
         if not matched_indices:
             return None
+        valid_matches = []
         for bt_idx in matched_indices:
-            bt_row = bt_idx_to_row_base.get(int(bt_idx))
+            bt_idx_i = int(bt_idx)
+            bt_row = bt_idx_to_row_base.get(bt_idx_i)
             if bt_row and _deal_meets_learned_criteria(cache, bt_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
+                valid_matches.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row_base)
 
-    def _find_first_learned_rules_match_default(cache: DealCriteriaCache) -> str | None:
+    def _find_best_learned_rules_match_default(
+        cache: DealCriteriaCache,
+        deal_row: dict[str, Any],
+        dealer: str
+    ) -> str | None:
+        valid_matches = []
         for bt_row in bt_rules_default_rows_base:
             if _deal_meets_learned_criteria(cache, bt_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
+                valid_matches.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row_base)
 
-    def _find_first_learned_rules_match_onthefly(cache: DealCriteriaCache) -> str | None:
+    def _find_best_learned_rules_match_onthefly(
+        cache: DealCriteriaCache,
+        deal_row: dict[str, Any],
+        dealer: str
+    ) -> str | None:
+        valid_matches = []
         for bt_row in bt_completed_rows_base:
             if _deal_meets_learned_criteria(cache, bt_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
+                valid_matches.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row_base)
     
-    def _find_first_merged_rules_match_precomputed(
+    def _find_best_merged_rules_match_precomputed(
         cache: DealCriteriaCache,
         matched_indices: List[int] | None,
+        deal_row: dict[str, Any],
+        dealer: str
     ) -> str | None:
         if not matched_indices:
             return None
+        
+        # Collect all valid matches from the precomputed list
+        valid_matches = []
         for bt_idx in matched_indices:
-            bt_row = bt_idx_to_row_base.get(int(bt_idx))
+            bt_idx_i = int(bt_idx)
+            bt_row = bt_idx_to_row_base.get(bt_idx_i)
             if bt_row and _deal_meets_merged_criteria(cache, bt_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
+                valid_matches.append({"bt_index": bt_idx_i, "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row_base)
     
-    def _find_first_merged_rules_match_onthefly(cache: DealCriteriaCache) -> str | None:
+    def _find_best_merged_rules_match_onthefly(
+        cache: DealCriteriaCache,
+        deal_row: dict[str, Any],
+        dealer: str
+    ) -> str | None:
+        # Collect valid matches from completed rows
+        valid_matches = []
         for bt_row in bt_completed_rows_base:
             if _deal_meets_merged_criteria(cache, bt_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
+                valid_matches.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row_base)
 
-    def _find_first_merged_rules_match_default(cache: DealCriteriaCache) -> str | None:
-        """Default path: search the merged-rules candidate pool first, then fall back to None."""
+    def _find_best_merged_rules_match_default(
+        cache: DealCriteriaCache,
+        deal_row: dict[str, Any],
+        dealer: str
+    ) -> str | None:
+        """Default path: search the merged-rules candidate pool, choose the best by EV/popularity."""
+        valid_matches = []
         for bt_row in bt_rules_default_rows_base:
             if _deal_meets_merged_criteria(cache, bt_row):
-                auc = bt_row.get("Auction")
-                return str(auc) if auc is not None else None
-        return None
+                valid_matches.append({"bt_index": int(bt_row.get("bt_index", 0)), "auction": bt_row.get("Auction"), "matching_deal_count": bt_row.get("matching_deal_count", 0)})
+                if len(valid_matches) >= RULES_MATCHES_MAX_RETURNED:
+                    break
+        
+        return choose_best_auction_match(valid_matches, deal_row, dealer, bt_idx_to_row_lookup=bt_idx_to_row_base)
     
     def _find_merged_rules_matches_precomputed(
         cache: DealCriteriaCache,
@@ -5279,11 +5294,11 @@ def handle_bidding_arena(
                 if has_precomputed_matches:
                     if not matched_indices:
                         diag_no_matched_indices += 1
-                    rules_auction = _find_first_merged_rules_match_precomputed(deal_cache, matched_indices)
+                    rules_auction = _find_best_merged_rules_match_precomputed(deal_cache, matched_indices, row, dealer)
                 else:
-                    rules_auction = _find_first_merged_rules_match_default(deal_cache)
+                    rules_auction = _find_best_merged_rules_match_default(deal_cache, row, dealer)
                     if rules_auction is None and rules_search_mode == "merged_default":
-                        rules_auction = _find_first_merged_rules_match_onthefly(deal_cache)
+                        rules_auction = _find_best_merged_rules_match_onthefly(deal_cache, row, dealer)
             
             if rules_auction is None:
                 diag_rules_none += 1
@@ -5306,22 +5321,22 @@ def handle_bidding_arena(
         if need_rules_learned:
             if has_precomputed_matches:
                 mi2 = _get_verified_matches(int(deal_idx))
-                rules_learned_auction = _find_first_learned_rules_match_precomputed(deal_cache, mi2)
+                rules_learned_auction = _find_best_learned_rules_match_precomputed(deal_cache, mi2, row, dealer)
             else:
-                rules_learned_auction = _find_first_learned_rules_match_default(deal_cache)
+                rules_learned_auction = _find_best_learned_rules_match_default(deal_cache, row, dealer)
                 if rules_learned_auction is None and rules_search_mode == "merged_default":
-                    rules_learned_auction = _find_first_learned_rules_match_onthefly(deal_cache)
+                    rules_learned_auction = _find_best_learned_rules_match_onthefly(deal_cache, row, dealer)
         
         # Pick Rules_Base auction (original BT criteria)
         if need_rules_base:
             if has_precomputed_matches:
                 # Use verified index (O(1) lookup, already bitmap-verified)
                 matched_indices = _get_verified_matches(int(deal_idx))
-                rules_base_auction = _find_first_rules_match_precomputed(
+                rules_base_auction = _find_best_rules_match_precomputed(
                     int(deal_idx), dealer, matched_indices, row, skip_criteria_check=True
                 )
             else:
-                rules_base_auction = _find_first_rules_match_onthefly(int(deal_idx), dealer, row)
+                rules_base_auction = _find_best_rules_match_onthefly(int(deal_idx), dealer, row)
         else:
             rules_base_auction = None
 
@@ -7878,6 +7893,7 @@ def _handle_list_next_bids_walk_fallback(
     bt_index_arr = state.get("bt_index_arr")
     is_mono = state.get("bt_index_monotonic", False)
     bt_parquet_file = state.get("bt_seat1_file")
+    bt_can_complete = state.get("bt_can_complete")
 
     # Handle empty auction (Opening Bids)
     if not auction_input:
@@ -8022,12 +8038,15 @@ def _handle_list_next_bids_walk_fallback(
         next_bids.append({
             "bid": str(row.get("candidate_bid")).upper(),
             "bt_index": idx,
+            # BT raw per-step criteria column (used as fallback to populate Agg_Expr_Seat_{next_seat})
+            "expr": row.get("Expr") or [],
             "agg_expr": crits,
             "is_completed_auction": is_complete,
             "is_dead_end": is_dead_end,
             "matching_deal_count": deal_count,
             "avg_ev_nv": avg_ev_nv,
             "avg_ev_v": avg_ev_v,
+            "can_complete": bool(bt_can_complete[int(idx)]) if (bt_can_complete is not None and idx is not None and int(idx) < len(bt_can_complete)) else None,
         })
     
     # Sort for UI consistency
