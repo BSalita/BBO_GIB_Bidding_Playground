@@ -2630,15 +2630,91 @@ def deals_by_index(req: DealsByIndexRequest) -> Dict[str, Any]:
         "ParScore", "Contract", "Score", "Result", "bid",
     ]
     cols = req.columns or default_cols
-    cols = [c for c in cols if c in deal_df.columns]
-    if not cols:
-        cols = ["index"]
+    cols = [str(c) for c in cols if c]  # normalize
+    # Columns present in the in-memory deal_df
+    cols_in_mem = [c for c in cols if c in deal_df.columns]
+    if not cols_in_mem:
+        cols_in_mem = ["index"] if "index" in deal_df.columns else [deal_df.columns[0]]
+    # Columns requested but not loaded into memory (e.g. heavy Probs_*).
+    cols_missing = [c for c in cols if c not in deal_df.columns]
 
     # Take rows by row position, then include _row_idx for downstream callers.
-    out_df = deal_df.select(cols)
+    out_df = deal_df.select(cols_in_mem)
     out_df = out_df.with_row_index("_row_idx")
     from plugins.bbo_handlers_common import take_rows_by_index as _take  # avoid polars version issues
     out_df = _take(out_df, row_positions)
+
+    # If callers requested columns that are not loaded into deal_df, fetch them directly
+    # from the source parquet file for just these row positions.
+    #
+    # This is critical for "wide" columns like Probs_* which are too large to keep in RAM
+    # but are needed for per-deal computations (e.g. doubled/redoubled EV).
+    if cols_missing:
+        # Hard requirement: deals parquet must exist (no fallback logic).
+        if not bbo_mldf_augmented_file.exists():
+            raise HTTPException(status_code=500, detail=f"deals parquet not found: {bbo_mldf_augmented_file}")
+
+        # Only fetch missing columns that actually exist in the parquet schema.
+        try:
+            pf = pq.ParquetFile(str(bbo_mldf_augmented_file))
+            schema_names = set(pf.schema.names)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to open deals parquet: {e}")
+
+        cols_missing = [c for c in cols_missing if c in schema_names]
+
+        if cols_missing:
+            # Map absolute row position -> rank in requested output order
+            pos_rank = {int(pos): i for i, pos in enumerate(row_positions)}
+
+            # Precompute row group start offsets to map positions -> row groups.
+            rg_starts: list[int] = []
+            total = 0
+            try:
+                for rg_i in range(pf.num_row_groups):
+                    rg_starts.append(total)
+                    total += int(pf.metadata.row_group(rg_i).num_rows)  # type: ignore[union-attr]
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to read parquet row group metadata: {e}")
+
+            import bisect as _bisect
+            by_rg: dict[int, list[int]] = {}
+            for pos in row_positions:
+                p = int(pos)
+                # rightmost start <= p
+                rg_i = int(_bisect.bisect_right(rg_starts, p) - 1)
+                if rg_i < 0:
+                    continue
+                by_rg.setdefault(rg_i, []).append(p)
+
+            parts: list[pl.DataFrame] = []
+            for rg_i, poss in by_rg.items():
+                start = rg_starts[rg_i]
+                try:
+                    tbl = pf.read_row_group(int(rg_i), columns=cols_missing)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Failed to read row group {rg_i}: {e}")
+                rg_df_any = pl.from_arrow(tbl)
+                rg_df: pl.DataFrame
+                if isinstance(rg_df_any, pl.Series):
+                    rg_df = rg_df_any.to_frame()
+                else:
+                    rg_df = rg_df_any
+                for p in poss:
+                    off = int(p - start)
+                    if off < 0 or off >= rg_df.height:
+                        continue
+                    parts.append(
+                        rg_df.slice(off, 1).with_columns(
+                            pl.lit(int(p)).alias("_row_idx"),
+                            pl.lit(int(pos_rank.get(int(p), 0))).alias("_rank"),
+                        )
+                    )
+
+            if parts:
+                extra_df = pl.concat(parts, how="vertical").sort("_rank").drop("_rank")
+                # Join on _row_idx (safe, unique for these rows)
+                out_df = out_df.join(extra_df, on="_row_idx", how="left")
 
     rows = out_df.to_dicts()
     resp = {"rows": rows, "count": len(rows)}

@@ -16,12 +16,12 @@ import polars as pl
 
 # Optional imports for par score calculation
 try:
-    from endplay.types import Deal, Vul, Player  # type: ignore[import-untyped]
+    from endplay.types import Deal, Vul, Player, Contract, Denom, Penalty  # type: ignore[import-untyped]
     from endplay.dds import calc_dd_table, par  # type: ignore[import-untyped]
     HAS_ENDPLAY = True
 except ImportError:
     HAS_ENDPLAY = False
-    Deal = Vul = Player = calc_dd_table = par = None  # type: ignore[misc, assignment]
+    Deal = Vul = Player = Contract = Denom = Penalty = calc_dd_table = par = None  # type: ignore[misc, assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +512,12 @@ def get_ai_contract(auction: str, dealer: str) -> str | None:
 def get_dd_score_for_auction(auction: str, dealer: str, deal_row: dict) -> int | None:
     """
     Get the double-dummy score for a contract derived from an auction.
+
+    Notes:
+    - For undoubled contracts, this uses the precomputed `DD_Score_{level}{strain}_{declarer}` column.
+    - For doubled/redoubled contracts, this uses endplay scoring to correctly apply penalties/bonuses,
+      deriving the DD result from the raw DD trick table columns `DD_{declarer}_{strain}` and the
+      deal's vulnerability (`Vul` / `Vulnerability`).
     
     Args:
         auction: Auction string like "1N-p-3N-p-p-p"
@@ -529,10 +535,83 @@ def get_dd_score_for_auction(auction: str, dealer: str, deal_row: dict) -> int |
     declarer = get_declarer_for_auction(auction, dealer)
     if not declarer:
         return None
-    
-    # Look up the DD score column
-    col_name = f"DD_Score_{level}{strain}_{declarer}"
-    return deal_row.get(col_name)
+
+    # Determine doubling/redoubling state for this auction.
+    # We only invoke endplay scoring when we *need* it (X/XX), to preserve the
+    # original fast-path behavior for undoubled contracts.
+    is_doubled = False
+    is_redoubled = False
+    try:
+        bids = auction.upper().split('-')
+        # Find the last contract bid index (skip passes/doubles/redoubles)
+        last_contract_idx = -1
+        for i in range(len(bids) - 1, -1, -1):
+            bid = bids[i].strip()
+            if not bid or bid == 'P':
+                continue
+            if bid in ('X', 'D', 'DBL', 'DOUBLE'):
+                continue
+            if bid in ('XX', 'R', 'RDBL', 'REDOUBLE'):
+                continue
+            if bid[0].isdigit():
+                last_contract_idx = i
+                break
+        if last_contract_idx >= 0:
+            for i in range(last_contract_idx + 1, len(bids)):
+                b = bids[i].strip().upper()
+                if b in ('X', 'D', 'DBL', 'DOUBLE'):
+                    is_doubled = True
+                    is_redoubled = False
+                elif b in ('XX', 'R', 'RDBL', 'REDOUBLE'):
+                    is_redoubled = True
+    except Exception:
+        is_doubled = False
+        is_redoubled = False
+
+    # Undoubled: keep original behavior (precomputed column).
+    if not is_doubled and not is_redoubled:
+        col_name = f"DD_Score_{level}{strain}_{declarer}"
+        return deal_row.get(col_name)
+
+    # Doubled/redoubled: score via endplay using DD tricks + vulnerability.
+    if not HAS_ENDPLAY:
+        return None
+
+    dd_tricks = get_dd_tricks_for_auction(auction, dealer, deal_row)
+    if dd_tricks is None:
+        return None
+
+    # Result: over/under tricks relative to contract.
+    try:
+        result = int(dd_tricks) - (int(level) + 6)
+    except Exception:
+        return None
+
+    # Vulnerability (board vulnerability, not just declarer-side).
+    vul_raw = deal_row.get("Vul", deal_row.get("Vulnerability", "None"))
+    vul = str(vul_raw).strip().upper() if vul_raw is not None else "NONE"
+    vul_map = {
+        "NONE": Vul.none, "N": Vul.none, "": Vul.none,  # type: ignore[union-attr]
+        "NS": Vul.ns, "N-S": Vul.ns, "N_S": Vul.ns,  # type: ignore[union-attr]
+        "EW": Vul.ew, "E-W": Vul.ew, "E_W": Vul.ew,  # type: ignore[union-attr]
+        "BOTH": Vul.both, "ALL": Vul.both,  # type: ignore[union-attr]
+    }
+    vul_enum = vul_map.get(vul, Vul.none)  # type: ignore[union-attr]
+
+    # Declarer mapping.
+    dealer_map = {'N': Player.north, 'E': Player.east, 'S': Player.south, 'W': Player.west}  # type: ignore[union-attr]
+    declarer_player = dealer_map.get(str(declarer).upper(), Player.north)  # type: ignore[union-attr]
+
+    # Denomination and penalty.
+    denom_str = "NT" if str(strain).upper() == "N" else str(strain).upper()
+    denom = Denom.find(denom_str)  # type: ignore[union-attr]
+    penalty = Penalty.redoubled if is_redoubled else Penalty.doubled if is_doubled else Penalty.undoubled  # type: ignore[union-attr]
+
+    try:
+        c = Contract(level=int(level), denom=denom, declarer=declarer_player, penalty=penalty, result=int(result))  # type: ignore[misc]
+        return int(c.score(vul_enum))  # type: ignore[misc]
+    except Exception:
+        return None
 
 
 def get_dd_tricks_for_auction(auction: str, dealer: str, deal_row: dict) -> int | None:
@@ -591,10 +670,109 @@ def get_ev_for_auction(auction: str, dealer: str, deal_row: dict) -> float | Non
     
     # Determine pair from declarer
     pair = 'NS' if declarer in ['N', 'S'] else 'EW'
+
+    # Determine doubling/redoubling state for this auction.
+    is_doubled = False
+    is_redoubled = False
+    try:
+        bids = auction.upper().split('-')
+        last_contract_idx = -1
+        for i in range(len(bids) - 1, -1, -1):
+            bid = bids[i].strip()
+            if not bid or bid == 'P':
+                continue
+            if bid in ('X', 'D', 'DBL', 'DOUBLE'):
+                continue
+            if bid in ('XX', 'R', 'RDBL', 'REDOUBLE'):
+                continue
+            if bid[0].isdigit():
+                last_contract_idx = i
+                break
+        if last_contract_idx >= 0:
+            for i in range(last_contract_idx + 1, len(bids)):
+                b = bids[i].strip().upper()
+                if b in ('X', 'D', 'DBL', 'DOUBLE'):
+                    is_doubled = True
+                    is_redoubled = False
+                elif b in ('XX', 'R', 'RDBL', 'REDOUBLE'):
+                    is_redoubled = True
+    except Exception:
+        is_doubled = False
+        is_redoubled = False
     
     # Look up the EV column: EV_{pair}_{declarer}_{strain}_{level}
     # Note: EV columns do NOT have vulnerability suffix - they are computed
     # from the deal's DD analysis for the specific contract
+    if not is_doubled and not is_redoubled:
+        col_name = f"EV_{pair}_{declarer}_{strain}_{level}"
+        return deal_row.get(col_name)
+
+    # Doubled/redoubled EV: compute from single-dummy probability matrix + endplay scoring.
+    if not HAS_ENDPLAY:
+        return None
+
+    # Vulnerability (board vulnerability).
+    vul_raw = deal_row.get("Vul", deal_row.get("Vulnerability", "None"))
+    vul = str(vul_raw).strip().upper() if vul_raw is not None else "NONE"
+    vul_map = {
+        "NONE": Vul.none, "N": Vul.none, "": Vul.none,  # type: ignore[union-attr]
+        "NS": Vul.ns, "N-S": Vul.ns, "N_S": Vul.ns,  # type: ignore[union-attr]
+        "EW": Vul.ew, "E-W": Vul.ew, "E_W": Vul.ew,  # type: ignore[union-attr]
+        "BOTH": Vul.both, "ALL": Vul.both,  # type: ignore[union-attr]
+    }
+    vul_enum = vul_map.get(vul, Vul.none)  # type: ignore[union-attr]
+
+    dealer_map = {'N': Player.north, 'E': Player.east, 'S': Player.south, 'W': Player.west}  # type: ignore[union-attr]
+    declarer_player = dealer_map.get(str(declarer).upper(), Player.north)  # type: ignore[union-attr]
+
+    denom_str = "NT" if str(strain).upper() == "N" else str(strain).upper()
+    denom = Denom.find(denom_str)  # type: ignore[union-attr]
+    penalty = Penalty.redoubled if is_redoubled else Penalty.doubled if is_doubled else Penalty.undoubled  # type: ignore[union-attr]
+
+    ev = 0.0
+    saw_any_prob = False
+    for t in range(14):
+        prob_col = f"Probs_{pair}_{declarer}_{str(strain).upper()}_{t}"
+        p = deal_row.get(prob_col)
+        if p is None:
+            continue
+        try:
+            pf = float(p)
+        except Exception:
+            continue
+        if pf == 0.0:
+            continue
+        saw_any_prob = True
+        result = int(t) - (int(level) + 6)
+        try:
+            c = Contract(level=int(level), denom=denom, declarer=declarer_player, penalty=penalty, result=int(result))  # type: ignore[misc]
+            score = float(c.score(vul_enum))  # type: ignore[misc]
+        except Exception:
+            continue
+        ev += pf * score
+
+    return ev if saw_any_prob else None
+
+
+def get_ev_for_auction_pre(auction: str, dealer: str, deal_row: dict) -> float | None:
+    """
+    Get the "legacy" expected value (EV) for a contract derived from an auction.
+
+    This is the precomputed EV lookup that IGNOREs doubling/redoubling. It exists so callers
+    can surface both methods side-by-side:
+    - `get_ev_for_auction_pre`: precomputed EV_{pair}_{declarer}_{strain}_{level}
+    - `get_ev_for_auction`: X/XX-aware EV (uses Probs_* + endplay scoring for doubled/redoubled)
+    """
+    contract = parse_contract_from_auction(auction)
+    if not contract:
+        return None
+
+    level, strain, _ = contract
+    declarer = get_declarer_for_auction(auction, dealer)
+    if not declarer:
+        return None
+
+    pair = "NS" if declarer in ["N", "S"] else "EW"
     col_name = f"EV_{pair}_{declarer}_{strain}_{level}"
     return deal_row.get(col_name)
 

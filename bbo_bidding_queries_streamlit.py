@@ -42,6 +42,7 @@ from bbo_bidding_queries_lib import (
     get_dd_score_for_auction,
     get_dd_tricks_for_auction,
     get_ev_for_auction,
+    get_ev_for_auction_pre,
 )
 
 # Import criteria evaluation helpers from handlers
@@ -1056,11 +1057,11 @@ def render_aggrid(
                 pass
 
     # Dynamic height based on explicit row/header heights set below.
-    # rowHeight=28, headerHeight=32, plus border/scrollbar buffer.
+    # rowHeight=25, headerHeight=25, plus border/scrollbar buffer.
     if height is None:
         n_rows = len(df)
-        ROW_HEIGHT = 28
-        HEADER_HEIGHT = 32
+        ROW_HEIGHT = 25
+        HEADER_HEIGHT = 25
         BUFFER = 10  # borders, scrollbar track, etc.
         # Cap at ~10 rows before scrolling kicks in.
         height = min(10 * ROW_HEIGHT + HEADER_HEIGHT + BUFFER,
@@ -1234,8 +1235,8 @@ def render_aggrid(
         gb.configure_column("Auction", width=250, minWidth=250, maxWidth=350)
     
     gb.configure_grid_options(
-        rowHeight=28,
-        headerHeight=32,
+        rowHeight=25,
+        headerHeight=25,
         suppressCellFocus=True,
         tooltipShowDelay=300,  # Show tooltips after 300ms hover
         suppressColumnVirtualisation=True,  # Prevent virtualization from affecting widths on rerender
@@ -5549,6 +5550,14 @@ def render_auction_builder():
                             for strain in ["C", "D", "H", "S", "N"]:
                                 for lvl in range(1, 8):
                                     pinned_cols.append(f"EV_{pair}_{decl}_{strain}_{lvl}")
+                    # Single-dummy probability columns used for X/XX EV_Contract.
+                    # Probs_{pair}_{declarer}_{strain}_{tricks} (560 columns) + Probs_Trials.
+                    pinned_cols.append("Probs_Trials")
+                    for pair in ["NS", "EW"]:
+                        for decl in ["N", "E", "S", "W"]:
+                            for strain in ["C", "D", "H", "S", "N"]:
+                                for t in range(14):
+                                    pinned_cols.append(f"Probs_{pair}_{decl}_{strain}_{t}")
                     data = api_post(
                         "/deals-by-index",
                         {
@@ -6138,8 +6147,7 @@ def render_auction_builder():
             for i, opt in enumerate(sorted_options):
                 criteria_list = opt.get("agg_expr", [])
                 criteria_str = "; ".join(criteria_list)
-                exprs_str = "\n".join(criteria_list) if isinstance(criteria_list, list) and criteria_list else "(none)"
-                # BT raw per-step Expr (may differ from Agg_Exprs after overlay/dedupe)
+                # BT raw per-step Expr (may differ from agg_expr after overlay/dedupe)
                 expr_list = opt.get("expr", [])
                 if isinstance(expr_list, str):
                     expr_text = expr_list.strip() if expr_list.strip() else "(none)"
@@ -6239,6 +6247,66 @@ def render_auction_builder():
                     except Exception:
                         row_data["Avg_EV"] = None
 
+                # -----------------------------------------------------------------
+                # Contract + DD (based on last contract bid, not current call)
+                # -----------------------------------------------------------------
+                # Use the auction *after* making this candidate call to determine the current contract.
+                # This ensures passes/doubles/redoubles still show DD for the standing contract.
+                contract_str: str | None = None
+                dd_col_name: str | None = None
+                dd_val: int | None = None
+                dd_score_val: int | None = None
+                ev_contract: float | None = None
+                ev_contract_pre: float | None = None
+                try:
+                    candidate_auction_norm = normalize_auction_input(next_auction).upper() if next_auction else ""
+                    # For per-deal EV lookup, force the auction to a completed form (append passes).
+                    # This makes P vs 6S comparable at the same decision point.
+                    candidate_auction_completed = _append_passes_to_complete(candidate_auction_norm) if candidate_auction_norm else ""
+                    c = parse_contract_from_auction(candidate_auction_norm)
+                    if candidate_auction_norm and c is None:
+                        # Passed out (all passes)
+                        toks = [t.strip().upper() for t in candidate_auction_norm.split("-") if t.strip()]
+                        if toks and all(t == "P" for t in toks):
+                            contract_str = "Passed out"
+                    if c is not None:
+                        level, strain, _ = c
+                        s = "NT" if str(strain).upper() == "N" else str(strain).upper()
+                        contract_str = f"{int(level)}{s}"
+                        if pinned_deal:
+                            dealer_for_contract = str(pinned_deal.get("Dealer", "N")).upper()
+                            declarer = get_declarer_for_auction(candidate_auction_norm, dealer_for_contract)
+                            if declarer:
+                                dd_col_name = f"DD_{declarer}_{str(strain).upper()}"
+                                raw = pinned_deal.get(dd_col_name)
+                                dd_val = int(raw) if raw is not None else None
+                                # DD score: for X/XX, score via endplay to apply doubling rules.
+                                dd_score_raw = get_dd_score_for_auction(candidate_auction_norm, dealer_for_contract, pinned_deal)
+                                dd_score_val = int(dd_score_raw) if dd_score_raw is not None else None
+                    # EV_Contract: pinned-deal EV for the completed candidate auction's contract.
+                    if pinned_deal and candidate_auction_completed:
+                        dealer_for_ev_contract = str(pinned_deal.get("Dealer", "N")).upper()
+                        # Precomputed EV (legacy; ignores X/XX)
+                        ev_pre_val = get_ev_for_auction_pre(candidate_auction_completed, dealer_for_ev_contract, pinned_deal)
+                        ev_contract_pre = round(float(ev_pre_val), 1) if ev_pre_val is not None else None
+                        # New EV (X/XX-aware)
+                        ev_val = get_ev_for_auction(candidate_auction_completed, dealer_for_ev_contract, pinned_deal)
+                        ev_contract = round(float(ev_val), 1) if ev_val is not None else None
+                except Exception:
+                    contract_str = contract_str
+                    dd_col_name = dd_col_name
+                    dd_val = dd_val
+                    dd_score_val = dd_score_val
+                    ev_contract = ev_contract
+                    ev_contract_pre = ev_contract_pre
+
+                row_data["Contract"] = contract_str or ""
+                row_data["DD_[NESW]_[CDHSN]"] = dd_val
+                row_data["_dd_col"] = dd_col_name or ""
+                row_data["DD_Score_Contract"] = dd_score_val
+                row_data["EV_Contract"] = ev_contract
+                row_data["EV_Contract_Pre"] = ev_contract_pre
+
                 # If this bid is a pinned-deal match but has no Avg_EV, treat it as rejected.
                 # (User expectation: valid bids should have an actionable EV signal.)
                 if (
@@ -6252,35 +6320,8 @@ def render_auction_builder():
                     row_data["_rejected"] = True
                     row_data["can_complete"] = can_complete
 
-                # DD tricks for this bidder direction + bid strain: DD_{Direction}_{Strain}
-                # (e.g., DD_N_D). This is useful for quick sanity-checking candidate strains.
-                dd_col_name: str | None = None
-                dd_val: int | None = None
-                try:
-                    bid_for_dd = str(opt.get("bid") or "").strip().upper()
-                    strain: str | None = None
-                    if len(bid_for_dd) >= 2 and bid_for_dd[0].isdigit():
-                        s = bid_for_dd[1].upper()
-                        # Normalize NT -> N
-                        if s == "N":
-                            strain = "N"
-                        elif s == "T" and len(bid_for_dd) >= 3 and bid_for_dd[1:3].upper() == "NT":
-                            strain = "N"
-                        elif s in ("C", "D", "H", "S"):
-                            strain = s
-                    if pinned_deal and seat_direction and strain:
-                        dd_col_name = f"DD_{seat_direction}_{strain}"
-                        raw = pinned_deal.get(dd_col_name)
-                        dd_val = int(raw) if raw is not None else None
-                except Exception:
-                    dd_col_name = None
-                    dd_val = None
-                row_data["DD_[NESW]_[CDHSN]"] = dd_val
-                row_data["_dd_col"] = dd_col_name or ""
-
                 row_data["Criteria_Count"] = len(criteria_list) if isinstance(criteria_list, list) else 0
                 row_data["Criteria"] = criteria_str if criteria_str else "(none)"
-                row_data["Agg_Exprs"] = exprs_str
                 row_data["Expr"] = expr_text
                 row_data["Categories"] = ""
                 # Attach categories (true flags) for this candidate's bt_index (if available)
@@ -6367,13 +6408,21 @@ def render_auction_builder():
                 if pinned_deal:
                     gb.configure_column("Direction", width=125, minWidth=115)  # 9 chars
                 gb.configure_column("Bid", width=80, minWidth=70)          # 3 chars
+                if "Contract" in pdf.columns:
+                    gb.configure_column("Contract", width=110, minWidth=95)
                 if "can_complete" in pdf.columns:
                     gb.configure_column("can_complete", width=130, minWidth=120, headerName="Can Complete")
                 if "DD_[NESW]_[CDHSN]" in pdf.columns:
                     gb.configure_column("DD_[NESW]_[CDHSN]", width=135, minWidth=120, headerName="DD")
+                if "DD_Score_Contract" in pdf.columns:
+                    gb.configure_column("DD_Score_Contract", width=135, minWidth=120, headerName="DD Score")
                 gb.configure_column("Matches", width=115, minWidth=105)    # 7 chars
                 gb.configure_column("Deals", width=100, minWidth=90)       # 5 chars
                 gb.configure_column("Avg_EV", width=105, minWidth=95, headerName="Avg EV")   # 6 chars
+                if "EV_Contract" in pdf.columns:
+                    gb.configure_column("EV_Contract", width=120, minWidth=110, headerName="EV Contract")
+                if "EV_Contract_Pre" in pdf.columns:
+                    gb.configure_column("EV_Contract_Pre", width=140, minWidth=125, headerName="EV Contract Pre")
                 gb.configure_column("EV_NV", width=100, minWidth=90, headerName="EV NV")    # 5 chars
                 gb.configure_column("EV_V", width=90, minWidth=80, headerName="EV V")       # 4 chars
                 gb.configure_column(
@@ -6388,13 +6437,6 @@ def render_auction_builder():
                         flex=1,
                         minWidth=140,
                         tooltipField="Expr",
-                    )
-                if "Agg_Exprs" in pdf.columns:
-                    gb.configure_column(
-                        "Agg_Exprs",
-                        flex=1,
-                        minWidth=140,
-                        tooltipField="Agg_Exprs",
                     )
                 gb.configure_column(
                     "Categories",
@@ -6416,6 +6458,10 @@ def render_auction_builder():
                     gb.configure_column("EV_V", hide=True)
                 else:
                     gb.configure_column("Avg_EV", hide=True)
+                    if "EV_Contract" in pdf.columns:
+                        gb.configure_column("EV_Contract", hide=True)
+                    if "EV_Contract_Pre" in pdf.columns:
+                        gb.configure_column("EV_Contract_Pre", hide=True)
                 
                 # Add row styling based on pinned deal match
                 if apply_row_styling and show_failed_criteria:
@@ -6431,7 +6477,7 @@ def render_auction_builder():
                             }
                         """)
                     )
-                gb.configure_grid_options(tooltipShowDelay=300)
+                gb.configure_grid_options(tooltipShowDelay=300, rowHeight=25, headerHeight=25)
                 return gb.build()
             
             # Custom CSS for row styling
@@ -6503,64 +6549,6 @@ def render_auction_builder():
                         st.session_state.auction_builder_last_applied = ""
                         st.rerun()
             
-            # Display Suggested Bids (Phase 5)
-            if suggested_bids_rows:
-                st.markdown("**5 Suggested Bids**")
-                sug_df = pl.DataFrame(
-                    [
-                        {
-                            "_idx": r["_idx"],
-                            "Bid": r["Bid"],
-                            "Criteria": r["Criteria"],
-                            "EV": r["EV"],
-                            "Deals": r["Deals"],
-                            "Matches": r["Matches"],
-                            "Bucket": r["Bucket"],
-                        }
-                        for r in suggested_bids_rows
-                    ]
-                )
-                sug_pdf = sug_df.to_pandas()
-                gb_sug = GridOptionsBuilder.from_dataframe(sug_pdf)
-                gb_sug.configure_selection(selection_mode="single", use_checkbox=False)
-                gb_sug.configure_column("_idx", hide=True)
-                gb_sug.configure_column("Bucket", hide=True)
-                gb_sug.configure_grid_options(
-                    getRowClass=JsCode(
-                        """
-                        function(params) {
-                            if (params.data.Bucket === 'Valid') {
-                                return 'row-suggest-valid';
-                            }
-                            if (params.data.Bucket === 'Rejected') {
-                                return 'row-suggest-rejected';
-                            }
-                            if (params.data.Bucket === 'Invalid') {
-                                return 'row-suggest-invalid';
-                            }
-                            return null;
-                        }
-                        """
-                    )
-                )
-                sug_opts = gb_sug.build()
-                sug_resp = AgGrid(
-                    sug_pdf,
-                    gridOptions=sug_opts,
-                    height=175,
-                    update_on=["selectionChanged"],
-                    theme="balham",
-                    allow_unsafe_jscode=True,
-                    custom_css={
-                        ".ag-row": {"cursor": "pointer"},
-                        ".row-suggest-valid": {"background-color": "#d4edda !important"},
-                        ".row-suggest-rejected": {"background-color": "#fff3cd !important"},
-                        ".row-suggest-invalid": {"background-color": "#f8d7da !important"},
-                    },
-                    key=f"auction_builder_suggested_bids_{current_auction}_{current_seat}",
-                )
-                handle_bid_selection(sug_resp)
-
             pandas_df = bids_df.to_pandas()
             
             # Count valid/invalid/rejected bids
@@ -6575,6 +6563,180 @@ def render_auction_builder():
                 rejected_rows = [r for r in bid_rows if r.get("_rejected")]
                 invalid_rows = [r for r in bid_rows if r.get("_matches") is False and not r.get("_rejected")]
                 other_rows = [r for r in bid_rows if r.get("_matches") is None and not r.get("_rejected")]
+
+                # Build Best Par Bids and Best EV Bids tables (5 columns each)
+                # These show the top bids ranked by Par and EV for the pinned deal
+                all_bids_for_ranking = valid_rows + rejected_rows + invalid_rows
+                
+                # Determine bucket for each bid
+                def get_bucket(r: dict[str, Any]) -> str:
+                    if r.get("_matches") is True and not r.get("_rejected"):
+                        return "Valid"
+                    elif r.get("_rejected"):
+                        return "Rejected"
+                    else:
+                        return "Invalid"
+                
+                # Best Par Bids: sort by DD_Score_Contract (descending, best score first)
+                best_par_bids: list[dict[str, Any]] = []
+                par_sorted = sorted(
+                    [r for r in all_bids_for_ranking if r.get("DD_Score_Contract") is not None],
+                    key=lambda x: float(x.get("DD_Score_Contract") or -9999),
+                    reverse=True
+                )[:5]  # Top 5
+                for r in par_sorted:
+                    dd_val = r.get("DD_Score_Contract")
+                    best_par_bids.append({
+                        "Bid": r.get("Bid", ""),
+                        "Contract": r.get("Contract", ""),
+                        "DD": int(dd_val) if dd_val is not None else None,
+                        "Deals": r.get("Deals", ""),
+                        "Matches": r.get("Matches", ""),
+                        "Bucket": get_bucket(r),
+                    })
+                
+                # Best EV Bids: sort by EV_Contract (descending, best EV first)
+                best_ev_bids: list[dict[str, Any]] = []
+                ev_sorted = sorted(
+                    [r for r in all_bids_for_ranking if r.get("EV_Contract") is not None],
+                    key=lambda x: float(x.get("EV_Contract") or -9999),
+                    reverse=True
+                )[:5]  # Top 5
+                for r in ev_sorted:
+                    best_ev_bids.append({
+                        "Bid": r.get("Bid", ""),
+                        "Contract": r.get("Contract", ""),
+                        "EV": r.get("EV_Contract"),
+                        "Deals": r.get("Deals", ""),
+                        "Matches": r.get("Matches", ""),
+                        "Bucket": get_bucket(r),
+                    })
+                
+                best_par_bids_df = pl.DataFrame(best_par_bids) if best_par_bids else pl.DataFrame()
+                best_ev_bids_df = pl.DataFrame(best_ev_bids) if best_ev_bids else pl.DataFrame()
+
+                # Shared CSS and row styling for all 3 tables
+                bid_table_css = {
+                    ".ag-row": {"cursor": "pointer"},
+                    ".row-suggest-valid": {"background-color": "#d4edda !important"},
+                    ".row-suggest-rejected": {"background-color": "#fff3cd !important"},
+                    ".row-suggest-invalid": {"background-color": "#f8d7da !important"},
+                }
+                row_class_js = JsCode(
+                    """
+                    function(params) {
+                        if (params.data.Bucket === 'Valid') {
+                            return 'row-suggest-valid';
+                        }
+                        if (params.data.Bucket === 'Rejected') {
+                            return 'row-suggest-rejected';
+                        }
+                        if (params.data.Bucket === 'Invalid') {
+                            return 'row-suggest-invalid';
+                        }
+                        return null;
+                    }
+                    """
+                )
+
+                # Display 3-column layout: 5 Suggested Bids | Best Par Bids | Best EV Bids
+                sug_col, par_col, ev_col = st.columns(3)
+                
+                with sug_col:
+                    if suggested_bids_rows:
+                        st.markdown("**Best Bids Ranked by Model**")
+                        sug_df = pl.DataFrame(
+                            [
+                                {
+                                    "_idx": r["_idx"],
+                                    "Bid": r["Bid"],
+                                    "Criteria": r["Criteria"],
+                                    "EV": r["EV"],
+                                    "Deals": r["Deals"],
+                                    "Matches": r["Matches"],
+                                    "Bucket": r["Bucket"],
+                                }
+                                for r in suggested_bids_rows
+                            ]
+                        )
+                        sug_pdf = sug_df.to_pandas()
+                        gb_sug = GridOptionsBuilder.from_dataframe(sug_pdf)
+                        gb_sug.configure_selection(selection_mode="single", use_checkbox=False)
+                        gb_sug.configure_column("_idx", hide=True)
+                        gb_sug.configure_column("Bucket", hide=True)
+                        gb_sug.configure_column("Matches", width=105)  # adjusted
+                        gb_sug.configure_grid_options(
+                            getRowClass=row_class_js,
+                            rowHeight=25,
+                            headerHeight=25,
+                        )
+                        sug_opts = gb_sug.build()
+                        sug_resp = AgGrid(
+                            sug_pdf,
+                            gridOptions=sug_opts,
+                            height=175,
+                            update_on=["selectionChanged"],
+                            theme="balham",
+                            allow_unsafe_jscode=True,
+                            custom_css=bid_table_css,
+                            key=f"auction_builder_suggested_bids_{current_auction}_{current_seat}",
+                        )
+                        handle_bid_selection(sug_resp)
+                    else:
+                        st.markdown("**Best Bids Ranked by Model**")
+                        st.caption("No suggested bids available")
+                
+                with par_col:
+                    st.markdown("**Best Bids Ranked by DD**")
+                    if best_par_bids:
+                        par_pdf = best_par_bids_df.to_pandas()
+                        gb_par = GridOptionsBuilder.from_dataframe(par_pdf)
+                        gb_par.configure_column("Bucket", hide=True)
+                        gb_par.configure_column("Contract", width=90)  # 10% tighter
+                        gb_par.configure_column("Matches", width=105)   # adjusted
+                        gb_par.configure_grid_options(
+                            getRowClass=row_class_js,
+                            rowHeight=25,
+                            headerHeight=25,
+                        )
+                        par_opts = gb_par.build()
+                        AgGrid(
+                            par_pdf,
+                            gridOptions=par_opts,
+                            height=175,
+                            theme="balham",
+                            allow_unsafe_jscode=True,
+                            custom_css=bid_table_css,
+                            key=f"auction_builder_best_par_bids_{current_seat}",
+                        )
+                    else:
+                        st.caption("No Par scores available")
+                
+                with ev_col:
+                    st.markdown("**Best Bids Ranked by EV**")
+                    if best_ev_bids:
+                        ev_pdf = best_ev_bids_df.to_pandas()
+                        gb_ev = GridOptionsBuilder.from_dataframe(ev_pdf)
+                        gb_ev.configure_column("Bucket", hide=True)
+                        gb_ev.configure_column("Contract", width=90)  # 10% tighter
+                        gb_ev.configure_column("Matches", width=105)   # adjusted
+                        gb_ev.configure_grid_options(
+                            getRowClass=row_class_js,
+                            rowHeight=25,
+                            headerHeight=25,
+                        )
+                        ev_opts = gb_ev.build()
+                        AgGrid(
+                            ev_pdf,
+                            gridOptions=ev_opts,
+                            height=175,
+                            theme="balham",
+                            allow_unsafe_jscode=True,
+                            custom_css=bid_table_css,
+                            key=f"auction_builder_best_ev_bids_{current_seat}",
+                        )
+                    else:
+                        st.caption("No EV scores available")
 
                 if not valid_rows:
                     st.warning(
@@ -6597,11 +6759,11 @@ def render_auction_builder():
                         valid_df = valid_df.drop("can_complete")
                     valid_pdf = valid_df.to_pandas()
                     valid_opts = build_bid_grid_options(valid_pdf, apply_row_styling=False)
-                    # Height: header (45) + rows (35 each) + horizontal scrollbar allowance (25)
+                    # Height: header (25) + rows (25 each) + buffer (35)
                     valid_resp = AgGrid(
                         valid_pdf,
                         gridOptions=valid_opts,
-                        height=min(350, 70 + len(valid_rows) * 35),
+                        height=min(375, 60 + len(valid_rows) * 25),
                         update_on=["selectionChanged"],
                         key=f"auction_builder_valid_grid_{current_seat}",
                         theme="balham",
@@ -6637,21 +6799,27 @@ def render_auction_builder():
                     if pinned_deal:
                         gb_rej.configure_column("Direction", width=125, minWidth=115)  # 9 chars
                     gb_rej.configure_column("Bid", width=80, minWidth=70)          # 3 chars
+                    if "Contract" in rejected_pdf.columns:
+                        gb_rej.configure_column("Contract", width=110, minWidth=95)
                     if "can_complete" in rejected_pdf.columns:
                         gb_rej.configure_column("can_complete", width=130, minWidth=120, headerName="Can Complete")
                     gb_rej.configure_column("Matches", width=115, minWidth=105)    # 7 chars
                     gb_rej.configure_column("Deals", width=100, minWidth=90)       # 5 chars
                     gb_rej.configure_column("Avg_EV", width=105, minWidth=95, headerName="Avg EV")   # 6 chars
+                    if "EV_Contract" in rejected_pdf.columns:
+                        gb_rej.configure_column("EV_Contract", width=120, minWidth=110, headerName="EV Contract")
+                    if "EV_Contract_Pre" in rejected_pdf.columns:
+                        gb_rej.configure_column("EV_Contract_Pre", width=140, minWidth=125, headerName="EV Contract Pre")
                     gb_rej.configure_column("EV_NV", width=100, minWidth=90, headerName="EV NV")    # 5 chars
                     gb_rej.configure_column("EV_V", width=90, minWidth=80, headerName="EV V")       # 4 chars
                     if "DD_[NESW]_[CDHSN]" in rejected_pdf.columns:
                         gb_rej.configure_column("DD_[NESW]_[CDHSN]", width=135, minWidth=120, headerName="DD")
+                    if "DD_Score_Contract" in rejected_pdf.columns:
+                        gb_rej.configure_column("DD_Score_Contract", width=135, minWidth=120, headerName="DD Score")
                     gb_rej.configure_column("Failure", width=115, minWidth=105)    # 7 chars
                     gb_rej.configure_column("Criteria", flex=1, minWidth=120, tooltipField="Criteria")
                     if "Expr" in rejected_pdf.columns:
                         gb_rej.configure_column("Expr", flex=1, minWidth=140, tooltipField="Expr")
-                    if "Agg_Exprs" in rejected_pdf.columns:
-                        gb_rej.configure_column("Agg_Exprs", flex=1, minWidth=140, tooltipField="Agg_Exprs")
 
                     # Display rules (match valid/invalid grids):
                     # - Pinned deal: show Avg_EV, hide EV_NV/EV_V
@@ -6661,11 +6829,16 @@ def render_auction_builder():
                         gb_rej.configure_column("EV_V", hide=True)
                     else:
                         gb_rej.configure_column("Avg_EV", hide=True)
+                        if "EV_Contract" in rejected_pdf.columns:
+                            gb_rej.configure_column("EV_Contract", hide=True)
+                        if "EV_Contract_Pre" in rejected_pdf.columns:
+                            gb_rej.configure_column("EV_Contract_Pre", hide=True)
+                    gb_rej.configure_grid_options(rowHeight=25, headerHeight=25)
                     rejected_opts = gb_rej.build()
                     rejected_resp = AgGrid(
                         rejected_pdf,
                         gridOptions=rejected_opts,
-                        height=min(250, 62 + len(rejected_rows) * 30),
+                        height=min(275, 60 + len(rejected_rows) * 25),
                         update_on=["selectionChanged"],
                         key=f"auction_builder_rejected_grid_{current_seat}",
                         theme="balham",
@@ -6683,11 +6856,11 @@ def render_auction_builder():
                     st.markdown(f"**❌ Invalid Bids ({len(invalid_rows)})**")
                     invalid_pdf = pl.DataFrame(invalid_rows).to_pandas()
                     invalid_opts = build_bid_grid_options(invalid_pdf, apply_row_styling=False)
-                    # Height: header (45) + rows (30 each) + horizontal scrollbar allowance (17)
+                    # Height: header (25) + rows (25 each) + buffer (35)
                     invalid_resp = AgGrid(
                         invalid_pdf,
                         gridOptions=invalid_opts,
-                        height=min(350, 62 + len(invalid_rows) * 30),
+                        height=min(375, 60 + len(invalid_rows) * 25),
                         update_on=["selectionChanged"],
                         key=f"auction_builder_invalid_grid_{current_seat}",
                         theme="balham",
@@ -6706,10 +6879,10 @@ def render_auction_builder():
                     other_pdf = pl.DataFrame(other_rows).to_pandas()
                     other_opts = build_bid_grid_options(other_pdf, apply_row_styling=False)
                     other_resp = AgGrid(
-                        # Height: header (45) + rows (30 each) + horizontal scrollbar allowance (17)
+                        # Height: header (25) + rows (25 each) + buffer (10)
                         other_pdf,
                         gridOptions=other_opts,
-                        height=min(300, 62 + len(other_rows) * 30),
+                        height=min(300, 35 + len(other_rows) * 25),
                         update_on=["selectionChanged"],
                         key=f"auction_builder_other_grid_{current_seat}",
                         theme="balham",
@@ -6729,7 +6902,7 @@ def render_auction_builder():
                     avail_resp = AgGrid(
                         avail_pdf,
                         gridOptions=avail_opts,
-                        height=min(350, 70 + len(available_rows) * 35),
+                        height=min(350, 35 + len(available_rows) * 25),
                         update_on=["selectionChanged"],
                         key=f"auction_builder_available_grid_{current_seat}",
                         theme="balham",
@@ -6768,12 +6941,13 @@ def render_auction_builder():
 
                     # No pinned deal: hide Avg_EV, show EV_NV/EV_V (same as main grid rules)
                     gb_rej.configure_column("Avg_EV", hide=True)
+                    gb_rej.configure_grid_options(rowHeight=25, headerHeight=25)
                     rejected_opts = gb_rej.build()
 
                     rejected_resp = AgGrid(
                         rejected_pdf,
                         gridOptions=rejected_opts,
-                        height=min(300, 62 + len(rejected_rows) * 30),
+                        height=min(325, 60 + len(rejected_rows) * 25),
                         update_on=["selectionChanged"],
                         key=f"auction_builder_rejected_grid_{current_seat}",
                         theme="balham",
@@ -6794,7 +6968,7 @@ def render_auction_builder():
                 grid_response = AgGrid(
                     pandas_df,
                     gridOptions=grid_options,
-                    height=min(400, 35 + len(bid_rows) * 28),
+                    height=min(400, 35 + len(bid_rows) * 25),
                     update_on=["selectionChanged"],
                     key=f"auction_builder_bids_grid_{current_seat}",
                     theme="balham",
@@ -7394,6 +7568,8 @@ def render_auction_builder():
         else:
             summary_hide_cols += ["Avg_EV"]
 
+        # Display Current Auction summary table
+        st.markdown("**Current Auction**")
         summary_selection = render_aggrid(
             summary_df,
             key="auction_builder_summary",
