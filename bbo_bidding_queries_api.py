@@ -1262,6 +1262,16 @@ class ContractEVDealsRequest(BaseModel):
     seed: Optional[int] = 0
     include_hands: bool = True
 
+
+class BestAuctionsLookaheadRequest(BaseModel):
+    """Request for server-side DFS to find best completed auctions by DD or EV."""
+    deal_row_idx: int          # Deal row index (from deal_df)
+    auction_prefix: str = ""   # Current auction prefix (empty = opening)
+    metric: str = "DD"         # "DD" or "EV"
+    max_depth: int = 20        # Max search depth
+    max_results: int = 10      # Max results to return
+
+
 # Import model registry for Bidding Arena
 from bbo_bidding_models import MODEL_REGISTRY
 
@@ -3568,6 +3578,36 @@ def contract_ev_deals(req: ContractEVDealsRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("contract-ev-deals", e)
+
+
+@app.post("/best-auctions-lookahead")
+def best_auctions_lookahead(req: BestAuctionsLookaheadRequest) -> Dict[str, Any]:
+    """Server-side DFS to find best completed auctions by DD or EV.
+    
+    Uses CSR index for O(1) next-bid traversal and bitmap DFs for O(1) criteria eval.
+    Single request replaces dozens of client-side API calls.
+    """
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+        resp = handler_module.handle_best_auctions_lookahead(
+            state=state,
+            deal_row_idx=req.deal_row_idx,
+            auction_prefix=req.auction_prefix,
+            metric=req.metric,
+            max_depth=req.max_depth,
+            max_results=req.max_results,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log_and_raise("best-auctions-lookahead", e)
 
 
 if __name__ == "__main__":  # pragma: no cover

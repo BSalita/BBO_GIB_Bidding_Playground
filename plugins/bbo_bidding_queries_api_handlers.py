@@ -8216,3 +8216,301 @@ def _handle_resolve_auction_path_fallback(
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return {"path": path_info, "elapsed_ms": round(elapsed_ms, 1)}
+
+
+# ---------------------------------------------------------------------------
+# Best Auctions Lookahead – Server-side DFS for DD/EV ranking
+# ---------------------------------------------------------------------------
+
+def handle_best_auctions_lookahead(
+    state: Dict[str, Any],
+    deal_row_idx: int,
+    auction_prefix: str,
+    metric: str,  # "DD" or "EV"
+    max_depth: int = 20,
+    max_results: int = 10,
+) -> Dict[str, Any]:
+    """Server-side DFS to find best completed auctions by DD or EV.
+    
+    Uses CSR index for O(1) next-bid traversal and bitmap DFs for O(1) criteria eval.
+    Single request replaces dozens of client-side API calls.
+    
+    Returns:
+        - auctions: List of {auction, contract, dd_score, ev, is_par}
+        - par_score: Deal's par score
+        - elapsed_ms: Processing time
+    """
+    t0 = time.perf_counter()
+    
+    deal_df = state.get("deal_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+    g3_index = state.get("g3_index")
+    
+    if deal_df is None:
+        raise ValueError("deal_df not loaded")
+    
+    # Get deal row
+    try:
+        deal_row = deal_df.row(int(deal_row_idx), named=True)
+    except (IndexError, ValueError) as e:
+        raise ValueError(f"Invalid deal_row_idx {deal_row_idx}: {e}")
+    
+    dealer_actual = str(deal_row.get("Dealer", "N")).upper()
+    par_score = deal_row.get("ParScore", deal_row.get("Par_Score"))
+    par_score_i: int | None = None
+    try:
+        par_score_i = int(par_score) if par_score is not None else None
+    except Exception:
+        par_score_i = None
+    
+    # Normalize auction prefix
+    auction_norm = normalize_auction_input(auction_prefix).upper() if auction_prefix else ""
+    
+    # Helper: strip leading passes for BT lookup
+    def strip_lp(auc: str) -> tuple[str, int]:
+        toks = [t.strip().upper() for t in auc.split("-") if t.strip()] if auc else []
+        n = 0
+        for t in toks:
+            if t == "P":
+                n += 1
+            else:
+                break
+        if n >= len(toks):
+            return "", n
+        return "-".join(toks[n:]), n
+    
+    # Helper: check if auction is complete
+    def is_complete(auc: str) -> bool:
+        bids = [b.strip().upper() for b in auc.split("-") if b.strip()]
+        if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
+            return True
+        last_c = -1
+        for i, b in enumerate(bids):
+            if b not in ("P", "X", "XX") and b and b[0].isdigit():
+                last_c = i
+        return last_c >= 0 and len(bids) >= last_c + 4 and all(b == "P" for b in bids[-3:])
+    
+    # Helper: get contract string
+    def get_contract(auc: str) -> str:
+        from bbo_bidding_queries_lib import parse_contract_from_auction
+        c = parse_contract_from_auction(auc)
+        if c:
+            l, s, _ = c
+            return f"{l}{'NT' if str(s).upper() == 'N' else str(s).upper()}"
+        toks = [t.strip().upper() for t in auc.split("-") if t.strip()]
+        return "Passed out" if toks and all(t == "P" for t in toks) else "?"
+    
+    # Helper: evaluate criteria for a deal (O(1) bitmap lookup)
+    def eval_criteria(criteria_list: List[str], bt_seat: int, dealer_rot: str) -> bool:
+        if not criteria_list:
+            return True  # Empty criteria = pass
+        
+        criteria_df = deal_criteria_by_seat_dfs.get(bt_seat, {}).get(dealer_rot)
+        available_cols = set(criteria_df.columns) if criteria_df is not None else set()
+        
+        for crit in criteria_list:
+            if crit is None:
+                continue
+            crit_s = str(crit)
+            
+            # Try dynamic SL evaluation first
+            sl_result = evaluate_sl_criterion(crit_s, dealer_rot, bt_seat, deal_row, fail_on_missing=False)
+            if sl_result is True:
+                continue
+            elif sl_result is False:
+                return False
+            
+            # Check if it was an SL criterion that couldn't be evaluated
+            if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
+                continue  # Treat as pass (permissive)
+            
+            # Bitmap lookup
+            if criteria_df is not None and crit_s in available_cols:
+                try:
+                    if not bool(criteria_df[crit_s][int(deal_row_idx)]):
+                        return False
+                except (IndexError, KeyError):
+                    continue  # Treat as pass
+            # Unknown criterion: treat as pass (permissive)
+        
+        return True
+    
+    # Helper: get next bids from CSR index with criteria filtering
+    def get_valid_next_bids(prefix_auc: str) -> List[Tuple[str, int, bool]]:
+        """Returns list of (bid, bt_index, is_completed) for criteria-pass bids."""
+        bt_prefix, lp = strip_lp(prefix_auc)
+        
+        # Resolve current bt_index
+        if not bt_prefix:
+            # Opening bids
+            openings = g3_index.openings if g3_index else {}
+            parent_idx = None
+        else:
+            parent_idx = _resolve_bt_index_by_traversal(state, bt_prefix)
+            if parent_idx is None:
+                return []
+        
+        # Get children
+        if parent_idx is None:
+            # Use openings dict for empty prefix
+            if not g3_index or not g3_index.openings:
+                return []
+            child_map = dict(g3_index.openings)
+        else:
+            child_map = _get_child_map_for_parent(state, parent_idx)
+        
+        if not child_map:
+            return []
+        
+        # Load metadata for children (agg_expr, is_completed_auction)
+        child_indices = list(child_map.values())
+        file_path = _bt_file_path_for_sql(state)
+        in_list = ", ".join(str(int(x)) for x in child_indices)
+        
+        conn = duckdb.connect(":memory:")
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT bt_index, candidate_bid, is_completed_auction, Expr
+                FROM read_parquet('{file_path}')
+                WHERE bt_index IN ({in_list})
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        
+        # Build metadata map
+        meta: Dict[int, Dict[str, Any]] = {}
+        for r in rows:
+            meta[int(r[0])] = {
+                "bid": str(r[1]).upper() if r[1] else "",
+                "is_complete": bool(r[2]),
+                "expr": r[3] if r[3] else [],
+            }
+        
+        # Seat/dealer for criteria evaluation
+        toks = [t for t in prefix_auc.split("-") if t.strip()] if prefix_auc else []
+        display_seat = (len(toks) % 4) + 1
+        bt_seat = ((display_seat - 1 - lp) % 4) + 1
+        dealer_rot = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + lp) % 4]
+        
+        # Filter by criteria
+        valid: List[Tuple[str, int, bool]] = []
+        for bid, idx in child_map.items():
+            m = meta.get(idx, {})
+            expr = m.get("expr") or []
+            if eval_criteria(expr, bt_seat, dealer_rot):
+                valid.append((bid, idx, m.get("is_complete", False)))
+        
+        return valid
+    
+    # Caches for DFS
+    dd_cache: Dict[str, int] = {}
+    ev_cache: Dict[str, float] = {}
+    ui_valid_cache: Dict[str, List[Tuple[str, int, bool]]] = {}
+    
+    def get_dd(auc: str) -> int:
+        if auc in dd_cache:
+            return dd_cache[auc]
+        try:
+            v = get_dd_score_for_auction(auc, dealer_actual, deal_row)
+            out = int(v) if v is not None else -99999
+        except Exception:
+            out = -99999
+        dd_cache[auc] = out
+        return out
+    
+    def get_ev(auc: str) -> float:
+        if auc in ev_cache:
+            return ev_cache[auc]
+        try:
+            v = get_ev_for_auction(auc, dealer_actual, deal_row)
+            out = float(v) if v is not None else float("-inf")
+        except Exception:
+            out = float("-inf")
+        ev_cache[auc] = out
+        return out
+    
+    # Results: (score, dd, ev, auction, contract)
+    results: List[Tuple[float, int, float, str, str]] = []
+    
+    def dfs(prefix_auc: str, depth: int) -> None:
+        if depth >= max_depth:
+            return
+        if len(results) >= max_results * 50:
+            return
+        
+        cache_key = prefix_auc
+        if cache_key in ui_valid_cache:
+            valid = ui_valid_cache[cache_key]
+        else:
+            valid = get_valid_next_bids(prefix_auc)
+            ui_valid_cache[cache_key] = valid
+        
+        if not valid:
+            return
+        
+        # Score and sort candidates by the chosen metric
+        scored: List[Tuple[float, str, int, bool]] = []
+        for bid, idx, is_comp in valid:
+            child_auc = f"{prefix_auc}-{bid}" if prefix_auc else bid
+            if is_comp or is_complete(child_auc):
+                dd_v = get_dd(child_auc)
+                ev_v = get_ev(child_auc)
+                score = float(dd_v) if metric.upper() == "DD" else ev_v
+                results.append((score, dd_v, ev_v, child_auc, get_contract(child_auc)))
+                scored.append((score, bid, idx, True))
+            else:
+                # Estimate score for ordering (use DD/EV of standing contract)
+                dd_v = get_dd(child_auc)
+                ev_v = get_ev(child_auc)
+                score = float(dd_v) if metric.upper() == "DD" else ev_v
+                scored.append((score, bid, idx, False))
+        
+        # Sort by score descending, explore top candidates
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        for score, bid, idx, is_comp in scored[:10]:
+            if is_comp:
+                continue  # Already added to results
+            child_auc = f"{prefix_auc}-{bid}" if prefix_auc else bid
+            dfs(child_auc, depth + 1)
+    
+    # Start DFS
+    dfs(auction_norm, 0)
+    
+    # Deduplicate and sort results
+    results.sort(key=lambda x: x[0], reverse=True)
+    seen: Set[str] = set()
+    output: List[Dict[str, Any]] = []
+    
+    for score, dd_v, ev_v, auc, contract in results:
+        if auc in seen:
+            continue
+        seen.add(auc)
+        is_par = par_score_i is not None and dd_v == par_score_i
+        output.append({
+            "auction": auc,
+            "contract": contract,
+            "dd_score": dd_v if dd_v > -90000 else None,
+            "ev": round(ev_v, 1) if ev_v != float("-inf") else None,
+            "is_par": is_par,
+        })
+    
+    # Output policy: all par auctions + fill to max_results
+    if par_score_i is not None:
+        par_aucs = [r for r in output if r.get("is_par")]
+        non_par = [r for r in output if not r.get("is_par")]
+        final = list(par_aucs)
+        if len(final) < max_results:
+            final.extend(non_par[: max_results - len(final)])
+    else:
+        final = output[:max_results]
+    
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "auctions": final,
+        "par_score": par_score_i,
+        "metric": metric.upper(),
+        "elapsed_ms": round(elapsed_ms, 1),
+    }

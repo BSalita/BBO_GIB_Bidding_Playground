@@ -5395,7 +5395,7 @@ def render_new_rules_metrics():
             st.error(f"Error fetching new rules metrics: {e}")
 
 
-def render_auction_builder():
+def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     """Build an auction step-by-step by selecting bids from BT-derived options."""
     st.header("🔨 Auction Builder")
     st.markdown("""
@@ -5687,17 +5687,17 @@ def render_auction_builder():
         # Tight button row - each button fills its narrow column
         btn_cols = st.columns([2, 2, 2, 2], gap="small")
         with btn_cols[0]:
-            apply_edit = st.button("Apply", key="auction_builder_apply_edit", use_container_width=True)
+            apply_edit = st.button("Apply", key="auction_builder_apply_edit", width="stretch")
         with btn_cols[1]:
-            append_ppp = st.button("Pass Out", key="auction_builder_append_ppp", help="Append '-P-P-P' and apply", use_container_width=True)
+            append_ppp = st.button("Pass Out", key="auction_builder_append_ppp", help="Append '-P-P-P' and apply", width="stretch")
         with btn_cols[2]:
-            if current_path and st.button("Undo", key="auction_builder_undo", use_container_width=True):
+            if current_path and st.button("Undo", key="auction_builder_undo", width="stretch"):
                 st.session_state.auction_builder_path.pop()
                 st.session_state.auction_builder_last_applied = ""
                 st.session_state.auction_builder_last_selected = ""  # Reset to allow re-selecting same bid
                 st.rerun()
         with btn_cols[3]:
-            if st.button("Clear", key="auction_builder_clear", help="Clear the current auction", use_container_width=True):
+            if st.button("Clear", key="auction_builder_clear", help="Clear the current auction", width="stretch"):
                 _clear_current_auction_state()
                 st.rerun()
 
@@ -6587,6 +6587,7 @@ def render_auction_builder():
                 for r in par_sorted:
                     dd_val = r.get("DD_Score_Contract")
                     best_par_bids.append({
+                        "_idx": r.get("_idx"),
                         "Bid": r.get("Bid", ""),
                         "Contract": r.get("Contract", ""),
                         "DD": int(dd_val) if dd_val is not None else None,
@@ -6604,6 +6605,7 @@ def render_auction_builder():
                 )[:5]  # Top 5
                 for r in ev_sorted:
                     best_ev_bids.append({
+                        "_idx": r.get("_idx"),
                         "Bid": r.get("Bid", ""),
                         "Contract": r.get("Contract", ""),
                         "EV": r.get("EV_Contract"),
@@ -6691,6 +6693,8 @@ def render_auction_builder():
                     if best_par_bids:
                         par_pdf = best_par_bids_df.to_pandas()
                         gb_par = GridOptionsBuilder.from_dataframe(par_pdf)
+                        gb_par.configure_selection(selection_mode="single", use_checkbox=False)
+                        gb_par.configure_column("_idx", hide=True)
                         gb_par.configure_column("Bucket", hide=True)
                         gb_par.configure_column("Contract", width=90)  # 10% tighter
                         gb_par.configure_column("Matches", width=105)   # adjusted
@@ -6700,15 +6704,17 @@ def render_auction_builder():
                             headerHeight=25,
                         )
                         par_opts = gb_par.build()
-                        AgGrid(
+                        par_resp = AgGrid(
                             par_pdf,
                             gridOptions=par_opts,
                             height=175,
+                            update_on=["selectionChanged"],
                             theme="balham",
                             allow_unsafe_jscode=True,
                             custom_css=bid_table_css,
                             key=f"auction_builder_best_par_bids_{current_seat}",
                         )
+                        handle_bid_selection(par_resp)
                     else:
                         st.caption("No Par scores available")
                 
@@ -6717,6 +6723,8 @@ def render_auction_builder():
                     if best_ev_bids:
                         ev_pdf = best_ev_bids_df.to_pandas()
                         gb_ev = GridOptionsBuilder.from_dataframe(ev_pdf)
+                        gb_ev.configure_selection(selection_mode="single", use_checkbox=False)
+                        gb_ev.configure_column("_idx", hide=True)
                         gb_ev.configure_column("Bucket", hide=True)
                         gb_ev.configure_column("Contract", width=90)  # 10% tighter
                         gb_ev.configure_column("Matches", width=105)   # adjusted
@@ -6726,17 +6734,1180 @@ def render_auction_builder():
                             headerHeight=25,
                         )
                         ev_opts = gb_ev.build()
-                        AgGrid(
+                        ev_resp = AgGrid(
                             ev_pdf,
                             gridOptions=ev_opts,
                             height=175,
+                            update_on=["selectionChanged"],
                             theme="balham",
                             allow_unsafe_jscode=True,
                             custom_css=bid_table_css,
                             key=f"auction_builder_best_ev_bids_{current_seat}",
                         )
+                        handle_bid_selection(ev_resp)
                     else:
                         st.caption("No EV scores available")
+
+                # Best Auctions by DD: find top auctions via UI-valid bids (criteria-pass only)
+                def find_best_reachable_auctions_from_valid(
+                    start_valid_rows: list[dict[str, Any]],
+                    start_auction: str,
+                    max_results: int = 5,
+                    max_depth: int = 20,
+                    max_api_calls: int = 1000,
+                ) -> list[dict[str, Any]]:
+                    """
+                    Best Auctions by DD.
+
+                    Uses the same lookahead concept as the debug trace's UI_Valid_Bid_Scores:
+                    for each UI-valid (criteria-pass) bid, explore deeper and compute the best
+                    completed DD score reachable in that subtree. Collect completed auctions
+                    and return all par-score auctions; if fewer than 5, fill with next-best DD.
+                    """
+                    if not pinned_deal or not start_valid_rows:
+                        return []
+                    
+                    dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
+                    row_idx = pinned_deal.get("_row_idx")
+                    par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
+                    par_score_i: int | None = None
+                    try:
+                        par_score_i = int(par_score) if par_score is not None else None
+                    except Exception:
+                        par_score_i = None
+                    
+                    # Collect completed auctions as: (dd_score, auction_str, contract_str, depth, path_bids)
+                    results: list[tuple[int, str, str, int, list[str]]] = []
+                    api_call_count = 0
+                    # Performance caches (per search invocation)
+                    ui_valid_cache: dict[str, list[dict[str, Any]]] = {}
+                    criteria_pass_cache: dict[tuple[str, int, tuple[str, ...]], bool] = {}
+                    
+                    def get_contract_str(auc: str) -> str:
+                        c = parse_contract_from_auction(auc)
+                        if c:
+                            l, s, _ = c
+                            return f"{l}{'NT' if str(s).upper() == 'N' else str(s).upper()}"
+                        return "Passed out" if all(t == "P" for t in auc.split("-") if t.strip()) else "?"
+
+                    def is_auc_complete(auc: str) -> bool:
+                        bids = [b.strip().upper() for b in auc.split("-") if b.strip()]
+                        if len(bids) >= 4 and all(b == "P" for b in bids[:4]): return True
+                        last_c = -1
+                        for i, b in enumerate(bids):
+                            if b not in ("P", "X", "XX") and b[0].isdigit(): last_c = i
+                        return last_c >= 0 and len(bids) >= last_c + 4 and all(b == "P" for b in bids[-3:])
+
+                    def _get_ui_valid_options(prefix_auc: str) -> list[dict[str, Any]]:
+                        """UI-valid (criteria-pass) candidates, ignoring UI rejection reasons."""
+                        nonlocal api_call_count
+                        cached = ui_valid_cache.get(prefix_auc)
+                        if cached is not None:
+                            return cached
+                        if api_call_count >= max_api_calls:
+                            out: list[dict[str, Any]] = []
+                            ui_valid_cache[prefix_auc] = out
+                            return out
+                        try:
+                            bt_prefix, lp_here = _strip_leading_passes(prefix_auc)
+                            api_call_count += 1
+                            opts = get_next_bid_options(bt_prefix)
+                        except Exception:
+                            out = []
+                            ui_valid_cache[prefix_auc] = out
+                            return out
+
+                        if not opts:
+                            out = []
+                            ui_valid_cache[prefix_auc] = out
+                            return out
+
+                        # Seat/dealer rotation must be computed from *this* prefix's leading passes.
+                        toks = [b for b in prefix_auc.split("-") if b.strip()]
+                        display_seat_here = (len(toks) % 4) + 1
+                        bt_seat_here = _bt_seat_from_display_seat(display_seat_here, lp_here)
+                        dealer_rot_here = _rotate_dealer_by(dealer_actual, lp_here)
+
+                        cand = [o for o in opts if not o.get("is_dead_end")]
+                        if row_idx is None:
+                            # Cannot evaluate criteria -> permissive.
+                            ui_valid_cache[prefix_auc] = cand
+                            return cand
+
+                        # Criteria-pass = failed/untracked are empty.
+                        valid: list[dict[str, Any]] = []
+                        no_crit = [o for o in cand if not (o.get("agg_expr") or [])]
+                        valid.extend(no_crit)
+
+                        with_crit = [o for o in cand if (o.get("agg_expr") or [])]
+                        if not with_crit:
+                            ui_valid_cache[prefix_auc] = valid
+                            return valid
+
+                        # Batch eval in chunks (avoid huge payloads), with per-criterion caching.
+                        chunk_size = 200
+                        i0 = 0
+                        while i0 < len(with_crit) and api_call_count < max_api_calls:
+                            chunk = with_crit[i0 : i0 + chunk_size]
+                            i0 += chunk_size
+                            try:
+                                # Split into cached vs unknown checks
+                                unknown: list[dict[str, Any]] = []
+                                for o in chunk:
+                                    crit = tuple(str(x) for x in (o.get("agg_expr") or []) if x is not None)
+                                    ck = (dealer_rot_here, int(bt_seat_here), crit)
+                                    cached_pass = criteria_pass_cache.get(ck)
+                                    if cached_pass is True:
+                                        valid.append(o)
+                                    elif cached_pass is False:
+                                        continue
+                                    else:
+                                        unknown.append(o)
+
+                                if not unknown:
+                                    continue
+
+                                api_call_count += 1
+                                res = api_post(
+                                    "/deal-criteria-eval-batch",
+                                    {
+                                        "deal_row_idx": int(row_idx),
+                                        "dealer": dealer_rot_here,
+                                        "checks": [{"seat": int(bt_seat_here), "criteria": list(o.get("agg_expr", []))} for o in unknown],
+                                    },
+                                    timeout=10,
+                                )
+                                rr = res.get("results") or []
+                                for j, r in enumerate(rr[: len(unknown)]):
+                                    if not (r.get("failed") or []) and not (r.get("untracked") or []):
+                                        valid.append(unknown[j])
+                                        crit = tuple(str(x) for x in (unknown[j].get("agg_expr") or []) if x is not None)
+                                        criteria_pass_cache[(dealer_rot_here, int(bt_seat_here), crit)] = True
+                                    else:
+                                        crit = tuple(str(x) for x in (unknown[j].get("agg_expr") or []) if x is not None)
+                                        criteria_pass_cache[(dealer_rot_here, int(bt_seat_here), crit)] = False
+                            except Exception:
+                                # Be permissive on server error.
+                                valid.extend(chunk)
+                        ui_valid_cache[prefix_auc] = valid
+                        return valid
+
+                    # Core recursion: for each UI-valid bid at a node, explore deeper and compute
+                    # the best DD reachable in that subtree (this is the same concept as UI_Valid_Bid_Scores).
+                    best_dd_cache: dict[tuple[str, int], int] = {}
+
+                    def explore(prefix_auc: str, path_bids: list[str], depth: int) -> int:
+                        nonlocal api_call_count
+                        if depth >= max_depth or api_call_count >= max_api_calls:
+                            return -99999
+
+                        cache_key = (prefix_auc, depth)
+                        if cache_key in best_dd_cache:
+                            return best_dd_cache[cache_key]
+
+                        best_here = -99999
+                        opts = _get_ui_valid_options(prefix_auc)
+                        if not opts:
+                            best_dd_cache[cache_key] = best_here
+                            return best_here
+
+                        # First compute per-candidate "best DD" by exploring further, then order candidates by that.
+                        scored_children: list[tuple[int, dict[str, Any], str, list[str], bool]] = []
+                        for o in opts:
+                            bid = str(o.get("bid", "")).upper()
+                            if not bid:
+                                continue
+                            child_auc = f"{prefix_auc}-{bid}" if prefix_auc else bid
+                            child_path = path_bids + [bid]
+                            is_complete_flag = bool(o.get("is_complete")) or is_auc_complete(child_auc)
+                            if is_complete_flag:
+                                ddv = None
+                                try:
+                                    ddv = get_dd_score_for_auction(child_auc, dealer_actual, pinned_deal)
+                                except Exception:
+                                    ddv = None
+                                dd_i = int(ddv) if ddv is not None else -99999
+                                best_here = max(best_here, dd_i)
+                                if ddv is not None:
+                                    results.append((dd_i, child_auc, get_contract_str(child_auc), depth + 1, child_path))
+                                scored_children.append((dd_i, o, child_auc, child_path, True))
+                            else:
+                                child_best = explore(child_auc, child_path, depth + 1)
+                                best_here = max(best_here, child_best)
+                                scored_children.append((child_best, o, child_auc, child_path, False))
+
+                        # If ParScore is known, optionally prune sub-branches that cannot reach Par.
+                        if par_score_i is not None:
+                            scored_children = [x for x in scored_children if x[0] >= int(par_score_i)]
+
+                        # Order: highest "best reachable DD" first.
+                        scored_children.sort(key=lambda x: x[0], reverse=True)
+
+                        # If we pruned above, we already explored those subtrees when computing child_best.
+                        # No further action needed here.
+                        best_dd_cache[cache_key] = best_here
+                        return best_here
+
+                    # Kick off exploration from the current auction prefix.
+                    # (We intentionally do NOT rely on the UI "Valid" grid rows here, because those exclude
+                    # UI-rejected bids; per requirement we ignore UI rejection and only enforce criteria-pass.)
+                    explore(start_auction, [], 0)
+                    
+                    # Dedup + sort results (best DD first, shorter depth tie-break)
+                    results.sort(key=lambda x: (x[0], -x[3]), reverse=True)
+                    uniq: list[dict[str, Any]] = []
+                    seen: set[str] = set()
+                    for dd_score, auction_str, contract_str, depth, path_bids in results:
+                        if auction_str in seen:
+                            continue
+                        seen.add(auction_str)
+                        achieves_par = par_score_i is not None and dd_score == int(par_score_i)
+                        uniq.append(
+                            {
+                                "Auction": auction_str,
+                                "Contract": contract_str,
+                                "DD_Score": dd_score,
+                                "Par": "✅" if achieves_par else "",
+                                "Depth": depth,
+                            }
+                        )
+
+                    # Output policy:
+                    # - Include ALL Par-score auctions (if ParScore is known).
+                    # - If fewer than 5 Par auctions, fill up to 5 rows with next-best DD auctions.
+                    if par_score_i is not None:
+                        par_rows = [r for r in uniq if r.get("Par") == "✅"]
+                        non_par_rows = [r for r in uniq if r.get("Par") != "✅"]
+                        out = list(par_rows)
+                        if len(out) < 5:
+                            out.extend(non_par_rows[: max(0, 5 - len(out))])
+                        return out
+
+                    # No ParScore available: return top-N best DD.
+                    return uniq[:max_results]
+
+                def find_best_auctions_by_ev_from_valid(
+                    start_valid_rows: list[dict[str, Any]],
+                    start_auction: str,
+                    max_results: int = 5,
+                    max_depth: int = 20,
+                    max_api_calls: int = 1000,
+                ) -> list[dict[str, Any]]:
+                    """Best Auctions by EV (criteria-pass only; ignore UI rejection)."""
+                    if not pinned_deal:
+                        return []
+
+                    dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
+                    row_idx = pinned_deal.get("_row_idx")
+                    par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
+                    try:
+                        par_score_i = int(par_score) if par_score is not None else None
+                    except Exception:
+                        par_score_i = None
+
+                    api_call_count = 0
+                    # Performance caches (per search invocation)
+                    ui_valid_cache: dict[str, list[dict[str, Any]]] = {}
+                    criteria_pass_cache: dict[tuple[str, int, tuple[str, ...]], bool] = {}
+                    # Collect completed auctions as: (ev, dd, auction_str, contract_str, depth, path_bids)
+                    ev_results: list[tuple[float, int, str, str, int, list[str]]] = []
+
+                    def get_contract_str(auc: str) -> str:
+                        c = parse_contract_from_auction(auc)
+                        if c:
+                            l, s, _ = c
+                            return f"{l}{'NT' if str(s).upper() == 'N' else str(s).upper()}"
+                        return "Passed out" if all(t == "P" for t in auc.split("-") if t.strip()) else "?"
+
+                    def is_auc_complete(auc: str) -> bool:
+                        bids = [b.strip().upper() for b in auc.split("-") if b.strip()]
+                        if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
+                            return True
+                        last_c = -1
+                        for i, b in enumerate(bids):
+                            if b not in ("P", "X", "XX") and b[0].isdigit():
+                                last_c = i
+                        return last_c >= 0 and len(bids) >= last_c + 4 and all(b == "P" for b in bids[-3:])
+
+                    def _get_ui_valid_options(prefix_auc: str) -> list[dict[str, Any]]:
+                        """UI-valid (criteria-pass) candidates, ignoring UI rejection reasons."""
+                        nonlocal api_call_count
+                        cached = ui_valid_cache.get(prefix_auc)
+                        if cached is not None:
+                            return cached
+                        if api_call_count >= max_api_calls:
+                            out: list[dict[str, Any]] = []
+                            ui_valid_cache[prefix_auc] = out
+                            return out
+                        try:
+                            bt_prefix, lp_here = _strip_leading_passes(prefix_auc)
+                            api_call_count += 1
+                            opts = get_next_bid_options(bt_prefix)
+                        except Exception:
+                            out = []
+                            ui_valid_cache[prefix_auc] = out
+                            return out
+
+                        if not opts:
+                            out = []
+                            ui_valid_cache[prefix_auc] = out
+                            return out
+
+                        toks = [b for b in prefix_auc.split("-") if b.strip()]
+                        display_seat_here = (len(toks) % 4) + 1
+                        bt_seat_here = _bt_seat_from_display_seat(display_seat_here, lp_here)
+                        dealer_rot_here = _rotate_dealer_by(dealer_actual, lp_here)
+
+                        cand = [o for o in opts if not o.get("is_dead_end")]
+                        if row_idx is None:
+                            ui_valid_cache[prefix_auc] = cand
+                            return cand
+
+                        valid: list[dict[str, Any]] = []
+                        no_crit = [o for o in cand if not (o.get("agg_expr") or [])]
+                        valid.extend(no_crit)
+                        with_crit = [o for o in cand if (o.get("agg_expr") or [])]
+                        if not with_crit:
+                            ui_valid_cache[prefix_auc] = valid
+                            return valid
+
+                        chunk_size = 200
+                        i0 = 0
+                        while i0 < len(with_crit) and api_call_count < max_api_calls:
+                            chunk = with_crit[i0 : i0 + chunk_size]
+                            i0 += chunk_size
+                            try:
+                                unknown: list[dict[str, Any]] = []
+                                for o in chunk:
+                                    crit = tuple(str(x) for x in (o.get("agg_expr") or []) if x is not None)
+                                    ck = (dealer_rot_here, int(bt_seat_here), crit)
+                                    cached_pass = criteria_pass_cache.get(ck)
+                                    if cached_pass is True:
+                                        valid.append(o)
+                                    elif cached_pass is False:
+                                        continue
+                                    else:
+                                        unknown.append(o)
+
+                                if not unknown:
+                                    continue
+
+                                api_call_count += 1
+                                res = api_post(
+                                    "/deal-criteria-eval-batch",
+                                    {
+                                        "deal_row_idx": int(row_idx),
+                                        "dealer": dealer_rot_here,
+                                        "checks": [{"seat": int(bt_seat_here), "criteria": list(o.get("agg_expr", []))} for o in unknown],
+                                    },
+                                    timeout=10,
+                                )
+                                rr = res.get("results") or []
+                                for j, r in enumerate(rr[: len(unknown)]):
+                                    if not (r.get("failed") or []) and not (r.get("untracked") or []):
+                                        valid.append(unknown[j])
+                                        crit = tuple(str(x) for x in (unknown[j].get("agg_expr") or []) if x is not None)
+                                        criteria_pass_cache[(dealer_rot_here, int(bt_seat_here), crit)] = True
+                                    else:
+                                        crit = tuple(str(x) for x in (unknown[j].get("agg_expr") or []) if x is not None)
+                                        criteria_pass_cache[(dealer_rot_here, int(bt_seat_here), crit)] = False
+                            except Exception:
+                                valid.extend(chunk)
+                        ui_valid_cache[prefix_auc] = valid
+                        return valid
+
+                    best_ev_cache: dict[tuple[str, int], float] = {}
+
+                    def explore(prefix_auc: str, path_bids: list[str], depth: int) -> float:
+                        nonlocal api_call_count
+                        if depth >= max_depth or api_call_count >= max_api_calls:
+                            return float("-inf")
+
+                        cache_key = (prefix_auc, depth)
+                        if cache_key in best_ev_cache:
+                            return best_ev_cache[cache_key]
+
+                        best_here = float("-inf")
+                        opts = _get_ui_valid_options(prefix_auc)
+                        if not opts:
+                            best_ev_cache[cache_key] = best_here
+                            return best_here
+
+                        # Compute per-candidate best EV by exploring further
+                        scored_children: list[tuple[float, dict[str, Any], str, list[str], bool]] = []
+                        for o in opts:
+                            bid = str(o.get("bid", "")).upper()
+                            if not bid:
+                                continue
+                            child_auc = f"{prefix_auc}-{bid}" if prefix_auc else bid
+                            child_path = path_bids + [bid]
+                            is_complete_flag = bool(o.get("is_complete")) or is_auc_complete(child_auc)
+                            if is_complete_flag:
+                                evv = None
+                                ddv = None
+                                try:
+                                    evv = get_ev_for_auction(child_auc, dealer_actual, pinned_deal)
+                                except Exception:
+                                    evv = None
+                                try:
+                                    ddv = get_dd_score_for_auction(child_auc, dealer_actual, pinned_deal)
+                                except Exception:
+                                    ddv = None
+                                ev_f = float(evv) if evv is not None else float("-inf")
+                                dd_i = int(ddv) if ddv is not None else -99999
+                                best_here = max(best_here, ev_f)
+                                if evv is not None:
+                                    ev_results.append((ev_f, dd_i, child_auc, get_contract_str(child_auc), depth + 1, child_path))
+                                scored_children.append((ev_f, o, child_auc, child_path, True))
+                            else:
+                                child_best = explore(child_auc, child_path, depth + 1)
+                                best_here = max(best_here, child_best)
+                                scored_children.append((child_best, o, child_auc, child_path, False))
+
+                        scored_children.sort(key=lambda x: x[0], reverse=True)
+                        best_ev_cache[cache_key] = best_here
+                        return best_here
+
+                    explore(start_auction, [], 0)
+
+                    # Dedup + sort results (best EV first; tie-break by DD then shorter depth)
+                    ev_results.sort(key=lambda x: (x[0], x[1], -x[4]), reverse=True)
+                    uniq: list[dict[str, Any]] = []
+                    seen: set[str] = set()
+                    for ev_f, dd_i, auction_str, contract_str, depth, path_bids in ev_results:
+                        if auction_str in seen:
+                            continue
+                        seen.add(auction_str)
+                        achieves_par = par_score_i is not None and dd_i == int(par_score_i)
+                        uniq.append(
+                            {
+                                "Auction": auction_str,
+                                "Contract": contract_str,
+                                "EV": round(float(ev_f), 1) if ev_f != float("-inf") else None,
+                                "DD_Score": dd_i if dd_i > -90000 else None,
+                                "Par": "✅" if achieves_par else "",
+                                "Depth": depth,
+                            }
+                        )
+
+                    return uniq[:max_results]
+
+                # Best Auctions by DD: lazy search triggered by button (server-side DFS)
+                if pinned_deal and valid_rows:
+                    st.markdown("**Best Auctions by DD**")
+                    cache_key_dd = f"_best_auctions_dd_cache_{current_auction}"
+                    cache_key_dd_elapsed = f"{cache_key_dd}__elapsed_s"
+                    best_auctions_dd: list[dict[str, Any]] = st.session_state.get(cache_key_dd, [])
+                    if st.button("🏆 Best Auctions by DD", key=f"search_best_auctions_dd_{current_seat}"):
+                        with st.spinner("Searching (server-side)..."):
+                            t0 = time.perf_counter()
+                            row_idx = pinned_deal.get("_row_idx")
+                            if row_idx is not None:
+                                try:
+                                    resp = api_post("/best-auctions-lookahead", {
+                                        "deal_row_idx": int(row_idx),
+                                        "auction_prefix": current_auction or "",
+                                        "metric": "DD",
+                                        "max_depth": 20,
+                                        "max_results": 10,
+                                    }, timeout=30)
+                                    # Convert API response to UI format
+                                    par_score_i = resp.get("par_score")
+                                    best_auctions_dd = []
+                                    for a in resp.get("auctions", []):
+                                        best_auctions_dd.append({
+                                            "Auction": a.get("auction", ""),
+                                            "Contract": a.get("contract", ""),
+                                            "DD_Score": a.get("dd_score"),
+                                            "Par": "✅" if a.get("is_par") else "",
+                                            "Depth": 0,  # Not tracked by server
+                                        })
+                                except Exception as e:
+                                    st.error(f"Server-side search failed: {e}")
+                                    best_auctions_dd = []
+                            else:
+                                best_auctions_dd = []
+                            st.session_state[cache_key_dd] = best_auctions_dd
+                            st.session_state[cache_key_dd_elapsed] = float(time.perf_counter() - t0)
+                    if best_auctions_dd:
+                        par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
+                        ach_count = sum(1 for a in best_auctions_dd if a.get("Par") == "✅")
+                        if par_score is not None:
+                            if ach_count > 0:
+                                elapsed_s = st.session_state.get(cache_key_dd_elapsed)
+                                elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
+                                st.success(f"Found {ach_count} auction(s) achieving par score of {par_score} ({elapsed_txt})")
+                            else:
+                                elapsed_s = st.session_state.get(cache_key_dd_elapsed)
+                                elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
+                                st.warning(f"Par score {par_score} not reachable via criteria-pass bids ({elapsed_txt}). Best DD: {best_auctions_dd[0]['DD_Score']}")
+                        
+                        best_auctions_df = pl.DataFrame(best_auctions_dd)
+                        best_auctions_pdf = best_auctions_df.to_pandas()
+                        
+                        gb_best = GridOptionsBuilder.from_dataframe(best_auctions_pdf)
+                        gb_best.configure_selection(selection_mode="single", use_checkbox=False)
+                        gb_best.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
+                        gb_best.configure_column("Contract", width=90)
+                        gb_best.configure_column("DD_Score", width=100, headerName="DD Score")
+                        gb_best.configure_column("Par", width=60)
+                        gb_best.configure_column("Depth", width=70)
+                        gb_best.configure_grid_options(rowHeight=25, headerHeight=25)
+                        best_opts = gb_best.build()
+                        
+                        best_auctions_resp = AgGrid(
+                            best_auctions_pdf,
+                            gridOptions=best_opts,
+                            height=min(200, 60 + len(best_auctions_dd) * 25),
+                            update_on=["selectionChanged"],
+                            theme="balham",
+                            key=f"auction_builder_best_auctions_dd_{current_seat}",
+                            custom_css={
+                                ".ag-row": {"cursor": "pointer"},
+                                ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
+                                ".ag-row-selected": {"background-color": "#CCE5FF !important"},
+                            },
+                        )
+                        
+                        # Handle selection: apply the selected auction
+                        sel_rows = best_auctions_resp.get("selected_rows")
+                        if sel_rows is not None and len(sel_rows) > 0:
+                            sel_row_data = sel_rows[0] if isinstance(sel_rows, list) else sel_rows.iloc[0].to_dict()
+                            selected_auction = str(sel_row_data.get("Auction", "")).strip()
+                            
+                            if selected_auction and selected_auction != current_auction:
+                                # Resolve the auction path and apply it
+                                try:
+                                    data = api_post("/resolve-auction-path", {"auction": selected_auction}, timeout=30)
+                                    new_path = data.get("path", [])
+                                    if new_path:
+                                        st.session_state.auction_builder_path = new_path
+                                        st.session_state.auction_builder_last_applied = selected_auction.upper()
+                                        st.session_state.auction_builder_last_selected = ""
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to apply auction: {e}")
+                    elif cache_key_dd in st.session_state:
+                        # Search was performed but found nothing
+                        st.info("No completed auctions found via criteria-pass bid paths.")
+
+                    st.markdown("**Best Auctions by EV**")
+                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}"
+                    cache_key_ev_elapsed = f"{cache_key_ev}__elapsed_s"
+                    best_auctions_ev: list[dict[str, Any]] = st.session_state.get(cache_key_ev, [])
+                    if st.button("📈 Best Auctions by EV", key=f"search_best_auctions_ev_{current_seat}"):
+                        with st.spinner("Searching (server-side)..."):
+                            t0_ev = time.perf_counter()
+                            row_idx = pinned_deal.get("_row_idx")
+                            if row_idx is not None:
+                                try:
+                                    resp = api_post("/best-auctions-lookahead", {
+                                        "deal_row_idx": int(row_idx),
+                                        "auction_prefix": current_auction or "",
+                                        "metric": "EV",
+                                        "max_depth": 20,
+                                        "max_results": 10,
+                                    }, timeout=30)
+                                    # Convert API response to UI format
+                                    best_auctions_ev = []
+                                    for a in resp.get("auctions", []):
+                                        best_auctions_ev.append({
+                                            "Auction": a.get("auction", ""),
+                                            "Contract": a.get("contract", ""),
+                                            "EV": a.get("ev"),
+                                            "DD_Score": a.get("dd_score"),
+                                            "Par": "✅" if a.get("is_par") else "",
+                                            "Depth": 0,
+                                        })
+                                except Exception as e:
+                                    st.error(f"Server-side search failed: {e}")
+                                    best_auctions_ev = []
+                            else:
+                                best_auctions_ev = []
+                            st.session_state[cache_key_ev] = best_auctions_ev
+                            st.session_state[cache_key_ev_elapsed] = float(time.perf_counter() - t0_ev)
+
+                    if best_auctions_ev:
+                        best_ev_df = pl.DataFrame(best_auctions_ev)
+                        best_ev_pdf = best_ev_df.to_pandas()
+
+                        gb_ev_auc = GridOptionsBuilder.from_dataframe(best_ev_pdf)
+                        gb_ev_auc.configure_selection(selection_mode="single", use_checkbox=False)
+                        gb_ev_auc.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
+                        gb_ev_auc.configure_column("Contract", width=90)
+                        if "EV" in best_ev_pdf.columns:
+                            gb_ev_auc.configure_column("EV", width=90)
+                        if "DD_Score" in best_ev_pdf.columns:
+                            gb_ev_auc.configure_column("DD_Score", width=110, headerName="DD Score")
+                        if "Par" in best_ev_pdf.columns:
+                            gb_ev_auc.configure_column("Par", width=60)
+                        gb_ev_auc.configure_column("Depth", width=70)
+                        gb_ev_auc.configure_grid_options(rowHeight=25, headerHeight=25)
+                        best_ev_opts = gb_ev_auc.build()
+
+                        best_ev_resp = AgGrid(
+                            best_ev_pdf,
+                            gridOptions=best_ev_opts,
+                            height=min(200, 60 + len(best_auctions_ev) * 25),
+                            update_on=["selectionChanged"],
+                            theme="balham",
+                            key=f"auction_builder_best_auctions_ev_{current_seat}",
+                            custom_css={
+                                ".ag-row": {"cursor": "pointer"},
+                                ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
+                                ".ag-row-selected": {"background-color": "#CCE5FF !important"},
+                            },
+                        )
+
+                        sel_rows_ev = best_ev_resp.get("selected_rows")
+                        if sel_rows_ev is not None and len(sel_rows_ev) > 0:
+                            sel_row_ev = sel_rows_ev[0] if isinstance(sel_rows_ev, list) else sel_rows_ev.iloc[0].to_dict()
+                            selected_auction_ev = str(sel_row_ev.get("Auction", "")).strip()
+                            if selected_auction_ev and selected_auction_ev != current_auction:
+                                try:
+                                    data = api_post("/resolve-auction-path", {"auction": selected_auction_ev}, timeout=30)
+                                    new_path = data.get("path", [])
+                                    if new_path:
+                                        st.session_state.auction_builder_path = new_path
+                                        st.session_state.auction_builder_last_applied = selected_auction_ev.upper()
+                                        st.session_state.auction_builder_last_selected = ""
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to apply auction: {e}")
+                    elif cache_key_ev in st.session_state:
+                        st.info("No completed auctions found via criteria-pass bid paths for EV search.")
+
+                    # ---------------------------------------------------------------------
+                    # Debug: trace a specific auction path step-by-step with depth/call usage
+                    # ---------------------------------------------------------------------
+                    with st.expander("Debug: Trace an auction path (depth + API calls)", expanded=False):
+                        trace_default = "1H-P-1S-P-4D-P-4N-P-5H-P-6S-P-P-P"
+                        trace_auction = st.text_input(
+                            "Auction to trace",
+                            value=trace_default,
+                            key=f"trace_auction_{current_seat}",
+                            help="Traces each step by calling /list-next-bids and /deal-criteria-eval-batch.",
+                        )
+                        trace_max_depth = int(st.number_input("Max depth", min_value=1, max_value=50, value=20, step=1, key=f"trace_depth_{current_seat}"))
+                        trace_max_calls = int(st.number_input("Max API calls", min_value=1, max_value=5000, value=1000, step=50, key=f"trace_calls_{current_seat}"))
+                        trace_beam = int(st.number_input("Beam width (top-N explored per node)", min_value=1, max_value=200, value=10, step=1, key=f"trace_beam_{current_seat}"))
+                        trace_show_alternatives = bool(
+                            st.checkbox(
+                                "Show UI-valid alternative candidates (with Best_DD lookahead)",
+                                value=True,
+                                key=f"trace_show_alts_{current_seat}",
+                            )
+                        )
+                        trace_alt_max_calls = int(
+                            st.number_input(
+                                "Alt lookahead max API calls (per candidate)",
+                                min_value=25,
+                                max_value=5000,
+                                value=250,
+                                step=25,
+                                key=f"trace_alt_calls_{current_seat}",
+                            )
+                        )
+
+                        def _trace_one_auction_path(auction_text: str, max_depth_i: int, max_calls_i: int, beam_width: int) -> list[dict[str, Any]]:
+                            if not pinned_deal:
+                                return []
+                            dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
+                            row_idx_local = pinned_deal.get("_row_idx")
+                            if row_idx_local is None:
+                                return []
+
+                            vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper()
+                            par_raw = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
+                            try:
+                                par_score_i = int(par_raw) if par_raw is not None else None
+                            except Exception:
+                                par_score_i = None
+
+                            def _is_auc_complete(auc: str) -> bool:
+                                """Auction completion rule: 4 opening passes OR 3 passes after a contract bid."""
+                                try:
+                                    bids = [b.strip().upper() for b in str(auc).split("-") if b.strip()]
+                                    if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
+                                        return True
+                                    last_contract_idx = -1
+                                    for i, b in enumerate(bids):
+                                        if b and b not in ("P", "X", "XX") and b[0].isdigit():
+                                            last_contract_idx = i
+                                    return (
+                                        last_contract_idx >= 0
+                                        and len(bids) >= last_contract_idx + 4
+                                        and all(b == "P" for b in bids[-3:])
+                                    )
+                                except Exception:
+                                    return False
+
+                            # "Best_DD" lookahead for this trace: score the FULL auction being traced.
+                            # This avoids misleading per-bid DD estimates for artificial calls.
+                            # For the provided debug auction, this should equal the max DD you know is reachable.
+                            best_dd: int | None = None
+                            try:
+                                full_auc_norm = normalize_auction_input(auction_text).upper()
+                                dd_full = get_dd_score_for_auction(full_auc_norm, dealer_actual, pinned_deal)
+                                best_dd = int(dd_full) if dd_full is not None else None
+                            except Exception:
+                                best_dd = None
+
+                            def _par_guided_key(dd_est: int) -> tuple[int, int, int]:
+                                if par_score_i is None or dd_est <= -90000:
+                                    return (0, dd_est, dd_est)
+                                return (1 if dd_est == par_score_i else 0, -abs(par_score_i - dd_est), dd_est)
+
+                            def _best_dd_lookahead_from_prefix(
+                                prefix_after_bid: str,
+                                depth_used: int,
+                                max_api_calls_local: int,
+                            ) -> int | None:
+                                """Find best completed DD reachable from this prefix via criteria-valid bids."""
+                                if not pinned_deal:
+                                    return None
+                                dealer_local = dealer_actual
+                                row_idx_local2 = row_idx_local
+                                if row_idx_local2 is None:
+                                    return None
+
+                                # Local caches for speed (per call)
+                                dd_prefix_cache: dict[str, int] = {}
+                                api_calls_local = 0
+                                best_dd_local: int | None = None
+
+                                def dd_est_prefix(auc: str) -> int:
+                                    if auc in dd_prefix_cache:
+                                        return dd_prefix_cache[auc]
+                                    try:
+                                        v = get_dd_score_for_auction(auc, dealer_local, pinned_deal)
+                                        out = int(v) if v is not None else -99999
+                                    except Exception:
+                                        out = -99999
+                                    dd_prefix_cache[auc] = out
+                                    return out
+
+                                def rec(auc_pref: str, d: int) -> None:
+                                    nonlocal api_calls_local, best_dd_local
+                                    if d >= max_depth_i:
+                                        return
+                                    if api_calls_local >= max_api_calls_local:
+                                        return
+                                    # Quick pruning: if we already hit par, we can't do better (for NS-positive par scoring).
+                                    if par_score_i is not None and best_dd_local is not None and best_dd_local == int(par_score_i):
+                                        return
+
+                                    try:
+                                        bt_pref, lp_here = _strip_leading_passes(auc_pref)
+                                        api_calls_local += 1
+                                        opts = get_next_bid_options(bt_pref)
+                                    except Exception:
+                                        return
+                                    if not opts:
+                                        return
+
+                                    # Determine seat/dealer for criteria evaluation at this node (match UI mapping)
+                                    toks = [b for b in auc_pref.split("-") if b.strip()]
+                                    display_seat_here = (len(toks) % 4) + 1
+                                    bt_seat_here = _bt_seat_from_display_seat(display_seat_here, lp_here)
+                                    dealer_rot_here = _rotate_dealer_by(dealer_local, lp_here)
+
+                                    # Candidate options: skip dead-ends; allow empty agg_expr (criteria-pass by definition)
+                                    cand: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+                                    for o in opts:
+                                        if o.get("is_dead_end"):
+                                            continue
+                                        bid_u = str(o.get("bid", "")).upper()
+                                        auc2 = f"{auc_pref}-{bid_u}"
+                                        dd_est = dd_est_prefix(auc2)
+                                        cand.append((_par_guided_key(dd_est), o))
+                                    cand.sort(key=lambda x: x[0], reverse=True)
+
+                                    # Scan in chunks until we collect some valid options
+                                    beam_local = 10
+                                    chunk_size = 25
+                                    valid_picks: list[dict[str, Any]] = []
+                                    i0 = 0
+                                    while i0 < len(cand) and len(valid_picks) < beam_local and api_calls_local < max_api_calls_local:
+                                        chunk = [x[1] for x in cand[i0 : i0 + chunk_size]]
+                                        i0 += chunk_size
+
+                                        no_crit = [o for o in chunk if not (o.get("agg_expr") or [])]
+                                        valid_picks.extend(no_crit)
+                                        if len(valid_picks) >= beam_local:
+                                            break
+
+                                        with_crit = [o for o in chunk if (o.get("agg_expr") or [])]
+                                        if not with_crit:
+                                            continue
+                                        try:
+                                            api_calls_local += 1
+                                            res = api_post(
+                                                "/deal-criteria-eval-batch",
+                                                {
+                                                    "deal_row_idx": int(row_idx_local2),
+                                                    "dealer": dealer_rot_here,
+                                                    "checks": [{"seat": int(bt_seat_here), "criteria": list(o.get("agg_expr") or [])} for o in with_crit],
+                                                },
+                                                timeout=10,
+                                            )
+                                            rr = res.get("results") or []
+                                            for j, r0 in enumerate(rr[: len(with_crit)]):
+                                                failed = (r0 or {}).get("failed") or []
+                                                untracked = (r0 or {}).get("untracked") or []
+                                                if len(failed) == 0 and len(untracked) == 0:
+                                                    valid_picks.append(with_crit[j])
+                                                    if len(valid_picks) >= beam_local:
+                                                        break
+                                        except Exception:
+                                            valid_picks.extend(with_crit)
+
+                                    valid_picks = valid_picks[:beam_local]
+
+                                    for o in valid_picks:
+                                        bid_u = str(o.get("bid", "")).upper()
+                                        auc2 = f"{auc_pref}-{bid_u}"
+                                        if o.get("is_complete") or _is_auc_complete(auc2):
+                                            try:
+                                                dd2 = get_dd_score_for_auction(auc2, dealer_local, pinned_deal)
+                                                if dd2 is not None:
+                                                    v = int(dd2)
+                                                    best_dd_local = v if best_dd_local is None else max(best_dd_local, v)
+                                            except Exception:
+                                                pass
+                                        else:
+                                            rec(auc2, d + 1)
+
+                                rec(prefix_after_bid, depth_used)
+                                return best_dd_local
+
+                            auc_norm = normalize_auction_input(auction_text).upper()
+                            bids = [b.strip().upper() for b in auc_norm.split("-") if b.strip()]
+                            out_rows: list[dict[str, Any]] = []
+                            alt_rows: list[dict[str, Any]] = []
+                            api_calls = 0
+                            cumulative_min_calls = 0
+
+                            prefix_display = ""
+                            for depth_i, next_bid in enumerate(bids, start=1):
+                                # Depth guard (same concept as search max_depth)
+                                depth_ok = depth_i <= max_depth_i
+
+                                bt_prefix, leading_passes_i = _strip_leading_passes(prefix_display)
+                                display_tokens = [t for t in prefix_display.split("-") if t.strip()] if prefix_display else []
+                                display_seat = (len(display_tokens) % 4) + 1
+                                bt_seat = _bt_seat_from_display_seat(display_seat, leading_passes_i)
+                                dealer_rot = _rotate_dealer_by(dealer_actual, leading_passes_i)
+
+                                # Call: list-next-bids (uncached for trace)
+                                api_calls += 1
+                                list_call_ok = api_calls <= max_calls_i
+                                opt = None
+                                # Counts to reconcile with UI grids
+                                bt_next_total = 0
+                                bt_non_dead_end = 0
+                                bt_non_empty_criteria = 0
+                                pinned_valid_count: int | None = None
+
+                                # Candidates tracked in the same space as the search:
+                                # - dead-ends removed
+                                # - empty agg_expr removed (UI treats these as "Rejected", not "Valid")
+                                candidates_all: list[tuple[tuple[int, int, int], int, bool, bool, dict[str, Any]]] = []
+                                target_rank: int | None = None  # rank among candidates_all (EV-desc)
+                                target_in_beam: bool | None = None
+                                target_in_beam_valid: bool | None = None
+                                target_dd_est: int | None = None
+                                target_ev_est: float | None = None
+                                crit_batch_call_made = False
+                                min_calls_this_step = 1  # list-next-bids
+                                try:
+                                    # Use UI helper to ensure consistent schema (force_refresh so this isn't affected by cache).
+                                    next_opts = get_next_bid_options(bt_prefix, force_refresh=True)
+                                    bt_next_total = int(len(next_opts or []))
+                                    for o in next_opts:
+                                        bid_u = str(o.get("bid", "")).upper()
+                                        if bid_u == next_bid:
+                                            opt = o
+                                        if o.get("is_dead_end"):
+                                            continue
+                                        bt_non_dead_end += 1
+                                        if not (o.get("agg_expr") or []):
+                                            continue
+                                        bt_non_empty_criteria += 1
+                                        # Rank candidates the same way the current search does: par/DD guided.
+                                        auc_after = f"{prefix_display}-{bid_u}" if prefix_display else bid_u
+                                        try:
+                                            dd_raw = get_dd_score_for_auction(
+                                                auc_after,
+                                                dealer_actual,
+                                                pinned_deal,
+                                            )
+                                            dd_est = int(dd_raw) if dd_raw is not None else -99999
+                                        except Exception:
+                                            dd_est = -99999
+                                        # EV estimate for the standing contract after this bid (can be misleading for artificial bids).
+                                        try:
+                                            ev_raw = get_ev_for_auction(auc_after, dealer_actual, pinned_deal)
+                                            ev_est = float(ev_raw) if ev_raw is not None else None
+                                        except Exception:
+                                            ev_est = None
+                                        if bid_u == next_bid:
+                                            target_dd_est = dd_est if dd_est > -90000 else None
+                                            target_ev_est = round(float(ev_est), 1) if ev_est is not None else None
+                                        candidates_all.append((_par_guided_key(dd_est), dd_est, bool(bid_u and bid_u[0].isdigit()), bid_u == "P", o))
+                                    candidates_all.sort(key=lambda x: x[0], reverse=True)
+                                    for idx0, c in enumerate(candidates_all):
+                                        if str(c[4].get("bid", "")).upper() == next_bid:
+                                            target_rank = idx0 + 1
+                                            break
+                                    target_in_beam = (target_rank is not None and target_rank <= int(beam_width))
+                                except Exception:
+                                    candidates_all = []
+
+                                # Call: criteria eval
+                                passes = None
+                                failed_n = None
+                                untracked_n = None
+                                valid_ids_all: set[int] = set()  # criteria-pass (failed/untracked empty)
+                                criteria_pass_count: int | None = None
+                                ui_valid_count: int | None = None
+                                ui_valid_bids: list[str] = []
+                                if candidates_all:
+                                    # Evaluate validity for *all* candidates (after structural filtering),
+                                    # so we can report a pinned-deal-valid count that matches the UI "Valid" grid.
+                                    crit_batch_call_made = True
+                                    api_calls += 1
+                                    min_calls_this_step += 1
+                                    try:
+                                        to_eval = [c[4] for c in candidates_all]
+                                        res = api_post(
+                                            "/deal-criteria-eval-batch",
+                                            {
+                                                "deal_row_idx": int(row_idx_local),
+                                                "dealer": dealer_rot,
+                                                "checks": [{"seat": int(bt_seat), "criteria": list(o.get("agg_expr") or [])} for o in to_eval],
+                                            },
+                                            timeout=10,
+                                        )
+                                        rr = res.get("results") or []
+                                        for i, r0 in enumerate(rr[: len(to_eval)]):
+                                            failed = (r0 or {}).get("failed") or []
+                                            untracked = (r0 or {}).get("untracked") or []
+                                            if len(failed) == 0 and len(untracked) == 0:
+                                                valid_ids_all.add(id(to_eval[i]))
+                                    except Exception:
+                                        # Search/trace treat server errors permissively.
+                                        for c in candidates_all:
+                                            valid_ids_all.add(id(c[4]))
+                                    criteria_pass_count = int(len(valid_ids_all))
+
+                                    # UI-valid is stricter than "criteria-pass":
+                                    # it also rejects bids that "cannot complete" and bids missing Avg_EV.
+                                    # Reproduce those rules here so the trace aligns with ✅ Valid Bids.
+                                    # NOTE: Avg_EV in the UI is only populated when Matches > 0.
+                                    # For trace, compute Matches via /auction-pattern-counts for these candidates.
+                                    ui_valid_ids: set[int] = set()
+                                    try:
+                                        # Build patterns for all candidate next_auctions at this prefix (display form).
+                                        next_to_pattern: dict[str, str] = {}
+                                        for _k, _dd, _is_digit, _is_p, o in candidates_all:
+                                            bid_u = str(o.get("bid", "")).upper()
+                                            next_auc = f"{prefix_display}-{bid_u}" if prefix_display else bid_u
+                                            next_to_pattern[next_auc] = next_auc.replace("-", "-*") + "*" if next_auc else "*"
+                                        patterns = list(dict.fromkeys(next_to_pattern.values()))
+                                        counts_by_pattern: dict[str, int] = {}
+                                        if patterns:
+                                            resp = api_post("/auction-pattern-counts", {"patterns": patterns}, timeout=15)
+                                            counts_by_pattern = resp.get("counts", {}) or {}
+                                        # Seat direction (dealer-relative) to pick vul for Avg_EV
+                                        directions = ["N", "E", "S", "W"]
+                                        try:
+                                            dealer_idx = directions.index(str(dealer_actual).upper())
+                                        except Exception:
+                                            dealer_idx = 0
+                                        seat_dir = directions[(dealer_idx + int(display_seat) - 1) % 4]
+                                        ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                                        ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+                                        is_vul_seat = (seat_dir in ("N", "S") and ns_vul) or (seat_dir in ("E", "W") and ew_vul)
+                                        ev_sign = -1.0 if int(display_seat) in (2, 4) else 1.0
+
+                                        for _k, _dd, _is_digit, _is_p, o in candidates_all:
+                                            oid = id(o)
+                                            matches_pinned = oid in valid_ids_all
+                                            if not matches_pinned:
+                                                continue
+                                            # cannot complete -> rejected (UI rule)
+                                            can_complete = o.get("can_complete")
+                                            can_complete_b = bool(can_complete) if can_complete is not None else True
+                                            if not can_complete_b:
+                                                continue
+                                            # missing Avg_EV -> rejected (UI rule)
+                                            bid_u = str(o.get("bid", "")).upper()
+                                            next_auc = f"{prefix_display}-{bid_u}" if prefix_display else bid_u
+                                            pat = next_to_pattern.get(next_auc)
+                                            matches_count = int(counts_by_pattern.get(pat, 0) or 0) if pat else 0
+                                            chosen = o.get("avg_ev_v") if is_vul_seat else o.get("avg_ev_nv")
+                                            avg_ev = None
+                                            if matches_count and matches_count > 0 and chosen is not None:
+                                                try:
+                                                    avg_ev = round(ev_sign * float(chosen), 1)
+                                                except Exception:
+                                                    avg_ev = None
+                                            if avg_ev is None:
+                                                continue
+                                            ui_valid_ids.add(oid)
+                                    except Exception:
+                                        # If the UI-only signals can't be computed, fall back to criteria-pass.
+                                        ui_valid_ids = set(valid_ids_all)
+
+                                    ui_valid_count = int(len(ui_valid_ids))
+                                    # Keep the existing column name but align it to UI-valid semantics.
+                                    pinned_valid_count = ui_valid_count
+                                    ui_valid_bids = [
+                                        str(o.get("bid", "")).upper()
+                                        for _k, _dd, _is_digit, _is_p, o in candidates_all
+                                        if id(o) in ui_valid_ids
+                                    ]
+
+                                    # Determine whether the target bid is (a) in beam, and (b) valid.
+                                    if target_in_beam:
+                                        target_obj = None
+                                        for _k, _dd, _is_digit, _is_p, o in candidates_all[: int(beam_width)]:
+                                            if str(o.get("bid", "")).upper() == next_bid:
+                                                target_obj = o
+                                                break
+                                        if target_obj is not None:
+                                            target_in_beam_valid = id(target_obj) in valid_ids_all
+                                            passes = target_in_beam_valid
+
+                                    # For convenience: if the target exists at this node, compute its direct pass/fail counts.
+                                    if opt is not None:
+                                        agg_expr = opt.get("agg_expr") or []
+                                        if not agg_expr:
+                                            # Empty criteria: UI treats as rejected; still "passes" criteria by definition,
+                                            # but it should not be followed by a valid-only search.
+                                            failed_n = 0
+                                            untracked_n = 0
+                                        else:
+                                            # We already evaluated it in the batch if it's in candidates_all.
+                                            # If it wasn't in candidates_all (dead-end or empty agg_expr), keep counts None.
+                                            failed_n = None
+                                            untracked_n = None
+
+                                cumulative_min_calls += int(min_calls_this_step)
+
+                                out_rows.append(
+                                    {
+                                        "Depth": depth_i,
+                                        "Prefix": prefix_display or "(opening)",
+                                        "Next_Bid": next_bid,
+                                        "BT_Prefix": bt_prefix or "(opening)",
+                                        "Leading_Passes": int(leading_passes_i),
+                                        "Display_Seat": int(display_seat),
+                                        "BT_Seat": int(bt_seat),
+                                        "Dealer_Rot": dealer_rot,
+                                        # This is a *path validation* call counter (it follows the known bid immediately).
+                                        "Trace_API_Calls_Used": int(api_calls),
+                                        "Max_API_Calls": int(max_calls_i),
+                                        "Depth_Limit": int(max_depth_i),
+                                        "Depth_OK": bool(depth_ok),
+                                        "Calls_OK": bool(api_calls <= max_calls_i),
+                                        "List_Call_OK": bool(list_call_ok),
+                                        "Found_As_Next": bool(opt is not None),
+                                        "Is_Dead_End": bool(opt.get("is_dead_end")) if opt is not None else None,
+                                        "Is_Complete_Flag": bool(opt.get("is_completed_auction")) if opt is not None else None,
+                                        "Agg_Expr_N": len(opt.get("agg_expr") or []) if opt is not None else None,
+                                        # Search reachability diagnostics
+                                        # Raw BT branching stats (helps explain "why so many candidates?")
+                                        "BT_Next_Total": int(bt_next_total),
+                                        "BT_NonDeadEnd": int(bt_non_dead_end),
+                                        "BT_NonEmptyCriteria": int(bt_non_empty_criteria),
+                                        # Candidate pool actually used for valid-only traversal (structural filtering applied)
+                                        "Candidate_Count": int(len(candidates_all)) if candidates_all else 0,
+                                        "Criteria_Pass_Count": criteria_pass_count,
+                                        "PinnedDeal_Valid_Count": pinned_valid_count,
+                                        "UI_Valid_Bids": ", ".join(ui_valid_bids),
+                                        "UI_Valid_Bid_Scores": "",
+                                        "Beam_Width": int(beam_width),
+                                        "Target_Rank": target_rank,
+                                        "Target_In_Beam": target_in_beam,
+                                        "Target_In_Beam_Valid": target_in_beam_valid,
+                                        "Trace_CritBatch_Call": bool(crit_batch_call_made),
+                                        "Target_Criteria_Passes": passes,
+                                        "Target_DD_Est": target_dd_est,
+                                        "Target_EV_Est": target_ev_est,
+                                        "Best_DD": best_dd,
+                                        "Failed_N": failed_n,
+                                        "Untracked_N": untracked_n,
+                                        # Lower-bound calls the search must spend at this node (ignores exploring other branches).
+                                        "Min_API_Calls_This_Step": int(min_calls_this_step),
+                                        "Cumulative_Min_API_Calls": int(cumulative_min_calls),
+                                    }
+                                )
+
+                                # Alternative UI-valid candidates at this step (long-form rows)
+                                if trace_show_alternatives and ui_valid_bids:
+                                    # Only do lookahead for a small number of candidates (this is debug-only).
+                                    bid_to_best_dd: dict[str, int | None] = {}
+                                    for cand_bid in ui_valid_bids[:10]:
+                                        cand_auc = f"{prefix_display}-{cand_bid}" if prefix_display else cand_bid
+                                        # Standing DD/EV estimates at this node after the candidate
+                                        cand_dd_est = None
+                                        cand_ev_est = None
+                                        try:
+                                            ddv = get_dd_score_for_auction(cand_auc, dealer_actual, pinned_deal)
+                                            cand_dd_est = int(ddv) if ddv is not None else None
+                                        except Exception:
+                                            cand_dd_est = None
+                                        try:
+                                            evv = get_ev_for_auction(cand_auc, dealer_actual, pinned_deal)
+                                            cand_ev_est = round(float(evv), 1) if evv is not None else None
+                                        except Exception:
+                                            cand_ev_est = None
+                                        cand_best_dd = _best_dd_lookahead_from_prefix(cand_auc, depth_i, trace_alt_max_calls)
+                                        bid_to_best_dd[cand_bid] = cand_best_dd
+                                        alt_rows.append(
+                                            {
+                                                "Depth": depth_i,
+                                                "Prefix": prefix_display or "(opening)",
+                                                "Candidate_Bid": cand_bid,
+                                                "Is_Chosen": bool(cand_bid == next_bid),
+                                                "Candidate_DD_Est": cand_dd_est,
+                                                "Candidate_EV_Est": cand_ev_est,
+                                                "Candidate_Best_DD": cand_best_dd,
+                                                "ParScore": par_score_i,
+                                            }
+                                        )
+                                    # Summarize onto the step row for quick scanning.
+                                    try:
+                                        items = []
+                                        for b, v in bid_to_best_dd.items():
+                                            items.append((b, v))
+                                        # Sort best-first (None last), then by bid text.
+                                        items.sort(key=lambda x: (-999999 if x[1] is None else int(x[1]), x[0]), reverse=True)
+                                        score_str = ", ".join(f"{b}: {v}" for b, v in items)
+                                        out_rows[-1]["UI_Valid_Bid_Scores"] = score_str
+                                    except Exception:
+                                        out_rows[-1]["UI_Valid_Bid_Scores"] = ""
+
+                                # Advance the display prefix
+                                prefix_display = f"{prefix_display}-{next_bid}" if prefix_display else next_bid
+
+                            # If alternatives were requested, stash them into session state for display.
+                            st.session_state[f"_trace_alt_rows_{current_seat}"] = alt_rows
+                            return out_rows
+
+                        if st.button("Trace", key=f"trace_btn_{current_seat}"):
+                            with st.spinner("Tracing auction path..."):
+                                trace_rows = _trace_one_auction_path(trace_auction, trace_max_depth, trace_max_calls, trace_beam)
+                            if not trace_rows:
+                                st.info("No trace output (need a pinned deal with _row_idx).")
+                            else:
+                                st.dataframe(pl.DataFrame(trace_rows).to_pandas(), width="stretch", hide_index=True)
+                                alt_rows = st.session_state.get(f"_trace_alt_rows_{current_seat}") or []
+                                if trace_show_alternatives and alt_rows:
+                                    st.markdown("**UI-valid alternatives (per step)**")
+                                    st.dataframe(pl.DataFrame(alt_rows).to_pandas(), width="stretch", hide_index=True)
 
                 if not valid_rows:
                     st.warning(
