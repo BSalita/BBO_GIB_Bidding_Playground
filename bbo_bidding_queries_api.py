@@ -3718,6 +3718,8 @@ def best_auctions_lookahead_start(req: BestAuctionsLookaheadStartRequest) -> Dic
 
     def _run_job() -> None:
         try:
+            t_wall0 = time.perf_counter()
+            t_cpu0 = time.process_time()
             # Delegate to hot-reloadable handler
             resp = handler_module.handle_best_auctions_lookahead(
                 state=state,
@@ -3730,11 +3732,15 @@ def best_auctions_lookahead_start(req: BestAuctionsLookaheadStartRequest) -> Dic
                 max_nodes=int(req.max_nodes),
                 beam_width=int(req.beam_width),
             )
+            t_wall1 = time.perf_counter()
+            t_cpu1 = time.process_time()
             with _BEST_AUCTIONS_JOBS_LOCK:
                 j = _BEST_AUCTIONS_JOBS.get(job_id)
                 if j is not None:
                     j["status"] = "completed"
                     j["result"] = resp
+                    j["wall_elapsed_s"] = round(t_wall1 - t_wall0, 3)
+                    j["cpu_elapsed_s"] = round(t_cpu1 - t_cpu0, 3)
                     j["finished_at_s"] = time.time()
         except Exception as e:
             with _BEST_AUCTIONS_JOBS_LOCK:

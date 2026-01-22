@@ -5773,6 +5773,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # job state
                 if "auction_builder_best_job_id" not in st.session_state:
                     st.session_state.auction_builder_best_job_id = None
+                if "auction_builder_best_started_at_s" not in st.session_state:
+                    st.session_state.auction_builder_best_started_at_s = None
+                if "auction_builder_best_started_cpu_s" not in st.session_state:
+                    st.session_state.auction_builder_best_started_cpu_s = None
 
                 start_col, poll_col = st.columns([1, 3])
                 with start_col:
@@ -5792,6 +5796,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     try:
                         resp = api_post("/best-auctions-lookahead/start", payload, timeout=10)
                         st.session_state.auction_builder_best_job_id = resp.get("job_id")
+                        st.session_state.auction_builder_best_started_at_s = time.perf_counter()
+                        st.session_state.auction_builder_best_started_cpu_s = time.process_time()
                         _st_info_elapsed("Auction Builder: best completions (start)", resp)
                     except Exception as e:
                         st.error(f"Failed to start search: {e}")
@@ -5813,6 +5819,42 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         st.error(f"Search failed: {status.get('error')}")
                     elif status.get("status") == "completed":
                         result = status.get("result") or {}
+                        # Wall time from "Start search" click to completion (client-side).
+                        started_at = st.session_state.get("auction_builder_best_started_at_s")
+                        if isinstance(started_at, (int, float)):
+                            wall_s = time.perf_counter() - float(started_at)
+                            # CPU time from "Start search" click to completion (client-side).
+                            started_cpu = st.session_state.get("auction_builder_best_started_cpu_s")
+                            cpu_s: float | None = None
+                            if isinstance(started_cpu, (int, float)):
+                                cpu_s = time.process_time() - float(started_cpu)
+                            if cpu_s is not None:
+                                st.info(f"Completed in {wall_s:.1f}s wall, {cpu_s:.1f}s CPU (client).")
+                            else:
+                                st.info(f"Completed in {wall_s:.1f}s (client wall time).")
+
+                        # Server-side wall/cpu time from async job wrapper (if available)
+                        try:
+                            job_wall_s = status.get("wall_elapsed_s")
+                            job_cpu_s = status.get("cpu_elapsed_s")
+                            if job_wall_s is not None or job_cpu_s is not None:
+                                parts: list[str] = []
+                                if job_wall_s is not None:
+                                    parts.append(f"{float(job_wall_s):.1f}s wall")
+                                if job_cpu_s is not None:
+                                    parts.append(f"{float(job_cpu_s):.1f}s CPU")
+                                if parts:
+                                    st.caption("Server job time: " + ", ".join(parts))
+                        except Exception:
+                            pass
+
+                        # Server-side compute time, if provided by handler
+                        try:
+                            server_ms = result.get("elapsed_ms")
+                            if server_ms is not None:
+                                st.caption(f"Server compute elapsed: {float(server_ms)/1000.0:.2f}s")
+                        except Exception:
+                            pass
                         auctions = result.get("auctions") or []
                         if not auctions:
                             st.warning("No completed auctions found within the current limits.")
