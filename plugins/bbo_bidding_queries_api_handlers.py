@@ -8697,3 +8697,225 @@ def handle_best_auctions_lookahead(
             "debug": debug_info
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Deal Matched BT Sample – sample BT rows for a pinned deal
+# ---------------------------------------------------------------------------
+
+def handle_deal_matched_bt_sample(
+    state: Dict[str, Any],
+    deal_row_idx: int,
+    n_samples: int = 25,
+    seed: int = 0,
+    metric: str = "DD",
+) -> Dict[str, Any]:
+    """Return BT rows that match a specific deal (GPU-verified index).
+
+    Uses `state["deal_to_bt_index_df"]` (loaded from `bbo_deal_to_bt_verified.parquet`) which maps:
+      deal_idx (row position in deals file) -> Matched_BT_Indices (list of bt_index values)
+    """
+    t0 = time.perf_counter()
+    import numpy as np
+
+    deal_df = state.get("deal_df")
+    if deal_df is None:
+        raise ValueError("deal_df not loaded")
+
+    # Deal row is needed for scoring (DD/EV) + dealer/par
+    try:
+        deal_row = deal_df.row(int(deal_row_idx), named=True)
+    except Exception as e:
+        raise ValueError(f"Invalid deal_row_idx {deal_row_idx}: {e}")
+    dealer_actual = str(deal_row.get("Dealer", "N")).upper()
+    par_score = deal_row.get("ParScore", deal_row.get("Par_Score"))
+    try:
+        par_score_i = int(par_score) if par_score is not None else None
+    except Exception:
+        par_score_i = None
+
+    deal_to_bt_index_df: Optional[pl.DataFrame] = state.get("deal_to_bt_index_df")
+    if deal_to_bt_index_df is None or deal_to_bt_index_df.height <= 0:
+        raise ValueError("deal_to_bt_index_df not loaded (run bbo_bt_filter_by_bitmap.py and restart API).")
+
+    # Cache numpy materializations across requests for O(log n) lookup.
+    global _DEAL_TO_BT_VERIFIED_INDEX_CACHE  # type: ignore[declared-but-unused]
+    try:
+        _DEAL_TO_BT_VERIFIED_INDEX_CACHE  # type: ignore[name-defined]
+    except Exception:
+        _DEAL_TO_BT_VERIFIED_INDEX_CACHE = {}  # type: ignore[name-defined]
+
+    cache = _DEAL_TO_BT_VERIFIED_INDEX_CACHE  # type: ignore[name-defined]
+    df_id = id(deal_to_bt_index_df)
+    if cache.get("df_id") != df_id:
+        cache["df_id"] = df_id
+        cache["deal_idx_arr"] = deal_to_bt_index_df["deal_idx"].to_numpy()
+        cache["matched_series"] = deal_to_bt_index_df.get_column("Matched_BT_Indices")
+
+    deal_idx_arr = cache.get("deal_idx_arr")
+    matched_series = cache.get("matched_series")
+    if deal_idx_arr is None or matched_series is None:
+        raise ValueError("Verified index cache not initialized")
+
+    pos = np.searchsorted(deal_idx_arr, int(deal_row_idx))
+    matches: list[int] = []
+    if pos < len(deal_idx_arr) and int(deal_idx_arr[pos]) == int(deal_row_idx):
+        try:
+            m = matched_series[int(pos)]
+        except Exception:
+            m = None
+        if m is None:
+            matches = []
+        else:
+            try:
+                if isinstance(m, pl.Series):
+                    matches = [int(x) for x in m.to_list() if x is not None]
+                elif isinstance(m, (list, tuple)):
+                    matches = [int(x) for x in m if x is not None]
+                else:
+                    matches = [int(x) for x in list(m) if x is not None]
+            except Exception:
+                matches = []
+
+    total_matches = len(matches)
+    if total_matches == 0:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {
+            "rows": [],
+            "counts": {"total_matches": 0, "returned": 0},
+            "metric": str(metric or "DD").upper(),
+            "par_score": par_score_i,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+
+    # Deterministic policy (per UI spec):
+    # 1) Consider up to a fixed cap of matched BT indices (sorted by bt_index).
+    # 2) Score all considered rows for the pinned deal.
+    # 3) Sort by (DD/EV desc, bt_index asc).
+    # 4) Return only the first `n_samples` rows for display.
+    #
+    # NOTE: `n_samples` is the UI "Max Best Auctions" (display cap).
+    want = int(n_samples)
+    want = max(1, min(want, 1000))  # display cap guardrail
+
+    CONSIDER_CAP = 1000
+    consider_n = min(int(CONSIDER_CAP), int(total_matches))
+    matches_sorted = sorted(matches)
+    consider_bt = matches_sorted[:consider_n]
+
+    # Fetch BT metadata for considered indices via DuckDB (avoid scanning huge in-memory BT).
+    file_path = _bt_file_path_for_sql(state)
+    conn = duckdb.connect(":memory:")
+    try:
+        in_list = ", ".join(str(int(x)) for x in consider_bt)
+        bt_df = conn.execute(
+            f"""
+            SELECT bt_index, Auction, is_completed_auction
+            FROM read_parquet('{file_path}')
+            WHERE bt_index IN ({in_list})
+            """
+        ).pl()
+        # Keep output stable: preserve consider_bt order
+        order_rank = {int(b): i for i, b in enumerate(consider_bt)}
+        if "bt_index" in bt_df.columns:
+            bt_df = bt_df.with_columns(
+                pl.col("bt_index")
+                .cast(pl.Int64)
+                .map_elements(lambda x: order_rank.get(int(x), 10**12))
+                .alias("_rank")
+            ).sort("_rank").drop("_rank")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    from bbo_bidding_queries_lib import parse_contract_from_auction
+
+    out_rows: list[dict[str, Any]] = []
+    metric_u = str(metric or "DD").upper()
+    for row in bt_df.iter_rows(named=True):
+        auc = str(row.get("Auction") or "")
+        bt_index = row.get("bt_index")
+        is_completed = bool(row.get("is_completed_auction"))
+
+        # Contract
+        contract = "?"
+        try:
+            c = parse_contract_from_auction(auc)
+            if c:
+                lvl, strain, _ = c
+                contract = f"{lvl}{'NT' if str(strain).upper() == 'N' else str(strain).upper()}"
+            else:
+                toks = [t for t in auc.split("-") if t.strip()]
+                if toks and all(str(t).strip().upper() == "P" for t in toks):
+                    contract = "Passed out"
+        except Exception:
+            contract = "?"
+
+        dd_score: int | None = None
+        ev: float | None = None
+        try:
+            dd_v = get_dd_score_for_auction(auc, dealer_actual, deal_row)
+            dd_score = int(dd_v) if dd_v is not None else None
+        except Exception:
+            dd_score = None
+        try:
+            ev_v = get_ev_for_auction(auc, dealer_actual, deal_row)
+            ev = round(float(ev_v), 1) if ev_v is not None else None
+        except Exception:
+            ev = None
+
+        is_par = par_score_i is not None and dd_score is not None and int(dd_score) == int(par_score_i)
+        out_rows.append(
+            {
+                "bt_index": bt_index,
+                "Auction": auc,
+                "Contract": contract,
+                "DD_Score": dd_score,
+                "EV": ev,
+                "Par": "✅" if is_par else "",
+                "is_completed_auction": is_completed,
+                "Score": dd_score if metric_u == "DD" else ev,
+            }
+        )
+
+    # Sort rows deterministically for UI:
+    # - DD view: DD desc, bt_index asc
+    # - EV view: EV desc, bt_index asc
+    def _safe_bt(x: Any) -> int:
+        try:
+            return int(x)
+        except Exception:
+            return 2**31 - 1
+
+    def _safe_dd(x: Any) -> int:
+        # None should sink to bottom for descending sort
+        try:
+            return int(x)
+        except Exception:
+            return -999_999
+
+    def _safe_ev(x: Any) -> float:
+        # None should sink to bottom for descending sort
+        try:
+            return float(x)
+        except Exception:
+            return float("-inf")
+
+    if metric_u == "DD":
+        out_rows.sort(key=lambda r: (-_safe_dd(r.get("DD_Score")), _safe_bt(r.get("bt_index"))))
+    else:
+        out_rows.sort(key=lambda r: (-_safe_ev(r.get("EV")), _safe_bt(r.get("bt_index"))))
+
+    # Display cap (after scoring/sorting).
+    out_rows = out_rows[:want]
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "rows": out_rows,
+        "counts": {"total_matches": total_matches, "considered": consider_n, "returned": len(out_rows)},
+        "metric": metric_u,
+        "par_score": par_score_i,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }

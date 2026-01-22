@@ -1288,6 +1288,18 @@ class BestAuctionsLookaheadStartRequest(BaseModel):
     beam_width: int = 50
 
 
+class DealMatchedBTSampleRequest(BaseModel):
+    """Sample BT rows that match a specific deal using the GPU-verified deal→BT index."""
+    # Primary key used by criteria bitmaps and deal_to_bt indices (row position in deals file).
+    deal_row_idx: int
+    # Optional deal `index` (user-facing). If provided, server maps it to deal_row_idx using
+    # the monotonic index cache built at startup.
+    deal_index: Optional[int] = None
+    n_samples: int = 25
+    seed: Optional[int] = 0  # 0 = non-reproducible
+    metric: str = "DD"       # "DD" or "EV" (controls which score column is emphasized)
+
+
 # Import model registry for Bidding Arena
 from bbo_bidding_models import MODEL_REGISTRY
 
@@ -3767,6 +3779,38 @@ def best_auctions_lookahead_status(job_id: str) -> Dict[str, Any]:
         # Shallow copy so we don't leak executor internals / allow mutation
         out = dict(job)
     return _attach_hot_reload_info(out, reload_info)
+
+
+@app.post("/deal-matched-bt-sample")
+def deal_matched_bt_sample(req: DealMatchedBTSampleRequest) -> Dict[str, Any]:
+    """Return a random sample of BT rows that match a pinned deal (GPU-verified index)."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+
+    # Allow callers to pass the user-facing deal `index` instead of deal_row_idx.
+    deal_row_idx = int(req.deal_row_idx)
+    if req.deal_index is not None:
+        deal_row_idx = _resolve_deal_row_idx_from_index(state, int(req.deal_index))
+
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+        resp = handler_module.handle_deal_matched_bt_sample(
+            state=state,
+            deal_row_idx=deal_row_idx,
+            n_samples=int(req.n_samples),
+            seed=int(req.seed or 0),
+            metric=str(req.metric or "DD"),
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log_and_raise("deal-matched-bt-sample", e)
 
 
 if __name__ == "__main__":  # pragma: no cover

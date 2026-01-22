@@ -233,7 +233,8 @@ def render_deal_diagram(
                 dealer = deal.get("Dealer", "?")
                 vul = deal.get("Vul", deal.get("Vulnerability", "?"))
                 par = deal.get("ParScore", deal.get("Par_Score", "?"))
-                st.caption(f"Dealer: {dealer} | Vul: {vul} | Par: {par}")
+                score = deal.get("Score", deal.get("score", "—"))
+                st.caption(f"Dealer: {dealer} | Vul: {vul} | Par: {par} | Score: {score}")
             
             # Cross layout: North at top center
             col_left, col_north, col_right = st.columns([1, 2, 1])
@@ -5421,8 +5422,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         st.session_state.auction_builder_options = {}  # Cache of available options per prefix
     if "auction_builder_pinned_deal" not in st.session_state:
         st.session_state.auction_builder_pinned_deal = None  # Cached pinned deal data
-    if "auction_builder_force_apply" not in st.session_state:
-        st.session_state.auction_builder_force_apply = False
 
     def _clear_current_auction_state() -> None:
         """Clear the current auction path + related caches (does not clear pinned deal)."""
@@ -5471,7 +5470,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     pin_col_in, pin_col_cl = st.sidebar.columns([0.88, 0.12])
     with pin_col_in:
         pinned_input = st.text_input(
-            "Deal Index or PBN",
+            "Deal Index",
             value=st.session_state.get("auction_builder_pinned_input", ""),
             placeholder="e.g., 12345 or N:AKQ.xxx.xxx.xxxx ...",
             help="Enter a deal index number or PBN string to pin. Criteria will be evaluated against this deal.",
@@ -5627,6 +5626,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             max_value=500,
             help="Maximum deals to show in matching deals list"
         )
+
+        max_best_auctions = st.number_input(
+            "Max Best Auctions",
+            value=25,
+            min_value=1,
+            max_value=1000,
+            help="Maximum rows to show in 'Best Auctions by DD/EV' (samples from deal→BT matches).",
+        )
         
         seed = st.number_input(
             "Random Seed",
@@ -5713,177 +5720,15 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 st.rerun()
 
     # -----------------------------------------------------------------------
-    # Best completions (server-side DFS) - async to avoid timeouts
+    # TODO(best-completions):
+    # Re-enable "Best completions (DD/EV)" once PBN pinning supports on-the-fly
+    # enrichment to a deal_row_idx (or equivalent server-side deal context),
+    # so we can compute best completions for pinned PBN deals, not just indexed deals.
+    #
+    # The API endpoints remain available:
+    # - POST /best-auctions-lookahead/start
+    # - GET  /best-auctions-lookahead/status/{job_id}
     # -----------------------------------------------------------------------
-    with st.expander("⭐ Best completions (DD/EV) – server search", expanded=False):
-        if not pinned_deal:
-            st.info("Pin a deal to search for the best completed auctions for that exact deal.")
-        else:
-            deal_row_idx = pinned_deal.get("_row_idx")
-            if deal_row_idx is None:
-                st.warning("Pinned deal is missing `_row_idx` (needed for server-side search).")
-            else:
-                metric = st.selectbox(
-                    "Metric",
-                    options=["DD", "EV"],
-                    index=0,
-                    key="auction_builder_best_metric",
-                    help="DD = double-dummy score, EV = expected value.",
-                )
-                c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
-                with c1:
-                    max_depth = st.number_input(
-                        "Max depth",
-                        min_value=1,
-                        max_value=40,
-                        value=20,
-                        step=1,
-                        key="auction_builder_best_max_depth",
-                    )
-                with c2:
-                    max_results = st.number_input(
-                        "Max results",
-                        min_value=1,
-                        max_value=50,
-                        value=25,
-                        step=1,
-                        key="auction_builder_best_max_results",
-                    )
-                with c3:
-                    deadline_s = st.number_input(
-                        "Time budget (s)",
-                        min_value=1.0,
-                        max_value=3600.0,
-                        value=1000.0,
-                        step=1.0,
-                        key="auction_builder_best_deadline_s",
-                        help="Runs asynchronously; higher values explore more, but consume more server CPU.",
-                    )
-                with c4:
-                    beam_width = st.number_input(
-                        "Beam width",
-                        min_value=1,
-                        max_value=200,
-                        value=50,
-                        step=1,
-                        key="auction_builder_best_beam_width",
-                        help="How many children per node are explored; higher can improve results but costs more.",
-                    )
-
-                # job state
-                if "auction_builder_best_job_id" not in st.session_state:
-                    st.session_state.auction_builder_best_job_id = None
-                if "auction_builder_best_started_at_s" not in st.session_state:
-                    st.session_state.auction_builder_best_started_at_s = None
-                if "auction_builder_best_started_cpu_s" not in st.session_state:
-                    st.session_state.auction_builder_best_started_cpu_s = None
-
-                start_col, poll_col = st.columns([1, 3])
-                with start_col:
-                    start = st.button("Start search", key="auction_builder_best_start")
-                if start:
-                    # Start async job (fast request; avoids long HTTP timeout)
-                    payload = {
-                        "deal_row_idx": int(deal_row_idx),
-                        "auction_prefix": current_auction or "",
-                        "metric": metric,
-                        "max_depth": int(max_depth),
-                        "max_results": int(max_results),
-                        "deadline_s": float(deadline_s),
-                        "max_nodes": 200000,
-                        "beam_width": int(beam_width),
-                    }
-                    try:
-                        resp = api_post("/best-auctions-lookahead/start", payload, timeout=10)
-                        st.session_state.auction_builder_best_job_id = resp.get("job_id")
-                        st.session_state.auction_builder_best_started_at_s = time.perf_counter()
-                        st.session_state.auction_builder_best_started_cpu_s = time.process_time()
-                        _st_info_elapsed("Auction Builder: best completions (start)", resp)
-                    except Exception as e:
-                        st.error(f"Failed to start search: {e}")
-
-                job_id = st.session_state.get("auction_builder_best_job_id")
-                if job_id:
-                    # Poll once per rerun; user can hit "Rerun" or click Refresh below.
-                    with poll_col:
-                        refresh = st.button("Refresh status", key="auction_builder_best_refresh")
-                    try:
-                        status = api_get(f"/best-auctions-lookahead/status/{job_id}", timeout=10)
-                    except Exception as e:
-                        status = {"status": "failed", "error": str(e)}
-
-                    st.caption(f"Job: `{job_id}` | Status: **{status.get('status')}**")
-                    if status.get("status") == "running":
-                        st.info("Search is running on the API server. Click “Refresh status” in a few seconds.")
-                    elif status.get("status") == "failed":
-                        st.error(f"Search failed: {status.get('error')}")
-                    elif status.get("status") == "completed":
-                        result = status.get("result") or {}
-                        # Wall time from "Start search" click to completion (client-side).
-                        started_at = st.session_state.get("auction_builder_best_started_at_s")
-                        if isinstance(started_at, (int, float)):
-                            wall_s = time.perf_counter() - float(started_at)
-                            # CPU time from "Start search" click to completion (client-side).
-                            started_cpu = st.session_state.get("auction_builder_best_started_cpu_s")
-                            cpu_s: float | None = None
-                            if isinstance(started_cpu, (int, float)):
-                                cpu_s = time.process_time() - float(started_cpu)
-                            if cpu_s is not None:
-                                st.info(f"Completed in {wall_s:.1f}s wall, {cpu_s:.1f}s CPU (client).")
-                            else:
-                                st.info(f"Completed in {wall_s:.1f}s (client wall time).")
-
-                        # Server-side wall/cpu time from async job wrapper (if available)
-                        try:
-                            job_wall_s = status.get("wall_elapsed_s")
-                            job_cpu_s = status.get("cpu_elapsed_s")
-                            if job_wall_s is not None or job_cpu_s is not None:
-                                parts: list[str] = []
-                                if job_wall_s is not None:
-                                    parts.append(f"{float(job_wall_s):.1f}s wall")
-                                if job_cpu_s is not None:
-                                    parts.append(f"{float(job_cpu_s):.1f}s CPU")
-                                if parts:
-                                    st.caption("Server job time: " + ", ".join(parts))
-                        except Exception:
-                            pass
-
-                        # Server-side compute time, if provided by handler
-                        try:
-                            server_ms = result.get("elapsed_ms")
-                            if server_ms is not None:
-                                st.caption(f"Server compute elapsed: {float(server_ms)/1000.0:.2f}s")
-                        except Exception:
-                            pass
-                        auctions = result.get("auctions") or []
-                        if not auctions:
-                            st.warning("No completed auctions found within the current limits.")
-                        else:
-                            df = pl.DataFrame(auctions)
-                            render_aggrid(
-                                df,
-                                key="auction_builder_best_auctions_table",
-                                height=calc_grid_height(len(df), max_height=300),
-                                table_name="auction_builder_best_auctions_table",
-                                fit_columns_to_view=True,
-                                show_sql_expander=False,
-                            )
-                            # Apply helper
-                            options = [str(a.get("auction")) for a in auctions if a.get("auction")]
-                            pick = st.selectbox(
-                                "Apply one of these auctions",
-                                options=options,
-                                key="auction_builder_best_pick",
-                            )
-                            apply_pick = st.button("Apply selected auction", key="auction_builder_best_apply")
-                            if apply_pick and pick:
-                                try:
-                                    st.session_state[edit_key] = str(pick).upper()
-                                    st.session_state.auction_builder_last_applied = ""
-                                    st.session_state.auction_builder_force_apply = True
-                                    st.rerun()
-                                except Exception:
-                                    pass
 
     # Handle manual auction edit - trigger on Enter (value change) OR button click
     # But skip if we just applied this same value (prevents render loop)
@@ -5925,10 +5770,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         edited_normalized = base
         # Ensure we don't get blocked by the "already applied" guard.
         st.session_state.auction_builder_last_applied = ""
-        apply_edit = True
-    # Programmatic apply (from Best completions)
-    if st.session_state.get("auction_builder_force_apply"):
-        st.session_state.auction_builder_force_apply = False
         apply_edit = True
     already_applied = edited_normalized == st.session_state.auction_builder_last_applied
     value_changed = edited_normalized != current_auction.upper()
@@ -6689,53 +6530,79 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 ".row-match-fail.ag-row-selected": {"background-color": "#eb959f !important"},
             }
             
-            # Helper to handle bid selection from any grid
-            def handle_bid_selection(grid_resp: Any) -> None:
+            # Helper to handle bid selection from any grid.
+            #
+            # IMPORTANT: AgGrid returns `selected_rows` on *every* Streamlit rerun (even when the rerun
+            # was triggered by unrelated widgets like checkboxes). If we auto-apply whenever
+            # `selected_rows` is non-empty, toggling a checkbox can inadvertently "re-apply" a persisted
+            # selection and change the auction state, making other sections appear/disappear.
+            #
+            # Fix: track the last selected `_idx` per grid, and only apply when it changes.
+            def handle_bid_selection(grid_resp: Any, grid_name: str) -> None:
                 sel_rows = grid_resp.get("selected_rows")
+                sel_row = None
                 if sel_rows is not None and len(sel_rows) > 0:
                     sel_row = sel_rows[0] if isinstance(sel_rows, list) else sel_rows.iloc[0].to_dict()
-                    sel_idx = int(sel_row.get("_idx", 0))
-                    sel_opt = dict(sorted_options[sel_idx])
-                    sel_bid = sel_opt.get("bid")
-                    sel_bid_s = str(sel_bid or "").strip().upper()
-                    
-                    selection_key = f"{current_auction}-{sel_bid_s}"
-                    if selection_key != st.session_state.auction_builder_last_selected:
-                        st.session_state.auction_builder_last_selected = selection_key
-                        computed_complete = _is_auction_complete_after_next_bid(current_auction, sel_bid_s)
-                        sel_opt["is_complete"] = bool(sel_opt.get("is_complete", False) or computed_complete)
-                        sel_opt["bid"] = sel_bid_s
-                        # Attach categories from the lookup cache
-                        bt_idx = sel_opt.get("bt_index")
-                        if bt_idx is not None:
-                            cats_str = bt_idx_to_categories_opt.get(int(bt_idx), "")
-                            if cats_str:
-                                sel_opt["categories"] = [c.strip() for c in cats_str.split(",") if c.strip()]
-                        st.session_state.auction_builder_path.append(sel_opt)
-                        # Normalize the entire stored path immediately using /resolve-auction-path.
-                        # This prevents later "rehydration" from changing earlier rows (green->red)
-                        # because the path mixes per-selection criteria with server-resolved criteria.
-                        try:
-                            new_auction = "-".join([step.get("bid", "") for step in st.session_state.auction_builder_path if step.get("bid")])
-                            if new_auction:
-                                data = api_post("/resolve-auction-path", {"auction": new_auction}, timeout=30)
-                                new_path = data.get("path", []) or []
-                                if new_path and len(new_path) == len(st.session_state.auction_builder_path):
-                                    # Preserve any client-side completion inference for trailing passes
-                                    try:
-                                        if st.session_state.auction_builder_path and new_path:
-                                            new_path[-1]["is_complete"] = bool(
-                                                new_path[-1].get("is_complete", False)
-                                                or st.session_state.auction_builder_path[-1].get("is_complete", False)
-                                            )
-                                    except Exception:
-                                        pass
-                                    st.session_state.auction_builder_path = new_path
-                        except Exception:
-                            # Best-effort only; keep the appended selection as-is.
-                            pass
-                        st.session_state.auction_builder_last_applied = ""
-                        st.rerun()
+                try:
+                    sel_idx = int(sel_row.get("_idx")) if sel_row is not None else None
+                except Exception:
+                    sel_idx = None
+
+                init_key = f"_ab_sel_init_{grid_name}_{current_seat}"
+                last_key = f"_ab_sel_last_{grid_name}_{current_seat}"
+                if not st.session_state.get(init_key, False):
+                    st.session_state[init_key] = True
+                    st.session_state[last_key] = sel_idx
+                    return
+
+                if st.session_state.get(last_key) == sel_idx:
+                    return
+                st.session_state[last_key] = sel_idx
+
+                if sel_idx is None:
+                    return
+
+                sel_opt = dict(sorted_options[sel_idx])
+                sel_bid = sel_opt.get("bid")
+                sel_bid_s = str(sel_bid or "").strip().upper()
+
+                selection_key = f"{current_auction}-{sel_bid_s}"
+                if selection_key != st.session_state.auction_builder_last_selected:
+                    st.session_state.auction_builder_last_selected = selection_key
+                    computed_complete = _is_auction_complete_after_next_bid(current_auction, sel_bid_s)
+                    sel_opt["is_complete"] = bool(sel_opt.get("is_complete", False) or computed_complete)
+                    sel_opt["bid"] = sel_bid_s
+                    # Attach categories from the lookup cache
+                    bt_idx = sel_opt.get("bt_index")
+                    if bt_idx is not None:
+                        cats_str = bt_idx_to_categories_opt.get(int(bt_idx), "")
+                        if cats_str:
+                            sel_opt["categories"] = [c.strip() for c in cats_str.split(",") if c.strip()]
+                    st.session_state.auction_builder_path.append(sel_opt)
+                    # Normalize the entire stored path immediately using /resolve-auction-path.
+                    # This prevents later "rehydration" from changing earlier rows (green->red)
+                    # because the path mixes per-selection criteria with server-resolved criteria.
+                    try:
+                        new_auction = "-".join([step.get("bid", "") for step in st.session_state.auction_builder_path if step.get("bid")])
+                        if new_auction:
+                            data = api_post("/resolve-auction-path", {"auction": new_auction}, timeout=30)
+                            new_path = data.get("path", []) or []
+                            if new_path and len(new_path) == len(st.session_state.auction_builder_path):
+                                # Preserve any client-side completion inference for trailing passes
+                                try:
+                                    if st.session_state.auction_builder_path and new_path:
+                                        new_path[-1]["is_complete"] = bool(
+                                            new_path[-1].get("is_complete", False)
+                                            or st.session_state.auction_builder_path[-1].get("is_complete", False)
+                                        )
+                                except Exception:
+                                    pass
+                                st.session_state.auction_builder_path = new_path
+                    except Exception:
+                        # Best-effort only; keep the appended selection as-is.
+                        pass
+                    st.session_state.auction_builder_last_applied = ""
+                    st.rerun()
             
             pandas_df = bids_df.to_pandas()
             
@@ -6871,7 +6738,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             custom_css=bid_table_css,
                             key=f"auction_builder_suggested_bids_{current_auction}_{current_seat}",
                         )
-                        handle_bid_selection(sug_resp)
+                        handle_bid_selection(sug_resp, "suggested")
                     else:
                         st.markdown("**Best Bids Ranked by Model**")
                         st.caption("No suggested bids available")
@@ -6902,7 +6769,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             custom_css=bid_table_css,
                             key=f"auction_builder_best_par_bids_{current_seat}",
                         )
-                        handle_bid_selection(par_resp)
+                        handle_bid_selection(par_resp, "best_par")
                     else:
                         st.caption("No Par scores available")
                 
@@ -6932,7 +6799,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             custom_css=bid_table_css,
                             key=f"auction_builder_best_ev_bids_{current_seat}",
                         )
-                        handle_bid_selection(ev_resp)
+                        handle_bid_selection(ev_resp, "best_ev")
                     else:
                         st.caption("No EV scores available")
 
@@ -7380,736 +7247,245 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                     return uniq[:max_results]
 
-                # Best Auctions by DD: lazy search triggered by button (server-side DFS)
+                # Best Auctions by DD/EV: sample matched BT rows for pinned deal (GPU-verified deal→BT index)
                 if pinned_deal and valid_rows:
-                    st.markdown("**Best Auctions by DD**")
-                    cache_key_dd = f"_best_auctions_dd_cache_{current_auction}"
+                    show_best_auctions = st.checkbox(
+                        f"Show Best {int(max_best_auctions)} Auctions Ranked by DD/EV",
+                        value=False,
+                        key=f"show_best_auctions_{current_seat}",
+                    )
+
+                    cache_key_dd = f"_best_auctions_dd_cache_{current_auction}_{seed}_{int(max_best_auctions)}"
                     cache_key_dd_elapsed = f"{cache_key_dd}__elapsed_s"
-                    best_auctions_dd: list[dict[str, Any]] = st.session_state.get(cache_key_dd, [])
-                    if st.button("🏆 Best Auctions by DD", key=f"search_best_auctions_dd_{current_seat}"):
-                        with st.spinner("Searching (server-side)..."):
-                            t0 = time.perf_counter()
-                            row_idx = pinned_deal.get("_row_idx")
-                            if row_idx is not None:
-                                try:
-                                    resp = api_post("/best-auctions-lookahead", {
-                                        "deal_row_idx": int(row_idx),
-                                        "auction_prefix": current_auction or "",
-                                        "metric": "DD",
-                                        "max_depth": 20,
-                                        "max_results": 10,
-                                    }, timeout=30)
-                                    # Convert API response to UI format
-                                    par_score_i = resp.get("par_score")
-                                    best_auctions_dd = []
-                                    for a in resp.get("auctions", []):
-                                        best_auctions_dd.append({
-                                            "Auction": a.get("auction", ""),
-                                            "Contract": a.get("contract", ""),
-                                            "DD_Score": a.get("dd_score"),
-                                            "Par": "✅" if a.get("is_par") else "",
-                                            "Depth": 0,  # Not tracked by server
-                                        })
-                                    # Cache stats for debugging
-                                    st.session_state[f"{cache_key_dd}__stats"] = resp.get("stats")
-                                except Exception as e:
-                                    st.error(f"Server-side search failed: {e}")
-                                    best_auctions_dd = []
-                            else:
-                                best_auctions_dd = []
-                            st.session_state[cache_key_dd] = best_auctions_dd
-                            st.session_state[cache_key_dd_elapsed] = float(time.perf_counter() - t0)
-                            if best_auctions_dd:
-                                par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
-                                ach_count = sum(1 for a in best_auctions_dd if a.get("Par") == "✅")
-                                if par_score is not None:
-                                    if ach_count > 0:
-                                        elapsed_s = st.session_state.get(cache_key_dd_elapsed)
-                                        elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
-                                        st.success(f"Found {ach_count} auction(s) achieving par score of {par_score} ({elapsed_txt})")
-                                    else:
-                                        elapsed_s = st.session_state.get(cache_key_dd_elapsed)
-                                        elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
-                                        st.warning(f"Par score {par_score} not reachable via criteria-pass bids ({elapsed_txt}). Best DD: {best_auctions_dd[0]['DD_Score']}")
-                                
-                                best_auctions_df = pl.DataFrame(best_auctions_dd)
-                                best_auctions_pdf = best_auctions_df.to_pandas()
-                                
-                                gb_best = GridOptionsBuilder.from_dataframe(best_auctions_pdf)
-                                gb_best.configure_selection(selection_mode="single", use_checkbox=False)
-                                gb_best.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
-                                gb_best.configure_column("Contract", width=90)
-                                gb_best.configure_column("DD_Score", width=100, headerName="DD Score")
-                                gb_best.configure_column("Par", width=60)
-                                gb_best.configure_column("Depth", width=70)
-                                gb_best.configure_grid_options(rowHeight=25, headerHeight=25)
-                                best_opts = gb_best.build()
-                                
-                                best_auctions_resp = AgGrid(
-                                    best_auctions_pdf,
-                                    gridOptions=best_opts,
-                                    height=min(200, 60 + len(best_auctions_dd) * 25),
-                                    update_on=["selectionChanged"],
-                                    theme="balham",
-                                    key=f"auction_builder_best_auctions_dd_{current_seat}",
-                                    custom_css={
-                                        ".ag-row": {"cursor": "pointer"},
-                                        ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
-                                        ".ag-row-selected": {"background-color": "#CCE5FF !important"},
-                                    },
-                                )
-                                
-                                # Handle selection: apply the selected auction
-                                sel_rows = best_auctions_resp.get("selected_rows")
-                                if sel_rows is not None and len(sel_rows) > 0:
-                                    sel_row_data = sel_rows[0] if isinstance(sel_rows, list) else sel_rows.iloc[0].to_dict()
-                                    selected_auction = str(sel_row_data.get("Auction", "")).strip()
-                                    
-                                    if selected_auction and selected_auction != current_auction:
-                                        # Resolve the auction path and apply it
-                                        try:
-                                            data = api_post("/resolve-auction-path", {"auction": selected_auction}, timeout=30)
-                                            new_path = data.get("path", [])
-                                            if new_path:
-                                                st.session_state.auction_builder_path = new_path
-                                                st.session_state.auction_builder_last_applied = selected_auction.upper()
-                                                st.session_state.auction_builder_last_selected = ""
-                                                st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Failed to apply auction: {e}")
-                            elif cache_key_dd in st.session_state:
-                                # Search was performed but found nothing
-                                st.info("No completed auctions found via criteria-pass bid paths.")
-                                # Show debug info from session state if available
-                                stats = st.session_state.get(f"{cache_key_dd}__stats")
-                                if stats:
-                                    with st.expander("Search Stats (Debug)"):
-                                        st.json(stats)
+                    cache_key_dd_attempted = f"{cache_key_dd}__attempted"
 
-                    st.markdown("**Best Auctions by EV**")
-                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}"
-                    cache_key_ev_elapsed = f"{cache_key_ev}__elapsed_s"
-                    best_auctions_ev: list[dict[str, Any]] = st.session_state.get(cache_key_ev, [])
-                    if st.button("📈 Best Auctions by EV", key=f"search_best_auctions_ev_{current_seat}"):
-                        with st.spinner("Searching (server-side)..."):
-                            t0_ev = time.perf_counter()
-                            row_idx = pinned_deal.get("_row_idx")
-                            if row_idx is not None:
-                                try:
-                                    resp = api_post("/best-auctions-lookahead", {
-                                        "deal_row_idx": int(row_idx),
-                                        "auction_prefix": current_auction or "",
-                                        "metric": "EV",
-                                        "max_depth": 20,
-                                        "max_results": 10,
-                                    }, timeout=30)
-                                    # Convert API response to UI format
-                                    best_auctions_ev = []
-                                    for a in resp.get("auctions", []):
-                                        best_auctions_ev.append({
-                                            "Auction": a.get("auction", ""),
-                                            "Contract": a.get("contract", ""),
-                                            "EV": a.get("ev"),
-                                            "DD_Score": a.get("dd_score"),
-                                            "Par": "✅" if a.get("is_par") else "",
-                                            "Depth": 0,
-                                        })
-                                    # Cache stats for debugging
-                                    st.session_state[f"{cache_key_ev}__stats"] = resp.get("stats")
-                                except Exception as e:
-                                    st.error(f"Server-side search failed: {e}")
-                                    best_auctions_ev = []
-                            else:
-                                best_auctions_ev = []
-                            st.session_state[cache_key_ev] = best_auctions_ev
-                            st.session_state[cache_key_ev_elapsed] = float(time.perf_counter() - t0_ev)
+                    if show_best_auctions:
+                        st.markdown("**Best Auctions Ranked by DD**")
+                        best_auctions_dd: list[dict[str, Any]] = st.session_state.get(cache_key_dd, [])
+                        attempted = bool(st.session_state.get(cache_key_dd_attempted, False))
 
-                    if best_auctions_ev:
-                        best_ev_df = pl.DataFrame(best_auctions_ev)
-                        best_ev_pdf = best_ev_df.to_pandas()
-
-                        gb_ev_auc = GridOptionsBuilder.from_dataframe(best_ev_pdf)
-                        gb_ev_auc.configure_selection(selection_mode="single", use_checkbox=False)
-                        gb_ev_auc.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
-                        gb_ev_auc.configure_column("Contract", width=90)
-                        if "EV" in best_ev_pdf.columns:
-                            gb_ev_auc.configure_column("EV", width=90)
-                        if "DD_Score" in best_ev_pdf.columns:
-                            gb_ev_auc.configure_column("DD_Score", width=110, headerName="DD Score")
-                        if "Par" in best_ev_pdf.columns:
-                            gb_ev_auc.configure_column("Par", width=60)
-                        gb_ev_auc.configure_column("Depth", width=70)
-                        gb_ev_auc.configure_grid_options(rowHeight=25, headerHeight=25)
-                        best_ev_opts = gb_ev_auc.build()
-
-                        best_ev_resp = AgGrid(
-                            best_ev_pdf,
-                            gridOptions=best_ev_opts,
-                            height=min(200, 60 + len(best_auctions_ev) * 25),
-                            update_on=["selectionChanged"],
-                            theme="balham",
-                            key=f"auction_builder_best_auctions_ev_{current_seat}",
-                            custom_css={
-                                ".ag-row": {"cursor": "pointer"},
-                                ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
-                                ".ag-row-selected": {"background-color": "#CCE5FF !important"},
-                            },
-                        )
-
-                        sel_rows_ev = best_ev_resp.get("selected_rows")
-                        if sel_rows_ev is not None and len(sel_rows_ev) > 0:
-                            sel_row_ev = sel_rows_ev[0] if isinstance(sel_rows_ev, list) else sel_rows_ev.iloc[0].to_dict()
-                            selected_auction_ev = str(sel_row_ev.get("Auction", "")).strip()
-                            if selected_auction_ev and selected_auction_ev != current_auction:
-                                try:
-                                    data = api_post("/resolve-auction-path", {"auction": selected_auction_ev}, timeout=30)
-                                    new_path = data.get("path", [])
-                                    if new_path:
-                                        st.session_state.auction_builder_path = new_path
-                                        st.session_state.auction_builder_last_applied = selected_auction_ev.upper()
-                                        st.session_state.auction_builder_last_selected = ""
-                                        st.rerun()
-                                except Exception as e:
-                                    st.error(f"Failed to apply auction: {e}")
-                    elif cache_key_ev in st.session_state:
-                        st.info("No completed auctions found via criteria-pass bid paths for EV search.")
-                        # Show debug info from session state if available
-                        stats_ev = st.session_state.get(f"{cache_key_ev}__stats")
-                        if stats_ev:
-                            with st.expander("Search Stats (Debug)"):
-                                st.json(stats_ev)
-
-                    # ---------------------------------------------------------------------
-                    # Debug: trace a specific auction path step-by-step with depth/call usage
-                    # ---------------------------------------------------------------------
-                    with st.expander("Debug: Trace an auction path (depth + API calls)", expanded=False):
-                        trace_default = "1H-P-1S-P-4D-P-4N-P-5H-P-6S-P-P-P"
-                        trace_auction = st.text_input(
-                            "Auction to trace",
-                            value=trace_default,
-                            key=f"trace_auction_{current_seat}",
-                            help="Traces each step by calling /list-next-bids and /deal-criteria-eval-batch.",
-                        )
-                        trace_max_depth = int(st.number_input("Max depth", min_value=1, max_value=50, value=20, step=1, key=f"trace_depth_{current_seat}"))
-                        trace_max_calls = int(st.number_input("Max API calls", min_value=1, max_value=5000, value=1000, step=50, key=f"trace_calls_{current_seat}"))
-                        trace_beam = int(st.number_input("Beam width (top-N explored per node)", min_value=1, max_value=200, value=10, step=1, key=f"trace_beam_{current_seat}"))
-                        trace_show_alternatives = bool(
-                            st.checkbox(
-                                "Show UI-valid alternative candidates (with Best_DD lookahead)",
-                                value=True,
-                                key=f"trace_show_alts_{current_seat}",
-                            )
-                        )
-                        trace_alt_max_calls = int(
-                            st.number_input(
-                                "Alt lookahead max API calls (per candidate)",
-                                min_value=25,
-                                max_value=5000,
-                                value=250,
-                                step=25,
-                                key=f"trace_alt_calls_{current_seat}",
-                            )
-                        )
-
-                        def _trace_one_auction_path(auction_text: str, max_depth_i: int, max_calls_i: int, beam_width: int) -> list[dict[str, Any]]:
-                            if not pinned_deal:
-                                return []
-                            dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
-                            row_idx_local = pinned_deal.get("_row_idx")
-                            if row_idx_local is None:
-                                return []
-
-                            vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper()
-                            par_raw = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
-                            try:
-                                par_score_i = int(par_raw) if par_raw is not None else None
-                            except Exception:
-                                par_score_i = None
-
-                            def _is_auc_complete(auc: str) -> bool:
-                                """Auction completion rule: 4 opening passes OR 3 passes after a contract bid."""
-                                try:
-                                    bids = [b.strip().upper() for b in str(auc).split("-") if b.strip()]
-                                    if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
-                                        return True
-                                    last_contract_idx = -1
-                                    for i, b in enumerate(bids):
-                                        if b and b not in ("P", "X", "XX") and b[0].isdigit():
-                                            last_contract_idx = i
-                                    return (
-                                        last_contract_idx >= 0
-                                        and len(bids) >= last_contract_idx + 4
-                                        and all(b == "P" for b in bids[-3:])
-                                    )
-                                except Exception:
-                                    return False
-
-                            # "Best_DD" lookahead for this trace: score the FULL auction being traced.
-                            # This avoids misleading per-bid DD estimates for artificial calls.
-                            # For the provided debug auction, this should equal the max DD you know is reachable.
-                            best_dd: int | None = None
-                            try:
-                                full_auc_norm = normalize_auction_input(auction_text).upper()
-                                dd_full = get_dd_score_for_auction(full_auc_norm, dealer_actual, pinned_deal)
-                                best_dd = int(dd_full) if dd_full is not None else None
-                            except Exception:
-                                best_dd = None
-
-                            def _par_guided_key(dd_est: int) -> tuple[int, int, int]:
-                                if par_score_i is None or dd_est <= -90000:
-                                    return (0, dd_est, dd_est)
-                                return (1 if dd_est == par_score_i else 0, -abs(par_score_i - dd_est), dd_est)
-
-                            def _best_dd_lookahead_from_prefix(
-                                prefix_after_bid: str,
-                                depth_used: int,
-                                max_api_calls_local: int,
-                            ) -> int | None:
-                                """Find best completed DD reachable from this prefix via criteria-valid bids."""
-                                if not pinned_deal:
-                                    return None
-                                dealer_local = dealer_actual
-                                row_idx_local2 = row_idx_local
-                                if row_idx_local2 is None:
-                                    return None
-
-                                # Local caches for speed (per call)
-                                dd_prefix_cache: dict[str, int] = {}
-                                api_calls_local = 0
-                                best_dd_local: int | None = None
-
-                                def dd_est_prefix(auc: str) -> int:
-                                    if auc in dd_prefix_cache:
-                                        return dd_prefix_cache[auc]
+                        # Auto-refresh policy:
+                        # - Load once per cache key (auction/seed/max_best_auctions).
+                        # - If it failed/returned empty, do not keep retrying on every Streamlit rerun;
+                        #   change inputs (or clear caches) to re-trigger.
+                        if (not attempted) and (not best_auctions_dd):
+                            with st.spinner("Loading (server-side)..."):
+                                t0 = time.perf_counter()
+                                row_idx = pinned_deal.get("_row_idx")
+                                if row_idx is not None:
                                     try:
-                                        v = get_dd_score_for_auction(auc, dealer_local, pinned_deal)
-                                        out = int(v) if v is not None else -99999
-                                    except Exception:
-                                        out = -99999
-                                    dd_prefix_cache[auc] = out
-                                    return out
-
-                                def rec(auc_pref: str, d: int) -> None:
-                                    nonlocal api_calls_local, best_dd_local
-                                    if d >= max_depth_i:
-                                        return
-                                    if api_calls_local >= max_api_calls_local:
-                                        return
-                                    # Quick pruning: if we already hit par, we can't do better (for NS-positive par scoring).
-                                    if par_score_i is not None and best_dd_local is not None and best_dd_local == int(par_score_i):
-                                        return
-
-                                    try:
-                                        bt_pref, lp_here = _strip_leading_passes(auc_pref)
-                                        api_calls_local += 1
-                                        opts = get_next_bid_options(bt_pref)
-                                    except Exception:
-                                        return
-                                    if not opts:
-                                        return
-
-                                    # Determine seat/dealer for criteria evaluation at this node (match UI mapping)
-                                    toks = [b for b in auc_pref.split("-") if b.strip()]
-                                    display_seat_here = (len(toks) % 4) + 1
-                                    bt_seat_here = _bt_seat_from_display_seat(display_seat_here, lp_here)
-                                    dealer_rot_here = _rotate_dealer_by(dealer_local, lp_here)
-
-                                    # Candidate options: skip dead-ends; allow empty agg_expr (criteria-pass by definition)
-                                    cand: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
-                                    for o in opts:
-                                        if o.get("is_dead_end"):
-                                            continue
-                                        bid_u = str(o.get("bid", "")).upper()
-                                        auc2 = f"{auc_pref}-{bid_u}"
-                                        dd_est = dd_est_prefix(auc2)
-                                        cand.append((_par_guided_key(dd_est), o))
-                                    cand.sort(key=lambda x: x[0], reverse=True)
-
-                                    # Scan in chunks until we collect some valid options
-                                    beam_local = 10
-                                    chunk_size = 25
-                                    valid_picks: list[dict[str, Any]] = []
-                                    i0 = 0
-                                    while i0 < len(cand) and len(valid_picks) < beam_local and api_calls_local < max_api_calls_local:
-                                        chunk = [x[1] for x in cand[i0 : i0 + chunk_size]]
-                                        i0 += chunk_size
-
-                                        no_crit = [o for o in chunk if not (o.get("agg_expr") or [])]
-                                        valid_picks.extend(no_crit)
-                                        if len(valid_picks) >= beam_local:
-                                            break
-
-                                        with_crit = [o for o in chunk if (o.get("agg_expr") or [])]
-                                        if not with_crit:
-                                            continue
-                                        try:
-                                            api_calls_local += 1
-                                            res = api_post(
-                                                "/deal-criteria-eval-batch",
-                                                {
-                                                    "deal_row_idx": int(row_idx_local2),
-                                                    "dealer": dealer_rot_here,
-                                                    "checks": [{"seat": int(bt_seat_here), "criteria": list(o.get("agg_expr") or [])} for o in with_crit],
-                                                },
-                                                timeout=10,
-                                            )
-                                            rr = res.get("results") or []
-                                            for j, r0 in enumerate(rr[: len(with_crit)]):
-                                                failed = (r0 or {}).get("failed") or []
-                                                untracked = (r0 or {}).get("untracked") or []
-                                                if len(failed) == 0 and len(untracked) == 0:
-                                                    valid_picks.append(with_crit[j])
-                                                    if len(valid_picks) >= beam_local:
-                                                        break
-                                        except Exception:
-                                            valid_picks.extend(with_crit)
-
-                                    valid_picks = valid_picks[:beam_local]
-
-                                    for o in valid_picks:
-                                        bid_u = str(o.get("bid", "")).upper()
-                                        auc2 = f"{auc_pref}-{bid_u}"
-                                        if o.get("is_complete") or _is_auc_complete(auc2):
-                                            try:
-                                                dd2 = get_dd_score_for_auction(auc2, dealer_local, pinned_deal)
-                                                if dd2 is not None:
-                                                    v = int(dd2)
-                                                    best_dd_local = v if best_dd_local is None else max(best_dd_local, v)
-                                            except Exception:
-                                                pass
-                                        else:
-                                            rec(auc2, d + 1)
-
-                                rec(prefix_after_bid, depth_used)
-                                return best_dd_local
-
-                            auc_norm = normalize_auction_input(auction_text).upper()
-                            bids = [b.strip().upper() for b in auc_norm.split("-") if b.strip()]
-                            out_rows: list[dict[str, Any]] = []
-                            alt_rows: list[dict[str, Any]] = []
-                            api_calls = 0
-                            cumulative_min_calls = 0
-
-                            prefix_display = ""
-                            for depth_i, next_bid in enumerate(bids, start=1):
-                                # Depth guard (same concept as search max_depth)
-                                depth_ok = depth_i <= max_depth_i
-
-                                bt_prefix, leading_passes_i = _strip_leading_passes(prefix_display)
-                                display_tokens = [t for t in prefix_display.split("-") if t.strip()] if prefix_display else []
-                                display_seat = (len(display_tokens) % 4) + 1
-                                bt_seat = _bt_seat_from_display_seat(display_seat, leading_passes_i)
-                                dealer_rot = _rotate_dealer_by(dealer_actual, leading_passes_i)
-
-                                # Call: list-next-bids (uncached for trace)
-                                api_calls += 1
-                                list_call_ok = api_calls <= max_calls_i
-                                opt = None
-                                # Counts to reconcile with UI grids
-                                bt_next_total = 0
-                                bt_non_dead_end = 0
-                                bt_non_empty_criteria = 0
-                                pinned_valid_count: int | None = None
-
-                                # Candidates tracked in the same space as the search:
-                                # - dead-ends removed
-                                # - empty agg_expr removed (UI treats these as "Rejected", not "Valid")
-                                candidates_all: list[tuple[tuple[int, int, int], int, bool, bool, dict[str, Any]]] = []
-                                target_rank: int | None = None  # rank among candidates_all (EV-desc)
-                                target_in_beam: bool | None = None
-                                target_in_beam_valid: bool | None = None
-                                target_dd_est: int | None = None
-                                target_ev_est: float | None = None
-                                crit_batch_call_made = False
-                                min_calls_this_step = 1  # list-next-bids
-                                try:
-                                    # Use UI helper to ensure consistent schema (force_refresh so this isn't affected by cache).
-                                    next_opts = get_next_bid_options(bt_prefix, force_refresh=True)
-                                    bt_next_total = int(len(next_opts or []))
-                                    for o in next_opts:
-                                        bid_u = str(o.get("bid", "")).upper()
-                                        if bid_u == next_bid:
-                                            opt = o
-                                        if o.get("is_dead_end"):
-                                            continue
-                                        bt_non_dead_end += 1
-                                        if not (o.get("agg_expr") or []):
-                                            continue
-                                        bt_non_empty_criteria += 1
-                                        # Rank candidates the same way the current search does: par/DD guided.
-                                        auc_after = f"{prefix_display}-{bid_u}" if prefix_display else bid_u
-                                        try:
-                                            dd_raw = get_dd_score_for_auction(
-                                                auc_after,
-                                                dealer_actual,
-                                                pinned_deal,
-                                            )
-                                            dd_est = int(dd_raw) if dd_raw is not None else -99999
-                                        except Exception:
-                                            dd_est = -99999
-                                        # EV estimate for the standing contract after this bid (can be misleading for artificial bids).
-                                        try:
-                                            ev_raw = get_ev_for_auction(auc_after, dealer_actual, pinned_deal)
-                                            ev_est = float(ev_raw) if ev_raw is not None else None
-                                        except Exception:
-                                            ev_est = None
-                                        if bid_u == next_bid:
-                                            target_dd_est = dd_est if dd_est > -90000 else None
-                                            target_ev_est = round(float(ev_est), 1) if ev_est is not None else None
-                                        candidates_all.append((_par_guided_key(dd_est), dd_est, bool(bid_u and bid_u[0].isdigit()), bid_u == "P", o))
-                                    candidates_all.sort(key=lambda x: x[0], reverse=True)
-                                    for idx0, c in enumerate(candidates_all):
-                                        if str(c[4].get("bid", "")).upper() == next_bid:
-                                            target_rank = idx0 + 1
-                                            break
-                                    target_in_beam = (target_rank is not None and target_rank <= int(beam_width))
-                                except Exception:
-                                    candidates_all = []
-
-                                # Call: criteria eval
-                                passes = None
-                                failed_n = None
-                                untracked_n = None
-                                valid_ids_all: set[int] = set()  # criteria-pass (failed/untracked empty)
-                                criteria_pass_count: int | None = None
-                                ui_valid_count: int | None = None
-                                ui_valid_bids: list[str] = []
-                                if candidates_all:
-                                    # Evaluate validity for *all* candidates (after structural filtering),
-                                    # so we can report a pinned-deal-valid count that matches the UI "Valid" grid.
-                                    crit_batch_call_made = True
-                                    api_calls += 1
-                                    min_calls_this_step += 1
-                                    try:
-                                        to_eval = [c[4] for c in candidates_all]
-                                        res = api_post(
-                                            "/deal-criteria-eval-batch",
+                                        resp = api_post(
+                                            "/deal-matched-bt-sample",
                                             {
-                                                "deal_row_idx": int(row_idx_local),
-                                                "dealer": dealer_rot,
-                                                "checks": [{"seat": int(bt_seat), "criteria": list(o.get("agg_expr") or [])} for o in to_eval],
+                                                "deal_row_idx": int(row_idx),
+                                                "metric": "DD",
+                                                "n_samples": int(max_best_auctions),
+                                                "seed": seed,
                                             },
-                                            timeout=10,
+                                            timeout=30,
                                         )
-                                        rr = res.get("results") or []
-                                        for i, r0 in enumerate(rr[: len(to_eval)]):
-                                            failed = (r0 or {}).get("failed") or []
-                                            untracked = (r0 or {}).get("untracked") or []
-                                            if len(failed) == 0 and len(untracked) == 0:
-                                                valid_ids_all.add(id(to_eval[i]))
-                                    except Exception:
-                                        # Search/trace treat server errors permissively.
-                                        for c in candidates_all:
-                                            valid_ids_all.add(id(c[4]))
-                                    criteria_pass_count = int(len(valid_ids_all))
+                                        best_auctions_dd = resp.get("rows", []) or []
+                                    except Exception as e:
+                                        st.error(f"Server-side load failed: {e}")
+                                        best_auctions_dd = []
+                                else:
+                                    best_auctions_dd = []
+                                st.session_state[cache_key_dd] = best_auctions_dd
+                                st.session_state[cache_key_dd_elapsed] = float(time.perf_counter() - t0)
+                                st.session_state[cache_key_dd_attempted] = True
 
-                                    # UI-valid is stricter than "criteria-pass":
-                                    # it also rejects bids that "cannot complete" and bids missing Avg_EV.
-                                    # Reproduce those rules here so the trace aligns with ✅ Valid Bids.
-                                    # NOTE: Avg_EV in the UI is only populated when Matches > 0.
-                                    # For trace, compute Matches via /auction-pattern-counts for these candidates.
-                                    ui_valid_ids: set[int] = set()
+                        if best_auctions_dd:
+                            par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
+                            ach_count = sum(1 for a in best_auctions_dd if a.get("Par") == "✅")
+                            if par_score is not None:
+                                elapsed_s = st.session_state.get(cache_key_dd_elapsed)
+                                elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
+                                if ach_count > 0:
+                                    st.success(f"Showing {len(best_auctions_dd)} row(s); {ach_count} achieve par {par_score} ({elapsed_txt})")
+                                else:
+                                    st.warning(f"Showing {len(best_auctions_dd)} row(s); no par auctions ({elapsed_txt})")
+
+                            best_auctions_df = pl.DataFrame(best_auctions_dd)
+                            # Drop API-only helper columns not meant for display.
+                            drop_cols = [c for c in ["is_completed_auction", "Score"] if c in best_auctions_df.columns]
+                            if drop_cols:
+                                best_auctions_df = best_auctions_df.drop(drop_cols)
+                            # Add client-side row number 'index' (1..N) and force it to be first column.
+                            if "index" not in best_auctions_df.columns:
+                                best_auctions_df = best_auctions_df.with_row_index("index", offset=1)
+                            cols = ["index"] + [c for c in best_auctions_df.columns if c != "index"]
+                            best_auctions_df = best_auctions_df.select(cols)
+
+                            best_auctions_pdf = best_auctions_df.to_pandas()
+                            gb_best = GridOptionsBuilder.from_dataframe(best_auctions_pdf)
+                            gb_best.configure_selection(selection_mode="single", use_checkbox=False)
+                            if "index" in best_auctions_pdf.columns:
+                                gb_best.configure_column("index", width=70, headerName="#")
+                            gb_best.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
+                            gb_best.configure_column("Contract", width=90)
+                            if "DD_Score" in best_auctions_pdf.columns:
+                                gb_best.configure_column("DD_Score", width=100, headerName="DD Score")
+                            if "EV" in best_auctions_pdf.columns:
+                                gb_best.configure_column("EV", width=90)
+                            gb_best.configure_column("Par", width=60)
+                            if "bt_index" in best_auctions_pdf.columns:
+                                gb_best.configure_column("bt_index", width=110, headerName="BT Index")
+                            gb_best.configure_grid_options(rowHeight=25, headerHeight=25)
+                            best_opts = gb_best.build()
+
+                            best_auctions_resp = AgGrid(
+                                best_auctions_pdf,
+                                gridOptions=best_opts,
+                                height=min(260, 60 + len(best_auctions_dd) * 25),
+                                update_on=["selectionChanged"],
+                                theme="balham",
+                                key=f"auction_builder_best_auctions_dd_{current_seat}",
+                                custom_css={
+                                    ".ag-row": {"cursor": "pointer"},
+                                    ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
+                                    ".ag-row-selected": {"background-color": "#CCE5FF !important"},
+                                },
+                            )
+
+                            sel_rows = best_auctions_resp.get("selected_rows")
+                            if sel_rows is not None and len(sel_rows) > 0:
+                                sel_row_data = sel_rows[0] if isinstance(sel_rows, list) else sel_rows.iloc[0].to_dict()
+                                selected_auction = str(sel_row_data.get("Auction", "")).strip()
+                                if selected_auction and selected_auction != current_auction:
                                     try:
-                                        # Build patterns for all candidate next_auctions at this prefix (display form).
-                                        next_to_pattern: dict[str, str] = {}
-                                        for _k, _dd, _is_digit, _is_p, o in candidates_all:
-                                            bid_u = str(o.get("bid", "")).upper()
-                                            next_auc = f"{prefix_display}-{bid_u}" if prefix_display else bid_u
-                                            next_to_pattern[next_auc] = next_auc.replace("-", "-*") + "*" if next_auc else "*"
-                                        patterns = list(dict.fromkeys(next_to_pattern.values()))
-                                        counts_by_pattern: dict[str, int] = {}
-                                        if patterns:
-                                            resp = api_post("/auction-pattern-counts", {"patterns": patterns}, timeout=15)
-                                            counts_by_pattern = resp.get("counts", {}) or {}
-                                        # Seat direction (dealer-relative) to pick vul for Avg_EV
-                                        directions = ["N", "E", "S", "W"]
-                                        try:
-                                            dealer_idx = directions.index(str(dealer_actual).upper())
-                                        except Exception:
-                                            dealer_idx = 0
-                                        seat_dir = directions[(dealer_idx + int(display_seat) - 1) % 4]
-                                        ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
-                                        ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
-                                        is_vul_seat = (seat_dir in ("N", "S") and ns_vul) or (seat_dir in ("E", "W") and ew_vul)
-                                        ev_sign = -1.0 if int(display_seat) in (2, 4) else 1.0
+                                        data = api_post("/resolve-auction-path", {"auction": selected_auction}, timeout=30)
+                                        new_path = data.get("path", [])
+                                        if new_path:
+                                            st.session_state.auction_builder_path = new_path
+                                            st.session_state.auction_builder_last_applied = selected_auction.upper()
+                                            st.session_state.auction_builder_last_selected = ""
+                                            st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Failed to apply auction: {e}")
+                        elif cache_key_dd_attempted in st.session_state:
+                            st.info("No matched BT rows returned for this deal (or limit is 0).")
 
-                                        for _k, _dd, _is_digit, _is_p, o in candidates_all:
-                                            oid = id(o)
-                                            matches_pinned = oid in valid_ids_all
-                                            if not matches_pinned:
-                                                continue
-                                            # cannot complete -> rejected (UI rule)
-                                            can_complete = o.get("can_complete")
-                                            can_complete_b = bool(can_complete) if can_complete is not None else True
-                                            if not can_complete_b:
-                                                continue
-                                            # missing Avg_EV -> rejected (UI rule)
-                                            bid_u = str(o.get("bid", "")).upper()
-                                            next_auc = f"{prefix_display}-{bid_u}" if prefix_display else bid_u
-                                            pat = next_to_pattern.get(next_auc)
-                                            matches_count = int(counts_by_pattern.get(pat, 0) or 0) if pat else 0
-                                            chosen = o.get("avg_ev_v") if is_vul_seat else o.get("avg_ev_nv")
-                                            avg_ev = None
-                                            if matches_count and matches_count > 0 and chosen is not None:
-                                                try:
-                                                    avg_ev = round(ev_sign * float(chosen), 1)
-                                                except Exception:
-                                                    avg_ev = None
-                                            if avg_ev is None:
-                                                continue
-                                            ui_valid_ids.add(oid)
+                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}"
+                    cache_key_ev_elapsed = f"{cache_key_ev}__elapsed_s"
+                    cache_key_ev_attempted = f"{cache_key_ev}__attempted"
+
+                    if show_best_auctions:
+                        st.markdown("**Best Auctions Ranked by EV**")
+                        best_auctions_ev: list[dict[str, Any]] = st.session_state.get(cache_key_ev, [])
+                        attempted_ev = bool(st.session_state.get(cache_key_ev_attempted, False))
+
+                        if (not attempted_ev) and (not best_auctions_ev):
+                            with st.spinner("Loading (server-side)..."):
+                                t0_ev = time.perf_counter()
+                                row_idx = pinned_deal.get("_row_idx")
+                                if row_idx is not None:
+                                    try:
+                                        resp = api_post(
+                                            "/deal-matched-bt-sample",
+                                            {
+                                                "deal_row_idx": int(row_idx),
+                                                "metric": "EV",
+                                                "n_samples": int(max_best_auctions),
+                                                "seed": seed,
+                                            },
+                                            timeout=30,
+                                        )
+                                        best_auctions_ev = resp.get("rows", []) or []
+                                    except Exception as e:
+                                        st.error(f"Server-side load failed: {e}")
+                                        best_auctions_ev = []
+                                else:
+                                    best_auctions_ev = []
+                                st.session_state[cache_key_ev] = best_auctions_ev
+                                st.session_state[cache_key_ev_elapsed] = float(time.perf_counter() - t0_ev)
+                                st.session_state[cache_key_ev_attempted] = True
+
+                        if best_auctions_ev:
+                            # Info summary (mirror DD expander style, but for EV).
+                            elapsed_s = st.session_state.get(cache_key_ev_elapsed)
+                            elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
+                            best_ev = best_auctions_ev[0].get("EV") if best_auctions_ev else None
+                            try:
+                                best_ev_f = float(best_ev) if best_ev is not None else None
+                            except Exception:
+                                best_ev_f = None
+                            if best_ev_f is None:
+                                st.success(f"Showing {len(best_auctions_ev)} row(s); best EV — ({elapsed_txt})")
+                            else:
+                                achieves_best = 0
+                                for r in best_auctions_ev:
+                                    try:
+                                        if float(r.get("EV")) == best_ev_f:
+                                            achieves_best += 1
                                     except Exception:
-                                        # If the UI-only signals can't be computed, fall back to criteria-pass.
-                                        ui_valid_ids = set(valid_ids_all)
-
-                                    ui_valid_count = int(len(ui_valid_ids))
-                                    # Keep the existing column name but align it to UI-valid semantics.
-                                    pinned_valid_count = ui_valid_count
-                                    ui_valid_bids = [
-                                        str(o.get("bid", "")).upper()
-                                        for _k, _dd, _is_digit, _is_p, o in candidates_all
-                                        if id(o) in ui_valid_ids
-                                    ]
-
-                                    # Determine whether the target bid is (a) in beam, and (b) valid.
-                                    if target_in_beam:
-                                        target_obj = None
-                                        for _k, _dd, _is_digit, _is_p, o in candidates_all[: int(beam_width)]:
-                                            if str(o.get("bid", "")).upper() == next_bid:
-                                                target_obj = o
-                                                break
-                                        if target_obj is not None:
-                                            target_in_beam_valid = id(target_obj) in valid_ids_all
-                                            passes = target_in_beam_valid
-
-                                    # For convenience: if the target exists at this node, compute its direct pass/fail counts.
-                                    if opt is not None:
-                                        agg_expr = opt.get("agg_expr") or []
-                                        if not agg_expr:
-                                            # Empty criteria: UI treats as rejected; still "passes" criteria by definition,
-                                            # but it should not be followed by a valid-only search.
-                                            failed_n = 0
-                                            untracked_n = 0
-                                        else:
-                                            # We already evaluated it in the batch if it's in candidates_all.
-                                            # If it wasn't in candidates_all (dead-end or empty agg_expr), keep counts None.
-                                            failed_n = None
-                                            untracked_n = None
-
-                                cumulative_min_calls += int(min_calls_this_step)
-
-                                out_rows.append(
-                                    {
-                                        "Depth": depth_i,
-                                        "Prefix": prefix_display or "(opening)",
-                                        "Next_Bid": next_bid,
-                                        "BT_Prefix": bt_prefix or "(opening)",
-                                        "Leading_Passes": int(leading_passes_i),
-                                        "Display_Seat": int(display_seat),
-                                        "BT_Seat": int(bt_seat),
-                                        "Dealer_Rot": dealer_rot,
-                                        # This is a *path validation* call counter (it follows the known bid immediately).
-                                        "Trace_API_Calls_Used": int(api_calls),
-                                        "Max_API_Calls": int(max_calls_i),
-                                        "Depth_Limit": int(max_depth_i),
-                                        "Depth_OK": bool(depth_ok),
-                                        "Calls_OK": bool(api_calls <= max_calls_i),
-                                        "List_Call_OK": bool(list_call_ok),
-                                        "Found_As_Next": bool(opt is not None),
-                                        "Is_Dead_End": bool(opt.get("is_dead_end")) if opt is not None else None,
-                                        "Is_Complete_Flag": bool(opt.get("is_completed_auction")) if opt is not None else None,
-                                        "Agg_Expr_N": len(opt.get("agg_expr") or []) if opt is not None else None,
-                                        # Search reachability diagnostics
-                                        # Raw BT branching stats (helps explain "why so many candidates?")
-                                        "BT_Next_Total": int(bt_next_total),
-                                        "BT_NonDeadEnd": int(bt_non_dead_end),
-                                        "BT_NonEmptyCriteria": int(bt_non_empty_criteria),
-                                        # Candidate pool actually used for valid-only traversal (structural filtering applied)
-                                        "Candidate_Count": int(len(candidates_all)) if candidates_all else 0,
-                                        "Criteria_Pass_Count": criteria_pass_count,
-                                        "PinnedDeal_Valid_Count": pinned_valid_count,
-                                        "UI_Valid_Bids": ", ".join(ui_valid_bids),
-                                        "UI_Valid_Bid_Scores": "",
-                                        "Beam_Width": int(beam_width),
-                                        "Target_Rank": target_rank,
-                                        "Target_In_Beam": target_in_beam,
-                                        "Target_In_Beam_Valid": target_in_beam_valid,
-                                        "Trace_CritBatch_Call": bool(crit_batch_call_made),
-                                        "Target_Criteria_Passes": passes,
-                                        "Target_DD_Est": target_dd_est,
-                                        "Target_EV_Est": target_ev_est,
-                                        "Best_DD": best_dd,
-                                        "Failed_N": failed_n,
-                                        "Untracked_N": untracked_n,
-                                        # Lower-bound calls the search must spend at this node (ignores exploring other branches).
-                                        "Min_API_Calls_This_Step": int(min_calls_this_step),
-                                        "Cumulative_Min_API_Calls": int(cumulative_min_calls),
-                                    }
+                                        pass
+                                st.success(
+                                    f"Showing {len(best_auctions_ev)} row(s); "
+                                    f"{achieves_best} achieve best EV of {best_ev_f} ({elapsed_txt})"
                                 )
 
-                                # Alternative UI-valid candidates at this step (long-form rows)
-                                if trace_show_alternatives and ui_valid_bids:
-                                    # Only do lookahead for a small number of candidates (this is debug-only).
-                                    bid_to_best_dd: dict[str, int | None] = {}
-                                    for cand_bid in ui_valid_bids[:10]:
-                                        cand_auc = f"{prefix_display}-{cand_bid}" if prefix_display else cand_bid
-                                        # Standing DD/EV estimates at this node after the candidate
-                                        cand_dd_est = None
-                                        cand_ev_est = None
-                                        try:
-                                            ddv = get_dd_score_for_auction(cand_auc, dealer_actual, pinned_deal)
-                                            cand_dd_est = int(ddv) if ddv is not None else None
-                                        except Exception:
-                                            cand_dd_est = None
-                                        try:
-                                            evv = get_ev_for_auction(cand_auc, dealer_actual, pinned_deal)
-                                            cand_ev_est = round(float(evv), 1) if evv is not None else None
-                                        except Exception:
-                                            cand_ev_est = None
-                                        cand_best_dd = _best_dd_lookahead_from_prefix(cand_auc, depth_i, trace_alt_max_calls)
-                                        bid_to_best_dd[cand_bid] = cand_best_dd
-                                        alt_rows.append(
-                                            {
-                                                "Depth": depth_i,
-                                                "Prefix": prefix_display or "(opening)",
-                                                "Candidate_Bid": cand_bid,
-                                                "Is_Chosen": bool(cand_bid == next_bid),
-                                                "Candidate_DD_Est": cand_dd_est,
-                                                "Candidate_EV_Est": cand_ev_est,
-                                                "Candidate_Best_DD": cand_best_dd,
-                                                "ParScore": par_score_i,
-                                            }
-                                        )
-                                    # Summarize onto the step row for quick scanning.
+                            best_ev_df = pl.DataFrame(best_auctions_ev)
+                            # Drop API-only helper columns not meant for display.
+                            drop_cols = [c for c in ["is_completed_auction", "Score"] if c in best_ev_df.columns]
+                            if drop_cols:
+                                best_ev_df = best_ev_df.drop(drop_cols)
+                            # Add client-side row number 'index' (1..N) and force it to be first column.
+                            if "index" not in best_ev_df.columns:
+                                best_ev_df = best_ev_df.with_row_index("index", offset=1)
+                            cols = ["index"] + [c for c in best_ev_df.columns if c != "index"]
+                            best_ev_df = best_ev_df.select(cols)
+
+                            best_ev_pdf = best_ev_df.to_pandas()
+                            gb_ev_auc = GridOptionsBuilder.from_dataframe(best_ev_pdf)
+                            gb_ev_auc.configure_selection(selection_mode="single", use_checkbox=False)
+                            if "index" in best_ev_pdf.columns:
+                                gb_ev_auc.configure_column("index", width=70, headerName="#")
+                            gb_ev_auc.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
+                            gb_ev_auc.configure_column("Contract", width=90)
+                            if "EV" in best_ev_pdf.columns:
+                                gb_ev_auc.configure_column("EV", width=90)
+                            if "DD_Score" in best_ev_pdf.columns:
+                                gb_ev_auc.configure_column("DD_Score", width=110, headerName="DD Score")
+                            if "Par" in best_ev_pdf.columns:
+                                gb_ev_auc.configure_column("Par", width=60)
+                            if "bt_index" in best_ev_pdf.columns:
+                                gb_ev_auc.configure_column("bt_index", width=110, headerName="BT Index")
+                            gb_ev_auc.configure_grid_options(rowHeight=25, headerHeight=25)
+                            best_ev_opts = gb_ev_auc.build()
+
+                            best_ev_resp = AgGrid(
+                                best_ev_pdf,
+                                gridOptions=best_ev_opts,
+                                height=min(260, 60 + len(best_auctions_ev) * 25),
+                                update_on=["selectionChanged"],
+                                theme="balham",
+                                key=f"auction_builder_best_auctions_ev_{current_seat}",
+                                custom_css={
+                                    ".ag-row": {"cursor": "pointer"},
+                                    ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
+                                    ".ag-row-selected": {"background-color": "#CCE5FF !important"},
+                                },
+                            )
+
+                            sel_rows_ev = best_ev_resp.get("selected_rows")
+                            if sel_rows_ev is not None and len(sel_rows_ev) > 0:
+                                sel_row_ev = sel_rows_ev[0] if isinstance(sel_rows_ev, list) else sel_rows_ev.iloc[0].to_dict()
+                                selected_auction_ev = str(sel_row_ev.get("Auction", "")).strip()
+                                if selected_auction_ev and selected_auction_ev != current_auction:
                                     try:
-                                        items = []
-                                        for b, v in bid_to_best_dd.items():
-                                            items.append((b, v))
-                                        # Sort best-first (None last), then by bid text.
-                                        items.sort(key=lambda x: (-999999 if x[1] is None else int(x[1]), x[0]), reverse=True)
-                                        score_str = ", ".join(f"{b}: {v}" for b, v in items)
-                                        out_rows[-1]["UI_Valid_Bid_Scores"] = score_str
-                                    except Exception:
-                                        out_rows[-1]["UI_Valid_Bid_Scores"] = ""
+                                        data = api_post("/resolve-auction-path", {"auction": selected_auction_ev}, timeout=30)
+                                        new_path = data.get("path", [])
+                                        if new_path:
+                                            st.session_state.auction_builder_path = new_path
+                                            st.session_state.auction_builder_last_applied = selected_auction_ev.upper()
+                                            st.session_state.auction_builder_last_selected = ""
+                                            st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Failed to apply auction: {e}")
+                        elif cache_key_ev_attempted in st.session_state:
+                            st.info("No matched BT rows returned for this deal (or limit is 0).")
 
-                                # Advance the display prefix
-                                prefix_display = f"{prefix_display}-{next_bid}" if prefix_display else next_bid
-
-                            # If alternatives were requested, stash them into session state for display.
-                            st.session_state[f"_trace_alt_rows_{current_seat}"] = alt_rows
-                            return out_rows
-
-                        if st.button("Trace", key=f"trace_btn_{current_seat}"):
-                            with st.spinner("Tracing auction path..."):
-                                trace_rows = _trace_one_auction_path(trace_auction, trace_max_depth, trace_max_calls, trace_beam)
-                            if not trace_rows:
-                                st.info("No trace output (need a pinned deal with _row_idx).")
-                            else:
-                                st.dataframe(pl.DataFrame(trace_rows).to_pandas(), width="stretch", hide_index=True)
-                                alt_rows = st.session_state.get(f"_trace_alt_rows_{current_seat}") or []
-                                if trace_show_alternatives and alt_rows:
-                                    st.markdown("**UI-valid alternatives (per step)**")
-                                    st.dataframe(pl.DataFrame(alt_rows).to_pandas(), width="stretch", hide_index=True)
+                    # Debug: Trace an auction path expander removed (no longer needed).
 
                 if not valid_rows:
                     st.warning(
@@ -8147,7 +7523,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             ".ag-row-selected": {"background-color": "#a3d4af !important"},
                         },
                     )
-                    handle_bid_selection(valid_resp)
+                    handle_bid_selection(valid_resp, "valid")
                 
                 # Rejected bids grid (dead ends, 0 deals, empty criteria)
                 if rejected_rows:
@@ -8222,7 +7598,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             ".ag-row-selected": {"background-color": "#ffda6a !important"},
                         },
                     )
-                    handle_bid_selection(rejected_resp)
+                    handle_bid_selection(rejected_resp, "rejected")
                 
                 # Invalid bids grid
                 if invalid_rows:
@@ -8244,7 +7620,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             ".ag-row-selected": {"background-color": "#eb959f !important"},
                         },
                     )
-                    handle_bid_selection(invalid_resp)
+                    handle_bid_selection(invalid_resp, "invalid")
                 
                 # Other rows (no match status - shouldn't happen when deal is pinned)
                 if other_rows:
@@ -8262,7 +7638,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         allow_unsafe_jscode=True,
                         custom_css=grid_custom_css,
                     )
-                    handle_bid_selection(other_resp)
+                    handle_bid_selection(other_resp, "other")
             elif use_two_dataframes and not show_failed_criteria:
                 # No pinned deal: split into Available vs Rejected using the same rejection logic.
                 available_rows = [r for r in bid_rows if not r.get("_rejected")]
@@ -8286,7 +7662,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             ".ag-row-selected": {"background-color": "#a3d4af !important"},
                         },
                     )
-                    handle_bid_selection(avail_resp)
+                    handle_bid_selection(avail_resp, "available")
                 else:
                     st.warning("No available bids (all candidates are rejected by BT/matches/deals/criteria rules).")
 
@@ -8331,7 +7707,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             ".ag-row-selected": {"background-color": "#ffda6a !important"},
                         },
                     )
-                    handle_bid_selection(rejected_resp)
+                    handle_bid_selection(rejected_resp, "rejected_unpinned")
             else:
                 # Single DataFrame mode
                 if show_failed_criteria and (valid_count > 0 or invalid_count > 0 or rejected_count > 0):
@@ -8348,7 +7724,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     allow_unsafe_jscode=True,
                     custom_css=grid_custom_css,
                 )
-                handle_bid_selection(grid_response)
+                handle_bid_selection(grid_response, "generic")
     
     # Summary DataFrame
     if current_path:
@@ -9175,7 +8551,16 @@ try:
                 if rules:
                     st.markdown(f"**{len(rules)} rules applied** affecting {stats.get('auctions_modified', 0):,} auctions")
                     rules_df = pl.DataFrame(rules)
-                    render_aggrid(rules_df, key="custom_criteria_rules", height=calc_grid_height(len(rules_df)), table_name="custom_criteria_rules")
+                    # AgGrid can render empty inside expanders; use Streamlit's native dataframe here.
+                    try:
+                        st.dataframe(
+                            rules_df.to_pandas(),
+                            use_container_width=True,
+                            height=calc_grid_height(len(rules_df), max_height=420, row_height=28, header_height=45),
+                        )
+                    except Exception:
+                        # Fallback: show as text if conversion fails
+                        st.write(rules_df)
                 else:
                     st.info("No rules defined in the CSV file.")
 except Exception:
