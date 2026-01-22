@@ -45,129 +45,15 @@ from bbo_bidding_queries_lib import (
     get_ev_for_auction_pre,
 )
 
-# Import criteria evaluation helpers from handlers
+# Import helpers from handlers
 from plugins.bbo_handlers_common import (
     annotate_criterion_with_value,
+    format_par_contracts as _format_par_contracts,
 )
 
 
 API_BASE = "http://127.0.0.1:8000"
 
-
-# ---------------------------------------------------------------------------
-# Par Contract formatting (copied from plugins.bbo_handlers_common to avoid
-# import path issues with mlBridge dependencies)
-# ---------------------------------------------------------------------------
-
-def _to_python_list(x: Any) -> list:
-    """Convert Polars list/Series or Python list to Python list."""
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return x
-    # Handle Polars Series or list types
-    if hasattr(x, "to_list"):
-        try:
-            return x.to_list()
-        except Exception:
-            pass
-    # Fallback: try to iterate
-    try:
-        return list(x)
-    except Exception:
-        return []
-
-
-def _par_contract_signature(c: Any) -> str:
-    """Stable signature for a par-contract dict (used for de-duping)."""
-    # Handle Polars struct which may not be a dict
-    if hasattr(c, "get"):
-        get_fn = c.get
-    elif isinstance(c, dict):
-        get_fn = c.get
-    else:
-        # Try to convert to dict
-        try:
-            c = dict(c) if hasattr(c, "__iter__") else {"_raw": c}
-            get_fn = c.get
-        except Exception:
-            return str(c)
-    
-    level = get_fn("Level", "")
-    strain = get_fn("Strain", "")
-    dbl = get_fn("Doubled", "")
-    if dbl == "":
-        dbl = get_fn("Double", "")
-    pair_dir = get_fn("Pair_Direction", "")
-    result = get_fn("Result", "")
-    return f"{level}|{strain}|{dbl}|{pair_dir}|{result}"
-
-
-def _dedup_par_contracts(par_contracts: Any) -> list[dict]:
-    """Return de-duplicated par contracts (preserving first-seen order)."""
-    # Convert to Python list first
-    contracts_list = _to_python_list(par_contracts)
-    if not contracts_list:
-        return []
-    
-    seen: set[str] = set()
-    out: list[dict] = []
-    for c in contracts_list:
-        # Convert struct to dict if needed
-        if not isinstance(c, dict) and hasattr(c, "__iter__"):
-            try:
-                c = dict(c)
-            except Exception:
-                continue
-        if not isinstance(c, dict):
-            continue
-        sig = _par_contract_signature(c)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append(c)
-    return out
-
-
-def _format_par_contracts(par_contracts: Any) -> str | None:
-    """Format ParContracts into a readable string, de-duped and with correct 'Doubled' key."""
-    if par_contracts is None:
-        return None
-    
-    # If already a string, return as-is
-    if isinstance(par_contracts, str):
-        return par_contracts
-    
-    # Convert and dedup
-    contracts = _dedup_par_contracts(par_contracts)
-    if not contracts:
-        # Fallback to string representation if we couldn't parse
-        return str(par_contracts) if par_contracts else None
-    
-    formatted: list[str] = []
-    for c in contracts:
-        level = c.get("Level", "")
-        strain = c.get("Strain", "")
-        dbl = c.get("Doubled", "")
-        if dbl == "":
-            dbl = c.get("Double", "")
-        pair_dir = c.get("Pair_Direction", "")
-        result = c.get("Result", "")
-        contract_str = f"{level}{strain}{dbl}"
-        if pair_dir:
-            contract_str += f" {pair_dir}"
-        if result is not None and result != "":
-            if isinstance(result, int):
-                if result == 0:
-                    contract_str += " ="
-                elif result > 0:
-                    contract_str += f" +{result}"
-                else:
-                    contract_str += f" {result}"
-            else:
-                contract_str += f" {result}"
-        formatted.append(contract_str.strip())
-    return ", ".join(formatted)
 
 # Shared constants
 SEAT_ROLES = {1: "Opener/Dealer", 2: "LHO", 3: "Partner", 4: "RHO"}

@@ -776,25 +776,66 @@ def seat_direction_map(seat: int) -> Dict[str, str]:
 # Par Contract Helpers
 # ===========================================================================
 
-def par_contract_signature(c: dict) -> str:
+def to_python_list(x: Any) -> list:
+    """Convert Polars list/Series or Python list to Python list."""
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    # Handle Polars Series or list types
+    if hasattr(x, "to_list"):
+        try:
+            return x.to_list()
+        except Exception:
+            pass
+    # Fallback: try to iterate
+    try:
+        return list(x)
+    except Exception:
+        return []
+
+
+def par_contract_signature(c: Any) -> str:
     """Stable signature for a par-contract dict (used for de-duping)."""
-    level = c.get("Level", "")
-    strain = c.get("Strain", "")
-    dbl = c.get("Doubled", "")
+    # Handle Polars struct which may not be a dict
+    if hasattr(c, "get"):
+        get_fn = c.get
+    elif isinstance(c, dict):
+        get_fn = c.get
+    else:
+        # Try to convert to dict
+        try:
+            c = dict(c) if hasattr(c, "__iter__") else {"_raw": c}
+            get_fn = c.get
+        except Exception:
+            return str(c)
+    
+    level = get_fn("Level", "")
+    strain = get_fn("Strain", "")
+    dbl = get_fn("Doubled", "")
     if dbl == "":
-        dbl = c.get("Double", "")
-    pair_dir = c.get("Pair_Direction", "")
-    result = c.get("Result", "")
+        dbl = get_fn("Double", "")
+    pair_dir = get_fn("Pair_Direction", "")
+    result = get_fn("Result", "")
     return f"{level}|{strain}|{dbl}|{pair_dir}|{result}"
 
 
 def dedup_par_contracts(par_contracts: Any) -> List[dict]:
     """Return de-duplicated par contracts (preserving first-seen order)."""
-    if not isinstance(par_contracts, list):
+    # Convert to Python list first (handles Polars types)
+    contracts_list = to_python_list(par_contracts)
+    if not contracts_list:
         return []
+    
     seen: set[str] = set()
     out: List[dict] = []
-    for c in par_contracts:
+    for c in contracts_list:
+        # Convert struct to dict if needed
+        if not isinstance(c, dict) and hasattr(c, "__iter__"):
+            try:
+                c = dict(c)
+            except Exception:
+                continue
         if not isinstance(c, dict):
             continue
         sig = par_contract_signature(c)
@@ -809,10 +850,19 @@ def format_par_contracts(par_contracts: Any) -> str | None:
     """Format ParContracts into a readable string, de-duped and with correct 'Doubled' key."""
     if par_contracts is None:
         return None
-    if not isinstance(par_contracts, list):
-        return str(par_contracts)
+    
+    # If already a string, return as-is
+    if isinstance(par_contracts, str):
+        return par_contracts
+    
+    # Convert and dedup
+    contracts = dedup_par_contracts(par_contracts)
+    if not contracts:
+        # Fallback to string representation if we couldn't parse
+        return str(par_contracts) if par_contracts else None
+    
     formatted: List[str] = []
-    for c in dedup_par_contracts(par_contracts):
+    for c in contracts:
         level = c.get("Level", "")
         strain = c.get("Strain", "")
         dbl = c.get("Doubled", "")

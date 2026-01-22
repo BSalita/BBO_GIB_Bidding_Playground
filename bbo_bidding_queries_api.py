@@ -22,7 +22,6 @@ import csv
 import gc
 import logging
 import operator
-import os
 import re
 import signal
 import sys

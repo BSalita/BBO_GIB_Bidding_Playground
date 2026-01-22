@@ -3,17 +3,12 @@ polars[rt64]
 pyarrow  # Parquet file support
 pandas
 numpy
-scikit-learn
-matplotlib
 endplay  # Bridge library (Deal, Vul, Player, dds, parsers)
 
 # GPU acceleration (optional - install with: pip install torch --index-url https://download.pytorch.org/whl/cu124)
 # torch
 
-# Expression evaluation
-asteval
-
-# Progress bars and visualization
+# Progress bars
 tqdm
 
 # Notebook support
@@ -25,21 +20,14 @@ fastapi
 uvicorn[standard]
 pydantic
 psutil
-aiohttp  # Async HTTP client for parallel API calls
 
 # Streamlit app
 streamlit
 streamlit-aggrid==1.1.8.post1
 requests
-altair  # Charts in Streamlit
-
-# Web scraping
-beautifulsoup4
 
 # Database
 duckdb
-sqlalchemy
-sqlalchemy-utils
 
 # Standard library (included with Python, no install needed):
 # pathlib, multiprocessing, pickle, re, gc, time, sys, datetime,

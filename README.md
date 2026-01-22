@@ -47,26 +47,15 @@ View learned criteria for any auction step, including:
 ### Wrong Bid Analysis
 Analyze criteria failures across deals to identify problematic rules.
 
-## Learning per-step `New_Rules` from Actual auctions (ground truth)
+## Learning per-step `New_Rules` from Actual Auctions (Ground Truth)
 
-See `tools/learn_new_rules_per_step.py`.
+The rule learning pipeline is implemented via Jupyter notebooks:
 
-- Learns per-step criteria that correlate with the *actual next bid* after a given auction prefix.
-- Can emit `New_Rules` as `list[str]` per BT step (mapped to a specific `bt_index` + seat).
+- **`bbo_learn_new_rules_bulk.ipynb`** - Discovers high-correlation criteria for each auction step
+- **`bbo_filter_new_rules.ipynb`** - Filters rules by quality thresholds and merges with base rules
+- **`bbo_bt_compile_rules.py`** - Compiles learned rules back into the main bidding table
 
-Example:
-
-```bash
-python -X utf8 tools/learn_new_rules_per_step.py ^
-  --parent-bt-index 408062489 ^
-  --max-deals 100000 ^
-  --min-pos 300 ^
-  --min-support 0.15 ^
-  --top-k 6 ^
-  --emit-bt-step ^
-  --output-parquet data/new_rules_step_1s.parquet ^
-  --progress print
-```
+See `Data_Pipeline.md` for the complete pipeline documentation.
 
 ## Performance Notes
 
