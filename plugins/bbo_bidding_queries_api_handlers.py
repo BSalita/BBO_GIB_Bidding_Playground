@@ -8229,6 +8229,9 @@ def handle_best_auctions_lookahead(
     metric: str,  # "DD" or "EV"
     max_depth: int = 20,
     max_results: int = 10,
+    deadline_s: float = 5.0,
+    max_nodes: int = 50000,  # max prefix expansions per request (safety cap)
+    beam_width: int = 25,    # how many children to explore per node (lookahead + dfs)
 ) -> Dict[str, Any]:
     """Server-side DFS to find best completed auctions by DD or EV.
     
@@ -8241,6 +8244,29 @@ def handle_best_auctions_lookahead(
         - elapsed_ms: Processing time
     """
     t0 = time.perf_counter()
+    # NOTE: This endpoint can be used both as a "quick lookahead" (short deadline)
+    # and as a longer-running background job. Keep robust safety caps.
+    try:
+        deadline_s = float(deadline_s)
+    except Exception:
+        deadline_s = 5.0
+    # Cap to avoid runaway server load (background jobs can increase this, but not unbounded).
+    deadline_s = max(0.1, min(deadline_s, 3600.0))
+    deadline_t = t0 + deadline_s
+
+    try:
+        max_nodes = int(max_nodes)
+    except Exception:
+        max_nodes = 50000
+    max_nodes = max(0, min(max_nodes, 2_000_000))
+
+    try:
+        beam_width = int(beam_width)
+    except Exception:
+        beam_width = 25
+    beam_width = max(1, min(beam_width, 200))
+
+    expanded_nodes = 0
     
     deal_df = state.get("deal_df")
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
@@ -8265,6 +8291,46 @@ def handle_best_auctions_lookahead(
     
     # Normalize auction prefix
     auction_norm = normalize_auction_input(auction_prefix).upper() if auction_prefix else ""
+
+    # Reuse a single DuckDB connection for the request and cache bt_index->metadata.
+    # The previous implementation created a new DuckDB connection per node, which is extremely slow.
+    file_path = _bt_file_path_for_sql(state)
+    conn = duckdb.connect(":memory:")
+    bt_meta_cache: Dict[int, Tuple[bool, List[str]]] = {}  # bt_index -> (is_completed, Expr list)
+    bt_meta_loaded = 0
+
+    def _hydrate_bt_meta(bt_indices: List[int]) -> None:
+        """Populate bt_meta_cache for any missing bt_index values."""
+        nonlocal bt_meta_loaded
+        missing = [int(x) for x in bt_indices if int(x) not in bt_meta_cache]
+        if not missing:
+            return
+        # Chunk to keep SQL manageable
+        chunk_size = 1000
+        for i in range(0, len(missing), chunk_size):
+            chunk = missing[i : i + chunk_size]
+            if not chunk:
+                continue
+            in_list = ", ".join(str(int(x)) for x in chunk)
+            # PERFORMANCE: Only load essential columns.
+            # Agg_Expr_Seat_* are huge (lists of strings) and slow to load.
+            # Use Expr directly - it's the criteria for this specific bid.
+            rows = conn.execute(
+                f"""
+                SELECT bt_index, is_completed_auction, Expr
+                FROM read_parquet('{file_path}')
+                WHERE bt_index IN ({in_list})
+                """
+            ).fetchall()
+            
+            for bt_idx, is_comp, expr in rows:
+                # Store Expr as the criteria for all seats (it's bid-specific)
+                expr_list = list(expr) if expr else []
+                bt_meta_cache[int(bt_idx)] = (
+                    bool(is_comp),
+                    expr_list,  # Single list, not per-seat
+                )
+            bt_meta_loaded += len(rows)
     
     # Helper: strip leading passes for BT lookup
     def strip_lp(auc: str) -> tuple[str, int]:
@@ -8362,31 +8428,11 @@ def handle_best_auctions_lookahead(
         if not child_map:
             return []
         
-        # Load metadata for children (agg_expr, is_completed_auction)
+        # Load metadata for children (Expr, is_completed_auction) with in-request caching.
         child_indices = list(child_map.values())
-        file_path = _bt_file_path_for_sql(state)
-        in_list = ", ".join(str(int(x)) for x in child_indices)
-        
-        conn = duckdb.connect(":memory:")
-        try:
-            rows = conn.execute(
-                f"""
-                SELECT bt_index, candidate_bid, is_completed_auction, Expr
-                FROM read_parquet('{file_path}')
-                WHERE bt_index IN ({in_list})
-                """
-            ).fetchall()
-        finally:
-            conn.close()
-        
-        # Build metadata map
-        meta: Dict[int, Dict[str, Any]] = {}
-        for r in rows:
-            meta[int(r[0])] = {
-                "bid": str(r[1]).upper() if r[1] else "",
-                "is_complete": bool(r[2]),
-                "expr": r[3] if r[3] else [],
-            }
+        t_hydrate = time.perf_counter()
+        _hydrate_bt_meta(child_indices)
+        debug_info["hydrate_time_ms"] += (time.perf_counter() - t_hydrate) * 1000
         
         # Seat/dealer for criteria evaluation
         toks = [t for t in prefix_auc.split("-") if t.strip()] if prefix_auc else []
@@ -8397,10 +8443,14 @@ def handle_best_auctions_lookahead(
         # Filter by criteria
         valid: List[Tuple[str, int, bool]] = []
         for bid, idx in child_map.items():
-            m = meta.get(idx, {})
-            expr = m.get("expr") or []
+            m = bt_meta_cache.get(int(idx))
+            if m is None:
+                continue
+            is_comp, expr = m
+            # Expr is the criteria for this specific bid (candidate_bid at this BT row).
+            # Evaluate it for the seat that is making this bid.
             if eval_criteria(expr, bt_seat, dealer_rot):
-                valid.append((bid, idx, m.get("is_complete", False)))
+                valid.append((bid, int(idx), bool(is_comp)))
         
         return valid
     
@@ -8408,6 +8458,8 @@ def handle_best_auctions_lookahead(
     dd_cache: Dict[str, int] = {}
     ev_cache: Dict[str, float] = {}
     ui_valid_cache: Dict[str, List[Tuple[str, int, bool]]] = {}
+    best_dd_cache: Dict[Tuple[str, int], int] = {}     # (prefix, depth_remaining) -> best DD reachable
+    best_ev_cache: Dict[Tuple[str, int], float] = {}   # (prefix, depth_remaining) -> best EV reachable
     
     def get_dd(auc: str) -> int:
         if auc in dd_cache:
@@ -8434,7 +8486,108 @@ def handle_best_auctions_lookahead(
     # Results: (score, dd, ev, auction, contract)
     results: List[Tuple[float, int, float, str, str]] = []
     
+    # Debug info
+    debug_info: Dict[str, Any] = {
+        "root_valid_count": 0,
+        "total_valid_found": 0,
+        "max_score_seen": float("-inf"),
+        "max_depth_reached": 0,
+        "first_valid_bid": None,
+        "first_bid_children": 0,
+        "first_bid_valid_children": 0,
+        "hydrate_time_ms": 0.0,
+    }
+
+    def _metric(dd_v: int, ev_v: float) -> float:
+        return float(dd_v) if metric.upper() == "DD" else float(ev_v)
+
+    def _best_reachable(prefix_auc: str, depth_remaining: int) -> float:
+        """Return best reachable completed metric from this prefix within depth_remaining.
+        
+        This is the critical fix: we cannot prioritize by the *standing* contract's DD/EV
+        for artificial bids. We need lookahead to know which branch can actually reach
+        a good completed auction.
+        """
+        nonlocal expanded_nodes
+        depth = max_depth - depth_remaining
+        debug_info["max_depth_reached"] = max(debug_info["max_depth_reached"], depth)
+
+        if depth_remaining <= 0:
+            return float("-inf")
+        if time.perf_counter() > deadline_t or expanded_nodes >= max_nodes:
+            return float("-inf")
+
+        key = (prefix_auc, depth_remaining)
+        if metric.upper() == "DD":
+            if key in best_dd_cache:
+                return float(best_dd_cache[key])
+        else:
+            if key in best_ev_cache:
+                return float(best_ev_cache[key])
+
+        # If already complete, score it.
+        if is_complete(prefix_auc):
+            dd_v = get_dd(prefix_auc)
+            ev_v = get_ev(prefix_auc)
+            out = _metric(dd_v, ev_v)
+            debug_info["max_score_seen"] = max(debug_info["max_score_seen"], out)
+            if metric.upper() == "DD":
+                best_dd_cache[key] = int(out)
+            else:
+                best_ev_cache[key] = float(out)
+            return out
+
+        # Expand children (criteria-pass)
+        valid = ui_valid_cache.get(prefix_auc)
+        if valid is None:
+            expanded_nodes += 1
+            valid = get_valid_next_bids(prefix_auc)
+            ui_valid_cache[prefix_auc] = valid
+            debug_info["total_valid_found"] += len(valid)
+        
+        if not valid:
+            if metric.upper() == "DD":
+                best_dd_cache[key] = -999999
+            else:
+                best_ev_cache[key] = float("-inf")
+            return float("-inf")
+
+        # Order children by quick heuristic, then compute best among top beam_width.
+        heur: List[Tuple[float, str, bool]] = []
+        for bid, _idx, is_comp in valid:
+            child_auc = f"{prefix_auc}-{bid}" if prefix_auc else bid
+            dd_v = get_dd(child_auc)
+            ev_v = get_ev(child_auc)
+            # Mildly prefer passing towards completion once a contract exists.
+            bonus = 0.01 if bid == "P" else 0.0
+            heur.append((_metric(dd_v, ev_v) + bonus, child_auc, bool(is_comp) or is_complete(child_auc)))
+        heur.sort(key=lambda x: x[0], reverse=True)
+
+        best = float("-inf")
+        for _h, child_auc, child_complete in heur[:beam_width]:
+            if time.perf_counter() > deadline_t or expanded_nodes >= max_nodes:
+                break
+            if child_complete:
+                dd_v = get_dd(child_auc)
+                ev_v = get_ev(child_auc)
+                score = _metric(dd_v, ev_v)
+                best = max(best, score)
+                debug_info["max_score_seen"] = max(debug_info["max_score_seen"], score)
+            else:
+                best = max(best, _best_reachable(child_auc, depth_remaining - 1))
+
+        if metric.upper() == "DD":
+            best_dd_cache[key] = int(best) if best != float("-inf") else -999999
+        else:
+            best_ev_cache[key] = float(best)
+        return best
+    
     def dfs(prefix_auc: str, depth: int) -> None:
+        nonlocal expanded_nodes
+        if time.perf_counter() > deadline_t:
+            return
+        if expanded_nodes >= max_nodes:
+            return
         if depth >= max_depth:
             return
         if len(results) >= max_results * 50:
@@ -8444,40 +8597,58 @@ def handle_best_auctions_lookahead(
         if cache_key in ui_valid_cache:
             valid = ui_valid_cache[cache_key]
         else:
+            expanded_nodes += 1
             valid = get_valid_next_bids(prefix_auc)
             ui_valid_cache[cache_key] = valid
+            debug_info["total_valid_found"] += len(valid)
         
         if not valid:
             return
         
-        # Score and sort candidates by the chosen metric
-        scored: List[Tuple[float, str, int, bool]] = []
+        if depth == 0:
+            debug_info["root_valid_count"] = len(valid)
+            if valid:
+                first_bid, first_idx, _ = valid[0]
+                debug_info["first_valid_bid"] = first_bid
+                # Get children count for first bid
+                first_child_map = _get_child_map_for_parent(state, first_idx) if first_idx else {}
+                debug_info["first_bid_children"] = len(first_child_map)
+        
+        # Score and sort candidates by lookahead best reachable metric
+        scored: List[Tuple[float, str, int, bool, str]] = []
         for bid, idx, is_comp in valid:
             child_auc = f"{prefix_auc}-{bid}" if prefix_auc else bid
-            if is_comp or is_complete(child_auc):
+            child_complete = bool(is_comp) or is_complete(child_auc)
+            if child_complete:
                 dd_v = get_dd(child_auc)
                 ev_v = get_ev(child_auc)
-                score = float(dd_v) if metric.upper() == "DD" else ev_v
+                score = _metric(dd_v, ev_v)
+                debug_info["max_score_seen"] = max(debug_info["max_score_seen"], score)
                 results.append((score, dd_v, ev_v, child_auc, get_contract(child_auc)))
-                scored.append((score, bid, idx, True))
+                scored.append((score, bid, idx, True, child_auc))
             else:
-                # Estimate score for ordering (use DD/EV of standing contract)
-                dd_v = get_dd(child_auc)
-                ev_v = get_ev(child_auc)
-                score = float(dd_v) if metric.upper() == "DD" else ev_v
-                scored.append((score, bid, idx, False))
+                # Lookahead to avoid missing artificial-bid branches.
+                score = _best_reachable(child_auc, max_depth - depth - 1)
+                scored.append((score, bid, idx, False, child_auc))
         
-        # Sort by score descending, explore top candidates
+        # Sort by lookahead score descending, explore top beam_width.
         scored.sort(key=lambda x: x[0], reverse=True)
         
-        for score, bid, idx, is_comp in scored[:10]:
+        for score, bid, idx, is_comp, child_auc in scored[:beam_width]:
+            if time.perf_counter() > deadline_t or expanded_nodes >= max_nodes:
+                break
             if is_comp:
                 continue  # Already added to results
-            child_auc = f"{prefix_auc}-{bid}" if prefix_auc else bid
             dfs(child_auc, depth + 1)
     
     # Start DFS
-    dfs(auction_norm, 0)
+    try:
+        dfs(auction_norm, 0)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     
     # Deduplicate and sort results
     results.sort(key=lambda x: x[0], reverse=True)
@@ -8508,9 +8679,21 @@ def handle_best_auctions_lookahead(
         final = output[:max_results]
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
+    
+    # Clean up debug_info for JSON serialization
+    if debug_info["max_score_seen"] == float("-inf"):
+        debug_info["max_score_seen"] = None
+    debug_info["hydrate_time_ms"] = round(debug_info["hydrate_time_ms"], 1)
+    
     return {
         "auctions": final,
         "par_score": par_score_i,
         "metric": metric.upper(),
         "elapsed_ms": round(elapsed_ms, 1),
+        "stats": {
+            "expanded_nodes": expanded_nodes,
+            "bt_meta_loaded_rows": bt_meta_loaded,
+            "deadline_s": deadline_s,
+            "debug": debug_info
+        },
     }

@@ -25,6 +25,7 @@ fastapi
 uvicorn[standard]
 pydantic
 psutil
+aiohttp  # Async HTTP client for parallel API calls
 
 # Streamlit app
 streamlit

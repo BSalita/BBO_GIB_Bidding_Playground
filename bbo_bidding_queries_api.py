@@ -29,6 +29,8 @@ import sys
 import threading
 import time
 import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple, TypeVar
@@ -912,6 +914,7 @@ class StatusResponse(BaseModel):
     initialized: bool
     initializing: bool
     warming: bool = False  # True while pre-warming endpoints
+    prewarm_progress: Optional[Dict[str, Any]] = None  # {"i": 1, "n": 12, "name": "endpoint-name"}
     error: Optional[str]
     bt_df_rows: Optional[int] = None
     deal_df_rows: Optional[int] = None
@@ -1272,6 +1275,19 @@ class BestAuctionsLookaheadRequest(BaseModel):
     max_results: int = 10      # Max results to return
 
 
+class BestAuctionsLookaheadStartRequest(BaseModel):
+    """Request to start an async best-auctions lookahead job (avoid client timeouts)."""
+    deal_row_idx: int
+    auction_prefix: str = ""
+    metric: str = "DD"
+    max_depth: int = 20
+    max_results: int = 10
+    # Controls for long-running searches (bounded server-side in handler as well).
+    deadline_s: float = 1000.0
+    max_nodes: int = 200000
+    beam_width: int = 50
+
+
 # Import model registry for Bidding Arena
 from bbo_bidding_models import MODEL_REGISTRY
 
@@ -1349,6 +1365,7 @@ STATE: Dict[str, Any] = {
     "initialized": False,
     "initializing": False,
     "warming": False,  # True while pre-warming endpoints
+    "prewarm_progress": None,  # Populated during endpoint pre-warm
     "error": None,
     "loading_step": None,  # Current loading step description
     "loaded_files": {},  # File name -> row count (updated as files load)
@@ -1380,6 +1397,44 @@ STATE: Dict[str, Any] = {
     # Set of available criterion names (from deal_criteria_by_direction_dfs) for normalizing CSV criteria strings.
     "available_criteria_names": None,
 }
+
+# ---------------------------------------------------------------------------
+# Async jobs: best auctions lookahead (timeout-safe)
+# ---------------------------------------------------------------------------
+
+_BEST_AUCTIONS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="best-auctions",
+)
+_BEST_AUCTIONS_JOBS_LOCK = threading.Lock()
+_BEST_AUCTIONS_JOBS: Dict[str, Dict[str, Any]] = {}
+_BEST_AUCTIONS_JOBS_MAX = 200
+_BEST_AUCTIONS_JOBS_TTL_S = 30 * 60  # 30 minutes
+
+
+def _best_auctions_jobs_gc(now_s: float | None = None) -> None:
+    """Remove old/completed jobs to cap memory growth."""
+    now = float(now_s if now_s is not None else time.time())
+    with _BEST_AUCTIONS_JOBS_LOCK:
+        # TTL-based cleanup
+        to_del: list[str] = []
+        for job_id, job in _BEST_AUCTIONS_JOBS.items():
+            created_at = float(job.get("created_at_s") or now)
+            if now - created_at > _BEST_AUCTIONS_JOBS_TTL_S:
+                to_del.append(str(job_id))
+        for job_id in to_del:
+            _BEST_AUCTIONS_JOBS.pop(job_id, None)
+
+        # Size-based cleanup (drop oldest)
+        if len(_BEST_AUCTIONS_JOBS) > _BEST_AUCTIONS_JOBS_MAX:
+            # Sort by created time asc, drop oldest extras
+            items = sorted(
+                _BEST_AUCTIONS_JOBS.items(),
+                key=lambda kv: float(kv[1].get("created_at_s") or now),
+            )
+            overflow = len(_BEST_AUCTIONS_JOBS) - _BEST_AUCTIONS_JOBS_MAX
+            for i in range(max(0, overflow)):
+                _BEST_AUCTIONS_JOBS.pop(items[i][0], None)
 
 # Additional optional data file paths
 bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
@@ -1611,6 +1666,24 @@ def _load_or_build_bt_can_complete_sidecar(
 def _prewarm_all_endpoints(bt_seat1_df: pl.DataFrame) -> None:
     """Pre-warm all endpoints to speed up first user request."""
     
+    def _set_prewarm_progress(i: int, n: int, name: str) -> None:
+        with _STATE_LOCK:
+            STATE["prewarm_progress"] = {"i": int(i), "n": int(n), "name": str(name)}
+            # Also decorate loading_step for clients that only show this string
+            ls = str(STATE.get("loading_step") or "Pre-warming endpoints...")
+            if "Pre-warming endpoints" in ls:
+                # Preserve the outer [step/total] prefix if present
+                prefix = ""
+                rest = ls
+                if ls.startswith("[") and "]" in ls:
+                    prefix = ls[: ls.index("]") + 1] + " "
+                    rest = ls[ls.index("]") + 1 :].strip()
+                STATE["loading_step"] = f"{prefix}{rest} ({i}/{n}) {name}"
+
+    def _clear_prewarm_progress() -> None:
+        with _STATE_LOCK:
+            STATE["prewarm_progress"] = None
+
     def _prewarm_endpoint(name: str, fn, *args, **kwargs):
         """Run a prewarm call and log its duration."""
         t0 = time.perf_counter()
@@ -1625,65 +1698,70 @@ def _prewarm_all_endpoints(bt_seat1_df: pl.DataFrame) -> None:
             return None
     
     prewarm_t0 = time.perf_counter()
-    
-    _prewarm_endpoint("openings-by-deal-index",
-        openings_by_deal_index, OpeningsByDealIndexRequest(sample_size=1))
 
-    _prewarm_endpoint("random-auction-sequences",
-        random_auction_sequences, RandomAuctionSequencesRequest(n_samples=1, seed=42))
+    # Pick a stable sample deal index for warm-ups that require one
+    sample_deal_row_idx = 0
+    try:
+        with _STATE_LOCK:
+            if STATE.get("deal_df") is not None and STATE["deal_df"].height > 1:
+                sample_deal_row_idx = 1
+    except Exception:
+        sample_deal_row_idx = 0
 
-    _prewarm_endpoint("auction-sequences-matching",
-        auction_sequences_matching,
-        AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))
-
-    _prewarm_endpoint("deals-matching-auction",
-        deals_matching_auction,
-        DealsMatchingAuctionRequest(pattern="^1N-p-3N$", n_auction_samples=1, n_deal_samples=3, seed=0))
-
-    _prewarm_endpoint("bidding-table-statistics",
-        bidding_table_statistics,
-        BiddingTableStatisticsRequest(auction_pattern="^1N-p-3N$", sample_size=1, seed=42))
-
-    _prewarm_endpoint("process-pbn",
-        process_pbn,
-        ProcessPBNRequest(
-            pbn="N:AKQ2.KQ2.AK2.AK2 T987.987.987.987 J654.654.654.654 3.JT53.QJT53.QJT5",
-            include_par=True, vul="None"))
-
-    _prewarm_endpoint("find-matching-auctions",
-        find_matching_auctions,
-        FindMatchingAuctionsRequest(hcp=15, sl_s=4, sl_h=3, sl_d=3, sl_c=3, total_points=17, seat=1, max_results=1))
-
-    _prewarm_endpoint("group-by-bid",
-        group_by_bid,
-        GroupByBidRequest(auction_pattern="^1N-p-3N$", n_auction_groups=1, n_deals_per_group=1, seed=42))
-
-    sample_resp = _prewarm_endpoint("pbn-sample", get_pbn_sample)
-    _prewarm_endpoint("pbn-random", get_pbn_random)
-
-    sample_pbn = getattr(sample_resp, "pbn", None) or (sample_resp.get("pbn", "") if sample_resp else "")
-    if sample_pbn:
-        _prewarm_endpoint("pbn-lookup", pbn_lookup, PBNLookupRequest(pbn=sample_pbn, max_results=1))
-
-    _prewarm_endpoint("execute-sql", execute_sql, ExecuteSQLRequest(sql="SELECT 1 AS x", max_rows=1))
-
-    # Pre-warm bt-seat-stats endpoint
+    # Pre-warm bt-seat-stats endpoint + list-next-bids helpers
     first_bt_index = None
     if bt_seat1_df.height > 0:
         try:
             first_bt_index = int(bt_seat1_df.select("bt_index").head(1).item())
         except Exception:
             pass
-    if first_bt_index is not None:
-        _prewarm_endpoint("bt-seat-stats", bt_seat_stats, BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))
 
-    _prewarm_endpoint("wrong-bid-stats", wrong_bid_stats, WrongBidStatsRequest(auction_pattern=None, seat=None))
-    _prewarm_endpoint("failed-criteria-summary", failed_criteria_summary, FailedCriteriaSummaryRequest(auction_pattern=None, top_n=5, seat=None))
-    _prewarm_endpoint("wrong-bid-leaderboard", wrong_bid_leaderboard, WrongBidLeaderboardRequest(top_n=5, seat=None))
-    _prewarm_endpoint("bidding-models", list_bidding_models)
-    _prewarm_endpoint("bidding-arena", bidding_arena, BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))
-    _prewarm_endpoint("rank-bids-by-ev", rank_bids_by_ev, RankBidsByEVRequest(auction="", max_deals=10, seed=42))
-    _prewarm_endpoint("new-rules-lookup", new_rules_lookup, NewRulesLookupRequest(auction="1S-p-2C"))
+    # Build task list so we can display i/n counts during warm-up.
+    # Keep payloads tiny so prewarm is fast and stable.
+    warm_pbn = "N:AKQ2.KQ2.AK2.AK2 T987.987.987.987 J654.654.654.654 3.JT53.QJT53.QJT5"
+    tasks: list[tuple[str, Any]] = [
+        ("openings-by-deal-index", (openings_by_deal_index, OpeningsByDealIndexRequest(sample_size=1))),
+        ("random-auction-sequences", (random_auction_sequences, RandomAuctionSequencesRequest(n_samples=1, seed=42))),
+        ("auction-sequences-matching", (auction_sequences_matching, AuctionSequencesMatchingRequest(pattern="^1N-p-3N$", n_samples=1, seed=0))),
+        ("deals-matching-auction", (deals_matching_auction, DealsMatchingAuctionRequest(pattern="^1N-p-3N$", n_auction_samples=1, n_deal_samples=1, seed=0))),
+        ("bidding-table-statistics", (bidding_table_statistics, BiddingTableStatisticsRequest(auction_pattern="^1N-p-3N$", sample_size=1, seed=42))),
+        ("process-pbn", (process_pbn, ProcessPBNRequest(pbn=warm_pbn, include_par=True, vul="None"))),
+        ("find-matching-auctions", (find_matching_auctions, FindMatchingAuctionsRequest(hcp=15, sl_s=4, sl_h=3, sl_d=3, sl_c=3, total_points=17, seat=1, max_results=1))),
+        ("group-by-bid", (group_by_bid, GroupByBidRequest(auction_pattern="^1N-p-3N$", n_auction_groups=1, n_deals_per_group=1, seed=42))),
+        ("pbn-sample", (get_pbn_sample, None)),
+        ("pbn-random", (get_pbn_random, None)),
+        ("pbn-lookup", (pbn_lookup, PBNLookupRequest(pbn=warm_pbn, max_results=1))),
+        ("execute-sql", (execute_sql, ExecuteSQLRequest(sql="SELECT 1 AS x", max_rows=1))),
+    ]
+    if first_bt_index is not None:
+        tasks.append(("bt-seat-stats", (bt_seat_stats, BTSeatStatsRequest(bt_index=first_bt_index, seat=0, max_deals=0))))
+
+    tasks.extend([
+        ("wrong-bid-stats", (wrong_bid_stats, WrongBidStatsRequest(auction_pattern=None, seat=None))),
+        ("failed-criteria-summary", (failed_criteria_summary, FailedCriteriaSummaryRequest(auction_pattern=None, top_n=5, seat=None))),
+        ("wrong-bid-leaderboard", (wrong_bid_leaderboard, WrongBidLeaderboardRequest(top_n=5, seat=None))),
+        ("bidding-models", (list_bidding_models, None)),
+        ("bidding-arena", (bidding_arena, BiddingArenaRequest(model_a="Rules", model_b="Actual", sample_size=10, seed=42))),
+        ("rank-bids-by-ev", (rank_bids_by_ev, RankBidsByEVRequest(auction="", max_deals=10, seed=42))),
+        ("new-rules-lookup", (new_rules_lookup, NewRulesLookupRequest(auction="1S-p-2C"))),
+        # Commonly used by the Streamlit app / auction builder
+        ("resolve-auction-path", (resolve_auction_path, ResolveAuctionPathRequest(auction="1N-p-3N"))),
+        ("list-next-bids", (list_next_bids, ListNextBidsRequest(auction="1N-p-3N"))),
+        ("deal-criteria-eval-batch", (deal_criteria_eval_batch, DealCriteriaEvalBatchRequest(deal_row_idx=sample_deal_row_idx, dealer="N", checks=[DealCriteriaCheck(seat=1, criteria=[])]))),
+        ("auction-pattern-counts", (auction_pattern_counts, AuctionPatternCountsRequest(patterns=["^1N-p-3N$"]))),
+        ("auction-dd-analysis", (auction_dd_analysis, AuctionDDAnalysisRequest(auction="1N-p-3N", max_deals=1, seed=42, include_hands=False, include_scores=False))),
+        ("best-auctions-lookahead", (best_auctions_lookahead, BestAuctionsLookaheadRequest(deal_row_idx=sample_deal_row_idx, auction_prefix="1N-p-3N", metric="DD", max_depth=3, max_results=2))),
+    ])
+
+    n = len(tasks)
+    for i, (name, call) in enumerate(tasks, start=1):
+        _set_prewarm_progress(i, n, name)
+        fn, req = call
+        if req is None:
+            _prewarm_endpoint(name, fn)
+        else:
+            _prewarm_endpoint(name, fn, req)
+    _clear_prewarm_progress()
 
     total_prewarm_s = time.perf_counter() - prewarm_t0
     print(f"[init] All endpoints pre-warmed in {total_prewarm_s:.2f}s")
@@ -2253,6 +2331,7 @@ def get_status() -> StatusResponse:
             initialized=bool(STATE["initialized"]),
             initializing=bool(STATE["initializing"]),
             warming=bool(STATE.get("warming", False)),
+            prewarm_progress=STATE.get("prewarm_progress"),
             error=STATE["error"],
             bt_df_rows=bt_df_rows,
             deal_df_rows=deal_df_rows,
@@ -3608,6 +3687,80 @@ def best_auctions_lookahead(req: BestAuctionsLookaheadRequest) -> Dict[str, Any]
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         _log_and_raise("best-auctions-lookahead", e)
+
+
+@app.post("/best-auctions-lookahead/start")
+def best_auctions_lookahead_start(req: BestAuctionsLookaheadStartRequest) -> Dict[str, Any]:
+    """Start a best-auctions search asynchronously (avoids client read timeouts)."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+
+    handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+    if not handler_module:
+        raise HTTPException(status_code=500, detail="Plugin 'bbo_bidding_queries_api_handlers' not found")
+
+    job_id = str(uuid.uuid4())
+    job: Dict[str, Any] = {
+        "job_id": job_id,
+        "status": "running",  # running|completed|failed
+        "created_at_s": time.time(),
+        "finished_at_s": None,
+        "request": req.model_dump(),
+        "result": None,
+        "error": None,
+    }
+
+    _best_auctions_jobs_gc(job["created_at_s"])
+    with _BEST_AUCTIONS_JOBS_LOCK:
+        _BEST_AUCTIONS_JOBS[job_id] = job
+
+    def _run_job() -> None:
+        try:
+            # Delegate to hot-reloadable handler
+            resp = handler_module.handle_best_auctions_lookahead(
+                state=state,
+                deal_row_idx=int(req.deal_row_idx),
+                auction_prefix=str(req.auction_prefix or ""),
+                metric=str(req.metric or "DD"),
+                max_depth=int(req.max_depth),
+                max_results=int(req.max_results),
+                deadline_s=float(req.deadline_s),
+                max_nodes=int(req.max_nodes),
+                beam_width=int(req.beam_width),
+            )
+            with _BEST_AUCTIONS_JOBS_LOCK:
+                j = _BEST_AUCTIONS_JOBS.get(job_id)
+                if j is not None:
+                    j["status"] = "completed"
+                    j["result"] = resp
+                    j["finished_at_s"] = time.time()
+        except Exception as e:
+            with _BEST_AUCTIONS_JOBS_LOCK:
+                j = _BEST_AUCTIONS_JOBS.get(job_id)
+                if j is not None:
+                    j["status"] = "failed"
+                    j["error"] = f"{e}"
+                    j["finished_at_s"] = time.time()
+
+    _BEST_AUCTIONS_EXECUTOR.submit(_run_job)
+    return _attach_hot_reload_info({"job_id": job_id, "status": "running"}, reload_info)
+
+
+@app.get("/best-auctions-lookahead/status/{job_id}")
+def best_auctions_lookahead_status(job_id: str) -> Dict[str, Any]:
+    """Poll status/results for an async best-auctions job."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    _best_auctions_jobs_gc()
+    with _BEST_AUCTIONS_JOBS_LOCK:
+        job = _BEST_AUCTIONS_JOBS.get(str(job_id))
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+        # Shallow copy so we don't leak executor internals / allow mutation
+        out = dict(job)
+    return _attach_hot_reload_info(out, reload_info)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -281,7 +281,7 @@ def club_results_json_to_sql(urls, starting_nfile=0, ending_nfile=0, initially_d
 
 
 # todo: can acblPath be removed?
-def club_results_create_sql_db(db_file_connection_string, create_tables_sql_file, db_file_path,  acblPath, input_subdir, db_memory_connection_string='sqlite://', starting_nfile=0, ending_nfile=0, write_direct_to_disk=False, create_tables=True, delete_db=False, perform_integrity_checks=False, create_engine_echo=False):
+def club_results_create_sql_db(db_file_connection_string, create_tables_sql_file, db_file_path,  acblPath, input_subdir, db_memory_connection_string='sqlite://', starting_nfile=0, ending_nfile=0, write_direct_to_disk=False, create_tables=True, delete_db=False, perform_integrity_checks=False, create_engine_echo=False, delete_bad_sql_files=True):
     if write_direct_to_disk:
         db_connection_string = db_file_connection_string # disk file based db
     else:
@@ -299,11 +299,42 @@ def club_results_create_sql_db(db_file_connection_string, create_tables_sql_file
     engine = sqlalchemy.create_engine(db_connection_string, echo=create_engine_echo)
     raw_connection = engine.raw_connection()
 
+    # -----------------------------------------------------------------------
+    # Performance pragmas (in-memory build mode)
+    # -----------------------------------------------------------------------
+    # Your instrumentation shows almost all time is in executescript(), not file I/O.
+    # These pragmas target SQLite's internal temp storage, journaling, and cache sizing.
+    #
+    # Only apply when building in-memory (write_direct_to_disk=False).
+    if not write_direct_to_disk:
+        try:
+            # Force temp tables / temp btrees into RAM (SQLite default may use disk).
+            raw_connection.execute("PRAGMA temp_store=MEMORY;")
+            # Crash-safety not relevant for in-memory build; improves speed.
+            raw_connection.execute("PRAGMA synchronous=OFF;")
+            # Journaling not needed for in-memory build.
+            raw_connection.execute("PRAGMA journal_mode=OFF;")
+            # Increase page cache (negative = KiB). Default is ~2MB; this is 512MB.
+            raw_connection.execute("PRAGMA cache_size=-524288;")
+        except Exception as e:
+            print_to_log_info(f"Warning: failed to apply performance pragmas: {type(e).__name__}: {e}")
+
     if create_tables:
         print_to_log_info(f"Creating tables from:{create_tables_sql_file}")
         with open(create_tables_sql_file, 'r', encoding='utf-8') as f:
             create_sql = f.read()
         raw_connection.executescript(create_sql) # create tables
+
+    print("sqlalchemy:", sqlalchemy.__version__)
+    print("sqlalchemy_utils:", sqlalchemy_utils.__version__)
+    import sqlite3
+    print("exe:", sys.executable)
+    print("sqlite:", sqlite3.sqlite_version)
+    print("db_list:", raw_connection.execute("PRAGMA database_list").fetchall())
+    print("journal:", raw_connection.execute("PRAGMA journal_mode").fetchall())
+    print("sync:", raw_connection.execute("PRAGMA synchronous").fetchall())
+    print("temp_store:", raw_connection.execute("PRAGMA temp_store").fetchall())
+    print("cache_size:", raw_connection.execute("PRAGMA cache_size").fetchall())
 
     # Discover input SQL scripts from one or more subdirectories under acblPath
     urls = []
@@ -320,6 +351,7 @@ def club_results_create_sql_db(db_file_connection_string, create_tables_sql_file
 
     total_script_execution_time = 0
     total_scripts_executed = 0
+
     canceled = False
     if ending_nfile == 0: ending_nfile = len(urls)
     filtered_urls = urls[starting_nfile:ending_nfile]
@@ -340,8 +372,11 @@ def club_results_create_sql_db(db_file_connection_string, create_tables_sql_file
             print_to_log_info(f"Error: {type(e).__name__} while processing file:{url.as_posix()}")
             print_to_log_info(traceback.format_exc())
             print_to_log_info(f"Every json field must be an entry in the schema file. Update schema if needed.")
-            print_to_log_info(f"Removing {url.as_posix()}")
-            sql_file.unlink(missing_ok=True) # delete any bad files, fix issues, rerun.
+            if delete_bad_sql_files:
+                print_to_log_info(f"Removing {url.as_posix()}")
+                sql_file.unlink(missing_ok=True) # delete any bad files, fix issues, rerun.
+            else:
+                print_to_log_info(f"Keeping {url.as_posix()} (delete_bad_sql_files=False)")
             continue # todo: log error.
             #break
         except KeyboardInterrupt as e:
@@ -350,7 +385,7 @@ def club_results_create_sql_db(db_file_connection_string, create_tables_sql_file
             canceled = True
             break
         else:
-            script_execution_time = time.time()-start_script_time
+            script_execution_time = time.time() - start_script_time
             if (nfile % 1000) == 0:
                 print_to_log_info(f"{nfile}/{total_filtered_urls} SQL script executed: file:{url.as_posix()}: time:{round(script_execution_time,2)}")
             total_script_execution_time += script_execution_time

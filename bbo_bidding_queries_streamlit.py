@@ -1420,6 +1420,15 @@ if not status["initialized"] or status.get("warming", False):
     st.header("Maintenance in progress")
     if status.get("warming", False):
         st.write("Server is warming up endpoints; please wait...")
+        prewarm = status.get("prewarm_progress") or {}
+        try:
+            i = int(prewarm.get("i") or 0)
+            n = int(prewarm.get("n") or 0)
+            name = str(prewarm.get("name") or "").strip()
+            if i > 0 and n > 0:
+                st.info(f"🔥 Warm-up: **{i}/{n}** {name}")
+        except Exception:
+            pass
     else:
         st.write("Server is loading data; please wait...")
     
@@ -5412,6 +5421,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         st.session_state.auction_builder_options = {}  # Cache of available options per prefix
     if "auction_builder_pinned_deal" not in st.session_state:
         st.session_state.auction_builder_pinned_deal = None  # Cached pinned deal data
+    if "auction_builder_force_apply" not in st.session_state:
+        st.session_state.auction_builder_force_apply = False
 
     def _clear_current_auction_state() -> None:
         """Clear the current auction path + related caches (does not clear pinned deal)."""
@@ -5701,6 +5712,137 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 _clear_current_auction_state()
                 st.rerun()
 
+    # -----------------------------------------------------------------------
+    # Best completions (server-side DFS) - async to avoid timeouts
+    # -----------------------------------------------------------------------
+    with st.expander("⭐ Best completions (DD/EV) – server search", expanded=False):
+        if not pinned_deal:
+            st.info("Pin a deal to search for the best completed auctions for that exact deal.")
+        else:
+            deal_row_idx = pinned_deal.get("_row_idx")
+            if deal_row_idx is None:
+                st.warning("Pinned deal is missing `_row_idx` (needed for server-side search).")
+            else:
+                metric = st.selectbox(
+                    "Metric",
+                    options=["DD", "EV"],
+                    index=0,
+                    key="auction_builder_best_metric",
+                    help="DD = double-dummy score, EV = expected value.",
+                )
+                c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+                with c1:
+                    max_depth = st.number_input(
+                        "Max depth",
+                        min_value=1,
+                        max_value=40,
+                        value=20,
+                        step=1,
+                        key="auction_builder_best_max_depth",
+                    )
+                with c2:
+                    max_results = st.number_input(
+                        "Max results",
+                        min_value=1,
+                        max_value=50,
+                        value=25,
+                        step=1,
+                        key="auction_builder_best_max_results",
+                    )
+                with c3:
+                    deadline_s = st.number_input(
+                        "Time budget (s)",
+                        min_value=1.0,
+                        max_value=3600.0,
+                        value=1000.0,
+                        step=1.0,
+                        key="auction_builder_best_deadline_s",
+                        help="Runs asynchronously; higher values explore more, but consume more server CPU.",
+                    )
+                with c4:
+                    beam_width = st.number_input(
+                        "Beam width",
+                        min_value=1,
+                        max_value=200,
+                        value=50,
+                        step=1,
+                        key="auction_builder_best_beam_width",
+                        help="How many children per node are explored; higher can improve results but costs more.",
+                    )
+
+                # job state
+                if "auction_builder_best_job_id" not in st.session_state:
+                    st.session_state.auction_builder_best_job_id = None
+
+                start_col, poll_col = st.columns([1, 3])
+                with start_col:
+                    start = st.button("Start search", key="auction_builder_best_start")
+                if start:
+                    # Start async job (fast request; avoids long HTTP timeout)
+                    payload = {
+                        "deal_row_idx": int(deal_row_idx),
+                        "auction_prefix": current_auction or "",
+                        "metric": metric,
+                        "max_depth": int(max_depth),
+                        "max_results": int(max_results),
+                        "deadline_s": float(deadline_s),
+                        "max_nodes": 200000,
+                        "beam_width": int(beam_width),
+                    }
+                    try:
+                        resp = api_post("/best-auctions-lookahead/start", payload, timeout=10)
+                        st.session_state.auction_builder_best_job_id = resp.get("job_id")
+                        _st_info_elapsed("Auction Builder: best completions (start)", resp)
+                    except Exception as e:
+                        st.error(f"Failed to start search: {e}")
+
+                job_id = st.session_state.get("auction_builder_best_job_id")
+                if job_id:
+                    # Poll once per rerun; user can hit "Rerun" or click Refresh below.
+                    with poll_col:
+                        refresh = st.button("Refresh status", key="auction_builder_best_refresh")
+                    try:
+                        status = api_get(f"/best-auctions-lookahead/status/{job_id}", timeout=10)
+                    except Exception as e:
+                        status = {"status": "failed", "error": str(e)}
+
+                    st.caption(f"Job: `{job_id}` | Status: **{status.get('status')}**")
+                    if status.get("status") == "running":
+                        st.info("Search is running on the API server. Click “Refresh status” in a few seconds.")
+                    elif status.get("status") == "failed":
+                        st.error(f"Search failed: {status.get('error')}")
+                    elif status.get("status") == "completed":
+                        result = status.get("result") or {}
+                        auctions = result.get("auctions") or []
+                        if not auctions:
+                            st.warning("No completed auctions found within the current limits.")
+                        else:
+                            df = pl.DataFrame(auctions)
+                            render_aggrid(
+                                df,
+                                key="auction_builder_best_auctions_table",
+                                height=calc_grid_height(len(df), max_height=300),
+                                table_name="auction_builder_best_auctions_table",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                            # Apply helper
+                            options = [str(a.get("auction")) for a in auctions if a.get("auction")]
+                            pick = st.selectbox(
+                                "Apply one of these auctions",
+                                options=options,
+                                key="auction_builder_best_pick",
+                            )
+                            apply_pick = st.button("Apply selected auction", key="auction_builder_best_apply")
+                            if apply_pick and pick:
+                                try:
+                                    st.session_state[edit_key] = str(pick).upper()
+                                    st.session_state.auction_builder_last_applied = ""
+                                    st.session_state.auction_builder_force_apply = True
+                                    st.rerun()
+                                except Exception:
+                                    pass
+
     # Handle manual auction edit - trigger on Enter (value change) OR button click
     # But skip if we just applied this same value (prevents render loop)
     edited_normalized = normalize_auction_input(edited_auction).upper() if edited_auction else ""
@@ -5741,6 +5883,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         edited_normalized = base
         # Ensure we don't get blocked by the "already applied" guard.
         st.session_state.auction_builder_last_applied = ""
+        apply_edit = True
+    # Programmatic apply (from Best completions)
+    if st.session_state.get("auction_builder_force_apply"):
+        st.session_state.auction_builder_force_apply = False
         apply_edit = True
     already_applied = edited_normalized == st.session_state.auction_builder_last_applied
     value_changed = edited_normalized != current_auction.upper()
@@ -7222,6 +7368,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                             "Par": "✅" if a.get("is_par") else "",
                                             "Depth": 0,  # Not tracked by server
                                         })
+                                    # Cache stats for debugging
+                                    st.session_state[f"{cache_key_dd}__stats"] = resp.get("stats")
                                 except Exception as e:
                                     st.error(f"Server-side search failed: {e}")
                                     best_auctions_dd = []
@@ -7229,67 +7377,72 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 best_auctions_dd = []
                             st.session_state[cache_key_dd] = best_auctions_dd
                             st.session_state[cache_key_dd_elapsed] = float(time.perf_counter() - t0)
-                    if best_auctions_dd:
-                        par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
-                        ach_count = sum(1 for a in best_auctions_dd if a.get("Par") == "✅")
-                        if par_score is not None:
-                            if ach_count > 0:
-                                elapsed_s = st.session_state.get(cache_key_dd_elapsed)
-                                elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
-                                st.success(f"Found {ach_count} auction(s) achieving par score of {par_score} ({elapsed_txt})")
-                            else:
-                                elapsed_s = st.session_state.get(cache_key_dd_elapsed)
-                                elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
-                                st.warning(f"Par score {par_score} not reachable via criteria-pass bids ({elapsed_txt}). Best DD: {best_auctions_dd[0]['DD_Score']}")
-                        
-                        best_auctions_df = pl.DataFrame(best_auctions_dd)
-                        best_auctions_pdf = best_auctions_df.to_pandas()
-                        
-                        gb_best = GridOptionsBuilder.from_dataframe(best_auctions_pdf)
-                        gb_best.configure_selection(selection_mode="single", use_checkbox=False)
-                        gb_best.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
-                        gb_best.configure_column("Contract", width=90)
-                        gb_best.configure_column("DD_Score", width=100, headerName="DD Score")
-                        gb_best.configure_column("Par", width=60)
-                        gb_best.configure_column("Depth", width=70)
-                        gb_best.configure_grid_options(rowHeight=25, headerHeight=25)
-                        best_opts = gb_best.build()
-                        
-                        best_auctions_resp = AgGrid(
-                            best_auctions_pdf,
-                            gridOptions=best_opts,
-                            height=min(200, 60 + len(best_auctions_dd) * 25),
-                            update_on=["selectionChanged"],
-                            theme="balham",
-                            key=f"auction_builder_best_auctions_dd_{current_seat}",
-                            custom_css={
-                                ".ag-row": {"cursor": "pointer"},
-                                ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
-                                ".ag-row-selected": {"background-color": "#CCE5FF !important"},
-                            },
-                        )
-                        
-                        # Handle selection: apply the selected auction
-                        sel_rows = best_auctions_resp.get("selected_rows")
-                        if sel_rows is not None and len(sel_rows) > 0:
-                            sel_row_data = sel_rows[0] if isinstance(sel_rows, list) else sel_rows.iloc[0].to_dict()
-                            selected_auction = str(sel_row_data.get("Auction", "")).strip()
-                            
-                            if selected_auction and selected_auction != current_auction:
-                                # Resolve the auction path and apply it
-                                try:
-                                    data = api_post("/resolve-auction-path", {"auction": selected_auction}, timeout=30)
-                                    new_path = data.get("path", [])
-                                    if new_path:
-                                        st.session_state.auction_builder_path = new_path
-                                        st.session_state.auction_builder_last_applied = selected_auction.upper()
-                                        st.session_state.auction_builder_last_selected = ""
-                                        st.rerun()
-                                except Exception as e:
-                                    st.error(f"Failed to apply auction: {e}")
-                    elif cache_key_dd in st.session_state:
-                        # Search was performed but found nothing
-                        st.info("No completed auctions found via criteria-pass bid paths.")
+                            if best_auctions_dd:
+                                par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
+                                ach_count = sum(1 for a in best_auctions_dd if a.get("Par") == "✅")
+                                if par_score is not None:
+                                    if ach_count > 0:
+                                        elapsed_s = st.session_state.get(cache_key_dd_elapsed)
+                                        elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
+                                        st.success(f"Found {ach_count} auction(s) achieving par score of {par_score} ({elapsed_txt})")
+                                    else:
+                                        elapsed_s = st.session_state.get(cache_key_dd_elapsed)
+                                        elapsed_txt = f"{float(elapsed_s):.2f}s" if elapsed_s is not None else "?"
+                                        st.warning(f"Par score {par_score} not reachable via criteria-pass bids ({elapsed_txt}). Best DD: {best_auctions_dd[0]['DD_Score']}")
+                                
+                                best_auctions_df = pl.DataFrame(best_auctions_dd)
+                                best_auctions_pdf = best_auctions_df.to_pandas()
+                                
+                                gb_best = GridOptionsBuilder.from_dataframe(best_auctions_pdf)
+                                gb_best.configure_selection(selection_mode="single", use_checkbox=False)
+                                gb_best.configure_column("Auction", flex=2, minWidth=200, tooltipField="Auction")
+                                gb_best.configure_column("Contract", width=90)
+                                gb_best.configure_column("DD_Score", width=100, headerName="DD Score")
+                                gb_best.configure_column("Par", width=60)
+                                gb_best.configure_column("Depth", width=70)
+                                gb_best.configure_grid_options(rowHeight=25, headerHeight=25)
+                                best_opts = gb_best.build()
+                                
+                                best_auctions_resp = AgGrid(
+                                    best_auctions_pdf,
+                                    gridOptions=best_opts,
+                                    height=min(200, 60 + len(best_auctions_dd) * 25),
+                                    update_on=["selectionChanged"],
+                                    theme="balham",
+                                    key=f"auction_builder_best_auctions_dd_{current_seat}",
+                                    custom_css={
+                                        ".ag-row": {"cursor": "pointer"},
+                                        ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
+                                        ".ag-row-selected": {"background-color": "#CCE5FF !important"},
+                                    },
+                                )
+                                
+                                # Handle selection: apply the selected auction
+                                sel_rows = best_auctions_resp.get("selected_rows")
+                                if sel_rows is not None and len(sel_rows) > 0:
+                                    sel_row_data = sel_rows[0] if isinstance(sel_rows, list) else sel_rows.iloc[0].to_dict()
+                                    selected_auction = str(sel_row_data.get("Auction", "")).strip()
+                                    
+                                    if selected_auction and selected_auction != current_auction:
+                                        # Resolve the auction path and apply it
+                                        try:
+                                            data = api_post("/resolve-auction-path", {"auction": selected_auction}, timeout=30)
+                                            new_path = data.get("path", [])
+                                            if new_path:
+                                                st.session_state.auction_builder_path = new_path
+                                                st.session_state.auction_builder_last_applied = selected_auction.upper()
+                                                st.session_state.auction_builder_last_selected = ""
+                                                st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Failed to apply auction: {e}")
+                            elif cache_key_dd in st.session_state:
+                                # Search was performed but found nothing
+                                st.info("No completed auctions found via criteria-pass bid paths.")
+                                # Show debug info from session state if available
+                                stats = st.session_state.get(f"{cache_key_dd}__stats")
+                                if stats:
+                                    with st.expander("Search Stats (Debug)"):
+                                        st.json(stats)
 
                     st.markdown("**Best Auctions by EV**")
                     cache_key_ev = f"_best_auctions_ev_cache_{current_auction}"
@@ -7319,6 +7472,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                             "Par": "✅" if a.get("is_par") else "",
                                             "Depth": 0,
                                         })
+                                    # Cache stats for debugging
+                                    st.session_state[f"{cache_key_ev}__stats"] = resp.get("stats")
                                 except Exception as e:
                                     st.error(f"Server-side search failed: {e}")
                                     best_auctions_ev = []
@@ -7376,6 +7531,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     st.error(f"Failed to apply auction: {e}")
                     elif cache_key_ev in st.session_state:
                         st.info("No completed auctions found via criteria-pass bid paths for EV search.")
+                        # Show debug info from session state if available
+                        stats_ev = st.session_state.get(f"{cache_key_ev}__stats")
+                        if stats_ev:
+                            with st.expander("Search Stats (Debug)"):
+                                st.json(stats_ev)
 
                     # ---------------------------------------------------------------------
                     # Debug: trace a specific auction path step-by-step with depth/call usage
