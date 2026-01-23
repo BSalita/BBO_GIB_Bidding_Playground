@@ -8709,11 +8709,15 @@ def handle_deal_matched_bt_sample(
     n_samples: int = 25,
     seed: int = 0,
     metric: str = "DD",
+    permissive_pass: bool = True,
 ) -> Dict[str, Any]:
     """Return BT rows that match a specific deal (GPU-verified index).
 
     Uses `state["deal_to_bt_index_df"]` (loaded from `bbo_deal_to_bt_verified.parquet`) which maps:
       deal_idx (row position in deals file) -> Matched_BT_Indices (list of bt_index values)
+    
+    Args:
+        permissive_pass: If True, Pass bids are always treated as valid even if criteria fails.
     """
     t0 = time.perf_counter()
     import numpy as np
@@ -8854,12 +8858,15 @@ def handle_deal_matched_bt_sample(
                 # Apply overlay + dedupe (will NOT re-load Agg_Expr since we pre-filled it above).
                 row_rules = _apply_overlay_and_dedupe(row_dict, state)
                 # Check conformance for this deal_row_idx against (possibly augmented) criteria.
+                # Use permissive_pass to allow 'P' bids even if their criteria fails.
+                # This matches the client-side logic where 'P' is always a valid bid choice.
                 conf = _check_deal_criteria_conformance_bitmap(
                     int(deal_row_idx),
                     row_rules,
                     dealer_actual,
                     deal_criteria_by_seat_dfs,
                     auction=str(row_rules.get("Auction") or ""),
+                    permissive_pass=permissive_pass,
                 )
                 if conf.get("first_wrong_seat") is None:
                     bt_rows_for_eval.append(row_rules)

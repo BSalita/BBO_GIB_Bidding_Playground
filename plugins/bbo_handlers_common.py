@@ -1404,6 +1404,7 @@ def check_deal_criteria_conformance_bitmap(
     dealer: str,
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
     auction: str | None = None,
+    permissive_pass: bool = False,
 ) -> Dict[str, Any]:
     """Check if a deal conforms to the criteria for each seat using bitmap lookups.
     
@@ -1413,6 +1414,7 @@ def check_deal_criteria_conformance_bitmap(
         dealer: Dealer direction (N/E/S/W)
         deal_criteria_by_seat_dfs: Pre-computed criteria bitmap DataFrames
         auction: Optional auction string for including bid in failed criteria
+        permissive_pass: If True, 'P' bids with failing criteria are not marked as wrong bids
     
     Returns:
         Dict with Wrong_Bid_S1-S4, Invalid_Criteria_S1-S4, and first_wrong_seat
@@ -1452,8 +1454,15 @@ def check_deal_criteria_conformance_bitmap(
                 continue
         
         if failed_criteria:
-            result[wrong_bid_col(seat)] = True
+            # Permissive Pass: if the bid at this seat is 'P', don't mark it as a wrong bid.
+            # Pass is always a legal bid choice, even if the criteria doesn't match.
             bid_at_seat = extract_bid_at_seat(auction, seat) if auction else None
+            is_pass = bid_at_seat is not None and str(bid_at_seat).strip().upper() in ("P", "PASS")
+            if permissive_pass and is_pass:
+                # Skip marking Pass as wrong bid - it's always valid
+                continue
+            
+            result[wrong_bid_col(seat)] = True
             if bid_at_seat:
                 result[invalid_criteria_col(seat)] = json.dumps([bid_at_seat, failed_criteria])
             else:

@@ -1297,6 +1297,10 @@ class DealMatchedBTSampleRequest(BaseModel):
     n_samples: int = 25
     seed: Optional[int] = 0  # 0 = non-reproducible
     metric: str = "DD"       # "DD" or "EV" (controls which score column is emphasized)
+    # If True, Pass bids are always treated as valid even if their criteria fails.
+    # TODO: Revisit whether a pass should always be valid. Perhaps it should be
+    # rejected but still show in 'Best Bids Ranked by Model'.
+    permissive_pass: bool = True
 
 
 # Import model registry for Bidding Arena
@@ -3804,6 +3808,7 @@ def deal_matched_bt_sample(req: DealMatchedBTSampleRequest) -> Dict[str, Any]:
             n_samples=int(req.n_samples),
             seed=int(req.seed or 0),
             metric=str(req.metric or "DD"),
+            permissive_pass=bool(req.permissive_pass),
         )
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:

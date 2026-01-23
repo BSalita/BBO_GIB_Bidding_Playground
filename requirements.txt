@@ -23,7 +23,7 @@ psutil
 
 # Streamlit app
 streamlit
-streamlit-aggrid==1.1.8.post1
+streamlit-aggrid==1.1.8.post1 # looks like 1.2.1.post2 is works.(?)
 requests
 
 # Database

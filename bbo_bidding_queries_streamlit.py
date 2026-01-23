@@ -788,6 +788,31 @@ def generate_passthrough_sql(df: pl.DataFrame, table_name: str) -> str:
     return f"SELECT\n    {cols_str}\nFROM {table_name}"
 
 
+def to_aggrid_safe_pandas(df: pl.DataFrame) -> pd.DataFrame:
+    """Convert a Polars DataFrame to pandas without Arrow-backed types.
+    
+    streamlit-aggrid's JS frontend uses an older Arrow library that can't
+    deserialize newer Arrow types like LargeUtf8. This function ensures
+    all columns use numpy/object dtypes that serialize correctly.
+    """
+    # Disable Arrow extension arrays to get regular numpy dtypes
+    try:
+        pandas_df = df.to_pandas(use_pyarrow_extension_array=False)
+    except TypeError:
+        # Older Polars versions don't have this parameter
+        pandas_df = df.to_pandas()
+    
+    # Additional fallback: convert any remaining Arrow-backed or string columns
+    for col in pandas_df.columns:
+        dtype_name = str(pandas_df[col].dtype).lower()
+        if "pyarrow" in dtype_name or "arrow" in dtype_name:
+            pandas_df[col] = pandas_df[col].astype(object)
+        elif pandas_df[col].dtype.name in ("string", "String"):
+            pandas_df[col] = pandas_df[col].astype(object)
+    
+    return pandas_df
+
+
 def render_aggrid(
     records: Any,
     key: str,
@@ -955,7 +980,9 @@ def render_aggrid(
                      n_rows * ROW_HEIGHT + HEADER_HEIGHT + BUFFER)
 
     # Build the grid options
-    pandas_df = df.to_pandas()
+    # Use helper to avoid Arrow LargeUtf8 incompatibility with streamlit-aggrid's JS frontend
+    pandas_df = to_aggrid_safe_pandas(df)
+    
     gb = GridOptionsBuilder.from_dataframe(pandas_df)
     # Disable pagination entirely to allow scrolling within the fixed height
     gb.configure_pagination(enabled=False)
@@ -1197,7 +1224,7 @@ def render_aggrid(
         }
     
     response = AgGrid(
-        df.to_pandas(),
+        pandas_df,
         gridOptions=grid_options,
         height=height,
         theme="balham",
@@ -5534,6 +5561,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             min_value=0,
             help="Seed for reproducible deal sampling"
         )
+        
+        always_valid_pass = st.checkbox(
+            "Always treat Pass as valid bid",
+            value=True,
+            help="If checked, Pass bids are always considered valid even if their criteria fail. "
+                 "This allows auctions with Pass to be included in Best Auctions results.",
+            key="always_valid_pass"
+        )
     
     # Build current auction string from path
     current_path = st.session_state.auction_builder_path
@@ -6522,6 +6557,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     sel_opt["bid"] = sel_bid_s
                     # Preserve client-side rule: Pass with empty criteria is valid.
                     sel_opt["_pass_no_criteria"] = bool(sel_bid_s == "P" and not (sel_opt.get("agg_expr") or []))
+                    # Mark Pass selected from valid-bids grid as valid for Summary consistency.
+                    # This handles cases where Pass is the only valid option but its criteria may
+                    # fail re-evaluation with different dealer/seat context in the Summary.
+                    if sel_bid_s == "P" and grid_name == "suggested":
+                        sel_opt["_pass_valid_selection"] = True
                     # Attach categories from the lookup cache
                     bt_idx = sel_opt.get("bt_index")
                     if bt_idx is not None:
@@ -6544,6 +6584,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     for j in range(min(len(old_path), len(new_path))):
                                         if old_path[j].get("_pass_no_criteria"):
                                             new_path[j]["_pass_no_criteria"] = True
+                                        if old_path[j].get("_pass_valid_selection"):
+                                            new_path[j]["_pass_valid_selection"] = True
                                 except Exception:
                                     pass
                                 # Preserve any client-side completion inference for trailing passes
@@ -6675,7 +6717,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 for r in suggested_bids_rows
                             ]
                         )
-                        sug_pdf = sug_df.to_pandas()
+                        sug_pdf = to_aggrid_safe_pandas(sug_df)
                         gb_sug = GridOptionsBuilder.from_dataframe(sug_pdf)
                         gb_sug.configure_selection(selection_mode="single", use_checkbox=False)
                         gb_sug.configure_column("_idx", hide=True)
@@ -6709,7 +6751,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 with par_col:
                     st.markdown("**Best Bids Ranked by DD**")
                     if best_par_bids:
-                        par_pdf = best_par_bids_df.to_pandas()
+                        par_pdf = to_aggrid_safe_pandas(best_par_bids_df)
                         gb_par = GridOptionsBuilder.from_dataframe(par_pdf)
                         gb_par.configure_selection(selection_mode="single", use_checkbox=False)
                         gb_par.configure_column("_idx", hide=True)
@@ -6739,7 +6781,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 with ev_col:
                     st.markdown("**Best Bids Ranked by EV**")
                     if best_ev_bids:
-                        ev_pdf = best_ev_bids_df.to_pandas()
+                        ev_pdf = to_aggrid_safe_pandas(best_ev_bids_df)
                         gb_ev = GridOptionsBuilder.from_dataframe(ev_pdf)
                         gb_ev.configure_selection(selection_mode="single", use_checkbox=False)
                         gb_ev.configure_column("_idx", hide=True)
@@ -7266,6 +7308,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                                 "metric": "DD",
                                                 "n_samples": int(max_best_auctions),
                                                 "seed": seed,
+                                                "permissive_pass": st.session_state.get("always_valid_pass", True),
                                             },
                                             timeout=30,
                                         )
@@ -7318,7 +7361,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             cols = ["index"] + [c for c in best_auctions_df.columns if c != "index"]
                             best_auctions_df = best_auctions_df.select(cols)
 
-                            best_auctions_pdf = best_auctions_df.to_pandas()
+                            best_auctions_pdf = to_aggrid_safe_pandas(best_auctions_df)
                             gb_best = GridOptionsBuilder.from_dataframe(best_auctions_pdf)
                             gb_best.configure_selection(selection_mode="single", use_checkbox=False)
                             if "index" in best_auctions_pdf.columns:
@@ -7393,6 +7436,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                                 "metric": "EV",
                                                 "n_samples": int(max_best_auctions),
                                                 "seed": seed,
+                                                "permissive_pass": st.session_state.get("always_valid_pass", True),
                                             },
                                             timeout=30,
                                         )
@@ -7471,7 +7515,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             cols = ["index"] + [c for c in best_ev_df.columns if c != "index"]
                             best_ev_df = best_ev_df.select(cols)
 
-                            best_ev_pdf = best_ev_df.to_pandas()
+                            best_ev_pdf = to_aggrid_safe_pandas(best_ev_df)
                             gb_ev_auc = GridOptionsBuilder.from_dataframe(best_ev_pdf)
                             gb_ev_auc.configure_selection(selection_mode="single", use_checkbox=False)
                             if "index" in best_ev_pdf.columns:
@@ -7546,7 +7590,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     # can_complete is only meaningful for diagnosing rejected/invalid paths
                     if "can_complete" in valid_df.columns:
                         valid_df = valid_df.drop("can_complete")
-                    valid_pdf = valid_df.to_pandas()
+                    valid_pdf = to_aggrid_safe_pandas(valid_df)
                     valid_opts = build_bid_grid_options(valid_pdf, apply_row_styling=False)
                     # Height: header (25) + rows (25 each) + buffer (35)
                     valid_resp = AgGrid(
@@ -7568,7 +7612,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Rejected bids grid (dead ends, 0 deals, empty criteria)
                 if rejected_rows:
                     st.markdown(f"**⚠️ Rejected Bids ({len(rejected_rows)})**")
-                    rejected_pdf = pl.DataFrame(rejected_rows).to_pandas()
+                    rejected_pdf = to_aggrid_safe_pandas(pl.DataFrame(rejected_rows))
                     # Configure Failure column
                     gb_rej = GridOptionsBuilder.from_dataframe(rejected_pdf)
                     gb_rej.configure_selection(selection_mode="single", use_checkbox=False)
@@ -7643,7 +7687,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Invalid bids grid
                 if invalid_rows:
                     st.markdown(f"**❌ Invalid Bids ({len(invalid_rows)})**")
-                    invalid_pdf = pl.DataFrame(invalid_rows).to_pandas()
+                    invalid_pdf = to_aggrid_safe_pandas(pl.DataFrame(invalid_rows))
                     invalid_opts = build_bid_grid_options(invalid_pdf, apply_row_styling=False)
                     # Height: header (25) + rows (25 each) + buffer (35)
                     invalid_resp = AgGrid(
@@ -7665,7 +7709,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Other rows (no match status - shouldn't happen when deal is pinned)
                 if other_rows:
                     st.markdown(f"**Other Bids ({len(other_rows)})**")
-                    other_pdf = pl.DataFrame(other_rows).to_pandas()
+                    other_pdf = to_aggrid_safe_pandas(pl.DataFrame(other_rows))
                     other_opts = build_bid_grid_options(other_pdf, apply_row_styling=False)
                     other_resp = AgGrid(
                         # Height: header (25) + rows (25 each) + buffer (10)
@@ -7686,7 +7730,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                 if available_rows:
                     st.markdown(f"**✅ Available Bids ({len(available_rows)})**")
-                    avail_pdf = pl.DataFrame(available_rows).to_pandas()
+                    avail_pdf = to_aggrid_safe_pandas(pl.DataFrame(available_rows))
                     avail_opts = build_bid_grid_options(avail_pdf, apply_row_styling=False)
                     avail_resp = AgGrid(
                         avail_pdf,
@@ -7708,7 +7752,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                 if rejected_rows:
                     st.markdown(f"**⚠️ Rejected Bids ({len(rejected_rows)})**")
-                    rejected_pdf = pl.DataFrame(rejected_rows).to_pandas()
+                    rejected_pdf = to_aggrid_safe_pandas(pl.DataFrame(rejected_rows))
 
                     # Configure rejected grid with explicit Failure column visible
                     gb_rej = GridOptionsBuilder.from_dataframe(rejected_pdf)
@@ -7826,6 +7870,13 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     data = api_post("/resolve-auction-path", {"auction": current_auction}, timeout=90)
                     new_path = data.get("path", [])
                     if new_path and len(new_path) == len(current_path):
+                        # Preserve client-side flags that shouldn't be invalidated by server rehydrate.
+                        old_path = current_path
+                        for j in range(min(len(old_path), len(new_path))):
+                            if old_path[j].get("_pass_no_criteria"):
+                                new_path[j]["_pass_no_criteria"] = True
+                            if old_path[j].get("_pass_valid_selection"):
+                                new_path[j]["_pass_valid_selection"] = True
                         st.session_state.auction_builder_path = new_path
                         current_path = new_path
                     rehydrate_elapsed_ms = data.get("_client_elapsed_ms") or data.get("elapsed_ms")
@@ -7834,7 +7885,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
         # Include bt_index from last step in header (use 'is not None' since bt_index=0 is valid)
         summary_bt_index = current_path[-1].get("bt_index") if current_path else None
-        summary_header = f"📋 Completed Auction Summary (bt_index: {summary_bt_index})" if summary_bt_index is not None else "📋 Completed Auction Summary"
+        summary_header = f"📋 Bid-by-Bid Summary (bt_index: {summary_bt_index})" if summary_bt_index is not None else "📋 Bid-by-Bid Summary"
         st.subheader(summary_header)
         if rehydrate_elapsed_ms is not None:
             st.info(f"Loaded auction criteria in {rehydrate_elapsed_ms/1000:.2f}s")
@@ -8010,8 +8061,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # via /resolve-auction-path, which aligns criteria to dealer-relative seats already.
                 # So evaluate using the actual dealer and the displayed seat.
                 dealer = pinned_deal.get("Dealer", "N")
-                # If this step was a client-side "Pass with no criteria", treat it as passing by definition.
-                criteria_list = [] if step.get("_pass_no_criteria") else step.get("agg_expr", [])
+                # If this step was a client-side "Pass with no criteria" OR was selected from a valid-bids
+                # grid (Best Bids Ranked by Model), treat it as passing to maintain consistency.
+                skip_eval = step.get("_pass_no_criteria") or step.get("_pass_valid_selection")
+                criteria_list = [] if skip_eval else step.get("agg_expr", [])
                 passes, failed = evaluate_criteria_for_pinned(criteria_list, seat_1_to_4, dealer, pinned_deal)
                 row["_passes"] = passes  # Hidden column for row styling
                 if passes:
