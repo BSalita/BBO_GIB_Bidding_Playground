@@ -8232,11 +8232,15 @@ def handle_best_auctions_lookahead(
     deadline_s: float = 5.0,
     max_nodes: int = 50000,  # max prefix expansions per request (safety cap)
     beam_width: int = 25,    # how many children to explore per node (lookahead + dfs)
+    permissive_pass: bool = True,  # If True, Pass bids always valid even if criteria fail
 ) -> Dict[str, Any]:
     """Server-side DFS to find best completed auctions by DD or EV.
     
     Uses CSR index for O(1) next-bid traversal and bitmap DFs for O(1) criteria eval.
     Single request replaces dozens of client-side API calls.
+    
+    Args:
+        permissive_pass: If True, Pass bids are always treated as valid even if criteria fail.
     
     Returns:
         - auctions: List of {auction, contract, dd_score, ev, is_par}
@@ -8449,7 +8453,9 @@ def handle_best_auctions_lookahead(
             is_comp, expr = m
             # Expr is the criteria for this specific bid (candidate_bid at this BT row).
             # Evaluate it for the seat that is making this bid.
-            if eval_criteria(expr, bt_seat, dealer_rot):
+            # When permissive_pass=True, Pass bids are always valid regardless of criteria.
+            bid_is_pass = str(bid).strip().upper() in ("P", "PASS")
+            if (permissive_pass and bid_is_pass) or eval_criteria(expr, bt_seat, dealer_rot):
                 valid.append((bid, int(idx), bool(is_comp)))
         
         return valid
@@ -8783,6 +8789,56 @@ def handle_deal_matched_bt_sample(
 
     total_matches = len(matches)
     if total_matches == 0:
+        # When permissive_pass=True and the pre-computed index has no matches,
+        # fall back to the lookahead search which can find auctions with Pass bids
+        # that have failing criteria but are still valid (permissive pass).
+        if permissive_pass:
+            try:
+                lookahead_resp = handle_best_auctions_lookahead(
+                    state=state,
+                    deal_row_idx=deal_row_idx,
+                    auction_prefix="",
+                    metric=metric,
+                    max_depth=20,
+                    max_results=n_samples,
+                    deadline_s=15.0,
+                    max_nodes=100000,
+                    beam_width=50,
+                    permissive_pass=True,
+                )
+                lookahead_rows = lookahead_resp.get("auctions", []) or []
+                if lookahead_rows:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    # Convert lookahead format to deal-matched-bt-sample format
+                    # Note: lookahead doesn't return bt_index, Matches, or Deals - those require
+                    # additional lookups. We set them to None/"" for now.
+                    out_rows = []
+                    for lr in lookahead_rows:
+                        dd_score = lr.get("dd_score")
+                        ev_val = lr.get("ev")
+                        is_par = lr.get("is_par", False)
+                        out_rows.append({
+                            "bt_index": None,  # Not available from lookahead
+                            "Auction": lr.get("auction", ""),
+                            "Contract": lr.get("contract", "?"),
+                            "DD_Score": dd_score,
+                            "EV": round(float(ev_val), 1) if ev_val is not None else None,
+                            "Par": "✅" if is_par else "",
+                            "Matches": "",  # Not available from lookahead
+                            "Deals": "",    # Not available from lookahead
+                            "is_completed_auction": True,
+                            "Score": dd_score if str(metric).upper() == "DD" else ev_val,
+                        })
+                    return {
+                        "rows": out_rows,
+                        "counts": {"total_matches": len(out_rows), "returned": len(out_rows), "source": "lookahead"},
+                        "metric": str(metric or "DD").upper(),
+                        "par_score": par_score_i,
+                        "elapsed_ms": round(elapsed_ms, 1),
+                    }
+            except Exception:
+                pass  # Fall through to empty response
+        
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return {
             "rows": [],
