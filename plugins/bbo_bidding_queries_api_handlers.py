@@ -8446,6 +8446,17 @@ def handle_best_auctions_lookahead(
         
         # Filter by criteria
         valid: List[Tuple[str, int, bool]] = []
+
+        # --- Support leading passes (Seat 2, 3, 4 openers) ---
+        if not bt_prefix:
+            toks = [t for t in prefix_auc.split("-") if t.strip()] if prefix_auc else []
+            if len(toks) < 3:
+                # Pass to next seat
+                valid.append(("P", -1, False))
+            elif len(toks) == 3:
+                # 4th pass = Passed Out
+                valid.append(("P", -1, True))
+
         for bid, idx in child_map.items():
             m = bt_meta_cache.get(int(idx))
             if m is None:
