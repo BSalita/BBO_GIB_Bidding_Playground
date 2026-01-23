@@ -7262,12 +7262,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     if show_best_auctions_key not in st.session_state:
                         st.session_state[show_best_auctions_key] = False
 
-                    # Include always_valid_pass in cache key so toggling the checkbox triggers a refresh
-                    pass_flag = "1" if st.session_state.get("always_valid_pass", True) else "0"
-                    cache_key_dd = f"_best_auctions_dd_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}_{pass_flag}"
+                    cache_key_dd = f"_best_auctions_dd_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
                     cache_key_dd_elapsed = f"{cache_key_dd}__elapsed_s"
                     cache_key_dd_attempted = f"{cache_key_dd}__attempted"
-                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}_{pass_flag}"
+                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
                     cache_key_ev_attempted = f"{cache_key_ev}__attempted"
 
                     # If we've already tried loading and got no rows, hide the button and show a message.
@@ -7416,7 +7414,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         elif cache_key_dd_attempted in st.session_state:
                             st.info("No matched BT rows returned for this deal (or limit is 0).")
 
-                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}_{pass_flag}"
+                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
                     cache_key_ev_elapsed = f"{cache_key_ev}__elapsed_s"
                     cache_key_ev_attempted = f"{cache_key_ev}__attempted"
 

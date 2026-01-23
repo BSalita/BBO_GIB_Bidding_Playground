@@ -1272,8 +1272,6 @@ class BestAuctionsLookaheadRequest(BaseModel):
     metric: str = "DD"         # "DD" or "EV"
     max_depth: int = 20        # Max search depth
     max_results: int = 10      # Max results to return
-    # If True, Pass bids are always treated as valid even if their criteria fails.
-    permissive_pass: bool = True
 
 
 class BestAuctionsLookaheadStartRequest(BaseModel):
@@ -1287,8 +1285,6 @@ class BestAuctionsLookaheadStartRequest(BaseModel):
     deadline_s: float = 1000.0
     max_nodes: int = 200000
     beam_width: int = 50
-    # If True, Pass bids are always treated as valid even if their criteria fails.
-    permissive_pass: bool = True
 
 
 class DealMatchedBTSampleRequest(BaseModel):
@@ -3700,7 +3696,6 @@ def best_auctions_lookahead(req: BestAuctionsLookaheadRequest) -> Dict[str, Any]
             metric=req.metric,
             max_depth=req.max_depth,
             max_results=req.max_results,
-            permissive_pass=req.permissive_pass,
         )
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
@@ -3751,7 +3746,6 @@ def best_auctions_lookahead_start(req: BestAuctionsLookaheadStartRequest) -> Dic
                 deadline_s=float(req.deadline_s),
                 max_nodes=int(req.max_nodes),
                 beam_width=int(req.beam_width),
-                permissive_pass=bool(req.permissive_pass),
             )
             t_wall1 = time.perf_counter()
             t_cpu1 = time.process_time()
