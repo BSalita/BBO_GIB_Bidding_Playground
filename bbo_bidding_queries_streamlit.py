@@ -5315,10 +5315,17 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         st.session_state.auction_builder_options = {}
         st.session_state.auction_builder_last_applied = ""
         st.session_state.auction_builder_last_selected = ""
-        # Clear rehydration tracking keys, deals counts cache, and categories cache
+        # Clear rehydration tracking keys, deals counts cache, categories cache, and best auctions caches
+        keys_to_clear = []
         for key in list(st.session_state.keys()):
-            if isinstance(key, str) and key.startswith("_rehydrated_"):
-                del st.session_state[key]
+            if isinstance(key, str) and (
+                key.startswith("_rehydrated_")
+                or key.startswith("_best_auctions_")
+                or key.startswith("show_best_auctions_")
+            ):
+                keys_to_clear.append(key)
+        for key in keys_to_clear:
+            del st.session_state[key]
         if "_deals_counts_all" in st.session_state:
             del st.session_state["_deals_counts_all"]
         if "_deals_counts_elapsed_ms" in st.session_state:
@@ -5566,7 +5573,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     # Display current auction state with editable input
     # Include bt_index from last step if available (use 'is not None' since bt_index=0 is valid)
     current_bt_index = current_path[-1].get("bt_index") if current_path else None
-    auction_header = f"Current Auction (bt_index: {current_bt_index})" if current_bt_index is not None else "Current Auction"
+    auction_header = f"Bidding Sequence (bt_index: {current_bt_index})" if current_bt_index is not None else "Bidding Sequence"
     st.subheader(auction_header)
     
     # Track last applied auction to prevent render loops
@@ -6076,6 +6083,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 bid_str = str(opt.get("bid", "")).upper()
                 next_auction = f"{current_auction}-{bid_str}" if current_auction else bid_str
                 matches_count = bid_matches.get(next_auction, 0)
+                is_pass = bid_str.strip().upper() in ("P", "PASS")
                 
                 # Check if pinned deal matches this bid's criteria
                 matches_pinned = None
@@ -6099,7 +6107,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Check if this bid should be rejected
                 deal_count = opt.get("matching_deal_count")
                 is_dead_end = opt.get("is_dead_end", False)
-                has_empty_criteria = not criteria_list
+                # Rule: any Pass with empty criteria is ALWAYS routed to Valid (never Rejected).
+                pass_no_criteria = bool(is_pass and (not criteria_list))
+                has_empty_criteria = (not criteria_list)
                 can_complete = opt.get("can_complete")
                 can_complete_b = bool(can_complete) if can_complete is not None else True
                 has_zero_deals = deal_count == 0
@@ -6109,6 +6119,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 #   Do NOT use those as rejection/invalid reasons.
                 # - Keep rejection for structural/data-quality issues only.
                 is_rejected = is_dead_end or has_empty_criteria
+                if pass_no_criteria:
+                    is_rejected = False
                 
                 # Build failure reason for display
                 failure_reasons = []
@@ -6118,8 +6130,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     failure_reasons.append("missing criteria")
                 if (show_failed_criteria and matches_pinned is True and not can_complete_b):
                     # Bid matches current criteria but cannot reach a completed auction anywhere downstream.
-                    is_rejected = True
-                    failure_reasons.append("cannot complete")
+                    if not pass_no_criteria:
+                        is_rejected = True
+                        failure_reasons.append("cannot complete")
                 failure_str = "; ".join(failure_reasons) if failure_reasons else ""
                 
                 row_data: dict[str, Any] = {
@@ -6173,6 +6186,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 dd_score_val: int | None = None
                 ev_contract: float | None = None
                 ev_contract_pre: float | None = None
+                declarer_dir_for_contract: str | None = None
                 try:
                     candidate_auction_norm = normalize_auction_input(next_auction).upper() if next_auction else ""
                     # For per-deal EV lookup, force the auction to a completed form (append passes).
@@ -6192,6 +6206,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             dealer_for_contract = str(pinned_deal.get("Dealer", "N")).upper()
                             declarer = get_declarer_for_auction(candidate_auction_norm, dealer_for_contract)
                             if declarer:
+                                declarer_dir_for_contract = str(declarer).upper()
                                 dd_col_name = f"DD_{declarer}_{str(strain).upper()}"
                                 raw = pinned_deal.get(dd_col_name)
                                 dd_val = int(raw) if raw is not None else None
@@ -6218,6 +6233,22 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 row_data["Contract"] = contract_str or ""
                 row_data["DD_[NESW]_[CDHSN]"] = dd_val
                 row_data["_dd_col"] = dd_col_name or ""
+                # DD/EV "contract" scores in the UI should be shown as "score for OUR side".
+                # `get_dd_score_for_auction` / `get_ev_for_auction` are declarer-relative:
+                # - Declarer makes => positive
+                # - Declarer sets  => negative
+                # So to display "our side" (the current bidder's partnership), negate when the
+                # declarer is on the opponents' side.
+                if pinned_deal and seat_direction and declarer_dir_for_contract:
+                    bidder_side = "NS" if str(seat_direction).upper() in ("N", "S") else "EW"
+                    declarer_side = "NS" if str(declarer_dir_for_contract).upper() in ("N", "S") else "EW"
+                    side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                    if dd_score_val is not None:
+                        dd_score_val = int(side_sign * float(dd_score_val))
+                    if ev_contract is not None:
+                        ev_contract = round(side_sign * float(ev_contract), 1)
+                    if ev_contract_pre is not None:
+                        ev_contract_pre = round(side_sign * float(ev_contract_pre), 1)
                 row_data["DD_Score_Contract"] = dd_score_val
                 row_data["EV_Contract"] = ev_contract
                 row_data["EV_Contract_Pre"] = ev_contract_pre
@@ -6229,11 +6260,18 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     and (matches_pinned is True)
                     and (row_data.get("Avg_EV") is None)
                 ):
-                    is_rejected = True
-                    failure_reasons.append("missing Avg_EV")
-                    failure_str = "; ".join(failure_reasons) if failure_reasons else ""
-                    row_data["_rejected"] = True
-                    row_data["can_complete"] = can_complete
+                    if not pass_no_criteria:
+                        is_rejected = True
+                        failure_reasons.append("missing Avg_EV")
+                        failure_str = "; ".join(failure_reasons) if failure_reasons else ""
+                        row_data["_rejected"] = True
+                        row_data["can_complete"] = can_complete
+
+                # Enforce: Pass with empty criteria is never rejected.
+                if pass_no_criteria:
+                    is_rejected = False
+                    row_data["_rejected"] = False
+                    failure_str = ""
 
                 row_data["Criteria_Count"] = len(criteria_list) if isinstance(criteria_list, list) else 0
                 row_data["Criteria"] = criteria_str if criteria_str else "(none)"
@@ -6251,10 +6289,13 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 if is_rejected:
                     row_data["Failure"] = failure_str
                 bid_rows.append(row_data)
-            
-            # Suggested bids ranked by objective function (criteria, EV, popularity)
+
+            # Suggested bids ranked by EV Contract, Matches, Bid
             suggested_bids_rows: list[dict[str, Any]] = []
             for r in bid_rows:
+                # Only allow valid bids in this table
+                if r.get("_rejected") or (r.get("_matches") is not True):
+                    continue
                 bucket = "Unknown"
                 if r.get("_rejected"):
                     bucket = "Rejected"
@@ -6271,32 +6312,53 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     bucket_rank = 0
 
                 criteria_count = int(r.get("Criteria_Count", 0) or 0)
-                ev_val = r.get("Avg_EV")
-                if ev_val is None:
-                    ev_val = r.get("EV_NV")
-                if ev_val is None:
-                    ev_val = r.get("EV_V")
-                ev_sort = float(ev_val) if ev_val is not None else -5000.0
-                popularity_raw = r.get("Deals")
+                # EV for sorting (EV Contract)
+                ev_contract_val = r.get("EV_Contract")
+                dd_score_contract_val = r.get("DD_Score_Contract")
+
+                # Any leading Pass (auction prefix is all P's) should have EV=0.0.
+                # This covers opening sequences like "", "P", "P-P", "P-P-P", etc.
                 try:
-                    popularity = int(popularity_raw)
+                    toks_now = [t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()]
+                    prefix_all_passes = (len(toks_now) == 0) or all(t == "P" for t in toks_now)
                 except Exception:
-                    popularity = 0
+                    prefix_all_passes = False
+                if prefix_all_passes and str(r.get("Bid", "")).strip().split(" ")[0].upper() == "P":
+                    ev_contract_val = 0.0
+
+                # Display missing EV Contract as 0.0 for this table
+                if ev_contract_val is None:
+                    ev_contract_val = 0.0
+                ev_contract_sort = float(ev_contract_val)
+                # DD Score sort: missing sinks to bottom
+                dd_sort = dd_score_contract_val
+                try:
+                    dd_sort_f = float(dd_sort) if dd_sort is not None else float("-inf")
+                except Exception:
+                    dd_sort_f = float("-inf")
+                matches_raw = r.get("Matches")
+                try:
+                    matches_i = int(matches_raw) if matches_raw is not None else 0
+                except Exception:
+                    matches_i = 0
+                bid_key = str(r.get("Bid", "")).strip().upper()
 
                 suggested_bids_rows.append(
                     {
                         "_idx": r.get("_idx"),
                         "Bid": r.get("Bid"),
                         "Criteria": criteria_count,
-                        "EV": ev_val,
+                        "EV Contract": ev_contract_val,
+                        "DD Score": dd_score_contract_val,
                         "Deals": r.get("Deals"),
                         "Matches": r.get("Matches"),
                         "Bucket": bucket,
-                        "_sort": (float(bucket_rank), float(criteria_count), ev_sort, float(popularity)),
+                        # Sort: DD Score desc, EV Contract desc, Matches desc, Bid asc
+                        "_sort": (-dd_sort_f, -ev_contract_sort, -float(matches_i), bid_key),
                     }
                 )
 
-            suggested_bids_rows.sort(key=lambda x: x.get("_sort", (0.0, 0.0, -5000.0, 0.0)), reverse=True)
+            suggested_bids_rows.sort(key=lambda x: x.get("_sort", (float("inf"), float("inf"), 0.0, "")))
             suggested_bids_rows = suggested_bids_rows[:5]
 
             bids_df = pl.DataFrame(bid_rows)
@@ -6458,6 +6520,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     computed_complete = _is_auction_complete_after_next_bid(current_auction, sel_bid_s)
                     sel_opt["is_complete"] = bool(sel_opt.get("is_complete", False) or computed_complete)
                     sel_opt["bid"] = sel_bid_s
+                    # Preserve client-side rule: Pass with empty criteria is valid.
+                    sel_opt["_pass_no_criteria"] = bool(sel_bid_s == "P" and not (sel_opt.get("agg_expr") or []))
                     # Attach categories from the lookup cache
                     bt_idx = sel_opt.get("bt_index")
                     if bt_idx is not None:
@@ -6474,6 +6538,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             data = api_post("/resolve-auction-path", {"auction": new_auction}, timeout=30)
                             new_path = data.get("path", []) or []
                             if new_path and len(new_path) == len(st.session_state.auction_builder_path):
+                                # Preserve client-side flags that shouldn't be invalidated by server rehydrate.
+                                try:
+                                    old_path = st.session_state.auction_builder_path
+                                    for j in range(min(len(old_path), len(new_path))):
+                                        if old_path[j].get("_pass_no_criteria"):
+                                            new_path[j]["_pass_no_criteria"] = True
+                                except Exception:
+                                    pass
                                 # Preserve any client-side completion inference for trailing passes
                                 try:
                                     if st.session_state.auction_builder_path and new_path:
@@ -6594,7 +6666,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "_idx": r["_idx"],
                                     "Bid": r["Bid"],
                                     "Criteria": r["Criteria"],
-                                    "EV": r["EV"],
+                                    "EV Contract": r.get("EV Contract"),
+                                    "DD Score": r.get("DD Score"),
                                     "Deals": r["Deals"],
                                     "Matches": r["Matches"],
                                     "Bucket": r["Bucket"],
@@ -6607,6 +6680,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         gb_sug.configure_selection(selection_mode="single", use_checkbox=False)
                         gb_sug.configure_column("_idx", hide=True)
                         gb_sug.configure_column("Bucket", hide=True)
+                        if "EV Contract" in sug_pdf.columns:
+                            gb_sug.configure_column("EV Contract", width=110)
+                        if "DD Score" in sug_pdf.columns:
+                            gb_sug.configure_column("DD Score", width=95)
                         gb_sug.configure_column("Matches", width=105)  # adjusted
                         gb_sug.configure_grid_options(
                             getRowClass=row_class_js,
@@ -7135,15 +7212,37 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                 # Best Auctions by DD/EV: sample matched BT rows for pinned deal (GPU-verified deal→BT index)
                 if pinned_deal and valid_rows:
-                    show_best_auctions = st.checkbox(
-                        f"Show Best {int(max_best_auctions)} Auctions Ranked by DD/EV",
-                        value=False,
-                        key=f"show_best_auctions_{current_seat}",
-                    )
+                    # Include deal identifier in cache key to ensure fresh data for each deal
+                    # Use the pinned input string directly - guaranteed to change when user enters new deal
+                    deal_cache_id = str(pinned_input or "").strip()
+                    
+                    show_best_auctions_key = f"show_best_auctions_{current_seat}_{deal_cache_id}"
+                    if show_best_auctions_key not in st.session_state:
+                        st.session_state[show_best_auctions_key] = False
 
-                    cache_key_dd = f"_best_auctions_dd_cache_{current_auction}_{seed}_{int(max_best_auctions)}"
+                    cache_key_dd = f"_best_auctions_dd_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
                     cache_key_dd_elapsed = f"{cache_key_dd}__elapsed_s"
                     cache_key_dd_attempted = f"{cache_key_dd}__attempted"
+                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
+                    cache_key_ev_attempted = f"{cache_key_ev}__attempted"
+
+                    # If we've already tried loading and got no rows, hide the button and show a message.
+                    attempted_dd = bool(st.session_state.get(cache_key_dd_attempted, False))
+                    attempted_ev = bool(st.session_state.get(cache_key_ev_attempted, False))
+                    cached_dd_rows = st.session_state.get(cache_key_dd, []) or []
+                    cached_ev_rows = st.session_state.get(cache_key_ev, []) or []
+                    if attempted_dd and attempted_ev and (not cached_dd_rows) and (not cached_ev_rows):
+                        st.info("Deal has no auction which will result in par score.")
+                        st.session_state[show_best_auctions_key] = False
+                        show_best_auctions = False
+                    else:
+                        if st.button(
+                            f"Show Best {int(max_best_auctions)} Auctions Ranked by DD/EV",
+                            key=f"{show_best_auctions_key}__btn",
+                        ):
+                            st.session_state[show_best_auctions_key] = True
+                            st.rerun()
+                        show_best_auctions = bool(st.session_state.get(show_best_auctions_key, False))
 
                     if show_best_auctions:
                         st.markdown("**Best Auctions Ranked by DD**")
@@ -7196,6 +7295,23 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             drop_cols = [c for c in ["is_completed_auction", "Score"] if c in best_auctions_df.columns]
                             if drop_cols:
                                 best_auctions_df = best_auctions_df.drop(drop_cols)
+                            # Sort by DD_Score (desc), Matches (desc), EV (desc), bt_index (asc)
+                            sort_cols = []
+                            sort_desc = []
+                            if "DD_Score" in best_auctions_df.columns:
+                                sort_cols.append("DD_Score")
+                                sort_desc.append(True)
+                            if "Matches" in best_auctions_df.columns:
+                                sort_cols.append("Matches")
+                                sort_desc.append(True)
+                            if "EV" in best_auctions_df.columns:
+                                sort_cols.append("EV")
+                                sort_desc.append(True)
+                            if "bt_index" in best_auctions_df.columns:
+                                sort_cols.append("bt_index")
+                                sort_desc.append(False)
+                            if sort_cols:
+                                best_auctions_df = best_auctions_df.sort(sort_cols, descending=sort_desc, nulls_last=True)
                             # Add client-side row number 'index' (1..N) and force it to be first column.
                             if "index" not in best_auctions_df.columns:
                                 best_auctions_df = best_auctions_df.with_row_index("index", offset=1)
@@ -7214,6 +7330,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             if "EV" in best_auctions_pdf.columns:
                                 gb_best.configure_column("EV", width=90)
                             gb_best.configure_column("Par", width=60)
+                            if "Matches" in best_auctions_pdf.columns:
+                                gb_best.configure_column("Matches", width=105)
+                            if "Deals" in best_auctions_pdf.columns:
+                                gb_best.configure_column("Deals", width=100)
                             if "bt_index" in best_auctions_pdf.columns:
                                 gb_best.configure_column("bt_index", width=110, headerName="BT Index")
                             gb_best.configure_grid_options(rowHeight=25, headerHeight=25)
@@ -7225,7 +7345,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 height=min(260, 60 + len(best_auctions_dd) * 25),
                                 update_on=["selectionChanged"],
                                 theme="balham",
-                                key=f"auction_builder_best_auctions_dd_{current_seat}",
+                                key=f"auction_builder_best_auctions_dd_{current_seat}_{deal_cache_id}",
                                 custom_css={
                                     ".ag-row": {"cursor": "pointer"},
                                     ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
@@ -7251,7 +7371,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         elif cache_key_dd_attempted in st.session_state:
                             st.info("No matched BT rows returned for this deal (or limit is 0).")
 
-                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}"
+                    cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
                     cache_key_ev_elapsed = f"{cache_key_ev}__elapsed_s"
                     cache_key_ev_attempted = f"{cache_key_ev}__attempted"
 
@@ -7285,6 +7405,19 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 st.session_state[cache_key_ev] = best_auctions_ev
                                 st.session_state[cache_key_ev_elapsed] = float(time.perf_counter() - t0_ev)
                                 st.session_state[cache_key_ev_attempted] = True
+                                
+                                # If both DD and EV have been attempted and both are empty,
+                                # switch to the single-message view (hide sections/button).
+                                try:
+                                    attempted_dd_now = bool(st.session_state.get(cache_key_dd_attempted, False))
+                                    attempted_ev_now = bool(st.session_state.get(cache_key_ev_attempted, False))
+                                    dd_rows_now = st.session_state.get(cache_key_dd, []) or []
+                                    ev_rows_now = st.session_state.get(cache_key_ev, []) or []
+                                    if attempted_dd_now and attempted_ev_now and (not dd_rows_now) and (not ev_rows_now):
+                                        st.session_state[show_best_auctions_key] = False
+                                        st.rerun()
+                                except Exception:
+                                    pass
 
                         if best_auctions_ev:
                             # Info summary (mirror DD expander style, but for EV).
@@ -7315,6 +7448,23 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             drop_cols = [c for c in ["is_completed_auction", "Score"] if c in best_ev_df.columns]
                             if drop_cols:
                                 best_ev_df = best_ev_df.drop(drop_cols)
+                            # Sort by EV (desc), Matches (desc), DD_Score (desc), bt_index (asc)
+                            sort_cols_ev = []
+                            sort_desc_ev = []
+                            if "EV" in best_ev_df.columns:
+                                sort_cols_ev.append("EV")
+                                sort_desc_ev.append(True)
+                            if "Matches" in best_ev_df.columns:
+                                sort_cols_ev.append("Matches")
+                                sort_desc_ev.append(True)
+                            if "DD_Score" in best_ev_df.columns:
+                                sort_cols_ev.append("DD_Score")
+                                sort_desc_ev.append(True)
+                            if "bt_index" in best_ev_df.columns:
+                                sort_cols_ev.append("bt_index")
+                                sort_desc_ev.append(False)
+                            if sort_cols_ev:
+                                best_ev_df = best_ev_df.sort(sort_cols_ev, descending=sort_desc_ev, nulls_last=True)
                             # Add client-side row number 'index' (1..N) and force it to be first column.
                             if "index" not in best_ev_df.columns:
                                 best_ev_df = best_ev_df.with_row_index("index", offset=1)
@@ -7334,6 +7484,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 gb_ev_auc.configure_column("DD_Score", width=110, headerName="DD Score")
                             if "Par" in best_ev_pdf.columns:
                                 gb_ev_auc.configure_column("Par", width=60)
+                            if "Matches" in best_ev_pdf.columns:
+                                gb_ev_auc.configure_column("Matches", width=105)
+                            if "Deals" in best_ev_pdf.columns:
+                                gb_ev_auc.configure_column("Deals", width=100)
                             if "bt_index" in best_ev_pdf.columns:
                                 gb_ev_auc.configure_column("bt_index", width=110, headerName="BT Index")
                             gb_ev_auc.configure_grid_options(rowHeight=25, headerHeight=25)
@@ -7345,7 +7499,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 height=min(260, 60 + len(best_auctions_ev) * 25),
                                 update_on=["selectionChanged"],
                                 theme="balham",
-                                key=f"auction_builder_best_auctions_ev_{current_seat}",
+                                key=f"auction_builder_best_auctions_ev_{current_seat}_{deal_cache_id}",
                                 custom_css={
                                     ".ag-row": {"cursor": "pointer"},
                                     ".ag-row-hover": {"background-color": "#E8F4FF !important", "border-left": "3px solid #007BFF !important"},
@@ -7856,7 +8010,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # via /resolve-auction-path, which aligns criteria to dealer-relative seats already.
                 # So evaluate using the actual dealer and the displayed seat.
                 dealer = pinned_deal.get("Dealer", "N")
-                criteria_list = step.get("agg_expr", [])
+                # If this step was a client-side "Pass with no criteria", treat it as passing by definition.
+                criteria_list = [] if step.get("_pass_no_criteria") else step.get("agg_expr", [])
                 passes, failed = evaluate_criteria_for_pinned(criteria_list, seat_1_to_4, dealer, pinned_deal)
                 row["_passes"] = passes  # Hidden column for row styling
                 if passes:
@@ -8441,7 +8596,7 @@ try:
                     try:
                         st.dataframe(
                             rules_df.to_pandas(),
-                            use_container_width=True,
+                            width="stretch",
                             height=calc_grid_height(len(rules_df), max_height=420, row_height=28, header_height=45),
                         )
                     except Exception:

@@ -8810,7 +8810,7 @@ def handle_deal_matched_bt_sample(
         in_list = ", ".join(str(int(x)) for x in consider_bt)
         bt_df = conn.execute(
             f"""
-            SELECT bt_index, Auction, is_completed_auction
+            SELECT bt_index, Auction, is_completed_auction, matching_deal_count
             FROM read_parquet('{file_path}')
             WHERE bt_index IN ({in_list})
             """
@@ -8832,9 +8832,79 @@ def handle_deal_matched_bt_sample(
 
     from bbo_bidding_queries_lib import parse_contract_from_auction
 
+    # Apply CSV overlay (custom_criteria_overlay) before scoring/display.
+    # The deal→BT verified index is computed from the compiled BT; overlay can add criteria on top.
+    # Filter out any BT rows that no longer match the pinned deal once overlay is applied.
+    bt_rows_for_eval: list[dict[str, Any]] = []
+    filtered_out = 0
+    try:
+        bt_seat1_file = state.get("bt_seat1_file")
+        deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+        if bt_seat1_file is not None and isinstance(deal_criteria_by_seat_dfs, dict):
+            bt_indices = [int(x) for x in (bt_df.get_column("bt_index").to_list() if "bt_index" in bt_df.columns else []) if x is not None]
+            agg_map = _load_agg_expr_for_bt_indices(bt_indices, bt_seat1_file) if bt_indices else {}
+            for row in bt_df.iter_rows(named=True):
+                row_dict = dict(row)
+                bt_index = row_dict.get("bt_index")
+                if bt_index is not None:
+                    try:
+                        row_dict.update(agg_map.get(int(bt_index), {}))
+                    except Exception:
+                        pass
+                # Apply overlay + dedupe (will NOT re-load Agg_Expr since we pre-filled it above).
+                row_rules = _apply_overlay_and_dedupe(row_dict, state)
+                # Check conformance for this deal_row_idx against (possibly augmented) criteria.
+                conf = _check_deal_criteria_conformance_bitmap(
+                    int(deal_row_idx),
+                    row_rules,
+                    dealer_actual,
+                    deal_criteria_by_seat_dfs,
+                    auction=str(row_rules.get("Auction") or ""),
+                )
+                if conf.get("first_wrong_seat") is None:
+                    bt_rows_for_eval.append(row_rules)
+                else:
+                    filtered_out += 1
+        else:
+            bt_rows_for_eval = [dict(r) for r in bt_df.iter_rows(named=True)]
+    except Exception:
+        # If anything goes wrong, fall back to the raw BT rows (best-effort).
+        bt_rows_for_eval = [dict(r) for r in bt_df.iter_rows(named=True)]
+
+    # Fetch pattern-based counts (Matches) for all auctions using the same API as bid options
+    auctions_list = [str(row.get("Auction") or "") for row in bt_rows_for_eval]
+    pattern_counts: dict[str, int] = {}
+    if auctions_list:
+        # Build regex patterns for exact auction matches (completed auctions end with -P-P-P)
+        # Use same pattern format as bid options: exact match for completed auctions
+        patterns = []
+        auc_to_pattern = {}
+        for auc in auctions_list:
+            auc_upper = auc.upper()
+            # For completed auctions, use exact match pattern
+            if auc_upper.endswith("-P-P-P"):
+                pat = f"^{auc_upper}$"
+            else:
+                # For incomplete auctions, match any completion
+                pat = f"^{auc_upper}.*-P-P-P$"
+            patterns.append(pat)
+            auc_to_pattern[auc] = pat
+        unique_patterns = list(dict.fromkeys(patterns))
+        try:
+            pattern_counts_resp = handle_auction_pattern_counts(state, unique_patterns)
+            counts_by_pattern = pattern_counts_resp.get("counts", {}) or {}
+            # Map patterns back to auctions
+            for auc in auctions_list:
+                pat = auc_to_pattern[auc]
+                pattern_counts[auc] = int(counts_by_pattern.get(pat, 0) or 0)
+        except Exception:
+            # Fallback: use 0 for all if pattern count fetch fails
+            for auc in auctions_list:
+                pattern_counts[auc] = 0
+
     out_rows: list[dict[str, Any]] = []
     metric_u = str(metric or "DD").upper()
-    for row in bt_df.iter_rows(named=True):
+    for row in bt_rows_for_eval:
         auc = str(row.get("Auction") or "")
         bt_index = row.get("bt_index")
         is_completed = bool(row.get("is_completed_auction"))
@@ -8867,6 +8937,11 @@ def handle_deal_matched_bt_sample(
             ev = None
 
         is_par = par_score_i is not None and dd_score is not None and int(dd_score) == int(par_score_i)
+        matching_deal_count = row.get("matching_deal_count")
+        # Matches: pattern-based count (same as bid options)
+        matches_count = pattern_counts.get(auc, 0)
+        # Deals: criteria-based count from BT row (same as bid options)
+        deals_count = matching_deal_count if matching_deal_count is not None else ""
         out_rows.append(
             {
                 "bt_index": bt_index,
@@ -8875,6 +8950,8 @@ def handle_deal_matched_bt_sample(
                 "DD_Score": dd_score,
                 "EV": ev,
                 "Par": "✅" if is_par else "",
+                "Matches": matches_count,
+                "Deals": deals_count,
                 "is_completed_auction": is_completed,
                 "Score": dd_score if metric_u == "DD" else ev,
             }
@@ -8914,7 +8991,7 @@ def handle_deal_matched_bt_sample(
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return {
         "rows": out_rows,
-        "counts": {"total_matches": total_matches, "considered": consider_n, "returned": len(out_rows)},
+        "counts": {"total_matches": total_matches, "considered": consider_n, "filtered_out": filtered_out, "returned": len(out_rows)},
         "metric": metric_u,
         "par_score": par_score_i,
         "elapsed_ms": round(elapsed_ms, 1),
