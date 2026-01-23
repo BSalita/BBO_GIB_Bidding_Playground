@@ -8435,12 +8435,17 @@ def handle_best_auctions_lookahead(
         return "Passed out" if toks and all(t == "P" for t in toks) else "?"
     
     # Helper: evaluate criteria for a deal (O(1) bitmap lookup)
+    # STRICT POLICY: all criteria must be evaluatable and true.
+    # - SL/complex criteria must be computable for this deal/seat (otherwise fail)
+    # - Bitmap criteria must exist in the bitmap DF and be true (otherwise fail)
     def eval_criteria(criteria_list: List[str], bt_seat: int, dealer_rot: str) -> bool:
         if not criteria_list:
             return True  # Empty criteria = pass
         
         criteria_df = deal_criteria_by_seat_dfs.get(bt_seat, {}).get(dealer_rot)
-        available_cols = set(criteria_df.columns) if criteria_df is not None else set()
+        if criteria_df is None:
+            return False
+        available_cols = set(criteria_df.columns)
         
         for crit in criteria_list:
             if crit is None:
@@ -8454,18 +8459,18 @@ def handle_best_auctions_lookahead(
             elif sl_result is False:
                 return False
             
-            # Check if it was an SL criterion that couldn't be evaluated
+            # If it's an SL criterion (or SL-style comparison) but can't be evaluated => FAIL (strict)
             if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
-                continue  # Treat as pass (permissive)
+                return False
             
             # Bitmap lookup
-            if criteria_df is not None and crit_s in available_cols:
-                try:
-                    if not bool(criteria_df[crit_s][int(deal_row_idx)]):
-                        return False
-                except (IndexError, KeyError):
-                    continue  # Treat as pass
-            # Unknown criterion: treat as pass (permissive)
+            if crit_s not in available_cols:
+                return False
+            try:
+                if not bool(criteria_df[crit_s][int(deal_row_idx)]):
+                    return False
+            except Exception:
+                return False
         
         return True
     
@@ -9079,6 +9084,7 @@ def handle_greedy_model_path(
     deal_row_idx: Optional[int] = None,
     seed: int = 42,
     max_depth: int = 40,
+    permissive_pass: bool = True,
 ) -> Dict[str, Any]:
     """Compute the greedy 'model path' from a given prefix by picking the top bid at each step.
     
@@ -9299,12 +9305,19 @@ def handle_greedy_model_path(
                 if is_pass and not crits: is_rejected = False
             else:
                 is_rejected = is_dead_end and not can_complete
+
+            # UI parity: if permissive-pass is enabled, Pass is never rejected.
+            if permissive_pass and is_pass:
+                is_rejected = False
             
             # Check pinned deal match (batched evaluation)
             matches_pinned = matches_pinned_by_row[i]
+            # UI parity: if permissive-pass is enabled, Pass always matches pinned deal.
+            if permissive_pass and is_pass:
+                matches_pinned = True
             
             if deal_row and matches_pinned and not can_complete:
-                if not (is_pass and not crits):
+                if not ((is_pass and not crits) or (permissive_pass and is_pass)):
                     is_rejected = True
 
             if is_rejected:

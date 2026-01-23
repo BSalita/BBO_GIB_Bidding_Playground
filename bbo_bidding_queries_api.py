@@ -1297,6 +1297,9 @@ class GreedyModelPathRequest(BaseModel):
     deal_row_idx: Optional[int] = None
     seed: int = 42
     max_depth: int = 40
+    # If True, Pass bids are always treated as valid even if their criteria fails.
+    # This should match the Streamlit "Always treat Pass as valid bid" checkbox behavior.
+    permissive_pass: bool = True
 
 
 class DealMatchedBTSampleRequest(BaseModel):
@@ -4059,6 +4062,7 @@ def greedy_model_path(req: GreedyModelPathRequest) -> Dict[str, Any]:
             deal_row_idx=req.deal_row_idx,
             seed=req.seed,
             max_depth=req.max_depth,
+            permissive_pass=bool(getattr(req, "permissive_pass", True)),
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:

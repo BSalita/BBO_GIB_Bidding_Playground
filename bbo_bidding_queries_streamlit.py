@@ -5673,6 +5673,23 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 _clear_current_auction_state()
                 st.rerun()
 
+    # If another UI element wants to "move" an auction into the bidding sequence,
+    # it can set this key and we will apply it via the existing resolve/apply logic.
+    pending_set_key = "_auction_builder_pending_set_auction"
+    pending_auction = st.session_state.get(pending_set_key)
+    if isinstance(pending_auction, str) and pending_auction.strip():
+        try:
+            st.session_state[edit_key] = pending_auction.strip()
+        except Exception:
+            pass
+        edited_auction = pending_auction.strip()
+        st.session_state.auction_builder_last_applied = ""  # ensure it applies
+        apply_edit = True
+        try:
+            del st.session_state[pending_set_key]
+        except Exception:
+            pass
+
     # -----------------------------------------------------------------------
     # TODO(best-completions):
     # Re-enable "Best completions (DD/EV)" once PBN pinning supports on-the-fly
@@ -6757,18 +6774,24 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 )
 
                 # --- Predicted Model Path (Greedy) ---
-                # Only compute when starting from empty auction (opening position)
+                # Compute only when starting from empty auction (opening position),
+                # but persist the UI box even after the user builds a non-empty
+                # Bidding Sequence (by displaying cached results).
+                #
                 # Build the greedy path by repeatedly picking the top bid using
                 # the same logic as "Best Bids Ranked by Model":
                 # 1. Filter to bids where pinned deal matches criteria (or Pass with no criteria)
                 # 2. Sort by: (-DD_Score, -EV_Score, -matches, bid_name)
-                if suggested_bids_rows and pinned_deal and not current_auction:
+                if pinned_deal:
                     import time as _time_module
                     deal_id = pinned_deal.get("index") if pinned_deal else "no_deal"
                     row_idx = pinned_deal.get("_row_idx")
-                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_{seed}_v3"
+                    pass_flag = 1 if bool(st.session_state.get("always_valid_pass", True)) else 0
+                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_{seed}_{pass_flag}_v4"
                     greedy_time_key = f"{greedy_cache_key}__time"
-                    if greedy_cache_key not in st.session_state:
+
+                    # Only compute from the opening position.
+                    if suggested_bids_rows and not current_auction and greedy_cache_key not in st.session_state:
                         _greedy_start = _time_module.perf_counter()
                         with st.spinner("Predicting model path..."):
                             try:
@@ -6776,7 +6799,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "auction_prefix": current_auction or "",
                                     "deal_row_idx": int(row_idx) if row_idx is not None else None,
                                     "seed": int(seed) if seed is not None else 42,
-                                    "max_depth": 40
+                                    "max_depth": 40,
+                                    # Keep in sync with "Always treat Pass as valid bid"
+                                    "permissive_pass": bool(st.session_state.get("always_valid_pass", True)),
                                 }
                                 # Greedy path can be slower on some deals; use a longer timeout.
                                 resp = api_post("/greedy-model-path", payload, timeout=90)
@@ -6794,11 +6819,22 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 st.error(f"Error predicting path: {e}")
                                 st.session_state[greedy_cache_key] = ""
                                 st.session_state[greedy_time_key] = 0.0
-                    
+
                     greedy_path_full = st.session_state.get(greedy_cache_key, "")
                     greedy_elapsed = st.session_state.get(greedy_time_key, 0)
                     if greedy_path_full:
-                        st.info(f"🔮 **Model's Predicted Path:** `{greedy_path_full}` ({greedy_elapsed:.1f}s)")
+                        msg_col, btn_col = st.columns([6, 2], gap="small")
+                        with msg_col:
+                            st.markdown(f"**Model Path:** `{greedy_path_full}` ({greedy_elapsed:.1f}s)")
+                        with btn_col:
+                            if st.button(
+                                "Move to Bidding Sequence",
+                                key=f"auction_builder_move_predicted_path_{deal_id}_{seed}",
+                                help="Overwrite the current bidding sequence with the model path.",
+                                width="stretch",
+                            ):
+                                st.session_state["_auction_builder_pending_set_auction"] = greedy_path_full
+                                st.rerun()
 
                 # Display 3-column layout: 5 Suggested Bids | Best Par Bids | Best EV Bids
                 sug_col, par_col, ev_col = st.columns(3)
@@ -7371,6 +7407,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     cache_key_dd_attempted = f"{cache_key_dd}__attempted"
                     cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
                     cache_key_ev_attempted = f"{cache_key_ev}__attempted"
+                    # Fallback: server-side lookahead (does not require verified deal→BT matches)
+                    cache_key_dd_look = f"_best_auctions_dd_lookahead_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
+                    cache_key_dd_look_attempted = f"{cache_key_dd_look}__attempted"
+                    cache_key_ev_look = f"_best_auctions_ev_lookahead_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
+                    cache_key_ev_look_attempted = f"{cache_key_ev_look}__attempted"
 
                     # If we've already tried loading and got no rows, hide the button and show a message.
                     attempted_dd = bool(st.session_state.get(cache_key_dd_attempted, False))
@@ -7378,12 +7419,13 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     cached_dd_rows = st.session_state.get(cache_key_dd, []) or []
                     cached_ev_rows = st.session_state.get(cache_key_ev, []) or []
                     if attempted_dd and attempted_ev and (not cached_dd_rows) and (not cached_ev_rows):
-                        st.info(
-                            "Deal has no pre-computed auction which will result in par score. "
-                            "Try manually entering auction."
+                        st.warning(
+                            "No **pre-computed matched completed auctions** were found for this deal in the verified deal→BT index "
+                            "(or they were all filtered out by overlay criteria). This does **not** mean there are no valid auctions.\n\n"
+                            "A server-side lookahead search will be used below to find the best DD/EV auctions reachable from the current prefix."
                         )
-                        st.session_state[show_best_auctions_key] = False
-                        show_best_auctions = False
+                        st.session_state[show_best_auctions_key] = True
+                        show_best_auctions = True
                     else:
                         if st.button(
                             f"Show Best {int(max_best_auctions)} Pre-computed Auctions Ranked by DD/EV",
@@ -7428,6 +7470,45 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 st.session_state[cache_key_dd] = best_auctions_dd
                                 st.session_state[cache_key_dd_elapsed] = float(time.perf_counter() - t0)
                                 st.session_state[cache_key_dd_attempted] = True
+
+                        # Fallback: if precomputed sample returned empty, run bounded lookahead once.
+                        if (not best_auctions_dd) and pinned_deal:
+                            attempted_look = bool(st.session_state.get(cache_key_dd_look_attempted, False))
+                            if not attempted_look:
+                                with st.spinner("Searching (server-side lookahead)..."):
+                                    row_idx = pinned_deal.get("_row_idx")
+                                    if row_idx is not None:
+                                        try:
+                                            resp = api_post(
+                                                "/best-auctions-lookahead",
+                                                {
+                                                    "deal_row_idx": int(row_idx),
+                                                    "auction_prefix": current_auction or "",
+                                                    "metric": "DD",
+                                                    "max_depth": 20,
+                                                    "max_results": int(max_best_auctions),
+                                                },
+                                                timeout=120,
+                                            )
+                                            aucs = resp.get("auctions") or []
+                                            best_auctions_dd = [
+                                                {
+                                                    "Auction": a.get("auction"),
+                                                    "Contract": a.get("contract"),
+                                                    "DD_Score": a.get("dd_score"),
+                                                    "EV": a.get("ev"),
+                                                    "Par": "✅" if a.get("is_par") else "",
+                                                }
+                                                for a in aucs
+                                                if a
+                                            ]
+                                        except Exception as e:
+                                            st.error(f"Lookahead failed: {e}")
+                                            best_auctions_dd = []
+                                    st.session_state[cache_key_dd_look] = best_auctions_dd
+                                    st.session_state[cache_key_dd_look_attempted] = True
+                            else:
+                                best_auctions_dd = st.session_state.get(cache_key_dd_look, []) or []
 
                         if best_auctions_dd:
                             par_score = pinned_deal.get("ParScore", pinned_deal.get("Par_Score"))
@@ -7519,7 +7600,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     except Exception as e:
                                         st.error(f"Failed to apply auction: {e}")
                         elif cache_key_dd_attempted in st.session_state:
-                            st.info("No matched BT rows returned for this deal (or limit is 0).")
+                            st.info("No matched BT rows returned for this deal. (Lookahead may also be empty.)")
 
                     cache_key_ev = f"_best_auctions_ev_cache_{current_auction}_{seed}_{int(max_best_auctions)}_{deal_cache_id}"
                     cache_key_ev_elapsed = f"{cache_key_ev}__elapsed_s"
@@ -7556,19 +7637,45 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 st.session_state[cache_key_ev] = best_auctions_ev
                                 st.session_state[cache_key_ev_elapsed] = float(time.perf_counter() - t0_ev)
                                 st.session_state[cache_key_ev_attempted] = True
-                                
-                                # If both DD and EV have been attempted and both are empty,
-                                # switch to the single-message view (hide sections/button).
-                                try:
-                                    attempted_dd_now = bool(st.session_state.get(cache_key_dd_attempted, False))
-                                    attempted_ev_now = bool(st.session_state.get(cache_key_ev_attempted, False))
-                                    dd_rows_now = st.session_state.get(cache_key_dd, []) or []
-                                    ev_rows_now = st.session_state.get(cache_key_ev, []) or []
-                                    if attempted_dd_now and attempted_ev_now and (not dd_rows_now) and (not ev_rows_now):
-                                        st.session_state[show_best_auctions_key] = False
-                                        st.rerun()
-                                except Exception:
-                                    pass
+
+                        # Fallback: if precomputed sample returned empty, run bounded lookahead once.
+                        if (not best_auctions_ev) and pinned_deal:
+                            attempted_look = bool(st.session_state.get(cache_key_ev_look_attempted, False))
+                            if not attempted_look:
+                                with st.spinner("Searching (server-side lookahead)..."):
+                                    row_idx = pinned_deal.get("_row_idx")
+                                    if row_idx is not None:
+                                        try:
+                                            resp = api_post(
+                                                "/best-auctions-lookahead",
+                                                {
+                                                    "deal_row_idx": int(row_idx),
+                                                    "auction_prefix": current_auction or "",
+                                                    "metric": "EV",
+                                                    "max_depth": 20,
+                                                    "max_results": int(max_best_auctions),
+                                                },
+                                                timeout=120,
+                                            )
+                                            aucs = resp.get("auctions") or []
+                                            best_auctions_ev = [
+                                                {
+                                                    "Auction": a.get("auction"),
+                                                    "Contract": a.get("contract"),
+                                                    "DD_Score": a.get("dd_score"),
+                                                    "EV": a.get("ev"),
+                                                    "Par": "✅" if a.get("is_par") else "",
+                                                }
+                                                for a in aucs
+                                                if a
+                                            ]
+                                        except Exception as e:
+                                            st.error(f"Lookahead failed: {e}")
+                                            best_auctions_ev = []
+                                    st.session_state[cache_key_ev_look] = best_auctions_ev
+                                    st.session_state[cache_key_ev_look_attempted] = True
+                            else:
+                                best_auctions_ev = st.session_state.get(cache_key_ev_look, []) or []
 
                         if best_auctions_ev:
                             # Info summary (mirror DD expander style, but for EV).
