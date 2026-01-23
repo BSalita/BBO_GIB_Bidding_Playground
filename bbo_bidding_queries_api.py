@@ -1286,6 +1286,12 @@ class BestAuctionsLookaheadStartRequest(BaseModel):
     max_nodes: int = 200000
     beam_width: int = 50
 
+class GreedyModelPathRequest(BaseModel):
+    auction_prefix: str = ""
+    deal_row_idx: Optional[int] = None
+    seed: int = 42
+    max_depth: int = 40
+
 
 class DealMatchedBTSampleRequest(BaseModel):
     """Sample BT rows that match a specific deal using the GPU-verified deal→BT index."""
@@ -3783,6 +3789,28 @@ def best_auctions_lookahead_status(job_id: str) -> Dict[str, Any]:
         out = dict(job)
     return _attach_hot_reload_info(out, reload_info)
 
+
+@app.post("/greedy-model-path")
+def greedy_model_path(req: GreedyModelPathRequest) -> Dict[str, Any]:
+    """Compute the greedy 'model path' from a given prefix by picking the top bid at each step."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    with _STATE_LOCK:
+        state = dict(STATE)
+    try:
+        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
+        if not handler_module:
+            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
+        resp = handler_module.handle_greedy_model_path(
+            state=state,
+            auction_prefix=req.auction_prefix,
+            deal_row_idx=req.deal_row_idx,
+            seed=req.seed,
+            max_depth=req.max_depth,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("greedy-model-path", e)
 
 @app.post("/deal-matched-bt-sample")
 def deal_matched_bt_sample(req: DealMatchedBTSampleRequest) -> Dict[str, Any]:

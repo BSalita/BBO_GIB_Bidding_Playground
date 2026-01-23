@@ -6696,6 +6696,29 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     """
                 )
 
+                # --- Predicted Model Path (Greedy) ---
+                # Show the path picking the top model bid at each step until completion.
+                if suggested_bids_rows:
+                    deal_id = pinned_deal.get("index") if pinned_deal else "no_deal"
+                    greedy_cache_key = f"_greedy_path_cache_{current_auction}_{deal_id}_{seed}"
+                    if greedy_cache_key not in st.session_state:
+                        with st.spinner("Predicting model path..."):
+                            greedy_data = api_post(
+                                "/greedy-model-path",
+                                {
+                                    "auction_prefix": current_auction,
+                                    "deal_row_idx": pinned_deal.get("_row_idx") if pinned_deal else None,
+                                    "seed": seed,
+                                    "max_depth": 40,
+                                },
+                                timeout=20,
+                            )
+                            st.session_state[greedy_cache_key] = greedy_data.get("greedy_path", "")
+                    
+                    greedy_path_full = st.session_state.get(greedy_cache_key, "")
+                    if greedy_path_full:
+                        st.info(f"🔮 **Model's Predicted Path:** `{greedy_path_full}`")
+
                 # Display 3-column layout: 5 Suggested Bids | Best Par Bids | Best EV Bids
                 sug_col, par_col, ev_col = st.columns(3)
                 
@@ -7274,7 +7297,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     cached_dd_rows = st.session_state.get(cache_key_dd, []) or []
                     cached_ev_rows = st.session_state.get(cache_key_ev, []) or []
                     if attempted_dd and attempted_ev and (not cached_dd_rows) and (not cached_ev_rows):
-                        st.info("Deal has no auction which will result in par score.")
+                        st.info(
+                            "Deal has no pre-computed auction which will result in par score. "
+                            "Try manually entering auction."
+                        )
                         st.session_state[show_best_auctions_key] = False
                         show_best_auctions = False
                     else:

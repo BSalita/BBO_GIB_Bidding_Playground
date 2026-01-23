@@ -37,6 +37,7 @@ from bbo_bidding_queries_lib import (
     normalize_auction_input,
     normalize_auction_user_text,
     get_ai_contract,
+    get_declarer_for_auction,
     get_dd_score_for_auction,
     get_ev_for_auction,
     compute_hand_features,
@@ -9002,4 +9003,174 @@ def handle_deal_matched_bt_sample(
         "metric": metric_u,
         "par_score": par_score_i,
         "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def handle_greedy_model_path(
+    state: Dict[str, Any],
+    auction_prefix: str,
+    deal_row_idx: Optional[int] = None,
+    seed: int = 42,
+    max_depth: int = 40,
+) -> Dict[str, Any]:
+    """Compute the greedy 'model path' from a given prefix by picking the top bid at each step.
+    
+    Replicates the 'Best Bids Ranked by Model' sorting logic from Streamlit:
+    Sort Key: (-dd_score, -ev_score, -matches_count, bid_name)
+    """
+    t0 = time.perf_counter()
+    deal_df = state.get("deal_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+    g3_index = state.get("g3_index")
+    
+    if deal_df is None:
+        raise ValueError("deal_df not loaded")
+    
+    deal_row = None
+    if deal_row_idx is not None:
+        try:
+            deal_row = deal_df.row(int(deal_row_idx), named=True)
+        except Exception:
+            pass
+            
+    dealer_actual = str(deal_row.get("Dealer", "N")).upper() if deal_row else "N"
+    
+    current_auc = normalize_auction_input(auction_prefix).upper() if auction_prefix else ""
+    path_bids = [t.strip() for t in current_auc.split("-") if t.strip()]
+    
+    file_path = _bt_file_path_for_sql(state)
+    conn = duckdb.connect(":memory:")
+    
+    def _is_complete(bids: List[str]) -> bool:
+        if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
+            return True
+        last_c = -1
+        for i, b in enumerate(bids):
+            if b not in ("P", "X", "XX") and b and b[0].isdigit():
+                last_c = i
+        return last_c >= 0 and len(bids) >= last_c + 4 and all(b == "P" for b in bids[-3:])
+
+    def _eval_criteria(criteria_list: List[str], bt_seat: int, dealer_rot: str) -> bool:
+        if not criteria_list: return True
+        if deal_row is None: return True # Permissive if no deal pinned
+        
+        criteria_df = deal_criteria_by_seat_dfs.get(bt_seat, {}).get(dealer_rot)
+        available_cols = set(criteria_df.columns) if criteria_df is not None else set()
+        
+        for crit in criteria_list:
+            if crit is None: continue
+            crit_s = str(crit)
+            
+            # SL evaluation
+            sl_result = evaluate_sl_criterion(crit_s, dealer_rot, bt_seat, deal_row, fail_on_missing=False)
+            if sl_result is True: continue
+            elif sl_result is False: return False
+            
+            if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
+                continue
+            
+            # Bitmap
+            if criteria_df is not None and crit_s in available_cols:
+                try:
+                    # Guard deal_row_idx for type checker
+                    idx = int(deal_row_idx) if deal_row_idx is not None else 0
+                    if not bool(criteria_df[crit_s][idx]):
+                        return False
+                except: continue
+        return True
+
+    for _ in range(max_depth):
+        if _is_complete(path_bids):
+            break
+            
+        prefix = "-".join(path_bids)
+        # Correct LP logic
+        toks = [t.strip().upper() for t in prefix.split("-") if t.strip()]
+        n_lp = 0
+        for t in toks:
+            if t == "P": n_lp += 1
+            else: break
+        bt_prefix_str = "-".join(toks[n_lp:]) if n_lp < len(toks) else ""
+        
+        # Resolve children
+        if not bt_prefix_str:
+            child_map = dict(g3_index.openings) if g3_index else {}
+        else:
+            parent_idx = _resolve_bt_index_by_traversal(state, bt_prefix_str)
+            if parent_idx is None: break
+            child_map = _get_child_map_for_parent(state, parent_idx)
+            
+        if not child_map: break
+        
+        # Load metadata
+        child_indices = list(child_map.values())
+        in_list = ", ".join(str(int(x)) for x in child_indices)
+        rows = conn.execute(
+            f"SELECT bt_index, candidate_bid, is_completed_auction, Expr, matching_deal_count FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})"
+        ).fetchall()
+        
+        # Seat/dealer
+        display_seat = (len(path_bids) % 4) + 1
+        bt_seat = ((display_seat - 1 - n_lp) % 4) + 1
+        dealer_rot = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + n_lp) % 4]
+        
+        # Candidates for greedy choice
+        candidates = []
+        for bt_idx, bid, is_comp, expr, matches_count in rows:
+            expr_list = list(expr) if expr else []
+            if _eval_criteria(expr_list, bt_seat, dealer_rot):
+                # Compute scores for sorting
+                dd_score = float("-inf")
+                ev_score = float("-inf")
+                
+                next_auc = f"{prefix}-{bid}" if prefix else bid
+                if deal_row:
+                    try:
+                        # DD Score (side-relative)
+                        declarer = get_declarer_for_auction(next_auc, dealer_actual)
+                        if declarer:
+                            raw_dd = get_dd_score_for_auction(next_auc, dealer_actual, deal_row)
+                            if raw_dd is not None:
+                                bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + len(path_bids)) % 4]
+                                bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
+                                declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
+                                side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                                dd_score = float(side_sign * float(raw_dd))
+                        
+                        # EV Score (side-relative)
+                        raw_ev = get_ev_for_auction(next_auc, dealer_actual, deal_row)
+                        if raw_ev is not None:
+                            # Use the same side_sign as DD score
+                            bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + len(path_bids)) % 4]
+                            bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
+                            # For EV, we need to know the declarer side of the completed auction
+                            # get_ev_for_auction already handles side negation for EV internally?
+                            # Let's check bbo_bidding_queries_lib.py:get_ev_for_auction
+                            # If it's not side-aware, we'll need to negate it.
+                            # Streamlit logic: side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                            # But wait, Streamlit applies side_sign to EV as well.
+                            ev_score = float(raw_ev) 
+                            if declarer:
+                                declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
+                                side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                                ev_score = float(side_sign * float(raw_ev))
+                    except: pass
+                
+                candidates.append({
+                    "bid": bid,
+                    "sort_key": (-dd_score, -ev_score, -float(matches_count or 0), str(bid).upper())
+                })
+        
+        if not candidates: break
+        
+        candidates.sort(key=lambda x: x["sort_key"])
+        best_bid = candidates[0]["bid"]
+        path_bids.append(best_bid)
+    
+    conn.close()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "greedy_path": "-".join(path_bids),
+        "steps": len(path_bids),
+        "elapsed_ms": round(elapsed_ms, 1)
     }

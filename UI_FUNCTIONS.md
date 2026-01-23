@@ -108,7 +108,7 @@ This document describes the Streamlit sidebar **Function** selectbox options and
     - Button: “Show Best N Auctions Ranked by DD/EV”
     - **Best Auctions Ranked by DD**
     - **Best Auctions Ranked by EV**
-    - Empty-case message: “Deal has no auction which will result in par score.”
+    - Empty-case message: “Deal has no pre-computed auction which will result in par score. Try manually entering auction.”
   - **📋 Completed Auction Summary** (step-by-step table, per seat/bid)
   - **Current Auction** (summary grid; selectable)
   - **🎯 Matching Deals** (deal list for the selected step or completed auction)
