@@ -9062,6 +9062,54 @@ def handle_deal_matched_bt_sample(
     # Display cap (after scoring/sorting).
     out_rows = out_rows[:want]
 
+    # If the precomputed index produced no usable rows (often due to leading passes),
+    # fall back to lookahead with permissive pass handling.
+    if (not out_rows) and permissive_pass:
+        try:
+            lookahead_resp = handle_best_auctions_lookahead(
+                state=state,
+                deal_row_idx=deal_row_idx,
+                auction_prefix="",
+                metric=metric,
+                max_depth=20,
+                max_results=n_samples,
+                deadline_s=15.0,
+                max_nodes=100000,
+                beam_width=50,
+                permissive_pass=True,
+            )
+            lookahead_rows = lookahead_resp.get("auctions", []) or []
+            if lookahead_rows:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                converted = []
+                for lr in lookahead_rows:
+                    dd_score = lr.get("dd_score")
+                    ev_val = lr.get("ev")
+                    is_par = lr.get("is_par", False)
+                    converted.append(
+                        {
+                            "bt_index": None,
+                            "Auction": lr.get("auction", ""),
+                            "Contract": lr.get("contract", "?"),
+                            "DD_Score": dd_score,
+                            "EV": round(float(ev_val), 1) if ev_val is not None else None,
+                            "Par": "✅" if is_par else "",
+                            "Matches": "",
+                            "Deals": "",
+                            "is_completed_auction": True,
+                            "Score": dd_score if metric_u == "DD" else ev_val,
+                        }
+                    )
+                return {
+                    "rows": converted,
+                    "counts": {"total_matches": len(converted), "returned": len(converted), "source": "lookahead"},
+                    "metric": metric_u,
+                    "par_score": par_score_i,
+                    "elapsed_ms": round(elapsed_ms, 1),
+                }
+        except Exception:
+            pass
+
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return {
         "rows": out_rows,
