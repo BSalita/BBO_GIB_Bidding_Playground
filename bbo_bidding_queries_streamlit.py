@@ -3227,6 +3227,25 @@ def render_bidding_arena():
         ),
     )
 
+    use_model_rules = st.sidebar.checkbox(
+        "Use Model Rules (greedy) instead of Auction Rules",
+        value=False,
+        help=(
+            "If enabled, Rules-like models will be evaluated via a step-by-step greedy path (similar to 'Model's Predicted Path') "
+            "instead of selecting a best matching completed BT auction. This is more faithful but slower."
+        ),
+    )
+
+    include_model_auction = st.sidebar.checkbox(
+        "Also compute Model auction (greedy) for comparison",
+        value=False,
+        help=(
+            "If enabled, the Arena will add extra columns (Auction_Model / Model_Contract / DD_Score_Model) "
+            "to the Sample Deal tables so you can compare Actual vs Rules vs Model in one view. "
+            "This does not change which two models are scored in the headline comparison."
+        ),
+    )
+
     debug_bt_index_raw = st.sidebar.text_input(
         "Pin BT index (optional).",
         value="",
@@ -3372,6 +3391,8 @@ def render_bidding_arena():
                 "deals_uri": deals_uri if deals_uri else None,
                 "deal_indices": pinned_indexes if pinned_indexes else None,
                 "search_all_bt_rows": bool(search_all_bt_rows),
+                "use_model_rules": bool(use_model_rules),
+                "include_model_auction": bool(include_model_auction),
             }
             # Cache the expensive arena response across Streamlit reruns (e.g., AgGrid selection changes).
             cache_key = ("bidding-arena", tuple(sorted(payload.items())))
@@ -3509,10 +3530,12 @@ def render_bidding_arena():
                             "Vul",
                             actual_col,
                             rules_col,
+                            "Auction_Model",
                             "Auction_Match",
                             "Hand_N", "Hand_E", "Hand_S", "Hand_W",
                             f"DD_Score_{model_a}" if f"DD_Score_{model_a}" in sample_df.columns else None,
                             f"DD_Score_{model_b}" if f"DD_Score_{model_b}" in sample_df.columns else None,
+                            "DD_Score_Model" if "DD_Score_Model" in sample_df.columns else None,
                             "IMP_Diff",
                         ]
                         compare_cols = [c for c in compare_cols if c and c in comparison_df.columns]
@@ -3599,6 +3622,9 @@ def render_bidding_arena():
                     "Hand_N", "Hand_E", "Hand_S", "Hand_W",
                     f"Auction_{model_a}",
                     f"Auction_{model_b}",
+                    "Auction_Model",
+                    "Model_Contract",
+                    "DD_Score_Model",
                     "Rules_Actual_BT_Lookup",
                     "Rules_Actual_BT_Index",
                     "Rules_Actual_Lead_Passes",
@@ -5941,6 +5967,28 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     }
                 )
 
+        # Permissive-pass support:
+        # If the user wants Pass to always be a valid bid, ensure 'P' is offered even when the BT
+        # does not explicitly include it at this node.
+        if always_valid_pass:
+            has_p = any(str(o.get("bid") or "").strip().upper() == "P" for o in (options or []))
+            if not has_p:
+                options = list(options or [])
+                options.append(
+                    {
+                        "bid": "P",
+                        "bt_index": None,
+                        "expr": [],
+                        "agg_expr": [],
+                        "can_complete": True,
+                        "is_complete": _is_auction_complete_after_next_bid(current_auction, "P"),
+                        "is_dead_end": False,
+                        "matching_deal_count": 0,
+                        "avg_ev_nv": None,
+                        "avg_ev_v": None,
+                    }
+                )
+
         if options:
             # Sort options: P first, then D, then R, then rest alphabetically
             def bid_sort_key(opt):
@@ -6119,6 +6167,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 next_auction = f"{current_auction}-{bid_str}" if current_auction else bid_str
                 matches_count = bid_matches.get(next_auction, 0)
                 is_pass = bid_str.strip().upper() in ("P", "PASS")
+                pass_always_valid = bool(is_pass and st.session_state.get("always_valid_pass", True))
                 
                 # Check if pinned deal matches this bid's criteria
                 matches_pinned = None
@@ -6127,6 +6176,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     matches, failed_list = check_pinned_match_with_failures(criteria_list, seat_1_to_4)
                     matches_pinned = matches
                     failed_criteria_str = "; ".join(failed_list) if failed_list else ""
+                # If enabled, Pass is always treated as matching the pinned deal (even if criteria fails).
+                if pinned_deal and show_failed_criteria and pass_always_valid:
+                    matches_pinned = True
+                    failed_criteria_str = ""
                 
                 # Compute direction from dealer + seat when deal is pinned
                 seat_direction: str | None = None
@@ -6156,6 +6209,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 is_rejected = is_dead_end or has_empty_criteria
                 if pass_no_criteria:
                     is_rejected = False
+                if pass_always_valid:
+                    is_rejected = False
                 
                 # Build failure reason for display
                 failure_reasons = []
@@ -6165,7 +6220,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     failure_reasons.append("missing criteria")
                 if (show_failed_criteria and matches_pinned is True and not can_complete_b):
                     # Bid matches current criteria but cannot reach a completed auction anywhere downstream.
-                    if not pass_no_criteria:
+                    if not (pass_no_criteria or pass_always_valid):
                         is_rejected = True
                         failure_reasons.append("cannot complete")
                 failure_str = "; ".join(failure_reasons) if failure_reasons else ""
@@ -6295,7 +6350,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     and (matches_pinned is True)
                     and (row_data.get("Avg_EV") is None)
                 ):
-                    if not pass_no_criteria:
+                    if not (pass_no_criteria or pass_always_valid):
                         is_rejected = True
                         failure_reasons.append("missing Avg_EV")
                         failure_str = "; ".join(failure_reasons) if failure_reasons else ""
@@ -6304,6 +6359,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                 # Enforce: Pass with empty criteria is never rejected.
                 if pass_no_criteria:
+                    is_rejected = False
+                    row_data["_rejected"] = False
+                    failure_str = ""
+                # Enforce: Pass is never rejected when permissive-pass is enabled.
+                if pass_always_valid:
                     is_rejected = False
                     row_data["_rejected"] = False
                     failure_str = ""
@@ -6697,27 +6757,48 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 )
 
                 # --- Predicted Model Path (Greedy) ---
-                # Show the path picking the top model bid at each step until completion.
-                if suggested_bids_rows:
+                # Only compute when starting from empty auction (opening position)
+                # Build the greedy path by repeatedly picking the top bid using
+                # the same logic as "Best Bids Ranked by Model":
+                # 1. Filter to bids where pinned deal matches criteria (or Pass with no criteria)
+                # 2. Sort by: (-DD_Score, -EV_Score, -matches, bid_name)
+                if suggested_bids_rows and pinned_deal and not current_auction:
+                    import time as _time_module
                     deal_id = pinned_deal.get("index") if pinned_deal else "no_deal"
-                    greedy_cache_key = f"_greedy_path_cache_{current_auction}_{deal_id}_{seed}"
+                    row_idx = pinned_deal.get("_row_idx")
+                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_{seed}_v3"
+                    greedy_time_key = f"{greedy_cache_key}__time"
                     if greedy_cache_key not in st.session_state:
+                        _greedy_start = _time_module.perf_counter()
                         with st.spinner("Predicting model path..."):
-                            greedy_data = api_post(
-                                "/greedy-model-path",
-                                {
-                                    "auction_prefix": current_auction,
-                                    "deal_row_idx": pinned_deal.get("_row_idx") if pinned_deal else None,
-                                    "seed": seed,
-                                    "max_depth": 40,
-                                },
-                                timeout=20,
-                            )
-                            st.session_state[greedy_cache_key] = greedy_data.get("greedy_path", "")
+                            try:
+                                payload = {
+                                    "auction_prefix": current_auction or "",
+                                    "deal_row_idx": int(row_idx) if row_idx is not None else None,
+                                    "seed": int(seed) if seed is not None else 42,
+                                    "max_depth": 40
+                                }
+                                # Greedy path can be slower on some deals; use a longer timeout.
+                                resp = api_post("/greedy-model-path", payload, timeout=90)
+                                if "error" in resp:
+                                    st.error(f"Error predicting path: {resp['error']}")
+                                    st.session_state[greedy_cache_key] = ""
+                                    st.session_state[greedy_time_key] = 0.0
+                                else:
+                                    path_auction = resp.get("greedy_path", "")
+                                    st.session_state[greedy_cache_key] = path_auction
+                                    st.session_state[greedy_time_key] = _time_module.perf_counter() - _greedy_start
+                                    if not path_auction:
+                                        st.warning(f"No path found. Debug: {resp.get('debug')}")
+                            except Exception as e:
+                                st.error(f"Error predicting path: {e}")
+                                st.session_state[greedy_cache_key] = ""
+                                st.session_state[greedy_time_key] = 0.0
                     
                     greedy_path_full = st.session_state.get(greedy_cache_key, "")
+                    greedy_elapsed = st.session_state.get(greedy_time_key, 0)
                     if greedy_path_full:
-                        st.info(f"🔮 **Model's Predicted Path:** `{greedy_path_full}`")
+                        st.info(f"🔮 **Model's Predicted Path:** `{greedy_path_full}` ({greedy_elapsed:.1f}s)")
 
                 # Display 3-column layout: 5 Suggested Bids | Best Par Bids | Best EV Bids
                 sug_col, par_col, ev_col = st.columns(3)
@@ -7305,7 +7386,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         show_best_auctions = False
                     else:
                         if st.button(
-                            f"Show Best {int(max_best_auctions)} Auctions Ranked by DD/EV",
+                            f"Show Best {int(max_best_auctions)} Pre-computed Auctions Ranked by DD/EV",
                             key=f"{show_best_auctions_key}__btn",
                         ):
                             st.session_state[show_best_auctions_key] = True

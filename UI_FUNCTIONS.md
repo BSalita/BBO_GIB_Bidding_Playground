@@ -105,7 +105,7 @@ This document describes the Streamlit sidebar **Function** selectbox options and
     - **Best Bids Ranked by DD**
     - **Best Bids Ranked by EV**
   - **Best auctions (optional on demand)**
-    - Button: “Show Best N Auctions Ranked by DD/EV”
+    - Button: “Show Best N Pre-computed Auctions Ranked by DD/EV”
     - **Best Auctions Ranked by DD**
     - **Best Auctions Ranked by EV**
     - Empty-case message: “Deal has no pre-computed auction which will result in par score. Try manually entering auction.”

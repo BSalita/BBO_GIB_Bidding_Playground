@@ -3937,6 +3937,8 @@ def handle_bidding_arena(
     deals_uri: Optional[str] = None,
     deal_indices: Optional[List[int]] = None,
     search_all_bt_rows: bool = False,
+    use_model_rules: bool = False,
+    include_model_auction: bool = False,
 ) -> Dict[str, Any]:
     """Handle /bidding-arena endpoint (Bidding Arena).
     
@@ -3981,6 +3983,14 @@ def handle_bidding_arena(
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
     bt_seat1_df = state.get("bt_seat1_df")
     _mark("read_state_refs")
+
+    # Model auction computation requires criteria bitmaps aligned to the in-memory deal_df.
+    # If the caller provides a custom deals_uri, we can't safely evaluate criteria against it.
+    if (use_model_rules or include_model_auction) and deals_uri:
+        raise ValueError(
+            "Model auction computation is not supported with custom deals_uri "
+            "(criteria bitmaps are not available for external deals)."
+        )
     
     # Validate models
     # Note: Merged rules are pre-compiled into BT, so all models are available
@@ -5106,7 +5116,24 @@ def handle_bidding_arena(
             rules_actual_base_criteria_by_seat: str = ""
             rules_actual_merged_criteria_by_seat: str = ""
             rules_actual_merged_only_criteria_by_seat: str = ""
-            if bid_str and allow_actual_lookup:
+
+            # Optional: Use step-by-step "model rules" (greedy path) instead of auction matching.
+            # This mirrors the UI's "Model's Predicted Path" behavior (opening-only).
+            if use_model_rules:
+                try:
+                    greedy = handle_greedy_model_path(
+                        state=state,
+                        auction_prefix="",
+                        deal_row_idx=int(deal_idx),
+                        seed=int(seed or DEFAULT_SEED),
+                        max_depth=40,
+                    )
+                    rules_auction = str(greedy.get("greedy_path") or "") or None
+                    rules_actual_bt_lookup = "model_rules"
+                except Exception as e:
+                    rules_auction = None
+                    rules_actual_bt_lookup = f"model_rules_error:{e}"
+            if (not use_model_rules) and bid_str and allow_actual_lookup:
                 _actual_lookup_used += 1
                 # Normalize the deal's auction to the BT's seat-1 view for lookup.
                 bid_norm_full = normalize_auction_input(str(bid_str))
@@ -5291,7 +5318,7 @@ def handle_bidding_arena(
             # If actual auction didn't match (or isn't in BT), search other candidates:
             # 1) default: merged-rules candidate pool
             # 2) fallback: generic on-the-fly candidate pool
-            if rules_auction is None:
+            if (not use_model_rules) and rules_auction is None:
                 if has_precomputed_matches:
                     if not matched_indices:
                         diag_no_matched_indices += 1
@@ -5395,6 +5422,29 @@ def handle_bidding_arena(
         
         # Model B
         contract_b, auction_b, dd_score_b = _get_model_result(model_b)
+
+        # Optional: compute a third "Model" auction (greedy path) for display-only comparison.
+        model_auction: str | None = None
+        model_contract: str | None = None
+        model_dd_score: int | None = None
+        if include_model_auction:
+            try:
+                greedy = handle_greedy_model_path(
+                    state=state,
+                    auction_prefix="",
+                    deal_row_idx=int(deal_idx),
+                    seed=int(seed or DEFAULT_SEED),
+                    max_depth=40,
+                )
+                model_auction = str(greedy.get("greedy_path") or "") or None
+                if model_auction:
+                    model_contract = get_ai_contract(model_auction, dealer)
+                    ddv = get_dd_score_for_auction(model_auction, dealer, row)
+                    model_dd_score = int(ddv) if ddv is not None else None
+            except Exception:
+                model_auction = None
+                model_contract = None
+                model_dd_score = None
         
         # Collect sample deals (include rejected deals, with reason)
         if len(sample_deals_output) < max_sample_output:
@@ -5431,6 +5481,9 @@ def handle_bidding_arena(
                     "Hand_W": row.get("Hand_W"),
                     f"Auction_{model_a}": auction_a,
                     f"Auction_{model_b}": auction_b,
+                    "Auction_Model": (normalize_auction_case(model_auction) if model_auction else None),
+                    "Model_Contract": model_contract,
+                    "DD_Score_Model": model_dd_score,
                     "Rules_Actual_BT_Lookup": rules_actual_bt_lookup,
                     "Rules_Actual_BT_Index": rules_actual_bt_index,
                     "Rules_Actual_Lead_Passes": rules_actual_lead_passes,
@@ -6624,7 +6677,14 @@ def handle_list_next_bids(
     auction_input = normalize_auction_input(auction)
     auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
     
-    resp = _handle_list_next_bids_walk_fallback(state, auction_input, auction_normalized, t0)
+    resp = _handle_list_next_bids_walk_fallback(
+        state,
+        auction_input,
+        auction_normalized,
+        t0,
+        include_deal_counts=True,
+        include_ev_stats=True,
+    )
     
     # Add extra metadata for the response if missing
     if "next_bids" not in resp and "bid_rankings" in resp:
@@ -7884,6 +7944,9 @@ def _handle_list_next_bids_walk_fallback(
     auction_input: str,
     auction_normalized: str,
     t0: float,
+    *,
+    include_deal_counts: bool = True,
+    include_ev_stats: bool = True,
 ) -> Dict[str, Any]:
     """Gemini-3.2 optimized version: Uses CSR index and O(log n) Polars lookup.
     
@@ -7954,7 +8017,7 @@ def _handle_list_next_bids_walk_fallback(
     
     # 4b. Build base mask from parent's cumulative criteria (for accurate deal counts)
     base_mask: pl.Series | None = None
-    if parent_bt_index >= 0:
+    if include_deal_counts and parent_bt_index >= 0:
         # Load parent row's Agg_Expr columns on-demand (they're not in bt_seat1_df)
         bt_parquet_file = state.get("bt_seat1_file")
         if bt_parquet_file:
@@ -7971,7 +8034,7 @@ def _handle_list_next_bids_walk_fallback(
     # Pre-load EV stats for all bt_indices in one go (O(n) filter is faster than repeated lookups)
     bt_ev_stats_df = state.get("bt_ev_stats_df")
     ev_lookup: Dict[int, Dict[str, Any]] = {}
-    if bt_ev_stats_df is not None and next_bid_rows.height > 0:
+    if include_ev_stats and bt_ev_stats_df is not None and next_bid_rows.height > 0:
         bt_indices = next_bid_rows["bt_index"].unique().to_list()
         bt_indices = [int(x) for x in bt_indices if x is not None]
         if bt_indices:
@@ -8008,11 +8071,15 @@ def _handle_list_next_bids_walk_fallback(
         crits = row_with_rules.get(agg_col) or []
         
         # Compute matching_deal_count on-demand by intersecting base_mask with new bid's criteria
-        deal_count = None
-        try:
-            deal_count = _compute_deal_count_with_base_mask(state, base_mask, row_with_rules, next_seat)
-        except Exception:
-            deal_count = row.get("matching_deal_count")  # Fall back to pre-computed
+        if include_deal_counts:
+            deal_count = None
+            try:
+                deal_count = _compute_deal_count_with_base_mask(state, base_mask, row_with_rules, next_seat)
+            except Exception:
+                deal_count = row.get("matching_deal_count")  # Fall back to pre-computed
+        else:
+            # Cheap fallback: use pre-computed count (or None if missing)
+            deal_count = row.get("matching_deal_count")
         
         # Detect dead end: not complete but has no children
         is_complete = bool(row.get("is_completed_auction", False))
@@ -8022,7 +8089,7 @@ def _handle_list_next_bids_walk_fallback(
         # Get Avg_EV for the next seat from precomputed stats (NV/V split)
         avg_ev_nv = None
         avg_ev_v = None
-        if idx is not None and idx in ev_lookup:
+        if include_ev_stats and idx is not None and idx in ev_lookup:
             ev_data = ev_lookup[idx]
             # Try NV/V split columns first (new format)
             nv_key = f"Avg_EV_S{next_seat}_NV"
@@ -9015,47 +9082,70 @@ def handle_greedy_model_path(
 ) -> Dict[str, Any]:
     """Compute the greedy 'model path' from a given prefix by picking the top bid at each step.
     
-    Replicates the 'Best Bids Ranked by Model' sorting logic from Streamlit:
-    Sort Key: (-dd_score, -ev_score, -matches_count, bid_name)
+    Optimized version:
+    1. Replicates 'Best Bids Ranked by Model' logic.
+    2. Minimizes DuckDB overhead.
+    3. Optimized criteria evaluation for single deal.
     """
     t0 = time.perf_counter()
     deal_df = state.get("deal_df")
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
     g3_index = state.get("g3_index")
+    bt_can_complete = state.get("bt_can_complete")
+    bt_openings_df = state.get("bt_openings_df")
+    bt_ev_stats_df = state.get("bt_ev_stats_df")
+    
+    debug_info: Dict[str, Any] = {"steps_tried": 0, "break_reason": None}
     
     if deal_df is None:
-        raise ValueError("deal_df not loaded")
+        return {"greedy_path": "", "steps": 0, "elapsed_ms": 0, "error": "deal_df not loaded", "debug": debug_info}
     
     deal_row = None
     if deal_row_idx is not None:
         try:
             deal_row = deal_df.row(int(deal_row_idx), named=True)
-        except Exception:
-            pass
+        except Exception as e:
+            debug_info["deal_row_error"] = str(e)
             
     dealer_actual = str(deal_row.get("Dealer", "N")).upper() if deal_row else "N"
     
-    current_auc = normalize_auction_input(auction_prefix).upper() if auction_prefix else ""
-    path_bids = [t.strip() for t in current_auc.split("-") if t.strip()]
+    current_auc_input = normalize_auction_input(auction_prefix).upper() if auction_prefix else ""
+    path_bids = [t.strip() for t in current_auc_input.split("-") if t.strip()]
     
     file_path = _bt_file_path_for_sql(state)
     conn = duckdb.connect(":memory:")
     
-    def _is_complete(bids: List[str]) -> bool:
-        if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
-            return True
-        last_c = -1
-        for i, b in enumerate(bids):
-            if b not in ("P", "X", "XX") and b and b[0].isdigit():
-                last_c = i
-        return last_c >= 0 and len(bids) >= last_c + 4 and all(b == "P" for b in bids[-3:])
+    # Pre-extract bid vocab
+    _, code_to_bid = _get_local_bid_vocab()
+    
+    # Performance optimization: if deal_row_idx is provided, pre-fetch all criterion bits for this deal
+    # to avoid repeated Series indexing in the loop.
+    deal_bits_cache: Dict[Tuple[int, str], Dict[str, bool]] = {} # (bt_seat, dealer_rot) -> {crit_s: val}
 
-    def _eval_criteria(criteria_list: List[str], bt_seat: int, dealer_rot: str) -> bool:
-        if not criteria_list: return True
-        if deal_row is None: return True # Permissive if no deal pinned
+    def _get_deal_bits(bt_seat: int, dealer_rot: str) -> Dict[str, bool]:
+        key = (bt_seat, dealer_rot)
+        if key in deal_bits_cache:
+            return deal_bits_cache[key]
         
+        bits = {}
         criteria_df = deal_criteria_by_seat_dfs.get(bt_seat, {}).get(dealer_rot)
-        available_cols = set(criteria_df.columns) if criteria_df is not None else set()
+        if criteria_df is not None and deal_row_idx is not None:
+            # This is still a bit slow but we only do it once per (seat, dealer) combo
+            idx = int(deal_row_idx)
+            # Fetching the whole row as a dict is faster than fetching each column individually in a loop
+            try:
+                row = criteria_df.row(idx, named=True)
+                bits = {k: bool(v) for k, v in row.items()}
+            except:
+                pass
+        deal_bits_cache[key] = bits
+        return bits
+
+    def _eval_criteria_fast(criteria_list: List[str], bt_seat: int, dealer_rot: str) -> bool:
+        if not criteria_list: return True
+        if deal_row is None: return True
+        
+        bits = _get_deal_bits(bt_seat, dealer_rot)
         
         for crit in criteria_list:
             if crit is None: continue
@@ -9069,18 +9159,17 @@ def handle_greedy_model_path(
             if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
                 continue
             
-            # Bitmap
-            if criteria_df is not None and crit_s in available_cols:
-                try:
-                    # Guard deal_row_idx for type checker
-                    idx = int(deal_row_idx) if deal_row_idx is not None else 0
-                    if not bool(criteria_df[crit_s][idx]):
-                        return False
-                except: continue
+            # Bitmap (cached)
+            if crit_s in bits:
+                if not bits[crit_s]:
+                    return False
         return True
 
-    for _ in range(max_depth):
-        if _is_complete(path_bids):
+    for step_i in range(max_depth):
+        debug_info["steps_tried"] = step_i + 1
+        
+        if _is_auction_complete_list(path_bids):
+            debug_info["break_reason"] = "complete"
             break
             
         prefix = "-".join(path_bids)
@@ -9092,76 +9181,179 @@ def handle_greedy_model_path(
             else: break
         bt_prefix_str = "-".join(toks[n_lp:]) if n_lp < len(toks) else ""
         
-        # Resolve children
-        if not bt_prefix_str:
-            child_map = dict(g3_index.openings) if g3_index else {}
-        else:
-            parent_idx = _resolve_bt_index_by_traversal(state, bt_prefix_str)
-            if parent_idx is None: break
-            child_map = _get_child_map_for_parent(state, parent_idx)
-            
-        if not child_map: break
-        
-        # Load metadata
-        child_indices = list(child_map.values())
-        in_list = ", ".join(str(int(x)) for x in child_indices)
-        rows = conn.execute(
-            f"SELECT bt_index, candidate_bid, is_completed_auction, Expr, matching_deal_count FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})"
-        ).fetchall()
+        # Use the same next-bid materialization as the UI (/list-next-bids),
+        # to avoid any mismatch in criteria selection/overlay/dedupe.
+        try:
+            auction_input = normalize_auction_input(bt_prefix_str or "")
+            auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
+            next_resp = _handle_list_next_bids_walk_fallback(
+                state,
+                auction_input,
+                auction_normalized,
+                time.perf_counter(),
+                include_deal_counts=False,  # critical: avoid per-step bitmap scans
+                include_ev_stats=False,
+            )
+            next_bids = next_resp.get("next_bids", []) or []
+        except Exception as e:
+            debug_info["break_reason"] = f"list_next_bids_error:{e}"
+            break
+
+        # UI behavior parity: at opening, ensure "P" is available
+        if bt_prefix_str == "":
+            has_p = any(str(b.get("bid", "")).upper() == "P" for b in next_bids)
+            if not has_p:
+                next_bids = list(next_bids) + [{
+                    "bid": "P",
+                    "bt_index": None,
+                    "agg_expr": [],
+                    "is_dead_end": False,
+                    "can_complete": True,
+                    "matching_deal_count": 0,
+                    "is_completed_auction": False,
+                }]
+
+        if not next_bids:
+            debug_info["break_reason"] = f"no_children:{bt_prefix_str or '(opening)'}"
+            break
         
         # Seat/dealer
         display_seat = (len(path_bids) % 4) + 1
         bt_seat = ((display_seat - 1 - n_lp) % 4) + 1
         dealer_rot = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + n_lp) % 4]
         
+        # Materialize row_dicts / crits_list in the same shape as before
+        row_dicts: list[dict[str, Any]] = []
+        crits_list: list[list] = []
+        for b in next_bids:
+            bid = str(b.get("bid", "")).upper()
+            row_dicts.append({
+                "bt_index": b.get("bt_index"),
+                "candidate_bid": bid,
+                "is_completed_auction": bool(b.get("is_completed_auction", False) or b.get("is_completed", False)),
+                "matching_deal_count": b.get("matching_deal_count", 0),
+                # Prefer explicit flags from list-next-bids when present
+                "is_dead_end": bool(b.get("is_dead_end", False)),
+                "can_complete": b.get("can_complete"),
+                # Optional (may be absent)
+                "next_bid_indices": b.get("next_bid_indices") or [],
+            })
+            crits_list.append(b.get("agg_expr") or [])
+
+        # Batch criteria evaluation (matches UI logic)
+        matches_pinned_by_row = [True] * len(row_dicts)
+        if deal_row is not None and deal_row_idx is not None:
+            checks: list[dict[str, Any]] = []
+            check_idx: list[int | None] = [None] * len(row_dicts)
+            for i, crits in enumerate(crits_list):
+                if crits:
+                    check_idx[i] = len(checks)
+                    checks.append({"seat": bt_seat, "criteria": list(crits)})
+            if checks:
+                batch_resp = handle_deal_criteria_failures_batch(
+                    state=state,
+                    deal_row_idx=int(deal_row_idx),
+                    dealer=dealer_rot,
+                    checks=checks,
+                )
+                results = batch_resp.get("results", [])
+                for i, idx in enumerate(check_idx):
+                    if idx is None:
+                        matches_pinned_by_row[i] = True
+                    elif idx < len(results):
+                        failed = results[idx].get("failed", []) or []
+                        untracked = results[idx].get("untracked", []) or []
+                        matches_pinned_by_row[i] = (len(failed) == 0 and len(untracked) == 0)
+                    else:
+                        matches_pinned_by_row[i] = True
+
         # Candidates for greedy choice
         candidates = []
-        for bt_idx, bid, is_comp, expr, matches_count in rows:
-            expr_list = list(expr) if expr else []
-            if _eval_criteria(expr_list, bt_seat, dealer_rot):
-                # Compute scores for sorting
-                dd_score = float("-inf")
-                ev_score = float("-inf")
-                
-                next_auc = f"{prefix}-{bid}" if prefix else bid
-                if deal_row:
-                    try:
-                        # DD Score (side-relative)
-                        declarer = get_declarer_for_auction(next_auc, dealer_actual)
-                        if declarer:
-                            raw_dd = get_dd_score_for_auction(next_auc, dealer_actual, deal_row)
-                            if raw_dd is not None:
-                                bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + len(path_bids)) % 4]
-                                bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
-                                declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
-                                side_sign = 1.0 if bidder_side == declarer_side else -1.0
-                                dd_score = float(side_sign * float(raw_dd))
-                        
-                        # EV Score (side-relative)
-                        raw_ev = get_ev_for_auction(next_auc, dealer_actual, deal_row)
-                        if raw_ev is not None:
-                            # Use the same side_sign as DD score
-                            bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + len(path_bids)) % 4]
-                            bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
-                            # For EV, we need to know the declarer side of the completed auction
-                            # get_ev_for_auction already handles side negation for EV internally?
-                            # Let's check bbo_bidding_queries_lib.py:get_ev_for_auction
-                            # If it's not side-aware, we'll need to negate it.
-                            # Streamlit logic: side_sign = 1.0 if bidder_side == declarer_side else -1.0
-                            # But wait, Streamlit applies side_sign to EV as well.
-                            ev_score = float(raw_ev) 
-                            if declarer:
-                                declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
-                                side_sign = 1.0 if bidder_side == declarer_side else -1.0
-                                ev_score = float(side_sign * float(raw_ev))
-                    except: pass
-                
-                candidates.append({
-                    "bid": bid,
-                    "sort_key": (-dd_score, -ev_score, -float(matches_count or 0), str(bid).upper())
-                })
+        rejected_count = 0
+        criteria_fail_count = 0
+        total_children = len(row_dicts)
         
-        if not candidates: break
+        for i, row_dict in enumerate(row_dicts):
+            bt_idx = row_dict["bt_index"]
+            bid = row_dict["candidate_bid"]
+            is_comp_auc = bool(row_dict.get("is_completed_auction"))
+            matches_count = row_dict.get("matching_deal_count")
+            next_indices_list = row_dict.get("next_bid_indices") or []
+            crits = crits_list[i]
+            
+            # Determine if Rejected
+            is_pass = str(bid).upper() in ("P", "PASS")
+            # Prefer explicit dead-end flag from list-next-bids if present
+            if "is_dead_end" in row_dict:
+                is_dead_end = bool(row_dict.get("is_dead_end"))
+            else:
+                is_dead_end = (not is_comp_auc) and len(next_indices_list) == 0
+            has_empty_criteria = not crits
+            if row_dict.get("can_complete") is not None:
+                can_complete = bool(row_dict.get("can_complete"))
+            else:
+                can_complete = bool(bt_can_complete[int(bt_idx)]) if (bt_can_complete is not None and bt_idx is not None and int(bt_idx) < len(bt_can_complete)) else True
+            
+            if deal_row:
+                is_rejected = is_dead_end or has_empty_criteria
+                if is_pass and not crits: is_rejected = False
+            else:
+                is_rejected = is_dead_end and not can_complete
+            
+            # Check pinned deal match (batched evaluation)
+            matches_pinned = matches_pinned_by_row[i]
+            
+            if deal_row and matches_pinned and not can_complete:
+                if not (is_pass and not crits):
+                    is_rejected = True
+
+            if is_rejected:
+                rejected_count += 1
+                continue
+            if not matches_pinned:
+                criteria_fail_count += 1
+                continue
+                
+            # Compute scores for sorting
+            dd_score = float("-inf")
+            ev_score = 0.0
+            
+            next_auc = f"{prefix}-{bid}" if prefix else bid
+            if deal_row:
+                try:
+                    # Side sign logic
+                    bidder_idx = len(path_bids)
+                    bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + bidder_idx) % 4]
+                    bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
+                    
+                    # DD Score (side-relative)
+                    declarer = get_declarer_for_auction(next_auc, dealer_actual)
+                    if declarer:
+                        raw_dd = get_dd_score_for_auction(next_auc, dealer_actual, deal_row)
+                        if raw_dd is not None:
+                            declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
+                            side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                            dd_score = float(side_sign * float(raw_dd))
+                    
+                    # EV Score (side-relative)
+                    raw_ev = get_ev_for_auction(next_auc, dealer_actual, deal_row)
+                    if raw_ev is not None:
+                        if declarer:
+                            declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
+                            side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                            ev_score = float(side_sign * float(raw_ev))
+                        else:
+                            ev_score = float(raw_ev)
+                except: pass
+            
+            candidates.append({
+                "bid": bid,
+                "sort_key": (-dd_score, -ev_score, -float(matches_count or 0), str(bid).upper())
+            })
+        
+        if not candidates:
+            debug_info["break_reason"] = f"no_valid_candidates:total={total_children},rejected={rejected_count},criteria_fail={criteria_fail_count},at_step={step_i},prefix={prefix}"
+            break
         
         candidates.sort(key=lambda x: x["sort_key"])
         best_bid = candidates[0]["bid"]
@@ -9172,5 +9364,15 @@ def handle_greedy_model_path(
     return {
         "greedy_path": "-".join(path_bids),
         "steps": len(path_bids),
-        "elapsed_ms": round(elapsed_ms, 1)
+        "elapsed_ms": round(elapsed_ms, 1),
+        "debug": debug_info,
     }
+
+def _is_auction_complete_list(bids: List[str]) -> bool:
+    if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
+        return True
+    last_c = -1
+    for i, b in enumerate(bids):
+        if b not in ("P", "X", "XX") and b and b[0].isdigit():
+            last_c = i
+    return last_c >= 0 and len(bids) >= last_c + 4 and all(b == "P" for b in bids[-3:])

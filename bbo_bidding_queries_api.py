@@ -1225,6 +1225,12 @@ class BiddingArenaRequest(BaseModel):
     # If True, the Rules model will search all completed BT rows (can be extremely slow).
     # Only relevant when the deal rows do not contain precomputed Matched_BT_Indices.
     search_all_bt_rows: bool = False
+    # If True, use step-by-step "model rules" (greedy path) instead of selecting a best matching
+    # completed auction from the BT for rules-like models. This is more faithful but slower.
+    use_model_rules: bool = False
+    # If True, ALSO compute a per-deal greedy "Model" auction for display/comparison in sample_deals,
+    # without changing which models are compared for scoring.
+    include_model_auction: bool = False
 
 
 class AuctionDDAnalysisRequest(BaseModel):
@@ -1913,25 +1919,269 @@ def _heavy_init() -> None:
         if _cli_deal_rows:
             print(f"[init] Sliced criteria bitmaps to {n_deals:,} rows to match deal_df")
 
-        # TEMPORARY FIX: Force unknown criteria columns to True until bitmaps are regenerated.
-        # These criteria exist in BT data but weren't in the bitmap generation pipeline.
-        # ALWAYS overwrite (even if column exists with False values).
-        # Remove this block after regenerating bitmaps with the updated mlBridgeAugmentLib.py.
-        _unknown_criteria_cols = [
-            pl.lit(True).alias("Forcing_One_Round"),
-            pl.lit(True).alias("Opponents_Cannot_Play_Undoubled_Below_2N"),
-            pl.lit(True).alias("Forcing_To_2N"),
-            pl.lit(True).alias("Forcing_To_3N"),
-        ]
-        for direction in list(deal_criteria_by_direction_dfs.keys()):
-            df = deal_criteria_by_direction_dfs[direction]
-            # ALWAYS overwrite these columns with True (even if they exist with False)
-            deal_criteria_by_direction_dfs[direction] = df.with_columns(_unknown_criteria_cols)
-        for seat in list(deal_criteria_by_seat_dfs.keys()):
-            for direction in list(deal_criteria_by_seat_dfs[seat].keys()):
-                df = deal_criteria_by_seat_dfs[seat][direction]
-                deal_criteria_by_seat_dfs[seat][direction] = df.with_columns(_unknown_criteria_cols)
-        print("[init] TEMPORARY: Forced unknown criteria columns (Forcing_One_Round, Forcing_To_2N, etc.) to True")
+        # TEMPORARY FIX (data-driven): Allow defining/overriding missing criteria columns from CSV.
+        # File format: each line is "<criteria>, <expr>" where expr is a boolean expression.
+        # Examples:
+        #   Forcing_To_3S, True
+        #   Some_New_Crit, SL_H >= 5 & SL_S >= 5
+        #
+        # This is applied to the bitmap DataFrames (both by-direction and by-seat) and ALWAYS overwrites
+        # the column if present (even if it exists with False values).
+        #
+        # NOTE: This runs at init time; restart the API server after editing the CSV.
+        from pathlib import Path as _Path
+        custom_criteria_file = (_Path(__file__).resolve().parent / "data" / "bbo_custom_criteria.csv")
+        if custom_criteria_file.exists():
+            import csv as _csv
+            import re as _re
+
+            def _seat_to_dir(dealer: str, seat: int) -> str:
+                dirs = ["N", "E", "S", "W"]
+                try:
+                    d0 = dirs.index(str(dealer or "N").upper())
+                except Exception:
+                    d0 = 0
+                s = int(seat) if seat is not None else 1
+                s = max(1, min(4, s))
+                return dirs[(d0 + (s - 1)) % 4]
+
+            def _hand_col_for_dir(d: str) -> str:
+                return f"Hand_{str(d).upper()}"
+
+            def _suit_len_from_hand_series(hand_s: pl.Series, suit_idx: int) -> pl.Series:
+                # Hand format: "AKQ.JT9.876.5432" (S.H.D.C). Void is "-" (or empty).
+                parts = hand_s.cast(pl.Utf8, strict=False).fill_null("").str.split(".")
+                suit = parts.list.get(int(suit_idx)).fill_null("")
+                suit = suit.cast(pl.Utf8, strict=False)
+                # '-' or '' => 0, else length of string (Series operations, not Expr)
+                lens = suit.str.len_chars().fill_null(0).cast(pl.Int16)
+                ok = ((suit != "") & (suit != "-")).cast(pl.Int16)
+                return (lens * ok).cast(pl.Int16)
+
+            def _tokenize(expr: str) -> list[str]:
+                # Normalize textual operators
+                e = str(expr).strip()
+                e = _re.sub(r"\bAND\b", "&", e, flags=_re.I)
+                e = _re.sub(r"\bOR\b", "|", e, flags=_re.I)
+                e = _re.sub(r"\bNOT\b", "~", e, flags=_re.I)
+                # Tokens: identifiers, numbers, ops, parens, &, |, ~
+                tok_re = _re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*|\d+|<=|>=|==|!=|<|>|\(|\)|\&|\||\~)\s*")
+                toks = [m.group(1) for m in tok_re.finditer(e)]
+                return toks
+
+            class _TokStream:
+                def __init__(self, toks: list[str]):
+                    self.toks = toks
+                    self.i = 0
+                def peek(self) -> str | None:
+                    return self.toks[self.i] if self.i < len(self.toks) else None
+                def pop(self) -> str:
+                    if self.i >= len(self.toks):
+                        raise ValueError("unexpected end of expression")
+                    t = self.toks[self.i]
+                    self.i += 1
+                    return t
+
+            # AST nodes are represented as tuples:
+            # ("or", left, right), ("and", left, right), ("not", child),
+            # ("cmp", op, left, right), ("id", name), ("num", value), ("bool", value)
+            def _parse_expr(ts: _TokStream):
+                node = _parse_or(ts)
+                return node
+            def _parse_or(ts: _TokStream):
+                node = _parse_and(ts)
+                while ts.peek() == "|":
+                    ts.pop()
+                    rhs = _parse_and(ts)
+                    node = ("or", node, rhs)
+                return node
+            def _parse_and(ts: _TokStream):
+                node = _parse_factor(ts)
+                while ts.peek() == "&":
+                    ts.pop()
+                    rhs = _parse_factor(ts)
+                    node = ("and", node, rhs)
+                return node
+            def _parse_factor(ts: _TokStream):
+                if ts.peek() == "~":
+                    ts.pop()
+                    return ("not", _parse_factor(ts))
+                if ts.peek() == "(":
+                    ts.pop()
+                    node = _parse_or(ts)
+                    if ts.pop() != ")":
+                        raise ValueError("missing ')'")
+                    return node
+                # Atom (id/num/bool) possibly followed by comparison
+                left = _parse_atom(ts)
+                op = ts.peek()
+                if op in ("<", "<=", ">", ">=", "==", "!="):
+                    ts.pop()
+                    right = _parse_atom(ts)
+                    return ("cmp", op, left, right)
+                return left
+            def _parse_atom(ts: _TokStream):
+                t = ts.pop()
+                if _re.fullmatch(r"\d+", t):
+                    return ("num", int(t))
+                tl = t.lower()
+                if tl == "true":
+                    return ("bool", True)
+                if tl == "false":
+                    return ("bool", False)
+                return ("id", t)
+
+            def _eval_ast_to_series(
+                ast_node,
+                *,
+                n_rows: int,
+                direction: str,
+                criteria_df: pl.DataFrame,
+                deal_df: pl.DataFrame,
+                caches: dict[tuple[str, str], pl.Series],
+            ) -> pl.Series:
+                kind = ast_node[0]
+                if kind == "bool":
+                    return pl.Series([bool(ast_node[1])] * n_rows)
+                if kind == "num":
+                    return pl.Series([int(ast_node[1])] * n_rows)
+                if kind == "id":
+                    name = str(ast_node[1])
+                    name_u = name.upper()
+                    # Special numeric features
+                    if name_u in ("HCP", "TOTAL_POINTS"):
+                        col = f"HCP_{str(direction).upper()}" if name_u == "HCP" else f"Total_Points_{str(direction).upper()}"
+                        if col in deal_df.columns:
+                            return deal_df.get_column(col).cast(pl.Int32, strict=False).fill_null(0)
+                        return pl.Series([0] * n_rows)
+                    if name_u in ("SL_S", "SL_H", "SL_D", "SL_C"):
+                        suit_map = {"SL_S": 0, "SL_H": 1, "SL_D": 2, "SL_C": 3}
+                        k = (str(direction).upper(), name_u)
+                        if k in caches:
+                            return caches[k]
+                        hand_col = _hand_col_for_dir(direction)
+                        if hand_col in deal_df.columns:
+                            s = _suit_len_from_hand_series(deal_df.get_column(hand_col), suit_map[name_u])
+                        else:
+                            s = pl.Series([0] * n_rows)
+                        caches[k] = s
+                        return s
+                    # Otherwise treat as a boolean criterion column (from bitmap df)
+                    if name in criteria_df.columns:
+                        return criteria_df.get_column(name).cast(pl.Boolean, strict=False).fill_null(False)
+                    # Unknown identifier => False (conservative)
+                    return pl.Series([False] * n_rows)
+                if kind == "not":
+                    a = _eval_ast_to_series(ast_node[1], n_rows=n_rows, direction=direction, criteria_df=criteria_df, deal_df=deal_df, caches=caches)
+                    return (~a.cast(pl.Boolean, strict=False).fill_null(False))
+                if kind in ("and", "or"):
+                    a = _eval_ast_to_series(ast_node[1], n_rows=n_rows, direction=direction, criteria_df=criteria_df, deal_df=deal_df, caches=caches)
+                    b = _eval_ast_to_series(ast_node[2], n_rows=n_rows, direction=direction, criteria_df=criteria_df, deal_df=deal_df, caches=caches)
+                    a = a.cast(pl.Boolean, strict=False).fill_null(False)
+                    b = b.cast(pl.Boolean, strict=False).fill_null(False)
+                    return (a & b) if kind == "and" else (a | b)
+                if kind == "cmp":
+                    op = ast_node[1]
+                    left = _eval_ast_to_series(ast_node[2], n_rows=n_rows, direction=direction, criteria_df=criteria_df, deal_df=deal_df, caches=caches)
+                    right = _eval_ast_to_series(ast_node[3], n_rows=n_rows, direction=direction, criteria_df=criteria_df, deal_df=deal_df, caches=caches)
+                    # Try numeric comparison
+                    l = left.cast(pl.Int32, strict=False)
+                    r = right.cast(pl.Int32, strict=False)
+                    if op == "<":
+                        return (l < r)
+                    if op == "<=":
+                        return (l <= r)
+                    if op == ">":
+                        return (l > r)
+                    if op == ">=":
+                        return (l >= r)
+                    if op == "==":
+                        return (l == r)
+                    if op == "!=":
+                        return (l != r)
+                raise ValueError(f"unsupported expression node: {ast_node}")
+
+            # Read CSV: two columns: criteria, expr
+            custom_rows: list[tuple[str, str]] = []
+            with custom_criteria_file.open("r", encoding="utf-8", newline="") as f:
+                reader = _csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    if len(row) < 2:
+                        continue
+                    crit = str(row[0]).strip()
+                    expr = str(row[1]).strip()
+                    if not crit or crit.startswith("#"):
+                        continue
+                    if not expr:
+                        continue
+                    custom_rows.append((crit, expr))
+
+            if custom_rows:
+                n_rows = int(deal_df.height)
+                # Per-direction caches for SL computations
+                sl_cache: dict[tuple[str, str], pl.Series] = {}
+                applied = 0
+                failures: list[str] = []
+
+                # Apply to by-direction bitmap DFs
+                for dkey in list(deal_criteria_by_direction_dfs.keys()):
+                    df = deal_criteria_by_direction_dfs[dkey]
+                    d = str(dkey).upper()
+                    for crit_name, expr_text in custom_rows:
+                        try:
+                            ts = _TokStream(_tokenize(expr_text))
+                            ast = _parse_expr(ts)
+                            series = _eval_ast_to_series(
+                                ast,
+                                n_rows=n_rows,
+                                direction=d,
+                                criteria_df=df,
+                                deal_df=deal_df,
+                                caches=sl_cache,
+                            ).cast(pl.Boolean, strict=False)
+                            deal_criteria_by_direction_dfs[dkey] = deal_criteria_by_direction_dfs[dkey].with_columns(
+                                series.alias(crit_name)
+                            )
+                            applied += 1
+                        except Exception as e:
+                            failures.append(f"{crit_name} (dir={d}): {e}")
+
+                # Apply to by-seat bitmap DFs
+                for seat in list(deal_criteria_by_seat_dfs.keys()):
+                    for dealer in list(deal_criteria_by_seat_dfs[seat].keys()):
+                        df = deal_criteria_by_seat_dfs[seat][dealer]
+                        dir_for_df = _seat_to_dir(str(dealer).upper(), int(seat))
+                        for crit_name, expr_text in custom_rows:
+                            try:
+                                ts = _TokStream(_tokenize(expr_text))
+                                ast = _parse_expr(ts)
+                                series = _eval_ast_to_series(
+                                    ast,
+                                    n_rows=n_rows,
+                                    direction=dir_for_df,
+                                    criteria_df=df,
+                                    deal_df=deal_df,
+                                    caches=sl_cache,
+                                ).cast(pl.Boolean, strict=False)
+                                deal_criteria_by_seat_dfs[seat][dealer] = deal_criteria_by_seat_dfs[seat][dealer].with_columns(
+                                    series.alias(crit_name)
+                                )
+                                applied += 1
+                            except Exception as e:
+                                failures.append(f"{crit_name} (seat={seat},dealer={dealer}): {e}")
+
+                msg = f"[init] Applied {applied} custom criteria overrides from {custom_criteria_file.name}"
+                if failures:
+                    msg += f" (failures: {len(failures)})"
+                print(msg)
+                if failures:
+                    # Print a few failures for debugging
+                    for s in failures[:5]:
+                        print(f"  - [custom-criteria] {s}")
+            else:
+                print(f"[init] Custom criteria file {custom_criteria_file.name} found but empty; no overrides applied")
 
         # Capture the canonical set of criterion names (as used by the bitmap DataFrames).
         # These are "original expressions" (directionless) after directional_to_directionless renaming.
@@ -3545,6 +3795,8 @@ def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
             deals_uri=req.deals_uri,
             deal_indices=req.deal_indices,
             search_all_bt_rows=bool(req.search_all_bt_rows),
+            use_model_rules=bool(req.use_model_rules),
+            include_model_auction=bool(req.include_model_auction),
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
