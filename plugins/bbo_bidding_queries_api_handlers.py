@@ -9358,6 +9358,18 @@ def handle_greedy_model_path(
                         else:
                             ev_score = float(raw_ev)
                 except: pass
+
+            # UI parity: if the auction so far is only passes (opening/lead-pass sequences),
+            # treat Pass as neutral (DD=0, EV=0) so it doesn't get pushed below negative
+            # DD-score actions just because DD is the first sort key.
+            try:
+                toks_now = [t.strip().upper() for t in str(prefix or "").split("-") if t.strip()]
+                prefix_all_passes = (len(toks_now) == 0) or all(t == "P" for t in toks_now)
+            except Exception:
+                prefix_all_passes = False
+            if prefix_all_passes and str(bid).upper() == "P":
+                dd_score = 0.0
+                ev_score = 0.0
             
             candidates.append({
                 "bid": bid,

@@ -62,6 +62,102 @@ MATCH_ALL_DEALERS_HELP = (
     "For example, '1N-p-3N' finds this auction whether North, East, South, or West is dealer."
 )
 
+# Auction Builder Notes (CSV-backed, local)
+AUCTION_BUILDER_NOTES_MAX_CHARS = 200
+AUCTION_BUILDER_NOTES_CSV = pathlib.Path(__file__).resolve().parent / "data" / "auction_builder_notes.csv"
+AUCTION_BUILDER_LAST_PIN_TXT = pathlib.Path(__file__).resolve().parent / "data" / "auction_builder_last_pinned_deal_index.txt"
+
+
+def _auction_builder_load_last_pinned_deal_index() -> int:
+    """Load last pinned deal index from disk (0 if missing/invalid)."""
+    try:
+        if not AUCTION_BUILDER_LAST_PIN_TXT.exists():
+            return 0
+        raw = AUCTION_BUILDER_LAST_PIN_TXT.read_text(encoding="utf-8").strip()
+        v = int(raw) if raw else 0
+        return v if v > 0 else 0
+    except Exception:
+        return 0
+
+
+def _auction_builder_save_last_pinned_deal_index(idx: int) -> None:
+    """Persist last pinned deal index to disk (UTF-8)."""
+    try:
+        v = int(idx)
+    except Exception:
+        return
+    if v <= 0:
+        return
+    AUCTION_BUILDER_LAST_PIN_TXT.parent.mkdir(parents=True, exist_ok=True)
+    AUCTION_BUILDER_LAST_PIN_TXT.write_text(str(v), encoding="utf-8")
+
+
+def _auction_builder_notes_empty_df() -> pl.DataFrame:
+    return pl.DataFrame(
+        {"deal_index": [], "note": [], "updated_at": []},
+        schema={"deal_index": pl.Int64, "note": pl.Utf8, "updated_at": pl.Utf8},
+    )
+
+
+def _auction_builder_load_notes_df(path: pathlib.Path) -> pl.DataFrame:
+    """Load notes CSV. Missing file => empty DataFrame."""
+    if not path.exists():
+        return _auction_builder_notes_empty_df()
+    df = pl.read_csv(path, infer_schema_length=1000)
+    # Defensive schema normalization (handles older/hand-edited files)
+    if "deal_index" not in df.columns:
+        df = df.with_columns(pl.lit(None).cast(pl.Int64).alias("deal_index"))
+    if "note" not in df.columns:
+        df = df.with_columns(pl.lit("").cast(pl.Utf8).alias("note"))
+    if "updated_at" not in df.columns:
+        df = df.with_columns(pl.lit("").cast(pl.Utf8).alias("updated_at"))
+    return (
+        df.select(["deal_index", "note", "updated_at"])
+        .with_columns(pl.col("deal_index").cast(pl.Int64), pl.col("note").cast(pl.Utf8), pl.col("updated_at").cast(pl.Utf8))
+        .filter(pl.col("deal_index").is_not_null())
+    )
+
+
+def _auction_builder_notes_map(df: pl.DataFrame) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for r in df.to_dicts():
+        try:
+            di = int(r.get("deal_index"))  # type: ignore[arg-type]
+        except Exception:
+            continue
+        out[di] = str(r.get("note") or "")
+    return out
+
+
+def _auction_builder_atomic_write_csv(df: pl.DataFrame, path: pathlib.Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    # Ensure UTF-8 encoding even with non-ASCII notes.
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        df.write_csv(f)
+    tmp.replace(path)
+
+
+def auction_builder_upsert_or_delete_note(*, deal_index: int, note: str) -> None:
+    """Upsert a note for deal_index. Empty note deletes the row."""
+    note_clean = str(note or "").strip()
+    if len(note_clean) > AUCTION_BUILDER_NOTES_MAX_CHARS:
+        raise ValueError(f"Note must be <= {AUCTION_BUILDER_NOTES_MAX_CHARS} characters.")
+
+    df = _auction_builder_load_notes_df(AUCTION_BUILDER_NOTES_CSV)
+    df = df.filter(pl.col("deal_index") != int(deal_index))
+    if note_clean:
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        df = pl.concat(
+            [
+                df,
+                pl.DataFrame([{"deal_index": int(deal_index), "note": note_clean, "updated_at": now}]),
+            ],
+            how="vertical",
+        )
+    df = df.sort("deal_index")
+    _auction_builder_atomic_write_csv(df, AUCTION_BUILDER_NOTES_CSV)
+
 
 def prepend_all_seats_prefix(pattern: str) -> str:
     """Prepend (p-)* to a pattern for matching all 4 dealer positions."""
@@ -5353,6 +5449,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     
     **Tip:** Pin a specific deal to see if each step's criteria match that deal.
     """)
+
+    # Reserve space for Notes immediately under the intro.
+    # We render into this placeholder later (after pinned deal resolution).
+    auction_note_slot = st.empty()
     
     # Initialize session state for auction path
     if "auction_builder_path" not in st.session_state:
@@ -5361,6 +5461,25 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         st.session_state.auction_builder_options = {}  # Cache of available options per prefix
     if "auction_builder_pinned_deal" not in st.session_state:
         st.session_state.auction_builder_pinned_deal = None  # Cached pinned deal data
+
+    # On entry to Auction Builder, auto-restore last pinned deal index (if nothing currently pinned).
+    entered = bool(st.session_state.pop("_entered_auction_builder", False))
+    if entered:
+        try:
+            curr_idx = int(st.session_state.get("auction_builder_pinned_index", 0) or 0)
+        except Exception:
+            curr_idx = 0
+        curr_pbn = str(st.session_state.get("auction_builder_pinned_pbn", "") or "").strip()
+        if curr_idx <= 0 and not curr_pbn:
+            try:
+                last_idx = int(st.session_state.get("auction_builder_last_saved_deal_index", 0) or 0)
+            except Exception:
+                last_idx = 0
+            if last_idx <= 0:
+                last_idx = _auction_builder_load_last_pinned_deal_index()
+            if last_idx > 0:
+                st.session_state["auction_builder_pinned_index"] = int(last_idx)
+                st.session_state["auction_builder_pinned_pbn"] = ""
 
     def _clear_current_auction_state() -> None:
         """Clear the current auction path + related caches (does not clear pinned deal)."""
@@ -5415,12 +5534,40 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     # Use columns to place a clear button next to the input
     pin_col_in, pin_col_cl = st.sidebar.columns([0.88, 0.12])
     with pin_col_in:
-        pinned_input = st.text_input(
+        def _on_change_pinned_index() -> None:
+            # Make numeric pin authoritative: clear PBN/LIN when index changes to >0
+            try:
+                idx_v = int(st.session_state.get("auction_builder_pinned_index", 0) or 0)
+            except Exception:
+                idx_v = 0
+            if idx_v > 0:
+                st.session_state["auction_builder_pinned_pbn"] = ""
+                # Remember last pinned index immediately (so it can be restored on next entry).
+                st.session_state["auction_builder_last_saved_deal_index"] = idx_v
+                _auction_builder_save_last_pinned_deal_index(idx_v)
+
+        def _on_change_pinned_pbn() -> None:
+            # Make PBN/LIN pin authoritative: clear index when PBN/LIN is non-empty
+            p = str(st.session_state.get("auction_builder_pinned_pbn", "") or "").strip()
+            if p:
+                st.session_state["auction_builder_pinned_index"] = 0
+
+        pinned_idx = st.number_input(
             "Deal Index",
-            value=st.session_state.get("auction_builder_pinned_input", ""),
-            placeholder="e.g., 12345 or N:AKQ.xxx.xxx.xxxx ...",
-            help="Enter a deal index number or PBN string to pin. Criteria will be evaluated against this deal.",
-            key="auction_builder_pinned_input",
+            min_value=0,
+            value=int(st.session_state.get("auction_builder_pinned_index", 0) or 0),
+            step=1,
+            help="Enter a deal index number to pin. Criteria will be evaluated against this deal.",
+            key="auction_builder_pinned_index",
+            on_change=_on_change_pinned_index,
+        )
+        pinned_pbn = st.text_input(
+            "PBN/LIN (optional)",
+            value=str(st.session_state.get("auction_builder_pinned_pbn", "") or ""),
+            placeholder="e.g., N:AKQ.xxx.xxx.xxxx ...",
+            help="Optional: paste a PBN/LIN deal string instead of a deal index.",
+            key="auction_builder_pinned_pbn",
+            on_change=_on_change_pinned_pbn,
         )
     with pin_col_cl:
         # Vertical alignment hack for the button
@@ -5432,9 +5579,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             for k in keys_to_clear:
                 if k in st.session_state:
                     del st.session_state[k]
-            st.session_state.auction_builder_pinned_input = ""
+            st.session_state.auction_builder_pinned_index = 0
+            st.session_state.auction_builder_pinned_pbn = ""
 
         st.button("❌", key="clear_pin_btn", help="Clear pinned deal", on_click=_clear_pin)
+
+    # Compute the actual pinned input (PBN wins if provided; else numeric index if > 0)
+    pinned_pbn_str = str(pinned_pbn or "").strip()
+    pinned_input = pinned_pbn_str if pinned_pbn_str else (str(int(pinned_idx)) if int(pinned_idx) > 0 else "")
 
     # If the pinned-deal textbox is changed (to a different value or cleared), clear the current auction.
     # This avoids stale "Current Auction" state being interpreted under a different pin context.
@@ -5506,14 +5658,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             for strain in ["C", "D", "H", "S", "N"]:
                                 for lvl in range(1, 8):
                                     pinned_cols.append(f"EV_{pair}_{decl}_{strain}_{lvl}")
-                    # Single-dummy probability columns used for X/XX EV_Contract.
-                    # Probs_{pair}_{declarer}_{strain}_{tricks} (560 columns) + Probs_Trials.
-                    pinned_cols.append("Probs_Trials")
-                    for pair in ["NS", "EW"]:
-                        for decl in ["N", "E", "S", "W"]:
-                            for strain in ["C", "D", "H", "S", "N"]:
-                                for t in range(14):
-                                    pinned_cols.append(f"Probs_{pair}_{decl}_{strain}_{t}")
+                    # NOTE: We intentionally do NOT request the single-dummy probability matrix (Probs_*)
+                    # here. It is very wide (560+ columns) and can cause timeouts when pinning
+                    # deals quickly via the Deal Index spinner. Undoubled EV is still available
+                    # via the precomputed EV_* columns; doubled/redoubled EV will be None.
                     data = api_post(
                         "/deals-by-index",
                         {
@@ -5521,7 +5669,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             "max_rows": 1,
                             "columns": pinned_cols,
                         },
-                        timeout=10,
+                        timeout=20,
                     )
                     _st_info_elapsed("Auction Builder: pin deal (by index)", data)
                     rows = data.get("rows", [])
@@ -5529,6 +5677,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         deal_data = dict(rows[0])
                         deal_data["_source"] = f"index:{idx}"
                         pinned_deal = deal_data
+                        # Remember last successfully pinned deal index.
+                        st.session_state["auction_builder_last_saved_deal_index"] = idx
+                        _auction_builder_save_last_pinned_deal_index(idx)
                     else:
                         pinned_deal_error = (
                             f"Deal index {idx} not found in the API server's loaded deals dataset. "
@@ -5562,6 +5713,91 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     # Also split Available vs Rejected even without a pinned deal, so rows are bucketed
     # consistently (dead end / no matches / no deals / missing criteria).
     use_two_dataframes = True
+
+    # Render Notes box under the Auction Builder intro.
+    with auction_note_slot.container(border=True):
+        st.markdown("**📝 Auction note**")
+        deal_idx_int: int | None = None
+        if pinned_deal:
+            try:
+                deal_idx_int = int(pinned_deal.get("index")) if pinned_deal.get("index") is not None else None
+            except Exception:
+                deal_idx_int = None
+
+        if deal_idx_int is None:
+            st.caption("Pin a deal **index** to view/edit notes.")
+        else:
+            notes_df = _auction_builder_load_notes_df(AUCTION_BUILDER_NOTES_CSV)
+            notes_m = _auction_builder_notes_map(notes_df)
+            saved_note = notes_m.get(deal_idx_int, "")
+
+            note_key = f"auction_builder_note_{deal_idx_int}"
+            saved_key = f"auction_builder_note_saved_{deal_idx_int}"
+            status_key = f"auction_builder_note_status_{deal_idx_int}"
+            if saved_key not in st.session_state:
+                st.session_state[saved_key] = saved_note
+                st.session_state[note_key] = saved_note
+
+            def _auction_note_save_cb(di: int, nk: str, sk: str, stk: str) -> None:
+                """Callback (runs before widget instantiation on rerun)."""
+                try:
+                    auction_builder_upsert_or_delete_note(
+                        deal_index=di,
+                        note=str(st.session_state.get(nk, "") or ""),
+                    )
+                    refreshed = _auction_builder_notes_map(
+                        _auction_builder_load_notes_df(AUCTION_BUILDER_NOTES_CSV)
+                    ).get(di, "")
+                    st.session_state[sk] = refreshed
+                    st.session_state[nk] = refreshed
+                    st.session_state[stk] = {"ok": True, "msg": "Saved."}
+                except Exception as e:
+                    st.session_state[stk] = {"ok": False, "msg": f"Could not save note: {e}"}
+
+            def _auction_note_cancel_cb(nk: str, sk: str) -> None:
+                """Callback (runs before widget instantiation on rerun)."""
+                st.session_state[nk] = str(st.session_state.get(sk, "") or "")
+
+            # Single-line notes: Enter (or blur) auto-saves via on_change callback.
+            st.text_input(
+                "Auction note (max 200 chars)",
+                key=note_key,
+                max_chars=AUCTION_BUILDER_NOTES_MAX_CHARS,
+                label_visibility="collapsed",
+                placeholder="Describe the issue with this auction…",
+                on_change=_auction_note_save_cb,
+                args=(deal_idx_int, note_key, saved_key, status_key),
+            )
+
+            btn_save, btn_cancel, _ = st.columns([1, 1, 6])
+            with btn_save:
+                st.button(
+                    "Save",
+                    key=f"auction_builder_note_save_{deal_idx_int}",
+                    width="stretch",
+                    on_click=_auction_note_save_cb,
+                    args=(deal_idx_int, note_key, saved_key, status_key),
+                )
+            with btn_cancel:
+                st.button(
+                    "Cancel",
+                    key=f"auction_builder_note_cancel_{deal_idx_int}",
+                    width="stretch",
+                    on_click=_auction_note_cancel_cb,
+                    args=(note_key, saved_key),
+                )
+
+            # Render status message set by callbacks
+            status = st.session_state.get(status_key)
+            if isinstance(status, dict):
+                if status.get("ok"):
+                    st.success(str(status.get("msg") or "Saved."))
+                else:
+                    st.error(str(status.get("msg") or "Could not save note."))
+                try:
+                    del st.session_state[status_key]
+                except Exception:
+                    pass
     
     
     with st.sidebar.expander("Settings", expanded=False):
@@ -6435,8 +6671,13 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     prefix_all_passes = (len(toks_now) == 0) or all(t == "P" for t in toks_now)
                 except Exception:
                     prefix_all_passes = False
-                if prefix_all_passes and str(r.get("Bid", "")).strip().split(" ")[0].upper() == "P":
+                bid0 = str(r.get("Bid", "")).strip().split(" ")[0].upper()
+                if prefix_all_passes and bid0 == "P":
                     ev_contract_val = 0.0
+                    # For opening/lead-pass sequences, Pass is effectively "no-op" and should not
+                    # get pushed below negative DD-score actions just because DD is the first sort key.
+                    # Treat it as DD=0 for ranking (and display), matching the intent of EV=0 above.
+                    dd_score_contract_val = 0
 
                 # Display missing EV Contract as 0.0 for this table
                 if ev_contract_val is None:
@@ -6774,9 +7015,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 )
 
                 # --- Predicted Model Path (Greedy) ---
-                # Compute only when starting from empty auction (opening position),
-                # but persist the UI box even after the user builds a non-empty
-                # Bidding Sequence (by displaying cached results).
+                # Compute once per pinned deal (keyed by deal index), regardless of the
+                # current Bidding Sequence. We always compute from the opening prefix ("").
+                # The UI box persists via session_state cache until the pinned deal changes.
                 #
                 # Build the greedy path by repeatedly picking the top bid using
                 # the same logic as "Best Bids Ranked by Model":
@@ -6786,17 +7027,16 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     import time as _time_module
                     deal_id = pinned_deal.get("index") if pinned_deal else "no_deal"
                     row_idx = pinned_deal.get("_row_idx")
-                    pass_flag = 1 if bool(st.session_state.get("always_valid_pass", True)) else 0
-                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_{seed}_{pass_flag}_v4"
+                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_v5"
                     greedy_time_key = f"{greedy_cache_key}__time"
 
-                    # Only compute from the opening position.
-                    if suggested_bids_rows and not current_auction and greedy_cache_key not in st.session_state:
+                    # Only compute when the pinned deal changes (cache miss by deal index).
+                    if greedy_cache_key not in st.session_state:
                         _greedy_start = _time_module.perf_counter()
                         with st.spinner("Predicting model path..."):
                             try:
                                 payload = {
-                                    "auction_prefix": current_auction or "",
+                                    "auction_prefix": "",
                                     "deal_row_idx": int(row_idx) if row_idx is not None else None,
                                     "seed": int(seed) if seed is not None else 42,
                                     "max_depth": 40,
@@ -6829,7 +7069,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         with btn_col:
                             if st.button(
                                 "Move to Bidding Sequence",
-                                key=f"auction_builder_move_predicted_path_{deal_id}_{seed}",
+                                key=f"auction_builder_move_predicted_path_{deal_id}",
                                 help="Overwrite the current bidding sequence with the model path.",
                                 width="stretch",
                             ):
@@ -8678,7 +8918,17 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     elapsed = cached_data.get("elapsed_sec", 0)
                     total_count = cached_data.get("total_count", len(sample_deals))
                     st.info(f"Showing **{len(sample_deals)}** of **{total_count}** matching deals in {elapsed:.2f}s")
+                    # Rehydrate notes on display so edits show up immediately (without re-fetching deals)
+                    notes_df = _auction_builder_load_notes_df(AUCTION_BUILDER_NOTES_CSV)
+                    notes_m = _auction_builder_notes_map(notes_df)
                     deals_df = pl.DataFrame(cached_data.get("display_rows", []))
+                    if len(deals_df) > 0 and "index" in deals_df.columns:
+                        deals_df = deals_df.with_columns(
+                            pl.col("index")
+                            .cast(pl.Int64, strict=False)
+                            .map_elements(lambda x: notes_m.get(int(x), "") if x is not None else "", return_dtype=pl.Utf8)
+                            .alias("Note")
+                        )
                     render_aggrid(
                         deals_df,
                         key="auction_builder_deals",
@@ -8756,8 +9006,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         }
                         
                         # Build display DataFrame
+                        notes_df = _auction_builder_load_notes_df(AUCTION_BUILDER_NOTES_CSV)
+                        notes_m = _auction_builder_notes_map(notes_df)
                         display_rows = []
                         for deal in sample_deals:
+                            try:
+                                di = int(deal.get("index")) if deal.get("index") is not None else None
+                            except Exception:
+                                di = None
                             display_rows.append({
                                 "index": deal.get("index"),
                                 "Dealer": deal.get("Dealer"),
@@ -8771,6 +9027,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "Result": deal.get("Result", ""),
                                 "Score": deal.get("Score", ""),
                                 "ParScore": deal.get("ParScore", ""),
+                                "Note": notes_m.get(di, "") if di is not None else "",
                             })
                         
                         # Cache the results including stats, timing, and total count
@@ -8952,6 +9209,11 @@ else:
 # ---------------------------------------------------------------------------
 # Dispatch to appropriate render function based on selection
 # ---------------------------------------------------------------------------
+
+# Track “entered Auction Builder” reliably (before dispatch).
+prev_choice = st.session_state.get("_last_func_choice")
+st.session_state["_last_func_choice"] = func_choice
+st.session_state["_entered_auction_builder"] = (func_choice == "Auction Builder" and prev_choice != "Auction Builder")
 
 match func_choice:
     case "Deals by Auction Pattern":
