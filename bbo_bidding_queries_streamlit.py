@@ -4720,7 +4720,7 @@ def render_rank_by_ev():
     # Call API (single endpoint provides both bid rankings and DD analysis)
     # =========================================================================
     # Cache version: increment when API response format changes
-    CACHE_VERSION = 25  # v25: force 'Which candidate bids perform best' nulls-last sort
+    CACHE_VERSION = 26  # v26: bust cache for EV-at-bid/EV-std population
     
     # Always fetch all columns from API; filter display based on checkboxes
     # This prevents cache busting when output options change
@@ -5528,6 +5528,24 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             color: #f00 !important;
             background: transparent !important;
         }
+
+        /* Make "Show Best ... Pre-computed Auctions" button green */
+        .st-key-show_best_auctions_btn_1 button,
+        .st-key-show_best_auctions_btn_2 button,
+        .st-key-show_best_auctions_btn_3 button,
+        .st-key-show_best_auctions_btn_4 button {
+            background: #28a745 !important;
+            border-color: #28a745 !important;
+            color: #fff !important;
+        }
+        .st-key-show_best_auctions_btn_1 button:hover,
+        .st-key-show_best_auctions_btn_2 button:hover,
+        .st-key-show_best_auctions_btn_3 button:hover,
+        .st-key-show_best_auctions_btn_4 button:hover {
+            background: #218838 !important;
+            border-color: #1e7e34 !important;
+            color: #fff !important;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -5791,7 +5809,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             status = st.session_state.get(status_key)
             if isinstance(status, dict):
                 if status.get("ok"):
-                    st.success(str(status.get("msg") or "Saved."))
+                    # Use toast so "Saved." doesn't linger while editing.
+                    st.toast(str(status.get("msg") or "Saved."))
                 else:
                     st.error(str(status.get("msg") or "Could not save note."))
                 try:
@@ -6001,6 +6020,18 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     st.error(f"Error resolving auction path: {e}")
                     new_path = [{"bid": b, "bt_index": None, "agg_expr": [], "is_complete": False} for b in expected_bids]
             
+            # Summary consistency:
+            # If the user has "Always treat Pass as valid bid" enabled, mark all Pass calls so
+            # the Bid-by-Bid Summary won't evaluate/flag criteria failures on Pass steps.
+            # (This matches the behavior when selecting bids from the per-step grids.)
+            try:
+                if bool(st.session_state.get("always_valid_pass", True)) and new_path:
+                    for step in new_path:
+                        if str(step.get("bid", "") or "").strip().upper() == "P":
+                            step["_pass_valid_selection"] = True
+            except Exception:
+                pass
+
             # Mark is_complete on final step if auction ends with 3 passes (or 4 passes for passed out)
             if new_path:
                 all_bids = [step.get("bid", "").upper() for step in new_path]
@@ -7669,7 +7700,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     else:
                         if st.button(
                             f"Show Best {int(max_best_auctions)} Pre-computed Auctions Ranked by DD/EV",
-                            key=f"{show_best_auctions_key}__btn",
+                            key=f"show_best_auctions_btn_{int(current_seat)}",
                         ):
                             st.session_state[show_best_auctions_key] = True
                             st.rerun()
@@ -7727,6 +7758,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                                     "metric": "DD",
                                                     "max_depth": 20,
                                                     "max_results": int(max_best_auctions),
+                                                    "permissive_pass": st.session_state.get("always_valid_pass", True),
                                                 },
                                                 timeout=120,
                                             )
@@ -7894,6 +7926,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                                     "metric": "EV",
                                                     "max_depth": 20,
                                                     "max_results": int(max_best_auctions),
+                                                    "permissive_pass": st.session_state.get("always_valid_pass", True),
                                                 },
                                                 timeout=120,
                                             )
@@ -8344,11 +8377,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         if rehydrate_elapsed_ms is not None:
             st.info(f"Loaded auction criteria in {rehydrate_elapsed_ms/1000:.2f}s")
         
-        # Check for cached deal stats to include in summary
-        deals_cache_key = f"auction_builder_deals_{current_auction}_{max_matching_deals}_{seed}"
-        cached_stats = None
-        if deals_cache_key in st.session_state and st.session_state[deals_cache_key] is not None:
-            cached_stats = st.session_state[deals_cache_key].get("stats")
+        # Per-step sampled-deal stats cache.
+        # Populated when the user clicks a row (Matching Deals section computes sample stats).
+        # Keep only the most recent selection to avoid accumulating lots of cached stats.
+        step_stats_map_all: dict[str, dict[str, Any]] = st.session_state.setdefault("_auction_builder_step_stats", {})
         
         # Helper to evaluate criteria against pinned deal
         def evaluate_criteria_for_pinned(criteria_list: list, seat: int, dealer: str, deal: dict) -> tuple[bool, list[str]]:
@@ -8447,6 +8479,99 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             st.session_state["_deals_counts_elapsed_ms"] = (time.perf_counter() - t0_counts) * 1000
             st.session_state["_deals_counts_steps"] = len(missing_partials)
 
+        # ------------------------------------------------------------------
+        # Sampled-deal stats for ALL steps (on demand, cached).
+        #
+        # This uses /sample-deals-by-auction-pattern and computes NV/V splits
+        # from the sampled deals. This is heavier than counts, but is now
+        # intentionally enabled for every step in the Current Auction grid.
+        # ------------------------------------------------------------------
+        step_stats_map: dict[str, dict[str, Any]] = st.session_state.setdefault("_auction_builder_step_stats", {})
+
+        # Keep cache small: only stats for the current path.
+        current_partials = ["-".join([s["bid"] for s in current_path[: i + 1]]) for i in range(len(current_path))]
+        for k in list(step_stats_map_all.keys()):
+            if k not in current_partials:
+                del step_stats_map_all[k]
+
+        def _calc_std(values: list[float]) -> float | None:
+            if len(values) < 2:
+                return None
+            mean = sum(values) / len(values)
+            variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+            return round(variance ** 0.5, 1)
+
+        def _compute_sampled_stats_for_partial(partial: str) -> dict[str, Any]:
+            """Compute sampled-deal stats for a partial auction prefix (or exact complete auction)."""
+            auction_upper = str(partial or "").upper()
+            if auction_upper.endswith("-P-P-P"):
+                arena_pattern = f"^{auction_upper}$"
+            else:
+                arena_pattern = f"^{auction_upper}.*-P-P-P$"
+            deals_data = api_post(
+                "/sample-deals-by-auction-pattern",
+                {"pattern": arena_pattern, "sample_size": int(max_matching_deals), "seed": int(seed)},
+                timeout=30,
+            )
+            sample_deals = deals_data.get("deals", []) or []
+
+            scores_nv: list[float] = []
+            scores_v: list[float] = []
+            par_scores_nv: list[float] = []
+            par_scores_v: list[float] = []
+
+            for deal in sample_deals:
+                vul = str(deal.get("Vul", "")).upper()
+                is_vul = vul not in ("NONE", "-", "", "O")  # O = None in some formats
+                score = deal.get("Score")
+                par = deal.get("ParScore")
+
+                if score is not None:
+                    try:
+                        s = float(score)
+                        (scores_v if is_vul else scores_nv).append(s)
+                    except (ValueError, TypeError):
+                        pass
+                if par is not None:
+                    try:
+                        p = float(par)
+                        (par_scores_v if is_vul else par_scores_nv).append(p)
+                    except (ValueError, TypeError):
+                        pass
+
+            return {
+                "_sample_size": int(max_matching_deals),
+                "_seed": int(seed),
+                "matches_nv": len(scores_nv) if scores_nv else None,
+                "matches_v": len(scores_v) if scores_v else None,
+                "avg_par_nv": round(sum(par_scores_nv) / len(par_scores_nv), 1) if par_scores_nv else None,
+                "avg_par_v": round(sum(par_scores_v) / len(par_scores_v), 1) if par_scores_v else None,
+                "ev_nv": round(sum(scores_nv) / len(scores_nv), 1) if scores_nv else None,
+                "ev_v": round(sum(scores_v) / len(scores_v), 1) if scores_v else None,
+                "ev_std_nv": _calc_std(scores_nv),
+                "ev_std_v": _calc_std(scores_v),
+            }
+
+        # Compute any missing stats (or stale due to settings change)
+        missing_stats = [
+            p
+            for p in current_partials
+            if (
+                p not in step_stats_map_all
+                or step_stats_map_all[p].get("_sample_size") != int(max_matching_deals)
+                or step_stats_map_all[p].get("_seed") != int(seed)
+            )
+        ]
+        if missing_stats:
+            with st.spinner(f"Computing sampled-deal stats for {len(missing_stats)} step(s)..."):
+                prog = st.progress(0)
+                try:
+                    for j, p in enumerate(missing_stats):
+                        step_stats_map_all[p] = _compute_sampled_stats_for_partial(p)
+                        prog.progress(int(((j + 1) / max(1, len(missing_stats))) * 100))
+                finally:
+                    prog.empty()
+
         for i, step in enumerate(current_path):
             bid_num = i + 1
             seat_1_to_4 = ((bid_num - 1) % 4) + 1
@@ -8487,6 +8612,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 "Direction": bid_dir if pinned_deal else None,
                 "Seat": seat_1_to_4,
                 "Bid": step["bid"],
+                # Keep the exact partial auction used for Matches/Deals computations.
+                # This avoids relying on Bid Num reconstruction when the grid is sorted/filtered.
+                "_partial_auction": partial_auction,
                 "BT Index": step.get("bt_index"),
                 "Matches": matches_count,
                 "Deals": deals_count,
@@ -8517,7 +8645,12 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 dealer = pinned_deal.get("Dealer", "N")
                 # If this step was a client-side "Pass with no criteria" OR was selected from a valid-bids
                 # grid (Best Bids Ranked by Model), treat it as passing to maintain consistency.
-                skip_eval = step.get("_pass_no_criteria") or step.get("_pass_valid_selection")
+                is_pass = str(step.get("bid", "") or "").strip().upper() == "P"
+                skip_eval = (
+                    step.get("_pass_no_criteria")
+                    or step.get("_pass_valid_selection")
+                    or (is_pass and bool(st.session_state.get("always_valid_pass", True)))
+                )
                 criteria_list = [] if skip_eval else step.get("agg_expr", [])
                 passes, failed = evaluate_criteria_for_pinned(criteria_list, seat_1_to_4, dealer, pinned_deal)
                 row["_passes"] = passes  # Hidden column for row styling
@@ -8532,29 +8665,25 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Green = has bt_index (in BT), Red = no bt_index (e.g., leading passes)
                 row["_passes"] = step.get("bt_index") is not None
             
-            # Add stats columns only on the last row (they apply to the full auction)
-            # Use Rankings-style naming: Matches, Avg Par, EV at Bid, EV Std (with NV/V suffix)
-            if cached_stats and i == len(current_path) - 1:
-                row["Matches_NV"] = cached_stats.get("matches_nv")
-                row["Matches_V"] = cached_stats.get("matches_v")
-                row["Avg Par_NV"] = cached_stats.get("avg_par_nv")
-                row["Avg Par_V"] = cached_stats.get("avg_par_v")
-                # NOTE: Do NOT overwrite step EV_NV/EV_V (precomputed GPU stats).
-                # These cached stats are sample-based (from /sample-deals-by-auction-pattern),
-                # so store them in separate columns.
-                row["EV at Bid_NV"] = cached_stats.get("ev_nv")
-                row["EV at Bid_V"] = cached_stats.get("ev_v")
-                row["EV Std_NV"] = cached_stats.get("ev_std_nv")
-                row["EV Std_V"] = cached_stats.get("ev_std_v")
-            elif cached_stats:
-                row["Matches_NV"] = None
-                row["Matches_V"] = None
-                row["Avg Par_NV"] = None
-                row["Avg Par_V"] = None
-                row["EV at Bid_NV"] = None
-                row["EV at Bid_V"] = None
-                row["EV Std_NV"] = None
-                row["EV Std_V"] = None
+            # Sampled-deal stats (computed and cached for all steps).
+            row["Matches_NV"] = None
+            row["Matches_V"] = None
+            row["Avg Par_NV"] = None
+            row["Avg Par_V"] = None
+            row["EV at Bid_NV"] = None
+            row["EV at Bid_V"] = None
+            row["EV Std_NV"] = None
+            row["EV Std_V"] = None
+            stats_for_partial = step_stats_map_all.get(partial_auction)
+            if isinstance(stats_for_partial, dict):
+                row["Matches_NV"] = stats_for_partial.get("matches_nv")
+                row["Matches_V"] = stats_for_partial.get("matches_v")
+                row["Avg Par_NV"] = stats_for_partial.get("avg_par_nv")
+                row["Avg Par_V"] = stats_for_partial.get("avg_par_v")
+                row["EV at Bid_NV"] = stats_for_partial.get("ev_nv")
+                row["EV at Bid_V"] = stats_for_partial.get("ev_v")
+                row["EV Std_NV"] = stats_for_partial.get("ev_std_nv")
+                row["EV Std_V"] = stats_for_partial.get("ev_std_v")
             summary_rows.append(row)
         
         # Show auction complete status and pinned deal match summary
@@ -8860,6 +8989,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         # - pinned: hide EV_NV/EV_V, Avg_EV (EV lookup has seat mismatch bug - to be fixed)
         # - not pinned: hide Avg_EV (use EV_NV/EV_V)
         summary_hide_cols = ["Agg_Expr_full", "Categories_full", "_passes"]
+        summary_hide_cols += ["_partial_auction"]
         if pinned_deal:
             summary_hide_cols += ["EV_NV", "EV_V", "Avg_EV"]
         else:
@@ -8873,7 +9003,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             height=calc_grid_height(4),
             table_name="auction_builder_summary",
             hide_cols=summary_hide_cols,
-            update_on=["selectionChanged"],
+            # cellClicked ensures clicking a cell updates selection immediately (not just row highlight).
+            update_on=["selectionChanged", "cellClicked"],
             fit_columns_to_view=False,
             row_pass_fail_col="_passes",
         )
@@ -8882,10 +9013,20 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         # render_aggrid returns a list of selected rows directly
         selected_step_auction: str | None = None
         if summary_selection and len(summary_selection) > 0:
-            sel_bid_num = summary_selection[0].get("Bid Num")
-            if sel_bid_num and sel_bid_num <= len(current_path):
-                # Build auction up to selected step
-                selected_step_auction = "-".join([s["bid"] for s in current_path[:sel_bid_num]])
+            row0 = summary_selection[0] or {}
+            # Prefer the exact partial auction stored in the row (robust to sorts/filters).
+            sel_partial = row0.get("_partial_auction")
+            if isinstance(sel_partial, str) and sel_partial.strip():
+                selected_step_auction = sel_partial.strip()
+            else:
+                # Fallback: reconstruct by Bid Num.
+                sel_bid_num_raw = row0.get("Bid Num")
+                try:
+                    sel_bid_num = int(sel_bid_num_raw) if sel_bid_num_raw is not None else None
+                except Exception:
+                    sel_bid_num = None
+                if sel_bid_num is not None and 1 <= sel_bid_num <= len(current_path):
+                    selected_step_auction = "-".join([s["bid"] for s in current_path[:sel_bid_num]])
         
         # If no row selected but auction is complete, show matching deals for full auction
         if selected_step_auction is None and is_complete and current_auction:
@@ -8895,8 +9036,15 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         if selected_step_auction is not None:
             display_auction = selected_step_auction
             st.subheader("🎯 Matching Deals")
-            # Check if selected auction matches the full current auction
-            is_selected_complete = (display_auction == current_auction) or display_auction.upper().endswith("-P-P-P")
+            # Check if the selected auction is a *completed* auction.
+            #
+            # IMPORTANT:
+            # - Deals' actual auctions are completed auctions (end with "-P-P-P").
+            # - The current Auction Builder prefix may be incomplete; even if it equals current_auction,
+            #   we must treat it as a prefix match unless it is actually complete.
+            is_selected_complete = display_auction.upper().endswith("-P-P-P") or (
+                bool(is_complete) and display_auction == current_auction
+            )
             if is_selected_complete:
                 st.caption(f"Deals where the actual auction matches: **{display_auction}**")
             else:
@@ -9037,6 +9185,13 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             "stats": stats,
                             "total_count": deals_data.get("total_count", len(sample_deals)),
                             "elapsed_sec": round((deals_data.get("_client_elapsed_ms") or deals_data.get("elapsed_ms") or 0) / 1000, 2),
+                        }
+                        # Make the sampled-deal stats visible in the Bid-by-Bid Summary for this exact partial.
+                        step_stats_map = st.session_state.setdefault("_auction_builder_step_stats", {})
+                        step_stats_map[str(display_auction)] = {
+                            "_sample_size": int(max_matching_deals),
+                            "_seed": int(seed),
+                            **dict(stats),
                         }
                         
                         if sample_deals:

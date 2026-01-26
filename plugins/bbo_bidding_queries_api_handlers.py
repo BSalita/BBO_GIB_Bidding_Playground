@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import random
 import re
 import statistics
@@ -2073,7 +2074,8 @@ def handle_deals_matching_auction(
             if deal_idx is not None and bt_info_for_check:
                 conformance = _check_deal_criteria_conformance_bitmap(
                     int(deal_idx), bt_info_for_check, dealer, deal_criteria_by_seat_dfs,
-                    auction=auction
+                    deal_row=deal_row,
+                    auction=auction,
                 )
                 # Add per-seat wrong bid columns
                 for seat in range(1, 5):
@@ -2748,7 +2750,7 @@ def _compute_wrong_bid_rate_for_bt_row(
         bid_str = row.get("_bid_str", "")
         
         conformance = _check_deal_criteria_conformance_bitmap(
-            int(deal_idx), bt_info, dealer, deal_criteria_by_seat_dfs, auction=bid_str
+            int(deal_idx), bt_info, dealer, deal_criteria_by_seat_dfs, deal_row=row, auction=bid_str
         )
         
         first_wrong = conformance["first_wrong_seat"]
@@ -3111,6 +3113,7 @@ LIMIT {n_auction_groups}"""
             if deal_idx is not None and bt_info:
                 conformance = _check_deal_criteria_conformance_bitmap(
                     int(deal_idx), bt_info, dealer, deal_criteria_by_seat_dfs,
+                    deal_row=deal_row,
                     auction=bt_auction or bid_auction
                 )
                 # Add per-seat wrong bid columns
@@ -7158,7 +7161,9 @@ def handle_rank_bids_by_ev(
         ev_v_sum_sq = 0.0
         ev_v_n = 0
         
-        if "Vul" in matched_df.columns and "ParScore" in matched_df.columns:
+        # We can compute EV-at-bid from historical Score even if ParScore isn't loaded.
+        # Par-related aggregates require ParScore, but EV/Std should not be blocked by it.
+        if "Vul" in matched_df.columns and "Dealer" in matched_df.columns:
             # Determine the next bidder direction per deal using the seat mapping.
             dealer_to_bidder = _seat_direction_map(next_seat)
             bidder_expr = pl.col("Dealer").replace(dealer_to_bidder)
@@ -7180,65 +7185,81 @@ def handle_rank_bids_by_ev(
                 # ParScore is NS-oriented; convert to "par from bidder's side" so it is
                 # comparable to EV which is computed relative to the bidder's partnership.
                 bidder_nv_df = nv_df.with_columns(bidder_expr.alias("_Bidder"))
-                nv_par = (
-                    bidder_nv_df
-                    .with_columns(
-                        pl.when(pl.col("_Bidder").is_in(["N", "S"]))
-                        .then(pl.col("ParScore"))
-                        .otherwise(-pl.col("ParScore"))
-                        .alias("_ParForBidder")
-                    )["_ParForBidder"]
-                    .drop_nulls()
-                )
-                if nv_par.len() > 0:
-                    par_sum = nv_par.sum()
-                    nv_par_sum = float(par_sum) if par_sum is not None else 0
+                if "ParScore" in bidder_nv_df.columns:
+                    nv_par = (
+                        bidder_nv_df
+                        .with_columns(
+                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
+                            .then(pl.col("ParScore"))
+                            .otherwise(-pl.col("ParScore"))
+                            .alias("_ParForBidder")
+                        )["_ParForBidder"]
+                        .drop_nulls()
+                    )
+                    if nv_par.len() > 0:
+                        par_sum = nv_par.sum()
+                        nv_par_sum = float(par_sum) if par_sum is not None else 0
                 
-                # Compute EV for NV deals relative to bidder direction (seat-based)
-                if bid_level and bid_strain and "Dealer" in nv_df.columns:
-                    for bidder in ["N", "E", "S", "W"]:
-                        pair = "NS" if bidder in ["N", "S"] else "EW"
-                        ev_col = f"EV_{pair}_{bidder}_{bid_strain}_{bid_level}_NV"
-                        if ev_col in bidder_nv_df.columns:
-                            sub = bidder_nv_df.filter(pl.col("_Bidder") == bidder)[ev_col].drop_nulls()
-                            n = sub.len()
-                            if n:
-                                s = float(sub.sum())
-                                ss = float((sub * sub).sum())
-                                ev_nv_sum += s
-                                ev_nv_sum_sq += ss
-                                ev_nv_n += int(n)
+                # EV-at-bid (and EV std) should be available even when per-contract EV columns
+                # are not loaded into deal_df (they are very wide).
+                #
+                # Policy: compute "EV at Bid" from historical *Score* from the bidder's side
+                # (NS score flipped for EW bidder). This matches the UI definition:
+                # "average score achieved when that bid becomes the final contract".
+                if "Score" in bidder_nv_df.columns:
+                    score_for_bidder = (
+                        bidder_nv_df
+                        .with_columns(
+                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
+                            .then(pl.col("Score").cast(pl.Float64, strict=False))
+                            .otherwise(-pl.col("Score").cast(pl.Float64, strict=False))
+                            .alias("_ScoreForBidder")
+                        )["_ScoreForBidder"]
+                        .drop_nulls()
+                    )
+                    n = int(score_for_bidder.len())
+                    if n > 0:
+                        s = float(score_for_bidder.sum() or 0.0)
+                        ss = float(((score_for_bidder * score_for_bidder).sum()) or 0.0)
+                        ev_nv_sum += s
+                        ev_nv_sum_sq += ss
+                        ev_nv_n += n
             
             if v_count > 0:
                 bidder_v_df = v_df.with_columns(bidder_expr.alias("_Bidder"))
-                v_par = (
-                    bidder_v_df
-                    .with_columns(
-                        pl.when(pl.col("_Bidder").is_in(["N", "S"]))
-                        .then(pl.col("ParScore"))
-                        .otherwise(-pl.col("ParScore"))
-                        .alias("_ParForBidder")
-                    )["_ParForBidder"]
-                    .drop_nulls()
-                )
-                if v_par.len() > 0:
-                    par_sum = v_par.sum()
-                    v_par_sum = float(par_sum) if par_sum is not None else 0
+                if "ParScore" in bidder_v_df.columns:
+                    v_par = (
+                        bidder_v_df
+                        .with_columns(
+                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
+                            .then(pl.col("ParScore"))
+                            .otherwise(-pl.col("ParScore"))
+                            .alias("_ParForBidder")
+                        )["_ParForBidder"]
+                        .drop_nulls()
+                    )
+                    if v_par.len() > 0:
+                        par_sum = v_par.sum()
+                        v_par_sum = float(par_sum) if par_sum is not None else 0
                 
-                # Compute EV for V deals relative to bidder direction (seat-based)
-                if bid_level and bid_strain and "Dealer" in v_df.columns:
-                    for bidder in ["N", "E", "S", "W"]:
-                        pair = "NS" if bidder in ["N", "S"] else "EW"
-                        ev_col = f"EV_{pair}_{bidder}_{bid_strain}_{bid_level}_V"
-                        if ev_col in bidder_v_df.columns:
-                            sub = bidder_v_df.filter(pl.col("_Bidder") == bidder)[ev_col].drop_nulls()
-                            n = sub.len()
-                            if n:
-                                s = float(sub.sum())
-                                ss = float((sub * sub).sum())
-                                ev_v_sum += s
-                                ev_v_sum_sq += ss
-                                ev_v_n += int(n)
+                if "Score" in bidder_v_df.columns:
+                    score_for_bidder = (
+                        bidder_v_df
+                        .with_columns(
+                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
+                            .then(pl.col("Score").cast(pl.Float64, strict=False))
+                            .otherwise(-pl.col("Score").cast(pl.Float64, strict=False))
+                            .alias("_ScoreForBidder")
+                        )["_ScoreForBidder"]
+                        .drop_nulls()
+                    )
+                    n = int(score_for_bidder.len())
+                    if n > 0:
+                        s = float(score_for_bidder.sum() or 0.0)
+                        ss = float(((score_for_bidder * score_for_bidder).sum()) or 0.0)
+                        ev_v_sum += s
+                        ev_v_sum_sq += ss
+                        ev_v_n += n
         
         # Compute averages
         avg_par_nv = round(nv_par_sum / nv_count, 0) if nv_count > 0 else None
@@ -8297,6 +8318,7 @@ def handle_best_auctions_lookahead(
     metric: str,  # "DD" or "EV"
     max_depth: int = 20,
     max_results: int = 10,
+    permissive_pass: bool = True,
     deadline_s: float = 5.0,
     max_nodes: int = 50000,  # max prefix expansions per request (safety cap)
     beam_width: int = 25,    # how many children to explore per node (lookahead + dfs)
@@ -8359,6 +8381,30 @@ def handle_best_auctions_lookahead(
     
     # Normalize auction prefix
     auction_norm = normalize_auction_input(auction_prefix).upper() if auction_prefix else ""
+    # IMPORTANT: Auction Builder tends to operate in BT seat-1 view (leading passes stripped),
+    # but DD/EV/par computations require seat-relative prefixes to align with the deal's dealer.
+    # Ensure the search prefix includes the deal's opening passes so scoring/par matching works.
+    deal_actual_auction_s = _bid_value_to_str(deal_row.get("bid") or deal_row.get("Actual_Auction") or "")
+    deal_lp = _count_leading_passes(deal_actual_auction_s)
+    prefix_lp = _count_leading_passes(auction_norm)
+    if int(deal_lp) > int(prefix_lp):
+        auction_norm = ("P-" * int(int(deal_lp) - int(prefix_lp))) + auction_norm
+    
+    # Custom CSV overlay (bbo_custom_auction_criteria.csv).
+    # These rules are defined in BT "seat-1 view" (leading passes stripped) and apply to *any*
+    # auction that starts with the rule's partial.
+    overlay = state.get("custom_criteria_overlay") or []
+    overlay_by_seat: dict[int, list[dict[str, Any]]] = {1: [], 2: [], 3: [], 4: []}
+    try:
+        for r in list(overlay) if isinstance(overlay, list) else []:
+            try:
+                s = int(r.get("seat"))  # type: ignore[call-arg]
+            except Exception:
+                continue
+            if 1 <= s <= 4:
+                overlay_by_seat[s].append(dict(r))
+    except Exception:
+        overlay_by_seat = {1: [], 2: [], 3: [], 4: []}
 
     # Reuse a single DuckDB connection for the request and cache bt_index->metadata.
     # The previous implementation created a new DuckDB connection per node, which is extremely slow.
@@ -8505,7 +8551,7 @@ def handle_best_auctions_lookahead(
         child_indices = list(child_map.values())
         t_hydrate = time.perf_counter()
         _hydrate_bt_meta(child_indices)
-        debug_info["hydrate_time_ms"] += (time.perf_counter() - t_hydrate) * 1000
+        _ = (time.perf_counter() - t_hydrate) * 1000  # keep timing local (no debug payload)
         
         # Seat/dealer for criteria evaluation
         toks = [t for t in prefix_auc.split("-") if t.strip()] if prefix_auc else []
@@ -8520,10 +8566,42 @@ def handle_best_auctions_lookahead(
             if m is None:
                 continue
             is_comp, expr = m
+            is_pass = str(bid or "").strip().upper() in ("P", "PASS")
             # Expr is the criteria for this specific bid (candidate_bid at this BT row).
             # Evaluate it for the seat that is making this bid.
-            if eval_criteria(expr, bt_seat, dealer_rot):
-                valid.append((bid, int(idx), bool(is_comp)))
+            if not (permissive_pass and is_pass):
+                if not eval_criteria(expr, bt_seat, dealer_rot):
+                    continue
+
+            # ALSO enforce the custom CSV overlay rules (if any) at this exact BT seat.
+            # The overlay is keyed in seat-1 view; `bt_prefix` is already stripped to that view.
+            # The "partial" match should be checked against the seat-1 view auction string.
+            rules_for_seat = overlay_by_seat.get(int(bt_seat), [])
+            if rules_for_seat:
+                bt_child_auc = f"{bt_prefix}-{bid}" if bt_prefix else str(bid)
+                bt_child_auc = bt_child_auc.upper()
+                from bbo_bidding_queries_lib import pattern_matches
+                overlay_ok = True
+                for rr in rules_for_seat:
+                    partial = str(rr.get("partial") or "").strip().upper()
+                    if not partial:
+                        continue
+                    if not pattern_matches(partial, bt_child_auc):
+                        continue
+                    criteria_list = rr.get("criteria") or []
+                    # Must satisfy ALL criteria for this overlay rule.
+                    try:
+                        if not (permissive_pass and is_pass):
+                            if not eval_criteria([str(x) for x in criteria_list if x is not None], bt_seat, dealer_rot):
+                                overlay_ok = False
+                                break
+                    except Exception:
+                        overlay_ok = False
+                        break
+                if not overlay_ok:
+                    continue
+
+            valid.append((bid, int(idx), bool(is_comp)))
         
         return valid
     
@@ -8558,18 +8636,6 @@ def handle_best_auctions_lookahead(
     
     # Results: (score, dd, ev, auction, contract)
     results: List[Tuple[float, int, float, str, str]] = []
-    
-    # Debug info
-    debug_info: Dict[str, Any] = {
-        "root_valid_count": 0,
-        "total_valid_found": 0,
-        "max_score_seen": float("-inf"),
-        "max_depth_reached": 0,
-        "first_valid_bid": None,
-        "first_bid_children": 0,
-        "first_bid_valid_children": 0,
-        "hydrate_time_ms": 0.0,
-    }
 
     def _metric(dd_v: int, ev_v: float) -> float:
         return float(dd_v) if metric.upper() == "DD" else float(ev_v)
@@ -8583,7 +8649,6 @@ def handle_best_auctions_lookahead(
         """
         nonlocal expanded_nodes
         depth = max_depth - depth_remaining
-        debug_info["max_depth_reached"] = max(debug_info["max_depth_reached"], depth)
 
         if depth_remaining <= 0:
             return float("-inf")
@@ -8603,7 +8668,6 @@ def handle_best_auctions_lookahead(
             dd_v = get_dd(prefix_auc)
             ev_v = get_ev(prefix_auc)
             out = _metric(dd_v, ev_v)
-            debug_info["max_score_seen"] = max(debug_info["max_score_seen"], out)
             if metric.upper() == "DD":
                 best_dd_cache[key] = int(out)
             else:
@@ -8616,7 +8680,6 @@ def handle_best_auctions_lookahead(
             expanded_nodes += 1
             valid = get_valid_next_bids(prefix_auc)
             ui_valid_cache[prefix_auc] = valid
-            debug_info["total_valid_found"] += len(valid)
         
         if not valid:
             if metric.upper() == "DD":
@@ -8645,7 +8708,6 @@ def handle_best_auctions_lookahead(
                 ev_v = get_ev(child_auc)
                 score = _metric(dd_v, ev_v)
                 best = max(best, score)
-                debug_info["max_score_seen"] = max(debug_info["max_score_seen"], score)
             else:
                 best = max(best, _best_reachable(child_auc, depth_remaining - 1))
 
@@ -8673,19 +8735,9 @@ def handle_best_auctions_lookahead(
             expanded_nodes += 1
             valid = get_valid_next_bids(prefix_auc)
             ui_valid_cache[cache_key] = valid
-            debug_info["total_valid_found"] += len(valid)
         
         if not valid:
             return
-        
-        if depth == 0:
-            debug_info["root_valid_count"] = len(valid)
-            if valid:
-                first_bid, first_idx, _ = valid[0]
-                debug_info["first_valid_bid"] = first_bid
-                # Get children count for first bid
-                first_child_map = _get_child_map_for_parent(state, first_idx) if first_idx else {}
-                debug_info["first_bid_children"] = len(first_child_map)
         
         # Score and sort candidates by lookahead best reachable metric
         scored: List[Tuple[float, str, int, bool, str]] = []
@@ -8696,7 +8748,6 @@ def handle_best_auctions_lookahead(
                 dd_v = get_dd(child_auc)
                 ev_v = get_ev(child_auc)
                 score = _metric(dd_v, ev_v)
-                debug_info["max_score_seen"] = max(debug_info["max_score_seen"], score)
                 results.append((score, dd_v, ev_v, child_auc, get_contract(child_auc)))
                 scored.append((score, bid, idx, True, child_auc))
             else:
@@ -8740,35 +8791,14 @@ def handle_best_auctions_lookahead(
             "ev": round(ev_v, 1) if ev_v != float("-inf") else None,
             "is_par": is_par,
         })
-    
-    # Output policy: all par auctions + fill to max_results
-    if par_score_i is not None:
-        par_aucs = [r for r in output if r.get("is_par")]
-        non_par = [r for r in output if not r.get("is_par")]
-        final = list(par_aucs)
-        if len(final) < max_results:
-            final.extend(non_par[: max_results - len(final)])
-    else:
-        final = output[:max_results]
+    final = output[:max_results]
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    
-    # Clean up debug_info for JSON serialization
-    if debug_info["max_score_seen"] == float("-inf"):
-        debug_info["max_score_seen"] = None
-    debug_info["hydrate_time_ms"] = round(debug_info["hydrate_time_ms"], 1)
-    
     return {
         "auctions": final,
         "par_score": par_score_i,
         "metric": metric.upper(),
         "elapsed_ms": round(elapsed_ms, 1),
-        "stats": {
-            "expanded_nodes": expanded_nodes,
-            "bt_meta_loaded_rows": bt_meta_loaded,
-            "deadline_s": deadline_s,
-            "debug": debug_info
-        },
     }
 
 
@@ -8805,6 +8835,12 @@ def handle_deal_matched_bt_sample(
     except Exception as e:
         raise ValueError(f"Invalid deal_row_idx {deal_row_idx}: {e}")
     dealer_actual = str(deal_row.get("Dealer", "N")).upper()
+    # Lead passes matter for mapping BT seat-1 view → dealer-relative seats.
+    # BT seat-1 view strips opening passes; criteria are stored as Agg_Expr_Seat_1..4 in that view.
+    # For conformance checks against deal bitmaps (dealer-relative), rotate criteria by the deal's leading passes.
+    actual_auction_s = _bid_value_to_str(deal_row.get("bid") or deal_row.get("Actual_Auction") or "")
+    lead_passes = _count_leading_passes(actual_auction_s)
+    auction_prefix = ("P-" * int(lead_passes)) if int(lead_passes) > 0 else ""
     par_score = deal_row.get("ParScore", deal_row.get("Par_Score"))
     try:
         par_score_i = int(par_score) if par_score is not None else None
@@ -8933,12 +8969,25 @@ def handle_deal_matched_bt_sample(
                 # Check conformance for this deal_row_idx against (possibly augmented) criteria.
                 # Use permissive_pass to allow 'P' bids even if their criteria fails.
                 # This matches the client-side logic where 'P' is always a valid bid choice.
+                rotated_rules = {
+                    **row_rules,
+                    # Rotate Agg_Expr_Seat_k from BT seat-1 view to dealer-relative seats.
+                    # dealer_seat = (lead_passes + bt_seat - 1) % 4 + 1
+                    **{
+                        f"Agg_Expr_Seat_{((int(lead_passes) + (bt_seat - 1)) % 4) + 1}": row_rules.get(
+                            f"Agg_Expr_Seat_{bt_seat}"
+                        )
+                        for bt_seat in range(1, 5)
+                    },
+                }
+                auction_for_check = f"{auction_prefix}{str(row_rules.get('Auction') or '')}"
                 conf = _check_deal_criteria_conformance_bitmap(
                     int(deal_row_idx),
-                    row_rules,
+                    rotated_rules,
                     dealer_actual,
                     deal_criteria_by_seat_dfs,
-                    auction=str(row_rules.get("Auction") or ""),
+                    deal_row=deal_row,
+                    auction=auction_for_check,
                     permissive_pass=permissive_pass,
                 )
                 if conf.get("first_wrong_seat") is None:
@@ -8985,7 +9034,12 @@ def handle_deal_matched_bt_sample(
     out_rows: list[dict[str, Any]] = []
     metric_u = str(metric or "DD").upper()
     for row in bt_rows_for_eval:
-        auc = str(row.get("Auction") or "")
+        auc_raw = str(row.get("Auction") or "")
+        # Ensure auction string includes the deal's opening passes for correct dealer-relative scoring.
+        # (BT/criteria logic often uses seat-1 view; scoring/par matching must align to actual dealer.)
+        auc_lp = _count_leading_passes(auc_raw)
+        diff_lp = int(lead_passes) - int(auc_lp)
+        auc = (("P-" * diff_lp) + auc_raw) if diff_lp > 0 else auc_raw
         bt_index = row.get("bt_index")
         is_completed = bool(row.get("is_completed_auction"))
 

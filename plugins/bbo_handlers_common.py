@@ -1403,6 +1403,7 @@ def check_deal_criteria_conformance_bitmap(
     bt_info: Dict[str, Any] | None,
     dealer: str,
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, Any]],
+    deal_row: Dict[str, Any] | None = None,
     auction: str | None = None,
     permissive_pass: bool = False,
 ) -> Dict[str, Any]:
@@ -1444,14 +1445,24 @@ def check_deal_criteria_conformance_bitmap(
         
         failed_criteria: List[str] = []
         for criterion in criteria_list:
-            if criterion not in criteria_df.columns:
+            # Case 1: precomputed bitmap criterion
+            if criterion in criteria_df.columns:
+                try:
+                    bitmap_value = criteria_df[criterion][deal_idx]
+                    if not bitmap_value:
+                        failed_criteria.append(criterion)
+                except (IndexError, KeyError):
+                    continue
                 continue
-            try:
-                bitmap_value = criteria_df[criterion][deal_idx]
-                if not bitmap_value:
-                    failed_criteria.append(criterion)
-            except (IndexError, KeyError):
-                continue
+
+            # Case 2: dynamic/overlay criterion (e.g., SL_S >= 5, HCP >= 12, complex logical expr)
+            if deal_row is not None:
+                try:
+                    ok = evaluate_sl_criterion(str(criterion), dealer, seat, deal_row, fail_on_missing=True)
+                except Exception:
+                    ok = None
+                if ok is False:
+                    failed_criteria.append(str(criterion))
         
         if failed_criteria:
             # Permissive Pass: if the bid at this seat is 'P', don't mark it as a wrong bid.
@@ -1824,6 +1835,11 @@ def evaluate_sl_criterion(
     
     # Try complex expression with logical operators (e.g., SL_D > SL_H | SL_D > SL_S)
     if is_complex_expression(criterion):
+        return evaluate_complex_expression(criterion, dealer, seat, deal_row, fail_on_missing)
+
+    # Try general comparison expression (e.g., HCP >= 30, Total_Points >= 25).
+    # These appear in bbo_custom_auction_criteria.csv and may not have bitmap columns.
+    if re.search(r"(>=|<=|==|!=|>|<)", str(criterion)):
         return evaluate_complex_expression(criterion, dealer, seat, deal_row, fail_on_missing)
     
     # Not an SL/complex criterion - fall through to bitmap lookup

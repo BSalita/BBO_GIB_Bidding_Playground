@@ -95,83 +95,20 @@ from bbo_bidding_queries_lib import (
 
 import importlib
 
+# Library-first core (shared state + plugin hot-reload)
+from bbo_bidding_core import CoreNotReadyError, CoreService
+
 # Track mtime of plugins directory for hot-reload
 _PLUGINS_DIR = pathlib.Path(__file__).parent / "plugins"
-_plugins_mtime: float = 0.0
-_plugins_last_reload_epoch_s: float | None = None
-_plugins_lock = threading.Lock()
+# Global, long-lived core instance for this process.
+CORE = CoreService(plugins_dir=_PLUGINS_DIR)
 
-# Global registry of loaded plugins
-PLUGINS: Dict[str, Any] = {}
+# Global registry of loaded plugins (hot-reloaded). Kept for compatibility with handler usage.
+PLUGINS: Dict[str, Any] = CORE.plugins
 
 def _reload_plugins() -> dict[str, object]:
-    """Reload all modules in the plugins directory if any have been modified.
-    
-    This allows editing handler code without restarting the server.
-    """
-    global _plugins_mtime, _plugins_last_reload_epoch_s
-    
-    # Check if plugins directory exists
-    if not _PLUGINS_DIR.exists():
-        return {"reloaded": False, "mtime": None, "reloaded_at": None}
-    
-    # Check mtime of the plugins directory itself and all .py files inside
-    # (max mtime of any file or the dir)
-    try:
-        current_mtime = _PLUGINS_DIR.stat().st_mtime
-        for p in _PLUGINS_DIR.glob("*.py"):
-            t = p.stat().st_mtime
-            if t > current_mtime:
-                current_mtime = t
-    except FileNotFoundError:
-        # A file might have been deleted during iteration
-        return {"reloaded": False, "mtime": None, "reloaded_at": None}
-    
-    with _plugins_lock:
-        if current_mtime > _plugins_mtime:
-            _plugins_last_reload_epoch_s = time.time()
-            print(f"[hot-reload] Reloading plugins (mtime {current_mtime})")
-            
-            # Ensure plugins dir is in path or package importable
-            # Since 'plugins' is a package (has __init__.py), we can import 'plugins.module_name'
-            
-            # Reload all .py files in plugins/
-            for p in _PLUGINS_DIR.glob("*.py"):
-                if p.name == "__init__.py":
-                    continue
-                
-                module_name = p.stem
-                full_module_name = f"plugins.{module_name}"
-                
-                try:
-                    if full_module_name in sys.modules:
-                        print(f"  - Reloading {full_module_name}")
-                        mod = sys.modules[full_module_name]
-                        if hasattr(mod, "__spec__") and mod.__spec__ is not None:
-                            module = importlib.reload(mod)
-                        else:
-                            # Fallback: if spec is missing, try to import again
-                            module = importlib.import_module(full_module_name)
-                    else:
-                        print(f"  - Importing {full_module_name}")
-                        module = importlib.import_module(full_module_name)
-                    
-                    PLUGINS[module_name] = module
-                except Exception as e:
-                    print(f"  ! Error loading {full_module_name}: {e}")
-            
-            _plugins_mtime = current_mtime
-            return {
-                "reloaded": True,
-                "mtime": current_mtime,
-                "reloaded_at": _plugins_last_reload_epoch_s,
-            }
-
-    return {
-        "reloaded": False,
-        "mtime": _plugins_mtime if _plugins_mtime else None,
-        "reloaded_at": _plugins_last_reload_epoch_s,
-    }
+    """Hot-reload plugins (delegates to CoreService)."""
+    return CORE.reload_plugins()
 
 # Initialize plugins on startup
 _reload_plugins()
@@ -304,8 +241,7 @@ def _prepare_handler_call() -> Tuple[Dict[str, Any], dict, Any]:
     """
     reload_info = _reload_plugins()
     _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state = CORE.snapshot_state()
     _sanity_check_state_for_memory(state)
     handler_module = _get_handler_module()
     return state, reload_info, handler_module
@@ -846,13 +782,12 @@ async def lifespan(app: FastAPI):
         os._exit(1)
 
     # Startup: start initialization in background thread
-    with _STATE_LOCK:
-        if not STATE["initialized"] and not STATE["initializing"]:
-            STATE["initializing"] = True
-            STATE["error"] = None
-            print("[startup] Starting initialization in background thread...")
-            thread = threading.Thread(target=_heavy_init, daemon=True)
-            thread.start()
+    try:
+        print("[startup] Starting initialization in background thread...")
+        CORE.start_init_async(init_fn=_heavy_init, check_required_files_fn=_check_required_files)
+    except Exception as e:
+        print(f"[startup] FATAL: failed to start init thread: {e}")
+        os._exit(1)
     
     yield  # Server runs here
     
@@ -1278,6 +1213,9 @@ class BestAuctionsLookaheadRequest(BaseModel):
     metric: str = "DD"         # "DD" or "EV"
     max_depth: int = 20        # Max search depth
     max_results: int = 10      # Max results to return
+    # If True, Pass bids are always treated as valid even if their criteria fails.
+    # Must stay consistent with Streamlit "Always treat Pass as valid bid".
+    permissive_pass: bool = True
 
 
 class BestAuctionsLookaheadStartRequest(BaseModel):
@@ -1287,6 +1225,7 @@ class BestAuctionsLookaheadStartRequest(BaseModel):
     metric: str = "DD"
     max_depth: int = 20
     max_results: int = 10
+    permissive_pass: bool = True
     # Controls for long-running searches (bounded server-side in handler as well).
     deadline_s: float = 1000.0
     max_nodes: int = 200000
@@ -1391,80 +1330,11 @@ class G3Index:
         # Filter for unique codes and convert to bid strings
         return sorted(list(set([CODE_TO_BID[c] for c in codes if c > 0])))
 
-STATE: Dict[str, Any] = {
-    "initialized": False,
-    "initializing": False,
-    "warming": False,  # True while pre-warming endpoints
-    "prewarm_progress": None,  # Populated during endpoint pre-warm
-    "error": None,
-    "loading_step": None,  # Current loading step description
-    "loaded_files": {},  # File name -> row count (updated as files load)
-    "deal_df": None,
-    "bt_seat1_df": None,  # Pre-compiled BT table (bbo_bt_compiled.parquet)
-    "bt_openings_df": None,  # Tiny opening-bid lookup table (built from bt_seat1_df)
-    "g3_index": None,       # Gemini-3.2 CSR Traversal Index (built on startup)
-    "deal_criteria_by_seat_dfs": None,
-    "deal_criteria_by_direction_dfs": None,
-    "results": None,
-    # Criteria / aggregate statistics for completed auctions (seat-1 view).
-    # Built from bbo_bt_criteria.parquet + bbo_bt_aggregate.parquet and keyed by bt_index.
-    "bt_stats_df": None,
-    # Completed auctions with Agg_Expr only (63MB, ~975K rows) for fast wrong-bid-stats
-    "bt_completed_agg_df": None,
-    # Optional: bid-category boolean flags from bbo_bt_categories.parquet (Phase 4).
-    "bt_categories_df": None,
-    "bt_category_cols": None,  # list[str]
-    # Fast bt_index -> row position mapping for lightweight BT
-    "bt_index_arr": None,      # numpy array of UInt32
-    "bt_index_monotonic": False,
-    "duckdb_conn": None,
-    # Hot-reloadable overlay rules loaded from bbo_custom_auction_criteria.csv.
-    # These rules are applied on-the-fly to BT rows when serving responses and when building criteria masks.
-    "custom_criteria_overlay": [],
-    # Loaded from bbo_bt_new_rules.parquet (optional - for detailed rule inspection)
-    "new_rules_df": None,
-    "custom_criteria_stats": {},
-    # Set of available criterion names (from deal_criteria_by_direction_dfs) for normalizing CSV criteria strings.
-    "available_criteria_names": None,
-}
+STATE: Dict[str, Any] = CORE.state
 
-# ---------------------------------------------------------------------------
-# Async jobs: best auctions lookahead (timeout-safe)
-# ---------------------------------------------------------------------------
-
-_BEST_AUCTIONS_EXECUTOR = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="best-auctions",
-)
-_BEST_AUCTIONS_JOBS_LOCK = threading.Lock()
-_BEST_AUCTIONS_JOBS: Dict[str, Dict[str, Any]] = {}
-_BEST_AUCTIONS_JOBS_MAX = 200
-_BEST_AUCTIONS_JOBS_TTL_S = 30 * 60  # 30 minutes
-
-
-def _best_auctions_jobs_gc(now_s: float | None = None) -> None:
-    """Remove old/completed jobs to cap memory growth."""
-    now = float(now_s if now_s is not None else time.time())
-    with _BEST_AUCTIONS_JOBS_LOCK:
-        # TTL-based cleanup
-        to_del: list[str] = []
-        for job_id, job in _BEST_AUCTIONS_JOBS.items():
-            created_at = float(job.get("created_at_s") or now)
-            if now - created_at > _BEST_AUCTIONS_JOBS_TTL_S:
-                to_del.append(str(job_id))
-        for job_id in to_del:
-            _BEST_AUCTIONS_JOBS.pop(job_id, None)
-
-        # Size-based cleanup (drop oldest)
-        if len(_BEST_AUCTIONS_JOBS) > _BEST_AUCTIONS_JOBS_MAX:
-            # Sort by created time asc, drop oldest extras
-            items = sorted(
-                _BEST_AUCTIONS_JOBS.items(),
-                key=lambda kv: float(kv[1].get("created_at_s") or now),
-            )
-            overflow = len(_BEST_AUCTIONS_JOBS) - _BEST_AUCTIONS_JOBS_MAX
-            for i in range(max(0, overflow)):
-                _BEST_AUCTIONS_JOBS.pop(items[i][0], None)
+#
+# NOTE: Async job registry lives in CoreService now (library-first).
+#
 
 # Additional optional data file paths
 bt_criteria_file = dataPath.joinpath("bbo_bt_criteria.parquet")
@@ -1473,7 +1343,7 @@ bt_criteria_seat1_file = dataPath.joinpath("bbo_bt_criteria_seat1_df.parquet")
 # Completed auctions with Agg_Expr only (63MB, ~975K rows) for fast wrong-bid-stats lookups
 bt_completed_agg_file = dataPath.joinpath("bbo_bt_completed_agg_expr.parquet")
 
-_STATE_LOCK = threading.Lock()
+_STATE_LOCK = CORE.state_lock
 
 # ---------------------------------------------------------------------------
 # DuckDB Connection for SQL queries
@@ -2623,11 +2493,15 @@ def start_init(background_tasks: BackgroundTasks) -> InitResponse:
             return InitResponse(status="already_initialized")
         if STATE["initializing"]:
             return InitResponse(status="already_initializing")
-        STATE["initializing"] = True
-        STATE["error"] = None
-
-    background_tasks.add_task(_heavy_init)
-    return InitResponse(status="started")
+    try:
+        CORE.start_init_async(init_fn=_heavy_init, check_required_files_fn=_check_required_files)
+        return InitResponse(status="started")
+    except Exception as e:
+        with _STATE_LOCK:
+            STATE["error"] = f"{type(e).__name__}: {e}"
+            STATE["initializing"] = False
+            STATE["initialized"] = False
+        return InitResponse(status="failed")
 
 
 @app.get("/custom-criteria-info")
@@ -2785,11 +2659,14 @@ def _ensure_ready() -> Tuple[
     Dict[int, Dict[str, pl.DataFrame]],
     Dict[Tuple[str, int], Dict[str, Any]],
 ]:
+    try:
+        CORE.ensure_ready()
+    except CoreNotReadyError as e:
+        # Preserve 503 semantics for Streamlit polling.
+        raise HTTPException(status_code=503, detail=str(e))
+
     with _STATE_LOCK:
-        if not STATE["initialized"]:
-            if STATE["initializing"]:
-                raise HTTPException(status_code=503, detail="Initialization in progress")
-            raise HTTPException(status_code=503, detail="Service not initialized")
+        # These are guaranteed by CoreService.ensure_ready() + successful init.
         deal_df = STATE["deal_df"]
         bt_seat1_df = STATE["bt_seat1_df"]
         bt_openings_df = STATE["bt_openings_df"]
@@ -2810,18 +2687,8 @@ def _ensure_ready() -> Tuple[
 @app.post("/openings-by-deal-index")
 def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
     """Opening bids by deal index - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()  # Validate state is ready
-    
-    with _STATE_LOCK:
-        state = dict(STATE)  # Shallow copy for handler
-    
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        # Access plugin dynamically to get fresh version
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-            
         resp = handler_module.handle_openings_by_deal_index(
             state=state,
             sample_size=req.sample_size,
@@ -2845,18 +2712,8 @@ def openings_by_deal_index(req: OpeningsByDealIndexRequest) -> Dict[str, Any]:
 @app.post("/random-auction-sequences")
 def random_auction_sequences(req: RandomAuctionSequencesRequest) -> Dict[str, Any]:
     """Random auction sequences - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-
-    with _STATE_LOCK:
-        state = dict(STATE)
-    
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_random_auction_sequences(
             state=state,
             n_samples=req.n_samples,
@@ -2877,21 +2734,12 @@ def random_auction_sequences(req: RandomAuctionSequencesRequest) -> Dict[str, An
 @app.post("/auction-sequences-matching")
 def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str, Any]:
     """Auction sequences matching pattern - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     
     if state.get("bt_seat1_df") is None or "previous_bid_indices" not in state["bt_seat1_df"].columns:
         raise HTTPException(status_code=500, detail="Column 'previous_bid_indices' not found in bt_seat1_df")
     
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_auction_sequences_matching(
             state=state,
             pattern=req.pattern,
@@ -2908,20 +2756,12 @@ def auction_sequences_matching(req: AuctionSequencesMatchingRequest) -> Dict[str
 @app.post("/auction-sequences-by-index")
 def auction_sequences_by_index(req: AuctionSequencesByIndexRequest) -> Dict[str, Any]:
     """Auction sequences by bt_index list - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
 
     if state.get("bt_seat1_df") is None or "previous_bid_indices" not in state["bt_seat1_df"].columns:
         raise HTTPException(status_code=500, detail="Column 'previous_bid_indices' not found in bt_seat1_df")
 
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_auction_sequences_by_index(
             state=state,
             indices=req.indices,
@@ -2938,20 +2778,13 @@ def deal_criteria_eval_batch(req: DealCriteriaEvalBatchRequest) -> Dict[str, Any
 
     Returns per-seat: passed, failed, untracked.
     """
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     # Allow callers to pass the user-facing deal `index` instead of deal_row_idx.
     # This is fast iff STATE["deal_index_monotonic"] is True.
     deal_row_idx = int(req.deal_row_idx)
     if req.deal_index is not None:
         deal_row_idx = _resolve_deal_row_idx_from_index(state, int(req.deal_index))
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_deal_criteria_failures_batch(
             state=state,
             deal_row_idx=deal_row_idx,
@@ -2968,8 +2801,7 @@ def deals_by_index(req: DealsByIndexRequest) -> Dict[str, Any]:
     """Fetch deal rows by user-facing `index` values using monotonic fast-path."""
     reload_info = _reload_plugins()
     _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state = CORE.snapshot_state()
     deal_df = state.get("deal_df")
     if not isinstance(deal_df, pl.DataFrame):
         raise HTTPException(status_code=500, detail="deal_df not loaded")
@@ -3093,9 +2925,7 @@ def bt_categories_by_index(req: BTCategoriesByIndexRequest) -> Dict[str, Any]:
     reload_info = _reload_plugins()
     _ensure_ready()
     t0 = time.perf_counter()
-
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state = CORE.snapshot_state()
 
     bt_categories_df: pl.DataFrame | None = state.get("bt_categories_df")
     bt_category_cols: list[str] = state.get("bt_category_cols") or []
@@ -3152,15 +2982,8 @@ def bt_categories_by_index(req: BTCategoriesByIndexRequest) -> Dict[str, Any]:
 @app.post("/resolve-auction-path")
 def resolve_auction_path(req: ResolveAuctionPathRequest) -> Dict[str, Any]:
     """Resolve a full auction string - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_resolve_auction_path(
             state=state,
             auction=req.auction,
@@ -3178,16 +3001,8 @@ def resolve_auction_path(req: ResolveAuctionPathRequest) -> Dict[str, Any]:
 @app.post("/deals-matching-auction")
 def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
     """Deals matching auction pattern - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_deals_matching_auction(
             state=state,
             pattern=req.pattern,
@@ -3209,15 +3024,8 @@ def deals_matching_auction(req: DealsMatchingAuctionRequest) -> Dict[str, Any]:
 @app.post("/sample-deals-by-auction-pattern")
 def sample_deals_by_auction_pattern(req: SampleDealsByAuctionPatternRequest) -> Dict[str, Any]:
     """Fast sampling of deals by actual-auction regex (no BT / Rules)."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_sample_deals_by_auction_pattern(
             state=state,
             pattern=req.pattern,
@@ -3232,15 +3040,8 @@ def sample_deals_by_auction_pattern(req: SampleDealsByAuctionPatternRequest) -> 
 @app.post("/auction-pattern-counts")
 def auction_pattern_counts(req: AuctionPatternCountsRequest) -> Dict[str, Any]:
     """Batch counts for actual-auction regex patterns (no BT / Rules)."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_auction_pattern_counts(
             state=state,
             patterns=list(req.patterns),
@@ -3258,16 +3059,8 @@ def auction_pattern_counts(req: AuctionPatternCountsRequest) -> Dict[str, Any]:
 @app.post("/bidding-table-statistics")
 def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, Any]:
     """Bidding table statistics - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_bidding_table_statistics(
             state=state,
             auction_pattern=req.auction_pattern,
@@ -3341,16 +3134,8 @@ def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[s
 @app.post("/process-pbn")
 def process_pbn(req: ProcessPBNRequest) -> Dict[str, Any]:
     """Process PBN or LIN deal(s) - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_process_pbn(
             state=state,
             pbn_input=req.pbn,
@@ -3461,21 +3246,13 @@ def _filter_auctions_by_hand_criteria(
 @app.post("/find-matching-auctions")
 def find_matching_auctions(req: FindMatchingAuctionsRequest) -> Dict[str, Any]:
     """Find matching auctions - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     
     if state.get("bt_seat1_df") is None:
         # This should never happen: bt_seat1 is a required file and init hard-fails if missing.
         raise HTTPException(status_code=503, detail="bt_seat1_df not loaded (pipeline error).")
     
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_find_matching_auctions(
             state=state,
             hcp=req.hcp, sl_s=req.sl_s, sl_h=req.sl_h, sl_d=req.sl_d, sl_c=req.sl_c,
@@ -3523,16 +3300,8 @@ def get_pbn_random() -> Dict[str, Any]:
 @app.post("/pbn-lookup")
 def pbn_lookup(req: PBNLookupRequest) -> Dict[str, Any]:
     """Look up a PBN deal in bbo_mldf_augmented.parquet and return matching rows."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_pbn_lookup(state, req.pbn, req.max_results)
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
@@ -3550,20 +3319,12 @@ def pbn_lookup(req: PBNLookupRequest) -> Dict[str, Any]:
 @app.post("/group-by-bid")
 def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
     """Group deals by bid - delegated to hot-reloadable handler."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     
     if 'bid' not in state["deal_df"].columns:
         raise HTTPException(status_code=500, detail="Column 'bid' not found in deal_df")
     
     try:
-        # Access plugin dynamically
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_group_by_bid(
             state=state,
             auction_pattern=req.auction_pattern,
@@ -3587,13 +3348,8 @@ def group_by_bid(req: GroupByBidRequest) -> Dict[str, Any]:
 @app.post("/bt-seat-stats")
 def bt_seat_stats(req: BTSeatStatsRequest) -> Dict[str, Any]:
     """Compute on-the-fly hand stats for a single bt_seat1 row and seat (or all seats)."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-
-    with _STATE_LOCK:
-        state = dict(STATE)
-        bt_seat1_df = STATE.get("bt_seat1_df")
-
+    state, reload_info, handler_module = _prepare_handler_call()
+    bt_seat1_df = state.get("bt_seat1_df")
     if bt_seat1_df is None:
         raise HTTPException(status_code=503, detail="bt_seat1_df not loaded (pipeline error).")
 
@@ -3602,10 +3358,6 @@ def bt_seat_stats(req: BTSeatStatsRequest) -> Dict[str, Any]:
         if row_df.height == 0:
             raise HTTPException(status_code=404, detail=f"bt_index {req.bt_index} not found in bt_seat1_df")
         bt_row = row_df.row(0, named=True)
-
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
 
         resp = handler_module.handle_bt_seat_stats(
             state=state,
@@ -3744,8 +3496,7 @@ def list_bidding_models() -> Dict[str, Any]:
 @app.post("/bidding-arena")
 def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
     """Bidding Arena: Head-to-head comparison between two bidding models."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
+    state, reload_info, handler_module = _prepare_handler_call()
     
     # Validate model names against registry
     if not MODEL_REGISTRY.is_valid_model(req.model_a):
@@ -3766,9 +3517,6 @@ def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
             detail="model_a and model_b must be different"
         )
     
-    with _STATE_LOCK:
-        state = dict(STATE)
-    
     # Check model availability
     model_a = MODEL_REGISTRY.get(req.model_a)
     model_b = MODEL_REGISTRY.get(req.model_b)
@@ -3784,10 +3532,6 @@ def bidding_arena(req: BiddingArenaRequest) -> Dict[str, Any]:
         )
     
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_bidding_arena(
             state=state,
             model_a=req.model_a,
@@ -3818,17 +3562,8 @@ def auction_dd_analysis(req: AuctionDDAnalysisRequest) -> Dict[str, Any]:
     Finds the auction in BT, matches its Agg_Expr_Seat_[1-4] criteria against
     the deal bitmaps, and returns DD_[NESW]_[CDHSN] columns for matched deals.
     """
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    
-    with _STATE_LOCK:
-        state = dict(STATE)
-    
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_auction_dd_analysis(
             state=state,
             auction=req.auction,
@@ -3851,17 +3586,8 @@ def list_next_bids(req: ListNextBidsRequest) -> Dict[str, Any]:
     with their bt_index and Agg_Expr criteria. Uses the sorted BT structure for
     efficient O(log n) lookups instead of regex scanning.
     """
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    
-    with _STATE_LOCK:
-        state = dict(STATE)
-    
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_list_next_bids(
             state=state,
             auction=req.auction,
@@ -3882,17 +3608,8 @@ def rank_bids_by_ev(req: RankBidsByEVRequest) -> Dict[str, Any]:
     Given an auction prefix (or empty for opening bids), finds all possible next bids
     using next_bid_indices and computes average EV for each bid across matching deals.
     """
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    
-    with _STATE_LOCK:
-        state = dict(STATE)
-    
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_rank_bids_by_ev(
             state=state,
             auction=req.auction,
@@ -3910,14 +3627,8 @@ def rank_bids_by_ev(req: RankBidsByEVRequest) -> Dict[str, Any]:
 @app.post("/contract-ev-deals")
 def contract_ev_deals(req: ContractEVDealsRequest) -> Dict[str, Any]:
     """Return deals matching a selected next bid and a specific contract EV row."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
         resp = handler_module.handle_contract_ev_deals(
             state=state,
             auction=req.auction,
@@ -3942,14 +3653,8 @@ def best_auctions_lookahead(req: BestAuctionsLookaheadRequest) -> Dict[str, Any]
     Uses CSR index for O(1) next-bid traversal and bitmap DFs for O(1) criteria eval.
     Single request replaces dozens of client-side API calls.
     """
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
         resp = handler_module.handle_best_auctions_lookahead(
             state=state,
             deal_row_idx=req.deal_row_idx,
@@ -3957,6 +3662,7 @@ def best_auctions_lookahead(req: BestAuctionsLookaheadRequest) -> Dict[str, Any]
             metric=req.metric,
             max_depth=req.max_depth,
             max_results=req.max_results,
+            permissive_pass=bool(getattr(req, "permissive_pass", True)),
         )
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
@@ -3968,65 +3674,26 @@ def best_auctions_lookahead(req: BestAuctionsLookaheadRequest) -> Dict[str, Any]
 @app.post("/best-auctions-lookahead/start")
 def best_auctions_lookahead_start(req: BestAuctionsLookaheadStartRequest) -> Dict[str, Any]:
     """Start a best-auctions search asynchronously (avoids client read timeouts)."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
-
-    handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-    if not handler_module:
-        raise HTTPException(status_code=500, detail="Plugin 'bbo_bidding_queries_api_handlers' not found")
+    state, reload_info, handler_module = _prepare_handler_call()
 
     job_id = str(uuid.uuid4())
-    job: Dict[str, Any] = {
-        "job_id": job_id,
-        "status": "running",  # running|completed|failed
-        "created_at_s": time.time(),
-        "finished_at_s": None,
-        "request": req.model_dump(),
-        "result": None,
-        "error": None,
-    }
 
-    _best_auctions_jobs_gc(job["created_at_s"])
-    with _BEST_AUCTIONS_JOBS_LOCK:
-        _BEST_AUCTIONS_JOBS[job_id] = job
+    def _run() -> Dict[str, Any]:
+        # Delegate to hot-reloadable handler
+        return handler_module.handle_best_auctions_lookahead(
+            state=state,
+            deal_row_idx=int(req.deal_row_idx),
+            auction_prefix=str(req.auction_prefix or ""),
+            metric=str(req.metric or "DD"),
+            max_depth=int(req.max_depth),
+            max_results=int(req.max_results),
+            permissive_pass=bool(getattr(req, "permissive_pass", True)),
+            deadline_s=float(req.deadline_s),
+            max_nodes=int(req.max_nodes),
+            beam_width=int(req.beam_width),
+        )
 
-    def _run_job() -> None:
-        try:
-            t_wall0 = time.perf_counter()
-            t_cpu0 = time.process_time()
-            # Delegate to hot-reloadable handler
-            resp = handler_module.handle_best_auctions_lookahead(
-                state=state,
-                deal_row_idx=int(req.deal_row_idx),
-                auction_prefix=str(req.auction_prefix or ""),
-                metric=str(req.metric or "DD"),
-                max_depth=int(req.max_depth),
-                max_results=int(req.max_results),
-                deadline_s=float(req.deadline_s),
-                max_nodes=int(req.max_nodes),
-                beam_width=int(req.beam_width),
-            )
-            t_wall1 = time.perf_counter()
-            t_cpu1 = time.process_time()
-            with _BEST_AUCTIONS_JOBS_LOCK:
-                j = _BEST_AUCTIONS_JOBS.get(job_id)
-                if j is not None:
-                    j["status"] = "completed"
-                    j["result"] = resp
-                    j["wall_elapsed_s"] = round(t_wall1 - t_wall0, 3)
-                    j["cpu_elapsed_s"] = round(t_cpu1 - t_cpu0, 3)
-                    j["finished_at_s"] = time.time()
-        except Exception as e:
-            with _BEST_AUCTIONS_JOBS_LOCK:
-                j = _BEST_AUCTIONS_JOBS.get(job_id)
-                if j is not None:
-                    j["status"] = "failed"
-                    j["error"] = f"{e}"
-                    j["finished_at_s"] = time.time()
-
-    _BEST_AUCTIONS_EXECUTOR.submit(_run_job)
+    CORE.start_job(job_id=job_id, payload=req.model_dump(), run_fn=_run)
     return _attach_hot_reload_info({"job_id": job_id, "status": "running"}, reload_info)
 
 
@@ -4035,27 +3702,17 @@ def best_auctions_lookahead_status(job_id: str) -> Dict[str, Any]:
     """Poll status/results for an async best-auctions job."""
     reload_info = _reload_plugins()
     _ensure_ready()
-    _best_auctions_jobs_gc()
-    with _BEST_AUCTIONS_JOBS_LOCK:
-        job = _BEST_AUCTIONS_JOBS.get(str(job_id))
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
-        # Shallow copy so we don't leak executor internals / allow mutation
-        out = dict(job)
-    return _attach_hot_reload_info(out, reload_info)
+    job = CORE.get_job(str(job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+    return _attach_hot_reload_info(job, reload_info)
 
 
 @app.post("/greedy-model-path")
 def greedy_model_path(req: GreedyModelPathRequest) -> Dict[str, Any]:
     """Compute the greedy 'model path' from a given prefix by picking the top bid at each step."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
         resp = handler_module.handle_greedy_model_path(
             state=state,
             auction_prefix=req.auction_prefix,
@@ -4071,10 +3728,7 @@ def greedy_model_path(req: GreedyModelPathRequest) -> Dict[str, Any]:
 @app.post("/deal-matched-bt-sample")
 def deal_matched_bt_sample(req: DealMatchedBTSampleRequest) -> Dict[str, Any]:
     """Return a random sample of BT rows that match a pinned deal (GPU-verified index)."""
-    reload_info = _reload_plugins()
-    _ensure_ready()
-    with _STATE_LOCK:
-        state = dict(STATE)
+    state, reload_info, handler_module = _prepare_handler_call()
 
     # Allow callers to pass the user-facing deal `index` instead of deal_row_idx.
     deal_row_idx = int(req.deal_row_idx)
@@ -4082,10 +3736,6 @@ def deal_matched_bt_sample(req: DealMatchedBTSampleRequest) -> Dict[str, Any]:
         deal_row_idx = _resolve_deal_row_idx_from_index(state, int(req.deal_index))
 
     try:
-        handler_module = PLUGINS.get("bbo_bidding_queries_api_handlers")
-        if not handler_module:
-            raise ImportError("Plugin 'bbo_bidding_queries_api_handlers' not found")
-
         resp = handler_module.handle_deal_matched_bt_sample(
             state=state,
             deal_row_idx=deal_row_idx,
