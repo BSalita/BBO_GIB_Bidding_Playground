@@ -1213,9 +1213,6 @@ class BestAuctionsLookaheadRequest(BaseModel):
     metric: str = "DD"         # "DD" or "EV"
     max_depth: int = 20        # Max search depth
     max_results: int = 10      # Max results to return
-    # If True, Pass bids are always treated as valid even if their criteria fails.
-    # Must stay consistent with Streamlit "Always treat Pass as valid bid".
-    permissive_pass: bool = True
 
 
 class BestAuctionsLookaheadStartRequest(BaseModel):
@@ -1225,7 +1222,6 @@ class BestAuctionsLookaheadStartRequest(BaseModel):
     metric: str = "DD"
     max_depth: int = 20
     max_results: int = 10
-    permissive_pass: bool = True
     # Controls for long-running searches (bounded server-side in handler as well).
     deadline_s: float = 1000.0
     max_nodes: int = 200000
@@ -3662,7 +3658,6 @@ def best_auctions_lookahead(req: BestAuctionsLookaheadRequest) -> Dict[str, Any]
             metric=req.metric,
             max_depth=req.max_depth,
             max_results=req.max_results,
-            permissive_pass=bool(getattr(req, "permissive_pass", True)),
         )
         return _attach_hot_reload_info(resp, reload_info)
     except ValueError as e:
@@ -3687,7 +3682,6 @@ def best_auctions_lookahead_start(req: BestAuctionsLookaheadStartRequest) -> Dic
             metric=str(req.metric or "DD"),
             max_depth=int(req.max_depth),
             max_results=int(req.max_results),
-            permissive_pass=bool(getattr(req, "permissive_pass", True)),
             deadline_s=float(req.deadline_s),
             max_nodes=int(req.max_nodes),
             beam_width=int(req.beam_width),

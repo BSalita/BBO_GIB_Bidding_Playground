@@ -109,6 +109,7 @@ This document describes the Streamlit sidebar **Function** selectbox options and
     - **Best Auctions Ranked by DD**
     - **Best Auctions Ranked by EV**
     - Empty-case message: “Deal has no pre-computed auction which will result in par score. Try manually entering auction.”
+    - Note (known issue): After clicking the “Show Best …” button, the **Model Path** auction box may not render (unresolved UI glitch).
   - **📋 Completed Auction Summary** (step-by-step table, per seat/bid)
   - **Current Auction** (summary grid; selectable)
   - **🎯 Matching Deals** (deal list for the selected step or completed auction)

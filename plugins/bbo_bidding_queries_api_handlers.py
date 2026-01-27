@@ -8318,7 +8318,6 @@ def handle_best_auctions_lookahead(
     metric: str,  # "DD" or "EV"
     max_depth: int = 20,
     max_results: int = 10,
-    permissive_pass: bool = True,
     deadline_s: float = 5.0,
     max_nodes: int = 50000,  # max prefix expansions per request (safety cap)
     beam_width: int = 25,    # how many children to explore per node (lookahead + dfs)
@@ -8566,12 +8565,10 @@ def handle_best_auctions_lookahead(
             if m is None:
                 continue
             is_comp, expr = m
-            is_pass = str(bid or "").strip().upper() in ("P", "PASS")
             # Expr is the criteria for this specific bid (candidate_bid at this BT row).
             # Evaluate it for the seat that is making this bid.
-            if not (permissive_pass and is_pass):
-                if not eval_criteria(expr, bt_seat, dealer_rot):
-                    continue
+            if not eval_criteria(expr, bt_seat, dealer_rot):
+                continue
 
             # ALSO enforce the custom CSV overlay rules (if any) at this exact BT seat.
             # The overlay is keyed in seat-1 view; `bt_prefix` is already stripped to that view.
@@ -8591,10 +8588,9 @@ def handle_best_auctions_lookahead(
                     criteria_list = rr.get("criteria") or []
                     # Must satisfy ALL criteria for this overlay rule.
                     try:
-                        if not (permissive_pass and is_pass):
-                            if not eval_criteria([str(x) for x in criteria_list if x is not None], bt_seat, dealer_rot):
-                                overlay_ok = False
-                                break
+                        if not eval_criteria([str(x) for x in criteria_list if x is not None], bt_seat, dealer_rot):
+                            overlay_ok = False
+                            break
                     except Exception:
                         overlay_ok = False
                         break
@@ -9155,7 +9151,7 @@ def handle_greedy_model_path(
     bt_openings_df = state.get("bt_openings_df")
     bt_ev_stats_df = state.get("bt_ev_stats_df")
     
-    debug_info: Dict[str, Any] = {"steps_tried": 0, "break_reason": None}
+    debug_info: Dict[str, Any] = {"steps_tried": 0, "break_reason": None, "forcing_pass_debug": []}
     
     if deal_df is None:
         return {"greedy_path": "", "steps": 0, "elapsed_ms": 0, "error": "deal_df not loaded", "debug": debug_info}
@@ -9171,6 +9167,11 @@ def handle_greedy_model_path(
     
     current_auc_input = normalize_auction_input(auction_prefix).upper() if auction_prefix else ""
     path_bids = [t.strip() for t in current_auc_input.split("-") if t.strip()]
+    # Track the chosen criteria for each bid in `path_bids` (same index).
+    # For the initial prefix (if any), we don't have criteria here; leave empty.
+    chosen_agg_expr_by_step: list[list[Any]] = [[] for _ in path_bids]
+    chosen_expr_by_step: list[list[Any]] = [[] for _ in path_bids]
+    chosen_bt_index_by_step: list[int | None] = [None for _ in path_bids]
     
     file_path = _bt_file_path_for_sql(state)
     conn = duckdb.connect(":memory:")
@@ -9224,6 +9225,111 @@ def handle_greedy_model_path(
                 if not bits[crit_s]:
                     return False
         return True
+
+    def _iter_criteria_tokens(criteria_val: Any) -> list[str]:
+        """Normalize Expr/Agg_Expr shapes into a list of upper-case tokens."""
+        if criteria_val is None:
+            return []
+        # Common shapes:
+        # - list[str]
+        # - list[Any]
+        # - single str
+        if isinstance(criteria_val, str):
+            s = criteria_val.strip()
+            return [s.upper()] if s else []
+        if isinstance(criteria_val, (list, tuple)):
+            out: list[str] = []
+            for x in criteria_val:
+                try:
+                    xs = str(x).strip()
+                    if xs:
+                        out.append(xs.upper())
+                except Exception:
+                    continue
+            return out
+        try:
+            s = str(criteria_val).strip()
+            return [s.upper()] if s else []
+        except Exception:
+            return []
+
+    def _has_forcing_to_3n(expr_list: Any, agg_expr_list: Any) -> bool:
+        # Forcing flag may be present either in raw Expr(s)/Criteria or in Agg_Expr.
+        for tok in (_iter_criteria_tokens(expr_list) + _iter_criteria_tokens(agg_expr_list)):
+            # Be permissive: sometimes a criterion can be embedded in a larger expression string.
+            # Example: "Forcing_To_3N & Some_Other_Flag"
+            if "FORCING_TO_3N" in tok:
+                return True
+        return False
+
+    # NOTE: Do not fall back to scanning full BT rows for forcing detection.
+    # Per project rule, use only partner's per-step Expr(s) and Agg_Expr(s) that came from list-next-bids.
+
+    def _is_contract_below_3nt(auction: str) -> bool:
+        """True iff the current contract (last bid) is strictly below 3NT."""
+        try:
+            toks0 = [t.strip().upper() for t in str(auction or "").split("-") if t.strip()]
+        except Exception:
+            toks0 = []
+        last_level: int | None = None
+        last_strain: str | None = None  # "C/D/H/S/N"
+        for t in toks0:
+            if len(t) == 2 and t[0] in "1234567" and t[1] in "CDHSN":
+                try:
+                    last_level = int(t[0])
+                    last_strain = t[1]
+                except Exception:
+                    continue
+        # No contract yet -> below 3NT
+        if last_level is None or last_strain is None:
+            return True
+        suit_order = {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}
+        try:
+            return (int(last_level), int(suit_order.get(str(last_strain).upper(), 0))) < (3, 4)
+        except Exception:
+            return True
+
+    # Partnership-level Forcing_To_3N state for the greedy path.
+    forcing_to_3n_active_by_side: dict[str, bool] = {"NS": False, "EW": False}
+    forcing_to_3n_passes_below_3nt_by_side: dict[str, int] = {"NS": 0, "EW": 0}
+
+    bt_seat1_file = state.get("bt_seat1_file") or _bt_file_path_for_sql(state)
+    _agg_cache: dict[int, dict[str, Any]] = {}
+
+    def _enrich_expr_and_agg_expr(
+        bt_idx: int | None,
+        bt_step_seat: int,
+        *,
+        fallback_expr: list[Any],
+        fallback_agg: list[Any],
+    ) -> tuple[list[Any], list[Any]]:
+        """Best-effort enrich chosen Expr/Agg_Expr from the BT row (on-demand).
+
+        Rationale: list-next-bids may return only per-step Expr-derived criteria when bt_seat1_df
+        is loaded in lightweight mode. Some aggregated flags (like Forcing_To_3N) can live only in
+        Agg_Expr_Seat_* columns and must be loaded from the parquet on-demand.
+        """
+        if bt_idx is None or bt_seat1_file is None:
+            return fallback_expr, fallback_agg
+        try:
+            bt_i = int(bt_idx)
+        except Exception:
+            return fallback_expr, fallback_agg
+        try:
+            row = _agg_cache.get(bt_i)
+            if row is None:
+                agg = _load_agg_expr_for_bt_indices([bt_i], bt_seat1_file)
+                if not isinstance(agg, dict) or bt_i not in agg:
+                    return fallback_expr, fallback_agg
+                base_row: dict[str, Any] = {"bt_index": bt_i}
+                base_row.update(agg.get(bt_i) or {})
+                row = _apply_all_rules_to_bt_row(base_row, state)
+                _agg_cache[bt_i] = row
+            expr_val = row.get("Expr") or fallback_expr
+            agg_val = row.get(f"Agg_Expr_Seat_{int(bt_step_seat)}") or fallback_agg
+            return expr_val, agg_val
+        except Exception:
+            return fallback_expr, fallback_agg
 
     for step_i in range(max_depth):
         debug_info["steps_tried"] = step_i + 1
@@ -9297,6 +9403,8 @@ def handle_greedy_model_path(
                 "can_complete": b.get("can_complete"),
                 # Optional (may be absent)
                 "next_bid_indices": b.get("next_bid_indices") or [],
+                # Optional: raw per-step criteria
+                "expr": b.get("expr") or [],
             })
             crits_list.append(b.get("agg_expr") or [])
 
@@ -9332,6 +9440,57 @@ def handle_greedy_model_path(
         rejected_count = 0
         criteria_fail_count = 0
         total_children = len(row_dicts)
+
+        # Forcing logic:
+        # If a side has Forcing_To_3N active, then while the contract is still below 3NT:
+        # - If the immediately previous call was an opponent Pass, the forcing side to act may NOT pass.
+        #   (This blocks the common "partner forced → opponent passed → responder cannot pass" case.)
+        # - Additionally, that side may make at most 1 Pass below 3NT; further passes below 3NT are rejected.
+        bidder_idx = len(path_bids)
+        bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + bidder_idx) % 4]
+        bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
+        bidder_forcing_active_before = bool(forcing_to_3n_active_by_side.get(bidder_side, False))
+        contract_below_3nt = _is_contract_below_3nt(prefix)
+        prev_call = str(path_bids[-1]).strip().upper() if path_bids else ""
+        prev_side: str | None = None
+        try:
+            if path_bids:
+                prev_bidder_idx = len(path_bids) - 1
+                prev_bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + prev_bidder_idx) % 4]
+                prev_side = "NS" if prev_bidder_dir in ("N", "S") else "EW"
+        except Exception:
+            prev_side = None
+
+        block_pass_after_opponent_pass = (
+            bidder_forcing_active_before
+            and contract_below_3nt
+            and prev_call in ("P", "PASS")
+            and (prev_side is not None and prev_side != bidder_side)
+        )
+        block_pass_for_bidder = (
+            block_pass_after_opponent_pass
+            or (
+                bidder_forcing_active_before
+                and contract_below_3nt
+                and int(forcing_to_3n_passes_below_3nt_by_side.get(bidder_side, 0) or 0) >= 1
+            )
+        )
+        try:
+            debug_info["forcing_pass_debug"].append({
+                "step": step_i + 1,
+                "prefix": prefix,
+                "bidder_dir": bidder_dir,
+                "bidder_side": bidder_side,
+                "prev_call": prev_call,
+                "prev_side": prev_side,
+                "contract_below_3nt": contract_below_3nt,
+                "forcing_active": dict(forcing_to_3n_active_by_side),
+                "passes_below_3nt": dict(forcing_to_3n_passes_below_3nt_by_side),
+                "block_pass_after_opponent_pass": bool(block_pass_after_opponent_pass),
+                "block_pass_for_bidder": bool(block_pass_for_bidder),
+            })
+        except Exception:
+            pass
         
         for i, row_dict in enumerate(row_dicts):
             bt_idx = row_dict["bt_index"]
@@ -9340,9 +9499,14 @@ def handle_greedy_model_path(
             matches_count = row_dict.get("matching_deal_count")
             next_indices_list = row_dict.get("next_bid_indices") or []
             crits = crits_list[i]
+            exprs = row_dict.get("expr") or []
             
             # Determine if Rejected
             is_pass = str(bid).upper() in ("P", "PASS")
+            # Enforce forcing sequences: once forcing is active, do not allow 2nd/3rd pass below 3NT.
+            if block_pass_for_bidder and is_pass:
+                rejected_count += 1
+                continue
             # Prefer explicit dead-end flag from list-next-bids if present
             if "is_dead_end" in row_dict:
                 is_dead_end = bool(row_dict.get("is_dead_end"))
@@ -9427,7 +9591,10 @@ def handle_greedy_model_path(
             
             candidates.append({
                 "bid": bid,
-                "sort_key": (-dd_score, -ev_score, -float(matches_count or 0), str(bid).upper())
+                "sort_key": (-dd_score, -ev_score, -float(matches_count or 0), str(bid).upper()),
+                "_agg_expr": crits,
+                "_expr": exprs,
+                "_bt_index": bt_idx,
             })
         
         if not candidates:
@@ -9435,8 +9602,54 @@ def handle_greedy_model_path(
             break
         
         candidates.sort(key=lambda x: x["sort_key"])
-        best_bid = candidates[0]["bid"]
+        best = candidates[0]
+        best_bid = best["bid"]
         path_bids.append(best_bid)
+        best_bt_idx = best.get("_bt_index")
+        best_expr_raw = best.get("_expr") or []
+        best_agg_raw = best.get("_agg_expr") or []
+        # Enrich to get true aggregated criteria (Agg_Expr_Seat_{bt_seat}) when available.
+        best_expr, best_agg = _enrich_expr_and_agg_expr(
+            best_bt_idx,
+            bt_seat,
+            fallback_expr=list(best_expr_raw) if isinstance(best_expr_raw, list) else [],
+            fallback_agg=list(best_agg_raw) if isinstance(best_agg_raw, list) else [],
+        )
+        chosen_agg_expr_by_step.append(best_agg or [])
+        chosen_expr_by_step.append(best_expr or [])
+        chosen_bt_index_by_step.append(best_bt_idx)
+
+        # Update partnership forcing state and pass counter (based on the bid we just took).
+        try:
+            best_is_pass = str(best_bid).strip().upper() in ("P", "PASS")
+            # Use enriched Expr/Agg_Expr for forcing detection.
+            best_has_forcing = _has_forcing_to_3n(best_expr, best_agg)
+            if best_has_forcing:
+                forcing_to_3n_active_by_side[bidder_side] = True
+            # Count passes only if forcing was already active at the time of the pass
+            # and we are still below 3NT at that time.
+            if best_is_pass and bidder_forcing_active_before and contract_below_3nt:
+                forcing_to_3n_passes_below_3nt_by_side[bidder_side] = int(
+                    forcing_to_3n_passes_below_3nt_by_side.get(bidder_side, 0) or 0
+                ) + 1
+            try:
+                if debug_info.get("forcing_pass_debug"):
+                    debug_info["forcing_pass_debug"][-1].update({
+                        "chosen_bid": best_bid,
+                        "chosen_is_pass": bool(best_is_pass),
+                        "chosen_has_forcing": bool(best_has_forcing),
+                        "chosen_bt_index": best_bt_idx,
+                        "chosen_bt_seat": int(bt_seat),
+                        "bt_seat1_file_present": bool(bt_seat1_file),
+                        "chosen_expr_len": len(best_expr) if isinstance(best_expr, list) else None,
+                        "chosen_agg_len": len(best_agg) if isinstance(best_agg, list) else None,
+                        "chosen_expr_sample": [str(x) for x in (best_expr or [])[:6]],
+                        "chosen_agg_sample": [str(x) for x in (best_agg or [])[:6]],
+                    })
+            except Exception:
+                pass
+        except Exception:
+            pass
     
     conn.close()
     elapsed_ms = (time.perf_counter() - t0) * 1000

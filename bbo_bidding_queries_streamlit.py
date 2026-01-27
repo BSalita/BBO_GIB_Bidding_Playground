@@ -5528,24 +5528,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             color: #f00 !important;
             background: transparent !important;
         }
-
-        /* Make "Show Best ... Pre-computed Auctions" button green */
-        .st-key-show_best_auctions_btn_1 button,
-        .st-key-show_best_auctions_btn_2 button,
-        .st-key-show_best_auctions_btn_3 button,
-        .st-key-show_best_auctions_btn_4 button {
-            background: #28a745 !important;
-            border-color: #28a745 !important;
-            color: #fff !important;
-        }
-        .st-key-show_best_auctions_btn_1 button:hover,
-        .st-key-show_best_auctions_btn_2 button:hover,
-        .st-key-show_best_auctions_btn_3 button:hover,
-        .st-key-show_best_auctions_btn_4 button:hover {
-            background: #218838 !important;
-            border-color: #1e7e34 !important;
-            color: #fff !important;
-        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -6020,18 +6002,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     st.error(f"Error resolving auction path: {e}")
                     new_path = [{"bid": b, "bt_index": None, "agg_expr": [], "is_complete": False} for b in expected_bids]
             
-            # Summary consistency:
-            # If the user has "Always treat Pass as valid bid" enabled, mark all Pass calls so
-            # the Bid-by-Bid Summary won't evaluate/flag criteria failures on Pass steps.
-            # (This matches the behavior when selecting bids from the per-step grids.)
-            try:
-                if bool(st.session_state.get("always_valid_pass", True)) and new_path:
-                    for step in new_path:
-                        if str(step.get("bid", "") or "").strip().upper() == "P":
-                            step["_pass_valid_selection"] = True
-            except Exception:
-                pass
-
             # Mark is_complete on final step if auction ends with 3 passes (or 4 passes for passed out)
             if new_path:
                 all_bids = [step.get("bid", "").upper() for step in new_path]
@@ -6436,14 +6406,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             for i, opt in enumerate(sorted_options):
                 criteria_list = opt.get("agg_expr", [])
                 criteria_str = "; ".join(criteria_list)
-                # BT raw per-step Expr (may differ from agg_expr after overlay/dedupe)
-                expr_list = opt.get("expr", [])
-                if isinstance(expr_list, str):
-                    expr_text = expr_list.strip() if expr_list.strip() else "(none)"
-                elif isinstance(expr_list, list) and expr_list:
-                    expr_text = "\n".join(str(x) for x in expr_list if x is not None and str(x).strip()) or "(none)"
-                else:
-                    expr_text = "(none)"
                 complete_marker = " ✅" if opt.get("is_complete") else ""
                 
                 # Get Matches count for this bid
@@ -6654,7 +6616,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                 row_data["Criteria_Count"] = len(criteria_list) if isinstance(criteria_list, list) else 0
                 row_data["Criteria"] = criteria_str if criteria_str else "(none)"
-                row_data["Expr"] = expr_text
                 row_data["Categories"] = ""
                 # Attach categories (true flags) for this candidate's bt_index (if available)
                 try:
@@ -6792,13 +6753,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     minWidth=100,
                     tooltipField="Criteria",
                 )
-                if "Expr" in pdf.columns:
-                    gb.configure_column(
-                        "Expr",
-                        flex=1,
-                        minWidth=140,
-                        tooltipField="Expr",
-                    )
                 gb.configure_column(
                     "Categories",
                     flex=1,
@@ -7049,6 +7003,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Compute once per pinned deal (keyed by deal index), regardless of the
                 # current Bidding Sequence. We always compute from the opening prefix ("").
                 # The UI box persists via session_state cache until the pinned deal changes.
+                # NOTE (known issue): The "Model Path" box sometimes does not render after clicking
+                # "Show Best N Pre-computed Auctions Ranked by DD/EV" below. Unresolved UI glitch;
+                # see TODO.md.
                 #
                 # Build the greedy path by repeatedly picking the top bid using
                 # the same logic as "Best Bids Ranked by Model":
@@ -7058,8 +7015,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     import time as _time_module
                     deal_id = pinned_deal.get("index") if pinned_deal else "no_deal"
                     row_idx = pinned_deal.get("_row_idx")
-                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_v5"
+                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_v6"
                     greedy_time_key = f"{greedy_cache_key}__time"
+                    greedy_debug_key = f"{greedy_cache_key}__debug"
 
                     # Only compute when the pinned deal changes (cache miss by deal index).
                     if greedy_cache_key not in st.session_state:
@@ -7080,19 +7038,23 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     st.error(f"Error predicting path: {resp['error']}")
                                     st.session_state[greedy_cache_key] = ""
                                     st.session_state[greedy_time_key] = 0.0
+                                    st.session_state[greedy_debug_key] = resp.get("debug") or {}
                                 else:
                                     path_auction = resp.get("greedy_path", "")
                                     st.session_state[greedy_cache_key] = path_auction
                                     st.session_state[greedy_time_key] = _time_module.perf_counter() - _greedy_start
+                                    st.session_state[greedy_debug_key] = resp.get("debug") or {}
                                     if not path_auction:
                                         st.warning(f"No path found. Debug: {resp.get('debug')}")
                             except Exception as e:
                                 st.error(f"Error predicting path: {e}")
                                 st.session_state[greedy_cache_key] = ""
                                 st.session_state[greedy_time_key] = 0.0
+                                st.session_state[greedy_debug_key] = {"error": str(e)}
 
                     greedy_path_full = st.session_state.get(greedy_cache_key, "")
                     greedy_elapsed = st.session_state.get(greedy_time_key, 0)
+                    greedy_debug = st.session_state.get(greedy_debug_key) or {}
                     if greedy_path_full:
                         msg_col, btn_col = st.columns([6, 2], gap="small")
                         with msg_col:
@@ -7106,6 +7068,17 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             ):
                                 st.session_state["_auction_builder_pending_set_auction"] = greedy_path_full
                                 st.rerun()
+                        with st.expander("Model Path debug", expanded=False):
+                            try:
+                                fp = greedy_debug.get("forcing_pass_debug")
+                                if isinstance(fp, list) and fp:
+                                    st.caption("forcing_pass_debug (per greedy step)")
+                                    st.dataframe(fp, width="stretch", height=220)
+                                else:
+                                    st.caption("No forcing_pass_debug rows present.")
+                            except Exception:
+                                pass
+                            st.json(greedy_debug)
 
                 # Display 3-column layout: 5 Suggested Bids | Best Par Bids | Best EV Bids
                 sug_col, par_col, ev_col = st.columns(3)
@@ -7698,9 +7671,26 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         st.session_state[show_best_auctions_key] = True
                         show_best_auctions = True
                     else:
+                        # Green button styling
+                        st.markdown(
+                            """
+                            <style>
+                            div[data-testid="stButton"] > button[kind="primary"] {
+                                background-color: #28a745;
+                                border-color: #28a745;
+                            }
+                            div[data-testid="stButton"] > button[kind="primary"]:hover {
+                                background-color: #218838;
+                                border-color: #1e7e34;
+                            }
+                            </style>
+                            """,
+                            unsafe_allow_html=True,
+                        )
                         if st.button(
                             f"Show Best {int(max_best_auctions)} Pre-computed Auctions Ranked by DD/EV",
-                            key=f"show_best_auctions_btn_{int(current_seat)}",
+                            key=f"{show_best_auctions_key}__btn",
+                            type="primary",
                         ):
                             st.session_state[show_best_auctions_key] = True
                             st.rerun()
@@ -7758,7 +7748,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                                     "metric": "DD",
                                                     "max_depth": 20,
                                                     "max_results": int(max_best_auctions),
-                                                    "permissive_pass": st.session_state.get("always_valid_pass", True),
                                                 },
                                                 timeout=120,
                                             )
@@ -7926,7 +7915,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                                     "metric": "EV",
                                                     "max_depth": 20,
                                                     "max_results": int(max_best_auctions),
-                                                    "permissive_pass": st.session_state.get("always_valid_pass", True),
                                                 },
                                                 timeout=120,
                                             )
@@ -8138,8 +8126,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         gb_rej.configure_column("DD_Score_Contract", width=135, minWidth=120, headerName="DD Score")
                     gb_rej.configure_column("Failure", width=115, minWidth=105)    # 7 chars
                     gb_rej.configure_column("Criteria", flex=1, minWidth=120, tooltipField="Criteria")
-                    if "Expr" in rejected_pdf.columns:
-                        gb_rej.configure_column("Expr", flex=1, minWidth=140, tooltipField="Expr")
 
                     # Display rules (match valid/invalid grids):
                     # - Pinned deal: show Avg_EV, hide EV_NV/EV_V
@@ -8645,12 +8631,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 dealer = pinned_deal.get("Dealer", "N")
                 # If this step was a client-side "Pass with no criteria" OR was selected from a valid-bids
                 # grid (Best Bids Ranked by Model), treat it as passing to maintain consistency.
-                is_pass = str(step.get("bid", "") or "").strip().upper() == "P"
-                skip_eval = (
-                    step.get("_pass_no_criteria")
-                    or step.get("_pass_valid_selection")
-                    or (is_pass and bool(st.session_state.get("always_valid_pass", True)))
-                )
+                # Also apply the "always_valid_pass" setting: if enabled and this is a Pass bid,
+                # skip criteria evaluation to match the behavior when manually selecting bids.
+                is_pass_bid = str(step.get("bid", "")).strip().upper() in ("P", "PASS")
+                pass_always_valid = bool(is_pass_bid and st.session_state.get("always_valid_pass", True))
+                skip_eval = step.get("_pass_no_criteria") or step.get("_pass_valid_selection") or pass_always_valid
                 criteria_list = [] if skip_eval else step.get("agg_expr", [])
                 passes, failed = evaluate_criteria_for_pinned(criteria_list, seat_1_to_4, dealer, pinned_deal)
                 row["_passes"] = passes  # Hidden column for row styling
