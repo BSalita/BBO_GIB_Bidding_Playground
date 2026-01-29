@@ -31,7 +31,7 @@ import pathlib
 import os
 import sys
 import re
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Literal, Set
 
 from bbo_bidding_queries_lib import (
     normalize_auction_input,
@@ -845,6 +845,44 @@ def api_post(path: str, payload: Dict[str, Any], timeout: int | None = None) -> 
     except Exception:
         pass
     return data
+
+
+def _fetch_auction_pattern_counts(
+    auctions: list[str],
+    cache: dict[str, int],
+    *,
+    pattern_style: Literal["bid_option", "completed_only"] = "completed_only",
+    timeout: int = 15,
+) -> None:
+    """Fetch pattern-based deal counts for the given auctions and update cache in place.
+
+    pattern_style:
+      - "bid_option": pattern is auction with '-' -> '-*' and trailing '*' (match any completion).
+      - "completed_only": pattern is ^auction$ if auction ends with -P-P-P, else ^auction.*-P-P-P$
+    """
+    missing = [a for a in auctions if a not in cache]
+    if not missing:
+        return
+    auction_to_pattern: dict[str, str] = {}
+    for a in missing:
+        a_u = (a or "").strip().upper()
+        if pattern_style == "bid_option":
+            pat = a_u.replace("-", "-*") + "*" if a_u else "*"
+        else:
+            if a_u.endswith("-P-P-P"):
+                pat = f"^{a_u}$"
+            else:
+                pat = f"^{a_u}.*-P-P-P$"
+        auction_to_pattern[a] = pat
+    patterns = list(dict.fromkeys(auction_to_pattern.values()))
+    try:
+        resp = api_post("/auction-pattern-counts", {"patterns": patterns}, timeout=timeout)
+        counts: dict[str, int] = resp.get("counts", {}) or {}
+        for auc, pat in auction_to_pattern.items():
+            cache[auc] = int(counts.get(pat, 0) or 0)
+    except Exception:
+        for a in missing:
+            cache[a] = 0
 
 
 def _st_info_elapsed(label: str, data: Dict[str, Any] | None) -> None:
@@ -6381,25 +6419,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             
             # Fetch missing matches (pattern-based counts)
             if missing_bids:
-                # Batch request: one API call for all missing bid-options
-                next_to_pattern: dict[str, str] = {}
-                for _bid_str, next_auction in missing_bids:
-                    # Preserve legacy pattern semantics used here
-                    next_to_pattern[next_auction] = next_auction.replace("-", "-*") + "*" if next_auction else "*"
-
-                try:
-                    patterns = list(dict.fromkeys(next_to_pattern.values()))
-                    resp = api_post(
-                        "/auction-pattern-counts",
-                        {"patterns": patterns},
-                        timeout=15,
-                    )
-                    counts_by_pattern: dict[str, int] = resp.get("counts", {}) or {}
-                    for next_auction, pat in next_to_pattern.items():
-                        bid_matches[next_auction] = int(counts_by_pattern.get(pat, 0) or 0)
-                except Exception:
-                    for _, next_auction in missing_bids:
-                        bid_matches[next_auction] = 0
+                missing_auctions = [next_auction for _, next_auction in missing_bids]
+                _fetch_auction_pattern_counts(
+                    missing_auctions, bid_matches, pattern_style="bid_option", timeout=15
+                )
             
             # Build DataFrame for bid selection
             bid_rows = []
@@ -6695,6 +6718,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "Criteria": criteria_count,
                         "EV Contract": ev_contract_val,
                         "DD Score": dd_score_contract_val,
+                        "Avg_EV": r.get("Avg_EV"),
                         "Deals": r.get("Deals"),
                         "Matches": r.get("Matches"),
                         "Bucket": bucket,
@@ -6948,7 +6972,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "_idx": r.get("_idx"),
                         "Bid": r.get("Bid", ""),
                         "Contract": r.get("Contract", ""),
-                        "DD": int(dd_val) if dd_val is not None else None,
+                        "DD Score": int(dd_val) if dd_val is not None else None,
                         "Deals": r.get("Deals", ""),
                         "Matches": r.get("Matches", ""),
                         "Bucket": get_bucket(r),
@@ -6966,7 +6990,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "_idx": r.get("_idx"),
                         "Bid": r.get("Bid", ""),
                         "Contract": r.get("Contract", ""),
-                        "EV": r.get("EV_Contract"),
+                        "EV Score": r.get("EV_Contract"),
                         "Deals": r.get("Deals", ""),
                         "Matches": r.get("Matches", ""),
                         "Bucket": get_bucket(r),
@@ -6999,103 +7023,146 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     """
                 )
 
-                # --- Predicted Model Path (Greedy) ---
-                # Compute once per pinned deal (keyed by deal index), regardless of the
-                # current Bidding Sequence. We always compute from the opening prefix ("").
-                # The UI box persists via session_state cache until the pinned deal changes.
-                # NOTE (known issue): The "Model Path" box sometimes does not render after clicking
-                # "Show Best N Pre-computed Auctions Ranked by DD/EV" below. Unresolved UI glitch;
-                # see TODO.md.
-                #
-                # Build the greedy path by repeatedly picking the top bid using
-                # the same logic as "Best Bids Ranked by Model":
-                # 1. Filter to bids where pinned deal matches criteria (or Pass with no criteria)
-                # 2. Sort by: (-DD_Score, -EV_Score, -matches, bid_name)
-                if pinned_deal:
-                    import time as _time_module
-                    deal_id = pinned_deal.get("index") if pinned_deal else "no_deal"
-                    row_idx = pinned_deal.get("_row_idx")
-                    greedy_cache_key = f"_greedy_path_cache_{deal_id}_v6"
-                    greedy_time_key = f"{greedy_cache_key}__time"
-                    greedy_debug_key = f"{greedy_cache_key}__debug"
+                # -------------------------------------------------------------------
+                # Matching BT Auctions (by Par)
+                # -------------------------------------------------------------------
+                par_contracts_raw = pinned_deal.get("ParContracts") if pinned_deal else None
+                if par_contracts_raw:
+                    # NOTE: Do not wrap AgGrid in an expander here (incompatible in this app).
+                    st.subheader("🎯 Matching BT Auctions (by Par)")
+                    prefix_display = f" starting with **{current_auction}**" if current_auction else ""
+                    st.caption(f"Completed BT auctions{prefix_display} resulting in the pinned deal's ParContracts.")
 
-                    # Only compute when the pinned deal changes (cache miss by deal index).
-                    if greedy_cache_key not in st.session_state:
-                        _greedy_start = _time_module.perf_counter()
-                        with st.spinner("Predicting model path..."):
+                    deal_idx = pinned_deal.get("index", 0) if pinned_deal else 0
+                    # Include current_auction in cache key so results update when auction changes
+                    par_cache_key = f"auction_builder_par_matches_{deal_idx}_{seed}_{current_auction}"
+                    par_elapsed_key = f"{par_cache_key}_elapsed"
+                    if par_cache_key not in st.session_state:
+                        with st.spinner("Searching BT..."):
                             try:
-                                payload = {
-                                    "auction_prefix": "",
-                                    "deal_row_idx": int(row_idx) if row_idx is not None else None,
-                                    "seed": int(seed) if seed is not None else 42,
-                                    "max_depth": 40,
-                                    # Keep in sync with "Always treat Pass as valid bid"
-                                    "permissive_pass": bool(st.session_state.get("always_valid_pass", True)),
-                                }
-                                # Greedy path can be slower on some deals; use a longer timeout.
-                                resp = api_post("/greedy-model-path", payload, timeout=90)
-                                if "error" in resp:
-                                    st.error(f"Error predicting path: {resp['error']}")
-                                    st.session_state[greedy_cache_key] = ""
-                                    st.session_state[greedy_time_key] = 0.0
-                                    st.session_state[greedy_debug_key] = resp.get("debug") or {}
-                                else:
-                                    path_auction = resp.get("greedy_path", "")
-                                    st.session_state[greedy_cache_key] = path_auction
-                                    st.session_state[greedy_time_key] = _time_module.perf_counter() - _greedy_start
-                                    st.session_state[greedy_debug_key] = resp.get("debug") or {}
-                                    if not path_auction:
-                                        st.warning(f"No path found. Debug: {resp.get('debug')}")
+                                par_resp = api_post(
+                                    "/find-bt-auctions-by-contracts",
+                                    {
+                                        "par_contracts": par_contracts_raw,
+                                        "dealer": pinned_deal.get("Dealer", "N"),
+                                        "auction_prefix": current_auction,
+                                    },
+                                    timeout=30
+                                )
+                                st.session_state[par_cache_key] = par_resp.get("auctions", [])
+                                st.session_state[par_elapsed_key] = par_resp.get("elapsed_ms", 0)
                             except Exception as e:
-                                st.error(f"Error predicting path: {e}")
-                                st.session_state[greedy_cache_key] = ""
-                                st.session_state[greedy_time_key] = 0.0
-                                st.session_state[greedy_debug_key] = {"error": str(e)}
+                                st.error(f"Error fetching par matches: {e}")
+                                st.session_state[par_cache_key] = []
+                                st.session_state[par_elapsed_key] = 0
 
-                    greedy_path_full = st.session_state.get(greedy_cache_key, "")
-                    greedy_elapsed = st.session_state.get(greedy_time_key, 0)
-                    greedy_debug = st.session_state.get(greedy_debug_key) or {}
-                    if greedy_path_full:
-                        msg_col, btn_col = st.columns([6, 2], gap="small")
-                        with msg_col:
-                            st.markdown(f"**Model Path:** `{greedy_path_full}` ({greedy_elapsed:.1f}s)")
-                        with btn_col:
-                            if st.button(
-                                "Move to Bidding Sequence",
-                                key=f"auction_builder_move_predicted_path_{deal_id}",
-                                help="Overwrite the current bidding sequence with the model path.",
-                                width="stretch",
-                            ):
-                                st.session_state["_auction_builder_pending_set_auction"] = greedy_path_full
-                                st.rerun()
-                        with st.expander("Model Path debug", expanded=False):
+                    par_matches = st.session_state[par_cache_key]
+                    par_elapsed = st.session_state.get(par_elapsed_key, 0)
+                    if par_matches:
+                        # Enrich server-provided rows with deal-specific scores and UI-consistent stats.
+                        dealer_actual = str(pinned_deal.get("Dealer", "N")).upper() if pinned_deal else "N"
+
+                        # Precompute vul flags (used for Avg_EV from NV/V split)
+                        vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper() if pinned_deal else ""
+                        ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                        ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+
+                        enriched_rows: list[dict[str, Any]] = []
+                        auc_list: list[str] = []
+                        for r in par_matches:
+                            rr = dict(r or {})
+                            auc = str(rr.get("Auction") or "").strip()
+                            if not auc:
+                                continue
+                            auc_list.append(auc)
+
+                            # Deal-specific scoring for the pinned deal
+                            dd_score: int | None = None
+                            ev_score: float | None = None
                             try:
-                                fp = greedy_debug.get("forcing_pass_debug")
-                                if isinstance(fp, list) and fp:
-                                    st.caption("forcing_pass_debug (per greedy step)")
-                                    st.dataframe(fp, width="stretch", height=220)
-                                else:
-                                    st.caption("No forcing_pass_debug rows present.")
+                                dd_v = get_dd_score_for_auction(auc, dealer_actual, pinned_deal)
+                                dd_score = int(dd_v) if dd_v is not None else None
                             except Exception:
-                                pass
-                            st.json(greedy_debug)
+                                dd_score = None
+                            try:
+                                ev_v = get_ev_for_auction(auc, dealer_actual, pinned_deal)
+                                ev_score = round(float(ev_v), 1) if ev_v is not None else None
+                            except Exception:
+                                ev_score = None
+                            rr["DD Score"] = dd_score
+                            rr["EV Score"] = ev_score
+
+                            # Avg_EV: use server-provided NV/V split (from bt_ev_stats_df) when available.
+                            avg_ev_nv = rr.get("avg_ev_nv")
+                            avg_ev_v = rr.get("avg_ev_v")
+                            pair = str(rr.get("Pair") or "").upper()
+                            rr["Avg_EV"] = None
+                            if avg_ev_nv is not None or avg_ev_v is not None:
+                                try:
+                                    is_vul = (pair == "NS" and ns_vul) or (pair == "EW" and ew_vul)
+                                    chosen = avg_ev_v if is_vul else avg_ev_nv
+                                    if chosen is not None:
+                                        # Normalize sign to NS-positive convention.
+                                        sign = 1.0 if pair == "NS" else (-1.0 if pair == "EW" else 1.0)
+                                        rr["Avg_EV"] = round(sign * float(chosen), 1)
+                                except Exception:
+                                    rr["Avg_EV"] = None
+
+                            enriched_rows.append(rr)
+
+                        # Matches: exact auction counts (batch), same endpoint used by bid options.
+                        counts_cache_key = f"_par_matches_counts_{deal_idx}_{seed}_{current_auction}"
+                        if counts_cache_key not in st.session_state:
+                            st.session_state[counts_cache_key] = {}
+                        par_counts: dict[str, int] = st.session_state[counts_cache_key]
+                        _fetch_auction_pattern_counts(
+                            auc_list, par_counts, pattern_style="completed_only", timeout=15
+                        )
+
+                        for rr in enriched_rows:
+                            a = str(rr.get("Auction") or "").strip()
+                            rr["Matches"] = int(par_counts.get(a, 0) or 0)
+
+                        par_matches_df = pl.DataFrame(enriched_rows)
+
+                        st.info(f"Found {len(par_matches)} matching auctions in {float(par_elapsed):.1f}ms.")
+
+                        selected_rows = render_aggrid(
+                            par_matches_df,
+                            key=f"auction_builder_par_matches_grid_{deal_idx}_{current_auction}",
+                            height=calc_grid_height(len(par_matches_df), max_height=300),
+                            table_name="auction_builder_par_matches",
+                            update_on=["selectionChanged"],
+                        )
+
+                        if selected_rows:
+                            selected_auc = str((selected_rows[0] or {}).get("Auction", "")).strip()
+                            if selected_auc:
+                                # Clicking a row should immediately move the auction into the
+                                # "Bidding Sequence" input and apply via existing resolve/apply logic.
+                                last_sel_key = f"auction_builder_par_matches_last_selected_{deal_idx}"
+                                if st.session_state.get(last_sel_key) != selected_auc:
+                                    st.session_state[last_sel_key] = selected_auc
+                                    st.session_state["_auction_builder_pending_set_auction"] = selected_auc
+                                    st.rerun()
+                    else:
+                        no_match_msg = f"No matching auctions found starting with '{current_auction}'." if current_auction else "No matching auctions found in the BT for these ParContracts."
+                        st.info(no_match_msg)
 
                 # Display 3-column layout: 5 Suggested Bids | Best Par Bids | Best EV Bids
                 sug_col, par_col, ev_col = st.columns(3)
                 
                 with sug_col:
                     if suggested_bids_rows:
-                        st.markdown("**Best Bids Ranked by Model**")
+                        st.markdown("**Best Bids Ranked by Model Score**")
                         sug_df = pl.DataFrame(
                             [
                                 {
                                     "_idx": r["_idx"],
                                     "Bid": r["Bid"],
-                                    "Criteria": r["Criteria"],
                                     "EV Contract": r.get("EV Contract"),
                                     "DD Score": r.get("DD Score"),
-                                    "Deals": r["Deals"],
-                                    "Matches": r["Matches"],
+                                    "Avg_EV": r.get("Avg_EV"),
                                     "Bucket": r["Bucket"],
                                 }
                                 for r in suggested_bids_rows
@@ -7110,7 +7177,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             gb_sug.configure_column("EV Contract", width=110)
                         if "DD Score" in sug_pdf.columns:
                             gb_sug.configure_column("DD Score", width=95)
-                        gb_sug.configure_column("Matches", width=105)  # adjusted
+                        if "Avg_EV" in sug_pdf.columns:
+                            gb_sug.configure_column("Avg_EV", width=95)
                         gb_sug.configure_grid_options(
                             getRowClass=row_class_js,
                             rowHeight=25,
@@ -7129,11 +7197,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         )
                         handle_bid_selection(sug_resp, "suggested")
                     else:
-                        st.markdown("**Best Bids Ranked by Model**")
+                        st.markdown("**Best Bids Ranked by Model Score**")
                         st.caption("No suggested bids available")
                 
                 with par_col:
-                    st.markdown("**Best Bids Ranked by DD**")
+                    st.markdown("**Best Bids Ranked by DD Score**")
                     if best_par_bids:
                         par_pdf = to_aggrid_safe_pandas(best_par_bids_df)
                         gb_par = GridOptionsBuilder.from_dataframe(par_pdf)
@@ -7141,6 +7209,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         gb_par.configure_column("_idx", hide=True)
                         gb_par.configure_column("Bucket", hide=True)
                         gb_par.configure_column("Contract", width=90)  # 10% tighter
+                        gb_par.configure_column("DD Score", width=95)
                         gb_par.configure_column("Matches", width=105)   # adjusted
                         gb_par.configure_grid_options(
                             getRowClass=row_class_js,
@@ -7163,7 +7232,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         st.caption("No Par scores available")
                 
                 with ev_col:
-                    st.markdown("**Best Bids Ranked by EV**")
+                    st.markdown("**Best Bids Ranked by EV Score**")
                     if best_ev_bids:
                         ev_pdf = to_aggrid_safe_pandas(best_ev_bids_df)
                         gb_ev = GridOptionsBuilder.from_dataframe(ev_pdf)
@@ -7171,6 +7240,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         gb_ev.configure_column("_idx", hide=True)
                         gb_ev.configure_column("Bucket", hide=True)
                         gb_ev.configure_column("Contract", width=90)  # 10% tighter
+                        gb_ev.configure_column("EV Score", width=95)
                         gb_ev.configure_column("Matches", width=105)   # adjusted
                         gb_ev.configure_grid_options(
                             getRowClass=row_class_js,
@@ -8436,32 +8506,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         # Fetch missing counts
         if missing_partials:
             t0_counts = time.perf_counter()
-            # Batch request: one API call for all missing partials
-            partial_to_pattern: dict[str, str] = {}
-            for partial in missing_partials:
-                partial_upper = partial.upper()
-                # Build regex pattern for deals starting with this partial auction
-                if partial_upper.endswith("-P-P-P"):
-                    partial_to_pattern[partial] = f"^{partial_upper}$"
-                else:
-                    partial_to_pattern[partial] = f"^{partial_upper}.*-P-P-P$"
-
-            try:
-                # Deduplicate patterns to minimize server work
-                patterns = list(dict.fromkeys(partial_to_pattern.values()))
-                resp = api_post(
-                    "/auction-pattern-counts",
-                    {"patterns": patterns},
-                    timeout=15,
-                )
-                counts: dict[str, int] = resp.get("counts", {}) or {}
-                for partial, pat in partial_to_pattern.items():
-                    deals_counts[partial] = int(counts.get(pat, 0) or 0)
-            except Exception:
-                # Fallback: mark missing as 0 (avoid repeated calls during reruns)
-                for partial in missing_partials:
-                    deals_counts[partial] = 0
-            # Cache elapsed time for display on subsequent renders
+            _fetch_auction_pattern_counts(
+                missing_partials, deals_counts, pattern_style="completed_only", timeout=15
+            )
             st.session_state["_deals_counts_elapsed_ms"] = (time.perf_counter() - t0_counts) * 1000
             st.session_state["_deals_counts_steps"] = len(missing_partials)
 
@@ -8630,7 +8677,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # So evaluate using the actual dealer and the displayed seat.
                 dealer = pinned_deal.get("Dealer", "N")
                 # If this step was a client-side "Pass with no criteria" OR was selected from a valid-bids
-                # grid (Best Bids Ranked by Model), treat it as passing to maintain consistency.
+                # grid (Best Bids Ranked by Model Score), treat it as passing to maintain consistency.
                 # Also apply the "always_valid_pass" setting: if enabled and this is a Pass bid,
                 # skip criteria evaluation to match the behavior when manually selecting bids.
                 is_pass_bid = str(step.get("bid", "")).strip().upper() in ("P", "PASS")

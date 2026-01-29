@@ -1059,6 +1059,15 @@ class ProcessPBNRequest(BaseModel):
     vul: str = "None"  # None, Both, NS, EW
 
 
+class FindBTAuctionsByContractsRequest(BaseModel):
+    """Request to find BT completed auctions matching a set of ParContracts."""
+    par_contracts: List[Dict[str, Any]]
+    dealer: str  # Pinned deal's dealer (N/E/S/W)
+    auction_prefix: str = ""  # Optional: filter to auctions starting with this prefix
+
+
+
+
 class FindMatchingAuctionsRequest(BaseModel):
     hcp: int
     sl_s: int
@@ -2987,6 +2996,24 @@ def resolve_auction_path(req: ResolveAuctionPathRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("resolve-auction-path", e)
+
+
+@app.post("/find-bt-auctions-by-contracts")
+def find_bt_auctions_by_contracts(req: FindBTAuctionsByContractsRequest) -> Dict[str, Any]:
+    """Find BT auctions by ParContracts - delegated to hot-reloadable handler."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_find_bt_auctions_by_contracts(
+            state=state,
+            par_contracts=req.par_contracts,
+            dealer=req.dealer,
+            auction_prefix=req.auction_prefix,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("find-bt-auctions-by-contracts", e)
+
+
 
 
 # ---------------------------------------------------------------------------

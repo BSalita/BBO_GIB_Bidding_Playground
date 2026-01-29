@@ -102,8 +102,8 @@ This document describes the Streamlit sidebar **Function** selectbox options and
   - **Bidding Sequence** (editable auction string + controls; includes bt_index in header when available)
   - **Bid suggestion tables** (3-column layout)
     - **Best Bids Ranked by Model**
-    - **Best Bids Ranked by DD**
-    - **Best Bids Ranked by EV**
+    - **Best Bids Ranked by DD Score**
+    - **Best Bids Ranked by EV Contract**
   - **Best auctions (optional on demand)**
     - Button: “Show Best N Pre-computed Auctions Ranked by DD/EV”
     - **Best Auctions Ranked by DD**

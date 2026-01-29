@@ -18,9 +18,11 @@ import base64
 import json
 import math
 import os
+import pathlib
 import random
 import re
 import statistics
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
@@ -44,6 +46,7 @@ from bbo_bidding_queries_lib import (
     compute_hand_features,
     compute_par_score,
     parse_pbn_deal,
+    parse_contract_from_auction,
     build_distribution_sql_for_bt,
     build_distribution_sql_for_deals,
     add_suit_length_columns,
@@ -128,6 +131,12 @@ from plugins.bbo_handlers_common import (
     eval_comparison,
     annotate_criterion_with_value,
 )
+
+
+# ---------------------------------------------------------------------------
+# V3 global cache (distinct from V1/V2)
+# ---------------------------------------------------------------------------
+
 
 # ---------------------------------------------------------------------------
 # Tuning constants (avoid magic numbers scattered through handlers)
@@ -881,6 +890,207 @@ def handle_openings_by_deal_index(
 # ---------------------------------------------------------------------------
 # Handler: /random-auction-sequences
 # ---------------------------------------------------------------------------
+
+
+def handle_find_bt_auctions_by_contracts(
+    state: Dict[str, Any],
+    par_contracts: List[Dict[str, Any]],
+    dealer: str,
+    auction_prefix: str = "",
+) -> Dict[str, Any]:
+    """Find BT completed auctions matching a set of ParContracts.
+    
+    Uses bt_stats_df (completed auctions with aggregates) when available so we can
+    return the same basic stats shown elsewhere in the UI (Deals, Avg_EV).
+    If auction_prefix is provided, only returns auctions starting with that prefix.
+    """
+    t0 = time.perf_counter()
+    
+    bt_stats_df = state.get("bt_stats_df")
+    bt_completed_agg_df = state.get("bt_completed_agg_df")
+    bt_seat1_df = state.get("bt_seat1_df")
+
+    if bt_stats_df is not None and bt_stats_df.height > 0:
+        completed_df = bt_stats_df
+    elif bt_completed_agg_df is not None and bt_completed_agg_df.height > 0:
+        # Fallback: bt_completed_agg_df (may not include Deals/Avg_EV columns)
+        completed_df = bt_completed_agg_df
+    else:
+        # Slow fallback: filter bt_seat1_df for completed auctions
+        if bt_seat1_df is None:
+            raise ValueError("bt_seat1_df not loaded")
+        if "is_completed_auction" not in bt_seat1_df.columns:
+            raise ValueError("is_completed_auction column missing")
+        completed_df = bt_seat1_df.filter(pl.col("is_completed_auction"))
+
+    if completed_df.height == 0:
+        return {"auctions": [], "elapsed_ms": 0}
+
+    # bt_stats_df is keyed by bt_index but may not include the auction string.
+    # For this endpoint we must have "Auction" available to:
+    # - filter by prefix
+    # - parse the final contract from the auction string
+    if "Auction" not in completed_df.columns:
+        auction_lookup: pl.DataFrame | None = None
+        if bt_completed_agg_df is not None and bt_completed_agg_df.height > 0 and "Auction" in bt_completed_agg_df.columns:
+            auction_lookup = bt_completed_agg_df.select(["bt_index", "Auction"])
+        elif bt_seat1_df is not None and bt_seat1_df.height > 0 and "Auction" in bt_seat1_df.columns:
+            # Slowest in-memory fallback (bt_seat1_df is large), but only used if needed.
+            auction_lookup = bt_seat1_df.select(["bt_index", "Auction"])
+        if auction_lookup is None:
+            raise ValueError("Auction column missing and no bt_index→Auction lookup available")
+        completed_df = completed_df.join(auction_lookup, on="bt_index", how="left")
+        # If the join fails to recover auction strings, drop those rows (cannot match/parsing fails).
+        if "Auction" in completed_df.columns:
+            completed_df = completed_df.drop_nulls(subset=["Auction"])
+    
+    # Normalize and apply auction prefix filter if provided
+    auction_prefix = str(auction_prefix or "").strip().upper()
+    if auction_prefix:
+        # Prefix match: auction must start with the given prefix
+        # Handle cases where prefix may or may not end with a separator
+        prefix_with_sep = auction_prefix if auction_prefix.endswith("-") else auction_prefix + "-"
+        completed_df = completed_df.filter(
+            pl.col("Auction").str.to_uppercase().str.starts_with(prefix_with_sep) |
+            pl.col("Auction").str.to_uppercase().eq(auction_prefix)
+        )
+
+    # Normalize dealer
+    dealer = str(dealer).upper()
+    if dealer not in DIRECTIONS:
+        dealer = "N"
+
+    # Prepare target contracts for matching
+    targets = []
+    for c in par_contracts:
+        level = c.get("Level")
+        strain = c.get("Strain")
+        pair = c.get("Pair_Direction")
+        dbl = c.get("Doubled") or c.get("Double") or ""
+        if level is not None and strain is not None and pair in ("NS", "EW"):
+            targets.append({
+                "level": int(level),
+                "strain": str(strain).upper(),
+                "pair": pair,
+                "doubled": str(dbl).upper() if dbl else ""
+            })
+
+    if not targets:
+        return {"auctions": [], "elapsed_ms": 0, "message": "No valid target contracts provided"}
+
+    # Optimization: Filter by strain first if possible, but strain is inside the Auction string.
+    # We'll iterate and filter. For 1M rows, this should be fast enough if we don't do too much per row.
+    auctions = completed_df["Auction"].to_list()
+    bt_indices = completed_df["bt_index"].to_list()
+    # Optional stats columns (present in bt_stats_df)
+    deals_list = completed_df["matching_deal_count"].to_list() if "matching_deal_count" in completed_df.columns else None
+    
+    matches = []
+    
+    # Pre-parse dealer indices for pair matching
+    # Opener (Seat 1) in BT is 'dealer' in the pinned deal context.
+    # NS pair in pinned deal: N, S
+    # EW pair in pinned deal: E, W
+    
+    for i, auc in enumerate(auctions):
+        # parse_contract_from_auction returns (level, strain, doubled_count)
+        # doubled_count: 0=none, 1=X, 2=XX
+        parsed = parse_contract_from_auction(auc)
+        if not parsed:
+            continue
+            
+        l, s, d_count = parsed
+        d_str = ""
+        if d_count == 1: d_str = "X"
+        elif d_count == 2: d_str = "XX"
+        
+        # Check if contract (level, strain, doubled) matches any target
+        potential_targets = [t for t in targets if t["level"] == l and t["strain"] == s and t["doubled"] == d_str]
+        if not potential_targets:
+            continue
+            
+        # Contract matches, now check pair
+        # Declarer relative to opener as Seat 1
+        decl = get_declarer_for_auction(auc, "N") # opener is North
+        if not decl:
+            continue
+            
+        # Map BT declarer to pinned deal pair
+        # BT Seat 1/3 -> opener's pair in pinned deal
+        # BT Seat 2/4 -> opponent's pair in pinned deal
+        
+        is_opener_pair = decl in ("N", "S")
+        
+        # Opener's pair in pinned deal:
+        if dealer in ("N", "S"):
+            opener_pair = "NS"
+            opponent_pair = "EW"
+        else:
+            opener_pair = "EW"
+            opponent_pair = "NS"
+            
+        actual_pair = opener_pair if is_opener_pair else opponent_pair
+        
+        # Final match check
+        for t in potential_targets:
+            if t["pair"] == actual_pair:
+                # Map seat-1-view direction to seat number (N/E/S/W -> 1/2/3/4)
+                decl_seat = 1 if decl == "N" else (2 if decl == "E" else (3 if decl == "S" else (4 if decl == "W" else None)))
+                matches.append({
+                    "bt_index": int(bt_indices[i]),
+                    "Auction": auc,
+                    "Contract": f"{l}{s}{d_str}{decl}", # Relative to opener
+                    "Pair": actual_pair,
+                    # These align with the bid-options grids (criteria-based count + precomputed Avg_EV).
+                    "Deals": int(deals_list[i]) if (deals_list is not None and deals_list[i] is not None) else None,
+                    "decl": decl,
+                    "decl_seat": decl_seat,
+                })
+                break
+
+    # Attach precomputed avg_ev_nv/avg_ev_v from bt_ev_stats_df when available.
+    # We return NV/V split so the Streamlit client can choose based on pinned-deal vul.
+    bt_ev_stats_df = state.get("bt_ev_stats_df")
+    if bt_ev_stats_df is not None and matches:
+        try:
+            bt_idx_list = [int(m.get("bt_index")) for m in matches if m.get("bt_index") is not None]
+            bt_idx_list = list(dict.fromkeys(bt_idx_list))
+            if bt_idx_list:
+                ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_idx_list))
+                ev_map: dict[int, dict[str, Any]] = {}
+                for ev_row in ev_subset.iter_rows(named=True):
+                    try:
+                        ev_map[int(ev_row["bt_index"])] = dict(ev_row)
+                    except Exception:
+                        continue
+                for m in matches:
+                    bt_i = m.get("bt_index")
+                    seat_i = m.get("decl_seat")
+                    if bt_i is None or seat_i is None:
+                        m["avg_ev_nv"] = None
+                        m["avg_ev_v"] = None
+                        continue
+                    row = ev_map.get(int(bt_i), {}) or {}
+                    nv_key = f"Avg_EV_S{int(seat_i)}_NV"
+                    v_key = f"Avg_EV_S{int(seat_i)}_V"
+                    if nv_key in row:
+                        m["avg_ev_nv"] = row.get(nv_key)
+                        m["avg_ev_v"] = row.get(v_key)
+                    else:
+                        # Backwards compatibility with old aggregate stats file
+                        aggregate = row.get(f"Avg_EV_S{int(seat_i)}")
+                        m["avg_ev_nv"] = aggregate
+                        m["avg_ev_v"] = aggregate
+        except Exception:
+            # Best-effort: leave avg_ev fields unset on any failure
+            pass
+                
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "auctions": matches,
+        "elapsed_ms": round(elapsed_ms, 1),
+        "total_completed_searched": completed_df.height
+    }
 
 
 def handle_random_auction_sequences(
