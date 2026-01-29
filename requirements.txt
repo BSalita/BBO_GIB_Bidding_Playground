@@ -23,7 +23,7 @@ psutil
 
 # Streamlit app
 streamlit
-streamlit-aggrid==1.1.8.post1 # looks like 1.2.1.post2 is works.(?)
+streamlit-aggrid==1.1.8-post2  # Known working version. If DataFrames display as empty space, try: pip install streamlit-aggrid==1.1.8-post2
 requests
 
 # Database
