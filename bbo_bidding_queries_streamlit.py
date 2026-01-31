@@ -7256,7 +7256,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                                         decl0,
                                                         vul0,
                                                         result_val,
+                                                        declarer_score=True,
                                                     )
+                                                # reverse sign of score if declarer and seat are on opposite sides
                                                 if (declarer_dir in ("N", "S")) ^ (seat_direction in ("N", "S")):
                                                     score_val = -score_val
                                 except Exception:
@@ -7278,6 +7280,12 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             })
                         
                         sug_df = pl.DataFrame(enriched_sug_rows)
+                        # Ensure default ordering is by Score (AgGrid can persist old sort state).
+                        if "Score" in sug_df.columns:
+                            try:
+                                sug_df = sug_df.sort("Score", descending=True, nulls_last=True)
+                            except Exception:
+                                pass
                         sug_pdf = to_aggrid_safe_pandas(sug_df)
                         gb_sug = GridOptionsBuilder.from_dataframe(sug_pdf)
                         gb_sug.configure_selection(selection_mode="single", use_checkbox=False)
@@ -7307,6 +7315,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             headerHeight=25,
                         )
                         sug_opts = gb_sug.build()
+                        # Force initial sort by Score descending.
+                        if "Score" in sug_pdf.columns and "sortModel" not in sug_opts:
+                            sug_opts["sortModel"] = [{"colId": "Score", "sort": "desc"}]
                         sug_resp = AgGrid(
                             sug_pdf,
                             gridOptions=sug_opts,
