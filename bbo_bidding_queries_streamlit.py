@@ -7048,6 +7048,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                         "par_contracts": par_contracts_raw,
                                         "dealer": pinned_deal.get("Dealer", "N"),
                                         "auction_prefix": current_auction,
+                                        # Fast-path for existing deals: row index in bbo_mldf_augmented.parquet
+                                        "deal_row_idx": pinned_deal.get("_row_idx"),
                                     },
                                     timeout=30
                                 )

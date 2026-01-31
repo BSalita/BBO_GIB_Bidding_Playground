@@ -381,6 +381,8 @@ auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
 # Precomputed deal-to-BT verified index (GPU pipeline output, optional)
 deal_to_bt_verified_file = dataPath.joinpath("bbo_deal_to_bt_verified.parquet")
+# Optional: precomputed deal_idx -> Par_Indexes (subset of verified deal→BT matches)
+deal_to_bt_par_verified_file = dataPath.joinpath("bbo_deal_to_bt_par_verified.parquet")
 
 # ---------------------------------------------------------------------------
 # Constants for hand criteria
@@ -1064,6 +1066,9 @@ class FindBTAuctionsByContractsRequest(BaseModel):
     par_contracts: List[Dict[str, Any]]
     dealer: str  # Pinned deal's dealer (N/E/S/W)
     auction_prefix: str = ""  # Optional: filter to auctions starting with this prefix
+    # Optional fast-path: when provided, server can use precomputed deal_idx -> Par_Indexes
+    # (row position in bbo_mldf_augmented.parquet).
+    deal_row_idx: Optional[int] = None
 
 
 
@@ -2320,6 +2325,28 @@ def _heavy_init() -> None:
             print("[init] No precomputed deal-to-BT index found (run bbo_bt_filter_by_bitmap.py)")
         _log_memory("after load deal_to_bt_index")
 
+        # Load precomputed deal-to-Par BT index (optional, post-processing output)
+        # This enables near-instant "Matching BT Auctions (by Par)" for existing deals.
+        deal_to_bt_par_index_df: Optional[pl.DataFrame] = None
+        if deal_to_bt_par_verified_file.exists():
+            try:
+                print(f"[init] Loading precomputed deal-to-Par index from {deal_to_bt_par_verified_file}...")
+                t0_par = time.perf_counter()
+                deal_to_bt_par_index_df = (
+                    pl.read_parquet(deal_to_bt_par_verified_file, columns=["deal_idx", "Par_Indexes"])
+                    .sort("deal_idx")
+                )
+                elapsed_par = time.perf_counter() - t0_par
+                par_info = f"{deal_to_bt_par_index_df.height:,} deals in {elapsed_par:.1f}s"
+                _update_loading_status(5, "Loading deal-to-Par index...", "deal_to_bt_par_index", par_info)
+                print(f"[init] deal_to_bt_par_index: {par_info} (sorted for fast lookup)")
+            except Exception as e:
+                print(f"[init] WARNING: Failed to load deal-to-Par index from {deal_to_bt_par_verified_file}: {e}")
+                deal_to_bt_par_index_df = None
+        else:
+            print("[init] No precomputed deal-to-Par index found (run bbo_bt_add_par_indexes.py)")
+        _log_memory("after load deal_to_bt_par_index")
+
         # Compute opening-bid candidates for all (dealer, seat) combinations
         _update_loading_status(6, "Processing opening bids (seat1-only)...", "bt_openings", "computing...")
         t0_openings = time.perf_counter()
@@ -2401,6 +2428,7 @@ def _heavy_init() -> None:
             STATE["available_criteria_names"] = available_criteria_names
             STATE["new_rules_df"] = new_rules_df
             STATE["deal_to_bt_index_df"] = deal_to_bt_index_df  # Precomputed deal→[bt_indices] DataFrame (or None)
+            STATE["deal_to_bt_par_index_df"] = deal_to_bt_par_index_df  # Precomputed deal→Par_Indexes (or None)
             STATE["bt_ev_stats_df"] = bt_ev_stats_df  # Precomputed Avg_EV/Avg_Par per bt_index per seat (or None)
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
@@ -3008,6 +3036,7 @@ def find_bt_auctions_by_contracts(req: FindBTAuctionsByContractsRequest) -> Dict
             par_contracts=req.par_contracts,
             dealer=req.dealer,
             auction_prefix=req.auction_prefix,
+            deal_row_idx=req.deal_row_idx,
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:

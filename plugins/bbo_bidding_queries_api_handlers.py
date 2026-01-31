@@ -897,6 +897,7 @@ def handle_find_bt_auctions_by_contracts(
     par_contracts: List[Dict[str, Any]],
     dealer: str,
     auction_prefix: str = "",
+    deal_row_idx: int | None = None,
 ) -> Dict[str, Any]:
     """Find BT completed auctions matching a set of ParContracts.
     
@@ -909,6 +910,176 @@ def handle_find_bt_auctions_by_contracts(
     bt_stats_df = state.get("bt_stats_df")
     bt_completed_agg_df = state.get("bt_completed_agg_df")
     bt_seat1_df = state.get("bt_seat1_df")
+
+    # ---------------------------------------------------------------------
+    # Fast path: existing deal (dataset-backed) with precomputed Par_Indexes.
+    # ---------------------------------------------------------------------
+    deal_to_bt_par_index_df: Optional[pl.DataFrame] = state.get("deal_to_bt_par_index_df")
+    if deal_row_idx is not None and deal_to_bt_par_index_df is not None and deal_to_bt_par_index_df.height > 0:
+        import numpy as np
+
+        # Cache numpy materializations across requests for O(log n) lookup.
+        global _DEAL_TO_BT_PAR_INDEX_CACHE  # type: ignore[declared-but-unused]
+        try:
+            _DEAL_TO_BT_PAR_INDEX_CACHE  # type: ignore[name-defined]
+        except Exception:
+            _DEAL_TO_BT_PAR_INDEX_CACHE = {}  # type: ignore[name-defined]
+
+        cache = _DEAL_TO_BT_PAR_INDEX_CACHE  # type: ignore[name-defined]
+        df_id = id(deal_to_bt_par_index_df)
+        if cache.get("df_id") != df_id:
+            cache["df_id"] = df_id
+            cache["deal_idx_arr"] = deal_to_bt_par_index_df["deal_idx"].to_numpy()
+            cache["par_series"] = deal_to_bt_par_index_df.get_column("Par_Indexes")
+
+        deal_idx_arr = cache.get("deal_idx_arr")
+        par_series = cache.get("par_series")
+        if deal_idx_arr is None or par_series is None:
+            raise ValueError("deal_to_bt_par_index_df cache not initialized")
+
+        pos = np.searchsorted(deal_idx_arr, int(deal_row_idx))
+        par_indices: list[int] = []
+        if pos < len(deal_idx_arr) and int(deal_idx_arr[pos]) == int(deal_row_idx):
+            try:
+                m = par_series[int(pos)]
+            except Exception:
+                m = None
+            if m is None:
+                par_indices = []
+            else:
+                try:
+                    if isinstance(m, pl.Series):
+                        par_indices = [int(x) for x in m.to_list() if x is not None]
+                    elif isinstance(m, (list, tuple)):
+                        par_indices = [int(x) for x in m if x is not None]
+                    else:
+                        par_indices = [int(x) for x in list(m) if x is not None]
+                except Exception:
+                    par_indices = []
+
+        if not par_indices:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {"auctions": [], "elapsed_ms": round(elapsed_ms, 1), "total_completed_searched": 0}
+
+        # Fetch minimal completed-auction rows for these bt_index values.
+        # Prefer bt_stats_df (has matching_deal_count), else bt_completed_agg_df, else seat1 (slow).
+        if bt_stats_df is not None and bt_stats_df.height > 0:
+            subset = bt_stats_df.filter(pl.col("bt_index").is_in(par_indices))
+        elif bt_completed_agg_df is not None and bt_completed_agg_df.height > 0:
+            subset = bt_completed_agg_df.filter(pl.col("bt_index").is_in(par_indices))
+        else:
+            if bt_seat1_df is None:
+                raise ValueError("bt_seat1_df not loaded")
+            subset = bt_seat1_df.filter(pl.col("bt_index").is_in(par_indices) & pl.col("is_completed_auction"))
+
+        # Ensure Auction exists for prefix filtering + contract parsing.
+        if "Auction" not in subset.columns:
+            lookup: pl.DataFrame | None = None
+            if bt_completed_agg_df is not None and bt_completed_agg_df.height > 0 and "Auction" in bt_completed_agg_df.columns:
+                lookup = bt_completed_agg_df.filter(pl.col("bt_index").is_in(par_indices)).select(["bt_index", "Auction"])
+            elif bt_seat1_df is not None and bt_seat1_df.height > 0 and "Auction" in bt_seat1_df.columns:
+                lookup = bt_seat1_df.filter(pl.col("bt_index").is_in(par_indices)).select(["bt_index", "Auction"])
+            if lookup is None:
+                raise ValueError("Auction column missing and no bt_index→Auction lookup available")
+            subset = subset.join(lookup, on="bt_index", how="left").drop_nulls(subset=["Auction"])
+
+        # Apply prefix filter (small subset).
+        auction_prefix = str(auction_prefix or "").strip().upper()
+        if auction_prefix:
+            prefix_with_sep = auction_prefix if auction_prefix.endswith("-") else auction_prefix + "-"
+            subset = subset.filter(
+                pl.col("Auction").str.to_uppercase().str.starts_with(prefix_with_sep)
+                | pl.col("Auction").str.to_uppercase().eq(auction_prefix)
+            )
+
+        # Normalize dealer (same semantics as slow path).
+        dealer = str(dealer).upper()
+        if dealer not in DIRECTIONS:
+            dealer = "N"
+
+        # Build response rows by parsing only the returned auctions (near-instant).
+        auctions = subset["Auction"].to_list()
+        bt_indices = subset["bt_index"].to_list()
+        deals_list = subset["matching_deal_count"].to_list() if "matching_deal_count" in subset.columns else None
+
+        matches: list[dict[str, Any]] = []
+        for i, auc in enumerate(auctions):
+            parsed = parse_contract_from_auction(auc)
+            if not parsed:
+                continue
+            l, s, d_count = parsed
+            d_str = "XX" if d_count == 2 else ("X" if d_count == 1 else "")
+            decl = get_declarer_for_auction(auc, "N")  # opener is North (seat-1 view)
+            if not decl:
+                continue
+
+            is_opener_pair = decl in ("N", "S")
+            if dealer in ("N", "S"):
+                opener_pair = "NS"
+                opponent_pair = "EW"
+            else:
+                opener_pair = "EW"
+                opponent_pair = "NS"
+            actual_pair = opener_pair if is_opener_pair else opponent_pair
+            decl_seat = 1 if decl == "N" else (2 if decl == "E" else (3 if decl == "S" else (4 if decl == "W" else None)))
+
+            bt_i = bt_indices[i]
+            if bt_i is None:
+                continue
+
+            matches.append(
+                {
+                    "bt_index": int(bt_i),
+                    "Auction": auc,
+                    "Contract": f"{l}{s}{d_str}{decl}",
+                    "Pair": actual_pair,
+                    "Deals": int(deals_list[i]) if (deals_list is not None and deals_list[i] is not None) else None,
+                    "decl": decl,
+                    "decl_seat": decl_seat,
+                }
+            )
+
+        # Attach avg_ev_nv/avg_ev_v from bt_ev_stats_df (same as slow path).
+        bt_ev_stats_df = state.get("bt_ev_stats_df")
+        if bt_ev_stats_df is not None and matches:
+            try:
+                bt_idx_list_fast: list[int] = []
+                for mm in matches:
+                    bt_val = mm.get("bt_index")
+                    if bt_val is None:
+                        continue
+                    bt_idx_list_fast.append(int(bt_val))
+                bt_idx_list_fast = list(dict.fromkeys(bt_idx_list_fast))
+                if bt_idx_list_fast:
+                    ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_idx_list_fast))
+                    ev_map_fast: dict[int, dict[str, Any]] = {}
+                    for ev_row in ev_subset.iter_rows(named=True):
+                        try:
+                            ev_map_fast[int(ev_row["bt_index"])] = dict(ev_row)
+                        except Exception:
+                            continue
+                    for m in matches:
+                        bt_i = m.get("bt_index")
+                        seat_i = m.get("decl_seat")
+                        if bt_i is None or seat_i is None:
+                            m["avg_ev_nv"] = None
+                            m["avg_ev_v"] = None
+                            continue
+                        row = ev_map_fast.get(int(bt_i), {}) or {}
+                        nv_key = f"Avg_EV_S{int(seat_i)}_NV"
+                        v_key = f"Avg_EV_S{int(seat_i)}_V"
+                        if nv_key in row:
+                            m["avg_ev_nv"] = row.get(nv_key)
+                            m["avg_ev_v"] = row.get(v_key)
+                        else:
+                            aggregate = row.get(f"Avg_EV_S{int(seat_i)}")
+                            m["avg_ev_nv"] = aggregate
+                            m["avg_ev_v"] = aggregate
+            except Exception:
+                pass
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return {"auctions": matches, "elapsed_ms": round(elapsed_ms, 1), "total_completed_searched": int(len(par_indices))}
 
     if bt_stats_df is not None and bt_stats_df.height > 0:
         completed_df = bt_stats_df
@@ -1036,8 +1207,11 @@ def handle_find_bt_auctions_by_contracts(
             if t["pair"] == actual_pair:
                 # Map seat-1-view direction to seat number (N/E/S/W -> 1/2/3/4)
                 decl_seat = 1 if decl == "N" else (2 if decl == "E" else (3 if decl == "S" else (4 if decl == "W" else None)))
+                bt_i = bt_indices[i]
+                if bt_i is None:
+                    break
                 matches.append({
-                    "bt_index": int(bt_indices[i]),
+                    "bt_index": int(bt_i),
                     "Auction": auc,
                     "Contract": f"{l}{s}{d_str}{decl}", # Relative to opener
                     "Pair": actual_pair,
@@ -1053,7 +1227,12 @@ def handle_find_bt_auctions_by_contracts(
     bt_ev_stats_df = state.get("bt_ev_stats_df")
     if bt_ev_stats_df is not None and matches:
         try:
-            bt_idx_list = [int(m.get("bt_index")) for m in matches if m.get("bt_index") is not None]
+            bt_idx_list: list[int] = []
+            for mm in matches:
+                bt_val = mm.get("bt_index")
+                if bt_val is None:
+                    continue
+                bt_idx_list.append(int(bt_val))
             bt_idx_list = list(dict.fromkeys(bt_idx_list))
             if bt_idx_list:
                 ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_idx_list))
