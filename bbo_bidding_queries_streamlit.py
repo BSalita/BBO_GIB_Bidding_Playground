@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Literal, Set
 import mlBridge.mlBridgeLib as mlBridgeLib
 
 from bbo_bidding_queries_lib import (
+    is_regex_pattern,
     normalize_auction_input,
     normalize_auction_user_text,
     format_elapsed,
@@ -577,7 +578,7 @@ def build_distribution_sql(
                 if perm_conditions:
                     sorted_condition = f"({' OR '.join(perm_conditions)})"
                     conditions.append(sorted_condition)
-                    descriptions.append(f"shape={''.join(map(str, shape))}")
+                    descriptions.append(f"shape={''.join([str(x) for x in shape])}")
     
     if not conditions:
         return "", ""
@@ -4314,8 +4315,18 @@ def render_custom_criteria_editor():
                         key=f"partial_{idx}",
                         label_visibility="collapsed",
                     )
-                    # Normalize to canonical uppercase
-                    new_partial_normalized = new_partial.strip().upper() if new_partial else ""
+                    # Normalize to canonical dash-separated form for literal auctions.
+                    # (Regex patterns are kept as uppercase strings.)
+                    new_partial_normalized = ""
+                    if new_partial:
+                        try:
+                            if is_regex_pattern(new_partial):
+                                new_partial_normalized = new_partial.strip().upper()
+                            else:
+                                new_partial_normalized = normalize_auction_input(new_partial).strip().upper()
+                                new_partial_normalized = re.sub(r"(?i)^(p-)+", "", new_partial_normalized)
+                        except Exception:
+                            new_partial_normalized = new_partial.strip().upper()
                     if new_partial_normalized != rule["partial_auction"]:
                         st.session_state.criteria_rules[idx]["partial_auction"] = new_partial_normalized
                 
@@ -5908,6 +5919,33 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 fit_columns_to_view=True,
             )
     
+    # -----------------------------------------------------------------------
+    # AI Model (derived from "Best Bids Ranked by Model Score")
+    # -----------------------------------------------------------------------
+    # We render the placeholder here (above "Bidding Sequence") but fill it later after
+    # we compute suggested bids. This avoids reordering the UI logic.
+    best_auction_placeholder = st.empty()
+    # Cache Best Auction per pinned deal so it remains invariant to the current built auction.
+    best_auc_deal_key: str | None = None
+    try:
+        if pinned_deal:
+            # Prefer stable row id when available; fall back to user-facing index.
+            rk = pinned_deal.get("_row_idx")
+            ik = pinned_deal.get("index")
+            if rk is not None:
+                best_auc_deal_key = f"row_{int(rk)}"
+            elif ik is not None:
+                best_auc_deal_key = f"idx_{int(ik)}"
+    except Exception:
+        best_auc_deal_key = None
+    best_auc_ss_key = f"_auction_builder_best_auction__{best_auc_deal_key}" if best_auc_deal_key else "_auction_builder_best_auction"
+    try:
+        cached_best_auc = st.session_state.get(best_auc_ss_key)
+        if isinstance(cached_best_auc, str) and cached_best_auc.strip():
+            best_auction_placeholder.info(f"AI Model: `{cached_best_auc.strip()}`")
+    except Exception:
+        pass
+
     # Display current auction state with editable input
     # Include bt_index from last step if available (use 'is not None' since bt_index=0 is valid)
     current_bt_index = current_path[-1].get("bt_index") if current_path else None
@@ -6169,6 +6207,236 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         except Exception:
             return False
         return False
+
+    def _next_display_seat_from_auction(auction_text: str) -> int:
+        """Return the next bidder seat number (1-4) in display/dealer-relative order."""
+        try:
+            toks = [t.strip().upper() for t in str(auction_text or "").split("-") if t.strip()]
+            return (len(toks) % 4) + 1
+        except Exception:
+            return 1
+
+    def _greedy_best_auction_complete(
+        start_auction: str,
+        *,
+        max_steps: int = 40,
+    ) -> str | None:
+        """Greedy completion: repeatedly apply the top-most Valid/green bid until complete.
+
+        "Valid/green" semantics match the Auction Builder:
+        - _matches == True (pinned deal passes criteria) and not rejected
+        - Pass is optionally treated as always-valid (user setting)
+        """
+        if not pinned_deal:
+            return None
+
+        auc = normalize_auction_input(start_auction).upper() if start_auction else ""
+        auc = auc.strip("-")
+
+        for _ in range(max_steps):
+            # Completion check (covers both passed-out and 3-pass endings).
+            toks = [t.strip().upper() for t in str(auc or "").split("-") if t.strip()]
+            if toks:
+                if len(toks) >= 4 and all(t == "P" for t in toks):
+                    return auc
+                trailing = 0
+                for t in reversed(toks):
+                    if t == "P":
+                        trailing += 1
+                    else:
+                        break
+                if trailing >= 3 and any(t != "P" for t in toks):
+                    return auc
+
+            seat_1_to_4 = _next_display_seat_from_auction(auc)
+            bt_prefix, leading_passes = _strip_leading_passes(auc)
+
+            options = get_next_bid_options(bt_prefix)
+            options = list(options or [])
+
+            # Opening-pass support (mirror main UI logic).
+            if bt_prefix == "":
+                has_p = any(str(o.get("bid") or "").strip().upper() == "P" for o in options)
+                if not has_p:
+                    options.append(
+                        {
+                            "bid": "P",
+                            "bt_index": None,
+                            "agg_expr": [],
+                            "is_complete": _is_auction_complete_after_next_bid(auc, "P"),
+                        }
+                    )
+
+            # Permissive-pass support (mirror main UI logic).
+            if st.session_state.get("always_valid_pass", True):
+                has_p = any(str(o.get("bid") or "").strip().upper() == "P" for o in options)
+                if not has_p:
+                    options.append(
+                        {
+                            "bid": "P",
+                            "bt_index": None,
+                            "expr": [],
+                            "agg_expr": [],
+                            "can_complete": True,
+                            "is_complete": _is_auction_complete_after_next_bid(auc, "P"),
+                            "is_dead_end": False,
+                            "matching_deal_count": 0,
+                            "avg_ev_nv": None,
+                            "avg_ev_v": None,
+                        }
+                    )
+
+            if not options:
+                return auc
+
+            # Score and choose the best Valid option.
+            dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
+            vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper()
+            ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+            ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+
+            best_score: float = float("-inf")
+            best_bid: str | None = None
+            best_is_complete = False
+
+            for opt in options:
+                bid_str = str(opt.get("bid", "")).strip().upper()
+                if not bid_str:
+                    continue
+                is_pass = bid_str in ("P", "PASS")
+                pass_always_valid = bool(is_pass and st.session_state.get("always_valid_pass", True))
+                criteria_list = opt.get("agg_expr", []) or []
+                pass_no_criteria = bool(is_pass and (not criteria_list))
+
+                # Determine if pinned deal matches criteria for this bid.
+                matches_pinned = True
+                if show_failed_criteria:
+                    matches_pinned, _failed_list = check_pinned_match_with_failures(criteria_list, seat_1_to_4)
+                if pass_always_valid:
+                    matches_pinned = True
+
+                # Rejection logic (mirror main UI).
+                is_dead_end = bool(opt.get("is_dead_end", False))
+                has_empty_criteria = (not criteria_list)
+                can_complete = opt.get("can_complete")
+                can_complete_b = bool(can_complete) if can_complete is not None else True
+
+                is_rejected = is_dead_end or has_empty_criteria
+                if pass_no_criteria:
+                    is_rejected = False
+                if pass_always_valid:
+                    is_rejected = False
+                if show_failed_criteria and matches_pinned is True and (not can_complete_b):
+                    if not (pass_no_criteria or pass_always_valid):
+                        is_rejected = True
+
+                if matches_pinned is not True or is_rejected:
+                    continue
+
+                # Seat direction for vulnerability/sign logic in score calculation.
+                seat_direction = None
+                try:
+                    directions = ["N", "E", "S", "W"]
+                    dealer_idx = directions.index(str(dealer_actual).upper()) if str(dealer_actual).upper() in directions else 0
+                    seat_direction = directions[(dealer_idx + int(seat_1_to_4) - 1) % 4]
+                except Exception:
+                    seat_direction = None
+
+                # Compute "model score" for this bid using the same logic as the grid.
+                score_val: float = float("-inf")
+                try:
+                    next_auc = f"{auc}-{bid_str}" if auc else bid_str
+                    next_auc = normalize_auction_input(next_auc).upper() if next_auc else ""
+
+                    # Determine doubling state from auction calls after last contract.
+                    bids = [b.strip().upper() for b in (next_auc or "").split("-") if b.strip()]
+                    last_contract_idx = -1
+                    for i in range(len(bids) - 1, -1, -1):
+                        bb = bids[i]
+                        if not bb or bb == "P":
+                            continue
+                        if bb in ("X", "D", "DBL", "DOUBLE"):
+                            continue
+                        if bb in ("XX", "R", "RDBL", "REDOUBLE"):
+                            continue
+                        if len(bb) >= 2 and bb[0].isdigit():
+                            last_contract_idx = i
+                            break
+
+                    is_dbl_val = False
+                    is_rdbl_val = False
+                    dbl_val = ""
+                    if last_contract_idx >= 0:
+                        is_doubled = False
+                        is_redoubled = False
+                        for bb in bids[last_contract_idx + 1 :]:
+                            if bb in ("X", "D", "DBL", "DOUBLE"):
+                                is_doubled = True
+                                is_redoubled = False
+                            elif bb in ("XX", "R", "RDBL", "REDOUBLE"):
+                                is_redoubled = True
+                        is_rdbl_val = bool(is_redoubled)
+                        is_dbl_val = bool(is_doubled and not is_redoubled)
+                        dbl_val = "XX" if is_rdbl_val else ("X" if is_doubled else "")
+
+                    c = parse_contract_from_auction(next_auc)
+                    if not c:
+                        # Passed out: treat score as 0
+                        if bids and all(bb == "P" for bb in bids):
+                            score_val = 0.0
+                        else:
+                            score_val = float("-inf")
+                    else:
+                        level_i, strain_i, _pos_i = c
+                        declarer = get_declarer_for_auction(next_auc, dealer_actual)
+                        if not declarer:
+                            score_val = float("-inf")
+                        else:
+                            declarer_dir = str(declarer).upper()
+                            is_ns = declarer_dir in ("N", "S")
+                            is_vul_val = (is_ns and ns_vul) or ((not is_ns) and ew_vul)
+                            tricks = get_dd_tricks_for_auction(next_auc, dealer_actual, pinned_deal)
+                            if tricks is None:
+                                score_val = float("-inf")
+                            else:
+                                result_val = int(tricks) - (int(level_i) + 6)
+                                lvl0 = int(level_i) - 1
+                                suit0 = mlBridgeLib.StrainSymToValue(str(strain_i).upper())
+                                dbl0 = 2 if is_rdbl_val else (1 if is_dbl_val else 0)
+                                decl0 = "NSEW".index(declarer_dir)
+                                vul0 = 1 if is_vul_val else 0
+                                s0 = mlBridgeLib.score(
+                                    lvl0,
+                                    suit0,
+                                    dbl0,
+                                    decl0,
+                                    vul0,
+                                    int(result_val),
+                                    declarer_score=True,
+                                )
+                                # Normalize to "our side" (same as grid logic).
+                                if seat_direction is not None:
+                                    if (declarer_dir in ("N", "S")) ^ (seat_direction in ("N", "S")):
+                                        s0 = -int(s0)
+                                score_val = float(s0)
+                except Exception:
+                    score_val = float("-inf")
+
+                if score_val > best_score:
+                    best_score = score_val
+                    best_bid = bid_str
+                    best_is_complete = bool(opt.get("is_complete", False)) or _is_auction_complete_after_next_bid(auc, bid_str)
+
+            if not best_bid:
+                return auc
+
+            auc = f"{auc}-{best_bid}" if auc else best_bid
+            auc = normalize_auction_input(auc).upper() if auc else ""
+            if best_is_complete:
+                return auc
+
+        # Safety cap reached: return best-effort prefix.
+        return auc or None
 
     def _strip_leading_passes(auction_text: str) -> tuple[str, int]:
         """Return (bt_prefix, leading_passes) where bt_prefix omits leading passes before first non-pass.
@@ -6657,29 +6925,31 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
             # Suggested bids ranked by EV Contract, Matches, Bid
             suggested_bids_rows: list[dict[str, Any]] = []
+            # Build the base "top 5 valid" list exactly as before.
+            valid_bid_rows: list[dict[str, Any]] = []
+            other_bid_rows: list[dict[str, Any]] = []
             for r in bid_rows:
-                # Only allow valid bids in this table
-                if r.get("_rejected") or (r.get("_matches") is not True):
-                    continue
-                bucket = "Unknown"
-                if r.get("_rejected"):
-                    bucket = "Rejected"
+                if (r.get("_rejected") is True) or (r.get("_matches") is False):
+                    other_bid_rows.append(r)
                 elif r.get("_matches") is True:
-                    bucket = "Valid"
-                elif r.get("_matches") is False:
-                    bucket = "Invalid"
-                bucket_rank = 0
-                if bucket == "Valid":
-                    bucket_rank = 2
-                elif bucket == "Rejected":
-                    bucket_rank = 1
-                elif bucket == "Invalid":
-                    bucket_rank = 0
+                    valid_bid_rows.append(r)
+
+            def _bucket_for_row(rr: dict[str, Any]) -> str:
+                if rr.get("_rejected"):
+                    return "Rejected"
+                if rr.get("_matches") is True:
+                    return "Valid"
+                if rr.get("_matches") is False:
+                    return "Invalid"
+                return "Unknown"
+
+            def _to_suggest_row(rr: dict[str, Any]) -> dict[str, Any]:
+                bucket = _bucket_for_row(rr)
 
                 criteria_count = int(r.get("Criteria_Count", 0) or 0)
                 # EV for sorting (EV Contract)
-                ev_contract_val = r.get("EV_Contract")
-                dd_score_contract_val = r.get("DD_Score_Contract")
+                ev_contract_val = rr.get("EV_Contract")
+                dd_score_contract_val = rr.get("DD_Score_Contract")
 
                 # Any leading Pass (auction prefix is all P's) should have EV=0.0.
                 # This covers opening sequences like "", "P", "P-P", "P-P-P", etc.
@@ -6688,7 +6958,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     prefix_all_passes = (len(toks_now) == 0) or all(t == "P" for t in toks_now)
                 except Exception:
                     prefix_all_passes = False
-                bid0 = str(r.get("Bid", "")).strip().split(" ")[0].upper()
+                bid0 = str(rr.get("Bid", "")).strip().split(" ")[0].upper()
                 if prefix_all_passes and bid0 == "P":
                     ev_contract_val = 0.0
                     # For opening/lead-pass sequences, Pass is effectively "no-op" and should not
@@ -6706,31 +6976,91 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     dd_sort_f = float(dd_sort) if dd_sort is not None else float("-inf")
                 except Exception:
                     dd_sort_f = float("-inf")
-                matches_raw = r.get("Matches")
+                matches_raw = rr.get("Matches")
                 try:
                     matches_i = int(matches_raw) if matches_raw is not None else 0
                 except Exception:
                     matches_i = 0
-                bid_key = str(r.get("Bid", "")).strip().upper()
+                bid_key = str(rr.get("Bid", "")).strip().upper()
 
-                suggested_bids_rows.append(
-                    {
-                        "_idx": r.get("_idx"),
-                        "Bid": r.get("Bid"),
-                        "Criteria": criteria_count,
-                        "EV Contract": ev_contract_val,
-                        "DD Score": dd_score_contract_val,
-                        "Avg_EV": r.get("Avg_EV"),
-                        "Deals": r.get("Deals"),
-                        "Matches": r.get("Matches"),
-                        "Bucket": bucket,
-                        # Sort: DD Score desc, EV Contract desc, Matches desc, Bid asc
-                        "_sort": (-dd_sort_f, -ev_contract_sort, -float(matches_i), bid_key),
-                    }
-                )
+                return {
+                    "_idx": rr.get("_idx"),
+                    "Bid": rr.get("Bid"),
+                    "Criteria": criteria_count,
+                    "EV Contract": ev_contract_val,
+                    "DD Score": dd_score_contract_val,
+                    "Avg_EV": rr.get("Avg_EV"),
+                    "Deals": rr.get("Deals"),
+                    "Matches": rr.get("Matches"),
+                    "Bucket": bucket,
+                    # Sort: DD Score desc, EV Contract desc, Matches desc, Bid asc
+                    "_sort": (-dd_sort_f, -ev_contract_sort, -float(matches_i), bid_key),
+                }
+
+            # Primary rows: top 5 valid (unchanged behavior).
+            for r in valid_bid_rows:
+                suggested_bids_rows.append(_to_suggest_row(r))
 
             suggested_bids_rows.sort(key=lambda x: x.get("_sort", (float("inf"), float("inf"), 0.0, "")))
             suggested_bids_rows = suggested_bids_rows[:5]
+
+            # Extra rows requested:
+            # Include any rejected/invalid bids where:
+            #   - can_complete == True (treat None as True)
+            #   - (DD Score >= DD Score of the current top row) OR (Avg_EV >= Avg_EV of the current top row)
+            top_avg_ev: float | None = None
+            top_dd: float | None = None
+            if suggested_bids_rows:
+                try:
+                    v0 = suggested_bids_rows[0].get("Avg_EV")
+                    top_avg_ev = float(v0) if v0 is not None else None
+                except Exception:
+                    top_avg_ev = None
+                try:
+                    d0 = suggested_bids_rows[0].get("DD Score")
+                    top_dd = float(d0) if d0 is not None else None
+                except Exception:
+                    top_dd = None
+
+            if top_avg_ev is not None or top_dd is not None:
+                existing_idx = {row.get("_idx") for row in suggested_bids_rows if row.get("_idx") is not None}
+                extras: list[dict[str, Any]] = []
+                for r in other_bid_rows:
+                    can_complete = r.get("can_complete")
+                    can_complete_b = bool(can_complete) if can_complete is not None else True
+                    if not can_complete_b:
+                        continue
+                    v = r.get("Avg_EV")
+                    d = r.get("DD_Score_Contract")
+                    try:
+                        v_f = float(v) if v is not None else None
+                    except Exception:
+                        v_f = None
+                    try:
+                        d_f = float(d) if d is not None else None
+                    except Exception:
+                        d_f = None
+
+                    meets = False
+                    if top_avg_ev is not None and v_f is not None and v_f >= float(top_avg_ev):
+                        meets = True
+                    if top_dd is not None and d_f is not None and d_f >= float(top_dd):
+                        meets = True
+                    if not meets:
+                        continue
+                    rr = _to_suggest_row(r)
+                    idx = rr.get("_idx")
+                    if idx is not None and idx in existing_idx:
+                        continue
+                    extras.append(rr)
+                    if idx is not None:
+                        existing_idx.add(idx)
+                # Keep extras stable and sensible: show higher Avg_EV first.
+                try:
+                    extras.sort(key=lambda x: float(x.get("Avg_EV") or float("-inf")), reverse=True)
+                except Exception:
+                    pass
+                suggested_bids_rows.extend(extras)
 
             bids_df = pl.DataFrame(bid_rows)
             
@@ -7128,6 +7458,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             rr["Matches"] = int(par_counts.get(a, 0) or 0)
 
                         par_matches_df = pl.DataFrame(enriched_rows)
+                        # UI request: color ALL rows green.
+                        # Use render_aggrid's pass/fail row styling with a constant True marker.
+                        par_matches_df = par_matches_df.with_columns(pl.lit(True).alias("_passes"))
 
                         st.info(f"Found {len(par_matches)} matching auctions in {float(par_elapsed):.1f}ms.")
 
@@ -7137,6 +7470,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             height=calc_grid_height(len(par_matches_df), max_height=300),
                             table_name="auction_builder_par_matches",
                             update_on=["selectionChanged"],
+                            row_pass_fail_col="_passes",
                         )
 
                         if selected_rows:
@@ -7288,6 +7622,22 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 sug_df = sug_df.sort("Score", descending=True, nulls_last=True)
                             except Exception:
                                 pass
+
+                        # Update AI Model display: full greedy completion.
+                        try:
+                            # IMPORTANT: AI Model should be invariant to the current built auction.
+                            # Compute it once per pinned deal from the opening (empty prefix).
+                            if best_auc_ss_key not in st.session_state:
+                                best_complete = _greedy_best_auction_complete("", max_steps=40)
+                                if isinstance(best_complete, str) and best_complete.strip():
+                                    st.session_state[best_auc_ss_key] = best_complete.strip()
+                                    best_auction_placeholder.info(f"AI Model: `{best_complete.strip()}`")
+                            else:
+                                cached_best = st.session_state.get(best_auc_ss_key)
+                                if isinstance(cached_best, str) and cached_best.strip():
+                                    best_auction_placeholder.info(f"AI Model: `{cached_best.strip()}`")
+                        except Exception:
+                            pass
                         sug_pdf = to_aggrid_safe_pandas(sug_df)
                         gb_sug = GridOptionsBuilder.from_dataframe(sug_pdf)
                         gb_sug.configure_selection(selection_mode="single", use_checkbox=False)
@@ -8567,7 +8917,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         st.subheader(summary_header)
         if rehydrate_elapsed_ms is not None:
             st.info(f"Loaded auction criteria in {rehydrate_elapsed_ms/1000:.2f}s")
-        
+
         # Per-step sampled-deal stats cache.
         # Populated when the user clicks a row (Matching Deals section computes sample stats).
         # Keep only the most recent selection to avoid accumulating lots of cached stats.
@@ -9034,7 +9384,17 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         actual_dd_tricks = int(actual_dd_tricks_val) if actual_dd_tricks_val is not None else None
                         # EV for actual contract
                         actual_ev_val = get_ev_for_auction(str(actual_auction), dealer, pinned_deal)
-                        actual_ev = round(float(actual_ev_val), 0) if actual_ev_val is not None else None
+                        if actual_ev_val is not None:
+                            actual_ev = round(float(actual_ev_val), 0)
+                        else:
+                            # Fallback: use the deal-level EV metric if per-contract EV lookup is missing.
+                            # This is typically declarer-relative; we will convert to EV_NS downstream
+                            # using the computed actual_declarer direction.
+                            deal_ev_fallback = pinned_deal.get("EV_Score_Declarer", pinned_deal.get("EV_Score"))
+                            try:
+                                actual_ev = round(float(deal_ev_fallback), 0) if deal_ev_fallback is not None else None
+                            except Exception:
+                                actual_ev = None
                     except Exception:
                         pass
                     # Get bt_index for actual auction via API
@@ -9055,9 +9415,172 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     except Exception:
                         pass
 
+                # Compute AI Model row (greedy completion) when available
+                best_auction_text: str | None = None
+                best_bt_index: int | None = None
+                best_bid: str | None = None
+                best_declarer: str | None = None
+                best_dd_tricks: int | None = None
+                best_dd_score: int | None = None
+                best_ev: float | None = None
+                try:
+                    best_auction_text = st.session_state.get(best_auc_ss_key)
+                    if isinstance(best_auction_text, str):
+                        best_auction_text = best_auction_text.strip()
+                    if not best_auction_text:
+                        best_auction_text = None
+                except Exception:
+                    best_auction_text = None
+                if best_auction_text:
+                    try:
+                        best_calls = [c.strip() for c in str(best_auction_text).split("-") if c.strip()]
+                        best_bid = _final_contract_from_calls(best_calls)
+                        best_declarer = _declarer_direction_from_calls(best_calls, dealer)
+                        best_dd_score_val = get_dd_score_for_auction(str(best_auction_text), dealer, pinned_deal)
+                        best_dd_score = int(best_dd_score_val) if best_dd_score_val is not None else None
+                        best_dd_tricks_val = get_dd_tricks_for_auction(str(best_auction_text), dealer, pinned_deal)
+                        best_dd_tricks = int(best_dd_tricks_val) if best_dd_tricks_val is not None else None
+                        best_ev_val = get_ev_for_auction(str(best_auction_text), dealer, pinned_deal)
+                        best_ev = round(float(best_ev_val), 0) if best_ev_val is not None else None
+                    except Exception:
+                        pass
+                    try:
+                        best_path_data = api_post("/resolve-auction-path", {"auction": str(best_auction_text)}, timeout=5)
+                        best_path = best_path_data.get("path", [])
+                        if best_path:
+                            best_bt_index = best_path[-1].get("bt_index")
+                    except Exception:
+                        pass
+
                 # Two-row DataFrame: Actual vs Built
                 # Get bt_index for built auction from last step of current_path
                 built_bt_index = current_path[-1].get("bt_index") if current_path else None
+
+                def _to_ns(val: int | float | None, declarer_dir: str | None) -> int | float | None:
+                    """Convert declarer-relative score/EV to NS-relative (NS positive)."""
+                    if val is None:
+                        return None
+                    d = str(declarer_dir or "").upper()
+                    sign = -1 if d in ("E", "W") else 1
+                    try:
+                        # Preserve int-ness when possible
+                        if isinstance(val, int):
+                            return int(sign * val)
+                        return float(sign * float(val))
+                    except Exception:
+                        return None
+
+                def _score_ns_from_auction_and_dd_tricks(
+                    auction: str | None,
+                    dealer_dir: str,
+                    dd_tricks: int | None,
+                    vul_text: str | None,
+                ) -> int | None:
+                    """Compute Score_NS from auction + DD tricks (NS-positive convention)."""
+                    if not auction:
+                        return None
+                    if dd_tricks is None:
+                        return None
+                    auc = str(auction).strip().upper()
+                    if not auc:
+                        return None
+                    # Passed out => 0
+                    toks = [t.strip().upper() for t in auc.split("-") if t.strip()]
+                    if toks and all(t == "P" for t in toks):
+                        return 0
+
+                    c = parse_contract_from_auction(auc)
+                    if not c:
+                        return None
+                    level_i, strain_i, pos_i = c
+                    try:
+                        # Determine doubling/redoubling state by scanning calls after last contract bid.
+                        is_doubled = False
+                        is_redoubled = False
+                        for bid in toks[int(pos_i) + 1 :]:
+                            if bid in ("X", "D", "DBL", "DOUBLE"):
+                                is_doubled = True
+                                is_redoubled = False
+                            elif bid in ("XX", "R", "RDBL", "REDOUBLE"):
+                                is_redoubled = True
+                        dbl0 = 2 if is_redoubled else (1 if is_doubled else 0)
+                    except Exception:
+                        dbl0 = 0
+
+                    declarer = get_declarer_for_auction(auc, dealer_dir)
+                    if not declarer:
+                        return None
+                    declarer_dir = str(declarer).upper()
+
+                    # Vulnerability: decide declarer's vulnerability from board vul.
+                    vul = str(vul_text or "").strip().upper()
+                    ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                    ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+                    is_ns = declarer_dir in ("N", "S")
+                    is_vul = (is_ns and ns_vul) or ((not is_ns) and ew_vul)
+
+                    # Result: over/under tricks relative to contract.
+                    try:
+                        result_val = int(dd_tricks) - (int(level_i) + 6)
+                    except Exception:
+                        return None
+
+                    # mlBridgeLib.score expects:
+                    # - level: 0..6 (contract level - 1)
+                    # - suit: 0..4 (CDHSN)
+                    # - double: 0..2 (''/X/XX)
+                    # - declarer: 0..3 (N/E/S/W index)
+                    # - vulnerability: 0..1 (is declarer vul)
+                    # - result: -13..6 (over/under tricks)
+                    try:
+                        lvl0 = int(level_i) - 1
+                        suit0 = mlBridgeLib.StrainSymToValue(str(strain_i).upper())
+                        decl0 = "NSEW".index(declarer_dir)
+                        vul0 = 1 if is_vul else 0
+                        declarer_score = int(
+                            mlBridgeLib.score(
+                                lvl0,
+                                suit0,
+                                int(dbl0),
+                                int(decl0),
+                                int(vul0),
+                                int(result_val),
+                                declarer_score=True,
+                            )
+                        )
+                    except Exception:
+                        return None
+
+                    # Convert to NS-positive.
+                    return (-declarer_score) if declarer_dir in ("E", "W") else declarer_score
+
+                dd_score_final_ns: int | None = None
+                try:
+                    v = _to_ns(dd_score_final, declarer_dir)
+                    dd_score_final_ns = int(v) if v is not None else None
+                except Exception:
+                    dd_score_final_ns = None
+
+                actual_dd_score_ns: int | None = None
+                try:
+                    v = _to_ns(actual_dd_score, actual_declarer)
+                    actual_dd_score_ns = int(v) if v is not None else None
+                except Exception:
+                    actual_dd_score_ns = None
+
+                built_ev_ns: float | None = None
+                try:
+                    v = _to_ns(built_ev, declarer_dir)
+                    built_ev_ns = float(v) if v is not None else None
+                except Exception:
+                    built_ev_ns = None
+
+                actual_ev_ns: float | None = None
+                try:
+                    v = _to_ns(actual_ev, actual_declarer)
+                    actual_ev_ns = float(v) if v is not None else None
+                except Exception:
+                    actual_ev_ns = None
                 completion_rows = [
                     {
                         "BT Index": actual_bt_index,
@@ -9066,8 +9589,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "Bid": actual_bid,
                         "Declarer": actual_declarer,
                         "DD_Tricks": actual_dd_tricks,
-                        "DD_Score": actual_dd_score,
-                        "EV": actual_ev,
+                        "DD_Score_NS": actual_dd_score_ns,
+                        "EV_NS": actual_ev_ns,
+                        "Score_NS": _score_ns_from_auction_and_dd_tricks(
+                            str(actual_auction) if actual_auction else None,
+                            dealer,
+                            actual_dd_tricks,
+                            pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
+                        ),
                     },
                     {
                         "BT Index": built_bt_index,
@@ -9076,14 +9605,51 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "Bid": final_contract,
                         "Declarer": declarer_dir or None,
                         "DD_Tricks": dd_tricks_final,
-                        "DD_Score": dd_score_final,
-                        "EV": built_ev,
+                        "DD_Score_NS": dd_score_final_ns,
+                        "EV_NS": built_ev_ns,
+                        "Score_NS": _score_ns_from_auction_and_dd_tricks(
+                            str(auction_text) if auction_text else None,
+                            dealer,
+                            dd_tricks_final,
+                            pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
+                        ),
                     },
                 ]
+                if best_auction_text:
+                    best_dd_score_ns: int | None = None
+                    best_ev_ns: float | None = None
+                    try:
+                        v = _to_ns(best_dd_score, best_declarer)
+                        best_dd_score_ns = int(v) if v is not None else None
+                    except Exception:
+                        best_dd_score_ns = None
+                    try:
+                        v = _to_ns(best_ev, best_declarer)
+                        best_ev_ns = float(v) if v is not None else None
+                    except Exception:
+                        best_ev_ns = None
+                    completion_rows.append(
+                        {
+                            "BT Index": best_bt_index,
+                            "Source": "AI Model",
+                            "Auction": best_auction_text,
+                            "Bid": best_bid,
+                            "Declarer": best_declarer,
+                            "DD_Tricks": best_dd_tricks,
+                            "DD_Score_NS": best_dd_score_ns,
+                            "EV_NS": best_ev_ns,
+                            "Score_NS": _score_ns_from_auction_and_dd_tricks(
+                                str(best_auction_text),
+                                dealer,
+                                best_dd_tricks,
+                                pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
+                            ),
+                        }
+                    )
                 render_aggrid(
                     pl.DataFrame(completion_rows),
                     key="auction_builder_complete_summary",
-                    height=120,
+                    height=140,
                     table_name="auction_builder_complete_summary",
                     fit_columns_to_view=True,
                     show_sql_expander=False,

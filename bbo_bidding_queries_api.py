@@ -468,23 +468,60 @@ def _load_auction_criteria() -> list[tuple[str, list[str]]]:
     
     criteria_list = []
     try:
-        with open(auction_criteria_file, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            for row in reader:
+        # IMPORTANT: Support line comments per spec:
+        # - A '#' anywhere in a line starts a comment
+        # - Everything from '#' to end-of-line is ignored
+        #
+        # We must strip comments at the *line* level before CSV parsing; stripping per cell is
+        # insufficient when a comment appears after a comma.
+        with open(auction_criteria_file, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.lstrip().startswith("#"):
+                    continue
+
+                # Strip inline comment from the full line (everything after '#').
+                line = _strip_inline_comment(line)
+                if not line:
+                    continue
+
+                # Parse this single (comment-stripped) line as CSV.
+                try:
+                    row = next(csv.reader([line]))
+                except Exception:
+                    continue
                 if not row:
                     continue
-                # Skip lines where first cell is a comment
-                first_cell = row[0].strip()
-                if first_cell.startswith('#'):
+
+                first_cell = (row[0] or "").strip()
+                if not first_cell:
                     continue
-                # Strip inline comments from first cell (partial auction) - canonical UPPERCASE
-                partial_auction = _strip_inline_comment(first_cell).upper()
+
+                # Normalize partial auction.
+                # IMPORTANT: allow *partial auctions* like "1N-2C" (and also tolerate whitespace/commas)
+                # by normalizing literal auctions into canonical dash-separated form.
+                partial_raw = _strip_inline_comment(first_cell)
+                partial_auction = ""
+                try:
+                    if is_regex_pattern(partial_raw):
+                        # Regex patterns: do not rewrite structure; just canonical uppercase.
+                        partial_auction = str(partial_raw).strip().upper()
+                    else:
+                        # Literal prefix auctions: normalize separators and tokens (PASS/NT).
+                        partial_auction = normalize_auction_input(partial_raw).strip().upper()
+                        # Overlay matching is in seat-1 view; strip leading passes if present.
+                        partial_auction = re.sub(r"^(P-)+", "", partial_auction)
+                except Exception:
+                    partial_auction = str(partial_raw or "").strip().upper()
                 if not partial_auction:
                     continue
-                # Strip inline comments from each criterion
-                criteria = []
+
+                # Strip inline comments from each criterion cell (kept for robustness).
+                criteria: list[str] = []
                 for c in row[1:]:
-                    c_clean = _strip_inline_comment(c)
+                    c_clean = _strip_inline_comment(str(c or ""))
                     if c_clean:
                         criteria.append(c_clean)
                 if criteria:
@@ -2576,7 +2613,13 @@ def save_custom_criteria_rules(req: CustomCriteriaSaveRequest) -> Dict[str, Any]
             # Write header comment
             writer.writerow(["# Custom auction criteria - format: partial_auction,criterion1,criterion2,..."])
             for rule in req.rules:
-                row = [rule.partial_auction.strip().upper()] + [c.strip() for c in rule.criteria]  # Canonical UPPERCASE
+                partial_raw = (rule.partial_auction or "").strip()
+                if is_regex_pattern(partial_raw):
+                    partial_norm = partial_raw.upper()
+                else:
+                    partial_norm = normalize_auction_input(partial_raw).strip().upper()
+                    partial_norm = re.sub(r"^(P-)+", "", partial_norm)
+                row = [partial_norm] + [c.strip() for c in rule.criteria]
                 writer.writerow(row)
         
         return {
