@@ -33,6 +33,8 @@ import sys
 import re
 from typing import Any, Dict, List, Literal, Set
 
+import mlBridge.mlBridgeLib as mlBridgeLib
+
 from bbo_bidding_queries_lib import (
     normalize_auction_input,
     normalize_auction_user_text,
@@ -7155,19 +7157,127 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 with sug_col:
                     if suggested_bids_rows:
                         st.markdown("**Best Bids Ranked by Model Score**")
-                        sug_df = pl.DataFrame(
-                            [
-                                {
-                                    "_idx": r["_idx"],
-                                    "Bid": r["Bid"],
-                                    "EV Contract": r.get("EV Contract"),
-                                    "DD Score": r.get("DD Score"),
-                                    "Avg_EV": r.get("Avg_EV"),
-                                    "Bucket": r["Bucket"],
-                                }
-                                for r in suggested_bids_rows
-                            ]
-                        )
+                        # Build enriched rows with Score, is_vul, Result, Dbl columns
+                        enriched_sug_rows = []
+                        dealer_actual = str(pinned_deal.get("Dealer", "N")).upper() if pinned_deal else "N"
+                        vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper() if pinned_deal else ""
+                        ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                        ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+                        
+                        for r in suggested_bids_rows:
+                            bid_str = str(r.get("Bid", "")).strip().upper().split(" ")[0]  # Remove complete marker if present
+                            next_auction = f"{current_auction}-{bid_str}" if current_auction else bid_str
+                            next_auction = normalize_auction_input(next_auction).upper() if next_auction else ""
+                            
+                            # Compute is_vul: True if declarer is vulnerable
+                            is_vul_val = False
+                            result_val: int | None = None
+                            dbl_val = ""
+                            is_dbl_val = False
+                            is_rdbl_val = False
+                            score_val: int | None = None
+                            
+                            if pinned_deal:
+                                try:
+                                    # Doubled status does NOT depend on declarer; it depends on the auction calls.
+                                    # NOTE: parse_contract_from_auction() does NOT encode doubling state; its 3rd return
+                                    # value is the contract bid position. We compute X/XX by scanning calls after the
+                                    # last contract bid (same semantics as bbo_bidding_queries_lib.get_ai_contract()).
+                                    bids = [b.strip().upper() for b in (next_auction or "").split("-") if b.strip()]
+                                    last_contract_idx = -1
+                                    for i in range(len(bids) - 1, -1, -1):
+                                        bid = bids[i]
+                                        if not bid or bid == "P":
+                                            continue
+                                        if bid in ("X", "D", "DBL", "DOUBLE"):
+                                            continue
+                                        if bid in ("XX", "R", "RDBL", "REDOUBLE"):
+                                            continue
+                                        if len(bid) >= 2 and bid[0].isdigit():
+                                            last_contract_idx = i
+                                            break
+
+                                    if last_contract_idx >= 0:
+                                        is_doubled = False
+                                        is_redoubled = False
+                                        for bid in bids[last_contract_idx + 1 :]:
+                                            if bid in ("X", "D", "DBL", "DOUBLE"):
+                                                is_doubled = True
+                                                is_redoubled = False  # a new double resets redouble
+                                            elif bid in ("XX", "R", "RDBL", "REDOUBLE"):
+                                                is_redoubled = True
+
+                                        is_rdbl_val = bool(is_redoubled)
+                                        is_dbl_val = bool(is_doubled and not is_redoubled)
+                                        dbl_val = "XX" if is_rdbl_val else ("X" if is_doubled else "")
+
+                                    # Parse contract and get declarer
+                                    c = parse_contract_from_auction(next_auction)
+                                    if c:
+                                        declarer = get_declarer_for_auction(next_auction, dealer_actual)
+                                        if declarer:
+                                            declarer_dir = str(declarer).upper()
+                                            # Check if declarer's pair is vulnerable
+                                            is_ns = declarer_dir in ("N", "S")
+                                            is_vul_val = (is_ns and ns_vul) or (not is_ns and ew_vul)
+                                            
+                                            # Result: DD tricks (from get_dd_tricks_for_auction)
+                                            try:
+                                                tricks = get_dd_tricks_for_auction(next_auction, dealer_actual, pinned_deal)
+                                                # "Result" convention: (tricks taken) - (contract level + 6)
+                                                # e.g., 4H making exactly => 0, one overtrick => +1, down two => -2
+                                                if tricks is None:
+                                                    result_val = None
+                                                else:
+                                                    level, _strain, _pos = c
+                                                    result_val = int(tricks) - (int(level) + 6)
+                                            except Exception:
+                                                result_val = None
+
+                                            # Score: use mlBridgeLib.score
+                                            # mlBridgeLib.score expects:
+                                            # - level: 0..6 (contract level - 1)
+                                            # - suit: 0..4 (CDHSN)
+                                            # - double: 0..2 (''/X/XX)
+                                            # - declarer: 0..3 (N/E/S/W index)
+                                            # - vulnerability: 0..1 (is declarer vul)
+                                            # - result: -13..6 (over/under tricks)
+                                            if result_val is not None:
+                                                level_i, strain_i, _pos_i = c
+                                                lvl0 = int(level_i) - 1
+                                                suit0 = mlBridgeLib.StrainSymToValue(str(strain_i).upper())
+                                                dbl0 = 2 if is_rdbl_val else (1 if is_dbl_val else 0)
+                                                decl0 = 'NSEW'.index(declarer_dir)
+                                                vul0 = 1 if is_vul_val else 0
+                                                score_val = mlBridgeLib.score(
+                                                        lvl0,
+                                                        suit0,
+                                                        dbl0,
+                                                        decl0,
+                                                        vul0,
+                                                        result_val,
+                                                    )
+                                                if (declarer_dir in ("N", "S")) ^ (seat_direction in ("N", "S")):
+                                                    score_val = -score_val
+                                except Exception:
+                                    pass
+                            
+                            enriched_sug_rows.append({
+                                "_idx": r["_idx"],
+                                "Bid": r["Bid"],
+                                "EV Contract": r.get("EV Contract"),
+                                "DD Score": r.get("DD Score"),
+                                "Avg_EV": r.get("Avg_EV"),
+                                "Score": score_val,
+                                "is_vul": is_vul_val,
+                                "is_dbl": is_dbl_val,
+                                "is_rdbl": is_rdbl_val,
+                                "Result": result_val,
+                                "Dbl": dbl_val,
+                                "Bucket": r["Bucket"],
+                            })
+                        
+                        sug_df = pl.DataFrame(enriched_sug_rows)
                         sug_pdf = to_aggrid_safe_pandas(sug_df)
                         gb_sug = GridOptionsBuilder.from_dataframe(sug_pdf)
                         gb_sug.configure_selection(selection_mode="single", use_checkbox=False)
@@ -7179,6 +7289,18 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             gb_sug.configure_column("DD Score", width=95)
                         if "Avg_EV" in sug_pdf.columns:
                             gb_sug.configure_column("Avg_EV", width=95)
+                        if "Score" in sug_pdf.columns:
+                            gb_sug.configure_column("Score", width=80)
+                        if "is_vul" in sug_pdf.columns:
+                            gb_sug.configure_column("is_vul", width=70)
+                        if "is_dbl" in sug_pdf.columns:
+                            gb_sug.configure_column("is_dbl", width=70)
+                        if "is_rdbl" in sug_pdf.columns:
+                            gb_sug.configure_column("is_rdbl", width=75)
+                        if "Result" in sug_pdf.columns:
+                            gb_sug.configure_column("Result", width=80)
+                        if "Dbl" in sug_pdf.columns:
+                            gb_sug.configure_column("Dbl", width=50)
                         gb_sug.configure_grid_options(
                             getRowClass=row_class_js,
                             rowHeight=25,
