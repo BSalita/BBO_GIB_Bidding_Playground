@@ -1403,8 +1403,29 @@ class G3Index:
         if bt_index >= len(self.offsets) - 1: return []
         start, end = self.offsets[bt_index], self.offsets[bt_index + 1]
         codes = self.bidcodes[start:end]
-        # Filter for unique codes and convert to bid strings
-        return sorted(list(set([CODE_TO_BID[c] for c in codes if c > 0])))
+        # Filter for unique codes and convert to bid strings.
+        #
+        # IMPORTANT: Do NOT sort bids lexicographically. Strain order is CDHSN (not CDHNS),
+        # so "1S" must sort before "1N". Use a contract-aware sort key.
+        uniq = {CODE_TO_BID[c] for c in codes if c > 0}
+
+        def _sort_key(bid: str) -> tuple:
+            b = str(bid or "").strip().upper()
+            if b in ("P", "PASS"):
+                return (2, 0, 0)
+            if b in ("D", "DBL", "DOUBLE", "X", "R", "RDBL", "REDOUBLE", "XX"):
+                return (1, 0, b)
+            # Contracts: 1C..7N (note: internal vocabulary uses "N", not "NT")
+            try:
+                level = int(b[0])
+            except Exception:
+                return (3, 0, b)
+            suit = b[1:] if len(b) > 1 else ""
+            suit = "N" if suit == "NT" else suit
+            suit_order = {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}.get(suit, 9)
+            return (0, level, suit_order)
+
+        return sorted(list(uniq), key=_sort_key)
 
 STATE: Dict[str, Any] = CORE.state
 

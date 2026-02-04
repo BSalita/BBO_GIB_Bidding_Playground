@@ -35,6 +35,13 @@ from typing import Any, Dict, List, Literal, Set
 
 import mlBridge.mlBridgeLib as mlBridgeLib
 
+from bbo_custom_questions_lib import (
+    load_custom_questions_csv,
+    sync_questions_into_docs,
+    CustomQuestion,
+    file_sha1,
+)
+
 from bbo_bidding_queries_lib import (
     is_regex_pattern,
     normalize_auction_input,
@@ -46,6 +53,8 @@ from bbo_bidding_queries_lib import (
     get_dd_tricks_for_auction,
     get_ev_for_auction,
     get_ev_for_auction_pre,
+    is_auction_valid,
+    validate_auction,
 )
 
 # Import helpers from handlers
@@ -71,6 +80,7 @@ MATCH_ALL_DEALERS_HELP = (
 AUCTION_BUILDER_NOTES_MAX_CHARS = 200
 AUCTION_BUILDER_NOTES_CSV = pathlib.Path(__file__).resolve().parent / "data" / "auction_builder_notes.csv"
 AUCTION_BUILDER_LAST_PIN_TXT = pathlib.Path(__file__).resolve().parent / "data" / "auction_builder_last_pinned_deal_index.txt"
+CUSTOM_QUESTIONS_CSV = pathlib.Path(__file__).resolve().parent / "data" / "bbo_custom_questions.csv"
 
 
 def _auction_builder_load_last_pinned_deal_index() -> int:
@@ -969,6 +979,9 @@ def render_aggrid(
     # Optional row styling based on a boolean column (e.g., "_passes")
     # If set, rows will be colored green (True) or red (False)
     row_pass_fail_col: str | None = None,
+    # Optional row styling based on a bucket column (e.g., "Source" or "Bucket")
+    # If set, rows will be colored: Valid=green, Rejected=yellow, Invalid=red
+    row_bucket_col: str | None = None,
     # Optional list of columns to show cell value as tooltip (for long text that gets truncated)
     tooltip_cols: list[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1338,8 +1351,45 @@ def render_aggrid(
             }}
         """)
     
+    # Row bucket styling: add getRowClass and hide the marker column
+    if row_bucket_col and row_bucket_col in df.columns:
+        # Hide the marker column
+        for col_def in grid_options.get("columnDefs", []):
+            if col_def.get("field") == row_bucket_col:
+                col_def["hide"] = True
+                break
+        # Add getRowClass for conditional styling
+        grid_options["getRowClass"] = JsCode(f"""
+            function(params) {{
+                if (params.data && params.data['{row_bucket_col}'] === 'Valid') {{
+                    return 'row-suggest-valid';
+                }}
+                if (params.data && params.data['{row_bucket_col}'] === 'Rejected') {{
+                    return 'row-suggest-rejected';
+                }}
+                if (params.data && params.data['{row_bucket_col}'] === 'Invalid') {{
+                    return 'row-suggest-invalid';
+                }}
+                return null;
+            }}
+        """)
+    
     # Build custom CSS
-    if row_pass_fail_col and row_pass_fail_col in df.columns:
+    if row_bucket_col and row_bucket_col in df.columns:
+        # Bucket-based row styling (same colors as valid/rejected/invalid bid grids)
+        custom_css = {
+            ".ag-row": {"cursor": "pointer" if is_interactive else "default"},
+            ".row-suggest-valid": {"background-color": "#d4edda !important"},
+            ".row-suggest-rejected": {"background-color": "#fff3cd !important"},
+            ".row-suggest-invalid": {"background-color": "#f8d7da !important"},
+            ".row-suggest-valid.ag-row-hover": {"background-color": "#b8dfc4 !important", "border-left": "3px solid #28a745 !important"},
+            ".row-suggest-rejected.ag-row-hover": {"background-color": "#ffe69c !important", "border-left": "3px solid #ffc107 !important"},
+            ".row-suggest-invalid.ag-row-hover": {"background-color": "#f1b0b7 !important", "border-left": "3px solid #dc3545 !important"},
+            ".row-suggest-valid.ag-row-selected": {"background-color": "#a3d4af !important"},
+            ".row-suggest-rejected.ag-row-selected": {"background-color": "#ffe082 !important"},
+            ".row-suggest-invalid.ag-row-selected": {"background-color": "#eb959f !important"},
+        }
+    elif row_pass_fail_col and row_pass_fail_col in df.columns:
         # Pass/fail row styling (same colors as valid/invalid bid grids)
         custom_css = {
             ".row-pass": {"background-color": "#d4edda"},  # Green
@@ -1378,7 +1428,7 @@ def render_aggrid(
         update_on=effective_update_on,
         data_return_mode=DataReturnMode.AS_INPUT,
         custom_css=custom_css,
-        allow_unsafe_jscode=True if row_pass_fail_col else False,
+        allow_unsafe_jscode=True if (row_pass_fail_col or row_bucket_col) else False,
     )
     
     selected_rows: Any = response.get("selected_rows", [])
@@ -5688,6 +5738,26 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     # On entry to Auction Builder, auto-restore last pinned deal index (if nothing currently pinned).
     entered = bool(st.session_state.pop("_entered_auction_builder", False))
     if entered:
+        # Sync custom questions into docs (fail-fast if CSV is missing/invalid).
+        # Best practice: gate on CSV content hash so we don't rewrite docs if unchanged.
+        try:
+            repo_root = pathlib.Path(__file__).resolve().parent
+            sha1_now = file_sha1(CUSTOM_QUESTIONS_CSV)
+            sha1_prev = str(st.session_state.get("_custom_questions_csv_sha1") or "")
+            if sha1_now != sha1_prev:
+                meta = sync_questions_into_docs(
+                    questions_csv=CUSTOM_QUESTIONS_CSV,
+                    players_md=repo_root / "docs" / "BIDDING_AI_QA_FOR_PLAYERS.md",
+                    coders_md=repo_root / "docs" / "BIDDING_AI_QA_FOR_CODERS.md",
+                )
+                st.session_state["_custom_questions_csv_sha1"] = meta.get("csv_sha1") or sha1_now
+            else:
+                # Already synced this exact CSV content in this Streamlit session.
+                st.session_state["_custom_questions_csv_sha1"] = sha1_now
+        except Exception as e:
+            st.error(f"Custom questions sync failed: {e}")
+            st.stop()
+
         try:
             curr_idx = int(st.session_state.get("auction_builder_pinned_index", 0) or 0)
         except Exception:
@@ -6092,7 +6162,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             )
     
     # -----------------------------------------------------------------------
-    # AI Model (derived from "Best Bids Ranked by Model Score")
+    # Cheater Model (derived from "Best Bids Ranked by Cheating Model")
     # -----------------------------------------------------------------------
     # We render the placeholder here (above "Bidding Sequence") but fill it later after
     # we compute suggested bids. This avoids reordering the UI logic.
@@ -6114,7 +6184,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     try:
         cached_best_auc = st.session_state.get(best_auc_ss_key)
         if isinstance(cached_best_auc, str) and cached_best_auc.strip():
-            best_auction_placeholder.info(f"AI Model: `{cached_best_auc.strip()}`")
+            best_auction_placeholder.info(f"Cheater Model: `{cached_best_auc.strip()}`")
     except Exception:
         pass
 
@@ -6235,6 +6305,15 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
     if (value_changed or apply_edit) and not already_applied:
         edited_normalized = normalize_auction_input(edited_auction).upper()
         if edited_normalized:
+            # Validate auction before processing
+            if not is_auction_valid(edited_normalized, require_complete=False):
+                validation_result = validate_auction(edited_normalized, require_complete=False)
+                error_msg = validation_result.get("error", "Invalid auction")
+                st.error(f"❌ Invalid auction: {error_msg}")
+                # Don't process invalid auctions
+                st.session_state.auction_builder_last_applied = edited_normalized  # Prevent re-trigger on invalid input
+                st.stop()
+            
             # Build expected bids list for length comparison
             expected_bids = [b.strip().upper() for b in edited_normalized.split("-") if b.strip()]
             expected_len = len(expected_bids)
@@ -6751,6 +6830,584 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     return (3, bid)
             
             sorted_options = sorted(options, key=bid_sort_key)
+
+            # -----------------------------------------------------------------
+            # Player-style Q&A (Q1..Q11) for the current auction context
+            # -----------------------------------------------------------------
+            # This is intentionally anchored to the *current auction decision point*:
+            # - We format prompts to include deal_index (if pinned) + auction text.
+            # - For evidence-backed answers, we use existing stable endpoints:
+            #   - /bid-details (phase2a posteriors, par posterior)
+            #   - /explain-bid (templated explanation + counterfactual)
+            #   - /list-next-bids (next-bid options + match counts)
+            import math
+            try:
+                qa_deal_index: int | None = None
+                if pinned_deal and pinned_deal.get("index") is not None:
+                    qa_deal_index = int(pinned_deal.get("index"))
+            except Exception:
+                qa_deal_index = None
+
+            def _qa_context_str() -> str:
+                auc = str(current_auction or "").strip()
+                di = str(qa_deal_index) if qa_deal_index is not None else "None"
+                return f"Context: deal_index={di}, auction='{auc if auc else '(opening)'}'"
+
+            def _qa_hist_stats(hist: dict[str, int] | None) -> dict[str, float | None]:
+                """Return mean + (p05,p95) from an integer histogram {value: count}."""
+                if not isinstance(hist, dict) or not hist:
+                    return {"mean": None, "p05": None, "p95": None}
+                try:
+                    items: list[tuple[int, int]] = []
+                    tot = 0
+                    s = 0.0
+                    for k, v in hist.items():
+                        kk = int(k)
+                        vv = int(v)
+                        if vv <= 0:
+                            continue
+                        items.append((kk, vv))
+                        tot += vv
+                        s += float(kk) * float(vv)
+                    if tot <= 0 or not items:
+                        return {"mean": None, "p05": None, "p95": None}
+                    items.sort(key=lambda x: x[0])
+                    mean = float(s / float(tot))
+
+                    def _q(p: float) -> float:
+                        target = p * float(tot)
+                        c = 0.0
+                        for kk, vv in items:
+                            c += float(vv)
+                            if c >= target:
+                                return float(kk)
+                        return float(items[-1][0])
+
+                    return {"mean": mean, "p05": _q(0.05), "p95": _q(0.95)}
+                except Exception:
+                    return {"mean": None, "p05": None, "p95": None}
+
+            # Candidate bids (for evidence-backed questions)
+            qa_bids: list[str] = []
+            try:
+                seen = set()
+                for o in (sorted_options or []):
+                    b = str(o.get("bid") or "").strip().upper()
+                    if not b or b in seen:
+                        continue
+                    seen.add(b)
+                    qa_bids.append(b)
+            except Exception:
+                qa_bids = []
+
+            # Load custom questions from CSV (fail-fast).
+            try:
+                qa_questions_all: list[CustomQuestion] = load_custom_questions_csv(CUSTOM_QUESTIONS_CSV)
+                qa_questions: list[CustomQuestion] = [q for q in qa_questions_all if q.enabled]
+                if not qa_questions:
+                    raise ValueError("No enabled questions in CSV")
+            except Exception as e:
+                st.error(f"Custom questions CSV invalid: {e}")
+                st.stop()
+
+            # Reset selection/answer when auction context changes
+            qa_ctx_key = "_auction_builder_qa_ctx"
+            qa_prev_ctx = str(st.session_state.get(qa_ctx_key, "") or "")
+            qa_curr_ctx = f"{qa_deal_index}:{str(current_auction or '').strip().upper()}"
+            if qa_prev_ctx != qa_curr_ctx:
+                st.session_state[qa_ctx_key] = qa_curr_ctx
+                for k in ["auction_builder_qa_qid", "auction_builder_qa_bid", "auction_builder_qa_why_not", "auction_builder_qa_answer"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+
+            with st.expander("💬 Q&A (players) — ask about current auction", expanded=False):
+                st.caption(_qa_context_str())
+
+                qa_title_by_id = {q.id: q.title for q in qa_questions}
+                qid = st.selectbox(
+                    "Question",
+                    options=[q.id for q in qa_questions],
+                    format_func=lambda x: str(qa_title_by_id.get(x, x)),
+                    key="auction_builder_qa_qid",
+                )
+
+                qobj = next((qq for qq in qa_questions if qq.id == qid), None)
+                if qobj is None:
+                    st.error(f"Question not found: {qid}")
+                    st.stop()
+
+                # Evidence controls: choose a candidate next bid only when required.
+                sel_bid = ""
+                if qobj.requires_candidate_bid:
+                    sel_bid = st.selectbox(
+                        "Candidate next bid (used as evidence context where applicable)",
+                        options=(qa_bids if qa_bids else [""]),
+                        index=(0 if qa_bids else 0),
+                        key="auction_builder_qa_bid",
+                        help="Some questions use /bid-details or /explain-bid, which are defined for (auction prefix + candidate next bid).",
+                    )
+                why_not_bid = None
+                if qid == "Q1":
+                    why_not_bid = st.selectbox(
+                        "Why not… (counterfactual bid)",
+                        options=["(none)"] + (qa_bids if qa_bids else []),
+                        index=0,
+                        key="auction_builder_qa_why_not",
+                    )
+
+                qa_max_deals = int(
+                    st.number_input(
+                        "Max deals (evidence sample size)",
+                        value=500,
+                        min_value=10,
+                        max_value=10_000,
+                        help="Controls the matched-deal sample size used by /bid-details and /explain-bid.",
+                        key="auction_builder_qa_max_deals",
+                    )
+                )
+
+                # Render the formatted prompt (always), using the template from CSV.
+                auction_disp = str(current_auction or "").strip().upper()
+                tmpl_vars = {
+                    "deal_index": str(qa_deal_index) if qa_deal_index is not None else "None",
+                    "auction": auction_disp if auction_disp else "(opening)",
+                    "candidate_bid": str(sel_bid or "").strip().upper() if sel_bid else "",
+                    "why_not_bid": (str(why_not_bid).strip().upper() if why_not_bid and why_not_bid != "(none)" else ""),
+                }
+                prompt_lines: list[str] = [_qa_context_str(), "", f'Prompt: "{qobj.prompt_player}"', qobj.prompt_template.format_map(tmpl_vars)]
+
+                st.markdown("**Formatted question**")
+                st.code("\n".join(prompt_lines))
+
+                def _qa_fetch_bid_details(auction_text: str, bid_text: str) -> dict[str, Any]:
+                    payload: dict[str, Any] = {
+                        "auction": str(auction_text or ""),
+                        "bid": str(bid_text or ""),
+                        "max_deals": int(qa_max_deals),
+                        "seed": int(seed),
+                        "vul_filter": None,
+                        "topk": 10,
+                        "include_phase2a": True,
+                        "_cache_version": 1,
+                    }
+                    if qa_deal_index is not None:
+                        payload["deal_index"] = int(qa_deal_index)
+                    return api_post("/bid-details", payload, timeout=60)
+
+                def _qa_fetch_explain_bid(auction_text: str, bid_text: str, why_not_text: str | None) -> dict[str, Any]:
+                    payload2: dict[str, Any] = {
+                        "auction": str(auction_text or ""),
+                        "bid": str(bid_text or ""),
+                        "why_not_bid": None if not why_not_text or why_not_text == "(none)" else str(why_not_text),
+                        "max_deals": int(qa_max_deals),
+                        "seed": int(seed),
+                        "vul_filter": None,
+                        "topk": 10,
+                        "include_phase2a": True,
+                        "_cache_version": 1,
+                    }
+                    if qa_deal_index is not None:
+                        payload2["deal_index"] = int(qa_deal_index)
+                    return api_post("/explain-bid", payload2, timeout=90)
+
+                def _qa_answer_q12_top_next_bids() -> pl.DataFrame:
+                    rows = []
+                    for o in (sorted_options or []):
+                        b = str(o.get("bid") or "").strip().upper()
+                        if not b:
+                            continue
+                        mc = o.get("matching_deal_count")
+                        try:
+                            mc_i = int(mc) if mc is not None else 0
+                        except Exception:
+                            mc_i = 0
+                        rows.append({"Bid": b, "MatchingDeals": mc_i})
+                    df = pl.DataFrame(rows) if rows else pl.DataFrame({"Bid": [], "MatchingDeals": []})
+                    if not df.is_empty():
+                        df = df.sort("MatchingDeals", descending=True)
+                        tot = int(df["MatchingDeals"].sum()) if "MatchingDeals" in df.columns else 0
+                        if tot > 0:
+                            df = df.with_columns((pl.col("MatchingDeals") / float(tot) * 100.0).round(2).alias("Prob_%"))
+                    return df.head(5)
+
+                def _qa_answer_q10_expected_completed_auctions() -> pl.DataFrame:
+                    """Approximate top completed auctions by chaining next-bid mass.
+
+                    Uses /list-next-bids matching_deal_count as a probability proxy. We expand a small beam of
+                    partial continuations and then "complete" each partial by appending trailing passes.
+                    """
+                    start = str(current_auction or "").strip().upper()
+                    # If already complete, show itself.
+                    try:
+                        toks0 = [t.strip().upper() for t in start.split("-") if t.strip()]
+                        if toks0:
+                            if len(toks0) >= 4 and all(t == "P" for t in toks0):
+                                return pl.DataFrame([{"Auction": start, "Prob_%": 100.0, "Depth": 0}])
+                            trailing = 0
+                            for t in reversed(toks0):
+                                if t == "P":
+                                    trailing += 1
+                                else:
+                                    break
+                            if trailing >= 3 and any(t != "P" for t in toks0):
+                                return pl.DataFrame([{"Auction": start, "Prob_%": 100.0, "Depth": 0}])
+                    except Exception:
+                        pass
+
+                    # Beam search settings: conservative to avoid a storm of API calls.
+                    max_depth = 4
+                    beam_width = 8
+
+                    # log-sum-exp accumulator for duplicate completed auctions
+                    completed_logp: dict[str, float] = {}
+
+                    def _lse(a: float | None, b: float) -> float:
+                        if a is None:
+                            return float(b)
+                        m = a if a > b else b
+                        return float(m + math.log(math.exp(a - m) + math.exp(b - m)))
+
+                    beam: list[tuple[str, float, int]] = [(start, 0.0, 0)]  # (auction_text, logp, depth)
+                    for _ in range(max_depth):
+                        new_beam: list[tuple[str, float, int]] = []
+                        for auc, logp, depth in beam:
+                            bt_pref, _lp = _strip_leading_passes(auc)
+                            opts = get_next_bid_options(bt_pref)
+                            rows2: list[tuple[str, int]] = []
+                            mass = 0
+                            for o in (opts or []):
+                                bid = str(o.get("bid") or "").strip().upper()
+                                if not bid:
+                                    continue
+                                try:
+                                    mc = int(o.get("matching_deal_count") or 0)
+                                except Exception:
+                                    mc = 0
+                                if mc <= 0:
+                                    continue
+                                mass += mc
+                                rows2.append((bid, mc))
+                            if mass <= 0 or not rows2:
+                                continue
+                            rows2.sort(key=lambda x: x[1], reverse=True)
+                            rows2 = rows2[:beam_width]
+                            for bid, mc in rows2:
+                                p = float(mc) / float(mass)
+                                if not (p > 0.0):
+                                    continue
+                                next_auc = f"{auc}-{bid}" if auc else bid
+                                lp2 = float(logp + math.log(p))
+                                # "Complete" by appending trailing passes (default completion convention).
+                                try:
+                                    completed_auc = _append_passes_to_complete(next_auc)
+                                except Exception:
+                                    completed_auc = next_auc
+                                prev = completed_logp.get(completed_auc)
+                                completed_logp[completed_auc] = _lse(prev, lp2)
+                                new_beam.append((next_auc, lp2, depth + 1))
+                        if not new_beam:
+                            break
+                        new_beam.sort(key=lambda x: x[1], reverse=True)
+                        beam = new_beam[:beam_width]
+
+                    if not completed_logp:
+                        return pl.DataFrame({"Auction": [], "Prob_%": [], "Depth": []})
+
+                    # Normalize among the completed set for display.
+                    max_logp = max(completed_logp.values())
+                    weights = {k: math.exp(v - max_logp) for k, v in completed_logp.items()}
+                    z = float(sum(weights.values())) if weights else 0.0
+                    out = []
+                    for auc, w in sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[:5]:
+                        out.append({"Auction": auc, "Prob_%": round((float(w) / z) * 100.0, 2) if z > 0 else None})
+                    return pl.DataFrame(out)
+
+                def _qa_answer_q11_surprises() -> pl.DataFrame:
+                    """Approximate 'surprise' using next-bid matching_deal_count mass at each step."""
+                    calls = [str(s.get("bid") or "").strip().upper() for s in (current_path or []) if str(s.get("bid") or "").strip()]
+                    if not calls:
+                        return pl.DataFrame({"Step": [], "AuctionPrefix": [], "Call": [], "ApproxP_%": [], "Surprise": []})
+                    out_rows: list[dict[str, Any]] = []
+                    prefix_parts: list[str] = []
+                    for i, call in enumerate(calls):
+                        prefix = "-".join(prefix_parts)
+                        bt_pref, _lp = _strip_leading_passes(prefix)
+                        opts = get_next_bid_options(bt_pref)
+                        mass = 0
+                        call_mass = None
+                        for o in (opts or []):
+                            try:
+                                mc = int(o.get("matching_deal_count") or 0)
+                            except Exception:
+                                mc = 0
+                            mass += mc
+                            if str(o.get("bid") or "").strip().upper() == call:
+                                call_mass = mc
+                        p = (float(call_mass) / float(mass)) if (mass and call_mass is not None) else float("nan")
+                        try:
+                            surprise = float("inf") if not (p > 0.0) else float(-math.log(p))
+                        except Exception:
+                            surprise = float("inf")
+                        out_rows.append(
+                            {
+                                "Step": int(i + 1),
+                                "AuctionPrefix": prefix if prefix else "(opening)",
+                                "Call": call,
+                                "ApproxP_%": None if not (p == p) else round(p * 100.0, 2),  # NaN check via p==p
+                                "Surprise": None if surprise == float("inf") else round(surprise, 3),
+                            }
+                        )
+                        prefix_parts.append(call)
+                    df = pl.DataFrame(out_rows) if out_rows else pl.DataFrame()
+                    if not df.is_empty() and "Surprise" in df.columns:
+                        df = df.sort("Surprise", descending=True, nulls_last=True)
+                    return df.head(3)
+
+                # Reactive answering: compute only when relevant inputs change.
+                q4_decl = None
+                q4_strain = None
+                if qid == "Q4":
+                    q4_decl = st.selectbox("Declarer", options=["N", "E", "S", "W"], index=2, key="auction_builder_qa_q4_decl")
+                    q4_strain = st.selectbox("Strain", options=["NT", "S", "H", "D", "C"], index=0, key="auction_builder_qa_q4_strain")
+
+                qa_compute_key = (
+                    "qa-v1",
+                    qa_curr_ctx,
+                    str(qid),
+                    str(sel_bid or ""),
+                    str(why_not_bid or ""),
+                    int(qa_max_deals),
+                    int(seed),
+                    str(q4_decl or ""),
+                    str(q4_strain or ""),
+                )
+                last_key = st.session_state.get("_auction_builder_qa_last_key")
+                if last_key != qa_compute_key:
+                    st.session_state["_auction_builder_qa_last_key"] = qa_compute_key
+
+                try:
+                    st.markdown("**Answer**")
+                    if qid in {"Q1", "Q2", "Q3", "Q6", "Q9"} and not sel_bid:
+                        st.warning("Pick a candidate next bid to compute evidence-backed posteriors/explanations.")
+                    elif qid == "Q1":
+                        with st.spinner("Computing explanation..."):
+                            expl = _qa_fetch_explain_bid(current_auction, sel_bid, why_not_bid)
+                        ex = (expl.get("explanation") or {}) if isinstance(expl, dict) else {}
+                        cf = (expl.get("counterfactual") or {}) if isinstance(expl, dict) else {}
+                        st.caption(
+                            "Note: any 'Top par contracts' mentioned are *double-dummy par* outcomes over the evidence set; "
+                            "they are not constrained to be at/above the contract reached in the current auction."
+                        )
+                        st.write(ex.get("text") or "No explanation returned.")
+                        if cf.get("text"):
+                            st.markdown("**Counterfactual**")
+                            st.write(cf.get("text"))
+                    elif qid == "Q2":
+                        with st.spinner("Computing HCP posterior..."):
+                            details = _qa_fetch_bid_details(current_auction, sel_bid)
+                        hists = details.get("hcp_histograms") or {}
+                        e_hist = hists.get("E") if isinstance(hists, dict) else None
+                        stats = _qa_hist_stats(e_hist if isinstance(e_hist, dict) else None)
+                        st.markdown("**Auction-conditioned; absolute direction E**")
+                        if stats["mean"] is None:
+                            st.write("No HCP posterior available for E in this evidence set.")
+                        else:
+                            st.write(
+                                f"East HCP estimate: mean **{float(stats['mean']):.1f}**, 90% interval **[{int(stats['p05'])}, {int(stats['p95'])}]**."
+                            )
+                    elif qid == "Q3":
+                        with st.spinner("Computing par posterior..."):
+                            details = _qa_fetch_bid_details(current_auction, sel_bid)
+                        ps = details.get("par_score") or {}
+                        pc = details.get("par_contracts") or {}
+                        st.caption("Evidence set is the matched deals for the selected candidate next bid.")
+                        st.caption(
+                            "Important: these are *par contracts* (double-dummy). They can be lower/higher than the contract the auction would reach."
+                        )
+                        mean = ps.get("mean")
+                        p10 = ps.get("p10")
+                        p90 = ps.get("p90")
+                        if mean is not None:
+                            st.write(
+                                f"ParScore: mean **{float(mean):.1f}** (P10={float(p10):.1f} / P90={float(p90):.1f} if available)."
+                            )
+                        topk = pc.get("topk") or []
+                        if topk:
+                            df = pl.DataFrame(topk).head(3)
+                            if "prob" in df.columns:
+                                df = df.with_columns((pl.col("prob") * 100).round(1).alias("Prob_%")).drop("prob")
+                            render_aggrid(
+                                df,
+                                key=f"auction_builder_qa_q3_topk_{qa_curr_ctx}",
+                                height=calc_grid_height(len(df), max_height=180),
+                                table_name="auction_builder_qa_q3_topk",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                        else:
+                            st.write("No par-contract posterior available.")
+                    elif qid == "Q4":
+                        st.markdown("**Pinned deal DD tricks**")
+                        if not pinned_deal:
+                            st.warning("Pin a deal index to answer Q4 using double-dummy tricks.")
+                        else:
+                            decl = str(q4_decl or "S")
+                            strain = str(q4_strain or "NT")
+                            s = "N" if strain == "NT" else strain
+                            col = f"DD_{decl}_{s}"
+                            v = pinned_deal.get(col)
+                            if v is None:
+                                st.write(f"No `{col}` available on pinned deal.")
+                            else:
+                                st.write(f"Double-dummy tricks for {decl} in {strain}: **{int(v)}**.")
+                    elif qid == "Q5":
+                        st.markdown("**Pinned deal DD tricks grid**")
+                        if not pinned_deal:
+                            st.warning("Pin a deal index to show the DD tricks grid (4×5).")
+                        else:
+                            rows = []
+                            for d in ["N", "E", "S", "W"]:
+                                r = {"Declarer": d}
+                                for su in ["C", "D", "H", "S", "N"]:
+                                    key = f"DD_{d}_{su}"
+                                    label = "NT" if su == "N" else su
+                                    r[label] = pinned_deal.get(key)
+                                rows.append(r)
+                            df = pl.DataFrame(rows)
+                            render_aggrid(
+                                df,
+                                key=f"auction_builder_qa_q5_dd_grid_{qa_curr_ctx}",
+                                height=calc_grid_height(len(df), max_height=220),
+                                table_name="auction_builder_qa_q5_dd_grid",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                    elif qid == "Q6":
+                        with st.spinner("Computing suit-length posteriors..."):
+                            details = _qa_fetch_bid_details(current_auction, sel_bid)
+                        sl = details.get("suit_length_histograms") or {}
+                        st.markdown("**Auction-conditioned; absolute directions**")
+                        if not isinstance(sl, dict) or not sl:
+                            st.write("No suit-length posteriors available in this evidence set.")
+                        else:
+                            out_rows = []
+                            for d in ["N", "E", "S", "W"]:
+                                d_obj = sl.get(d) or {}
+                                if not isinstance(d_obj, dict):
+                                    continue
+                                for su in ["S", "H", "D", "C"]:
+                                    st_hist = d_obj.get(su)
+                                    stats = _qa_hist_stats(st_hist if isinstance(st_hist, dict) else None)
+                                    out_rows.append(
+                                        {
+                                            "Dir": d,
+                                            "Suit": su,
+                                            "Mean": None if stats["mean"] is None else round(float(stats["mean"]), 2),
+                                            "P05": stats["p05"],
+                                            "P95": stats["p95"],
+                                        }
+                                    )
+                            df = pl.DataFrame(out_rows) if out_rows else pl.DataFrame()
+                            if not df.is_empty():
+                                render_aggrid(
+                                    df,
+                                    key=f"auction_builder_qa_q6_sl_{qa_curr_ctx}",
+                                    height=calc_grid_height(len(df), max_height=320),
+                                    table_name="auction_builder_qa_q6_sl",
+                                    fit_columns_to_view=True,
+                                    show_sql_expander=False,
+                                )
+                    elif qid == "Q7":
+                        st.info("Q7 is not wired yet (needs lead engine / lead data).")
+                    elif qid == "Q8":
+                        st.info("Q8 is not wired yet (needs lead engine + evaluation across matched deals).")
+                    elif qid == "Q9":
+                        toks = [t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()]
+                        if len(toks) < 1:
+                            st.info("Need at least one call in the auction to compare before vs after.")
+                        else:
+                            last_call = toks[-1]
+                            before = "-".join(toks[:-1])
+                            with st.spinner("Computing before/after posteriors..."):
+                                d_before = _qa_fetch_bid_details(before, last_call)
+                                d_after = _qa_fetch_bid_details(current_auction, sel_bid)
+                            hb = d_before.get("hcp_histograms") or {}
+                            ha = d_after.get("hcp_histograms") or {}
+                            rows = []
+                            for d in ["N", "E", "S", "W"]:
+                                sb = _qa_hist_stats((hb.get(d) if isinstance(hb, dict) else None))
+                                sa = _qa_hist_stats((ha.get(d) if isinstance(ha, dict) else None))
+                                if sb["mean"] is None or sa["mean"] is None:
+                                    continue
+                                rows.append(
+                                    {
+                                        "Dir": d,
+                                        "HCP_mean_before": round(float(sb["mean"]), 2),
+                                        "HCP_mean_after": round(float(sa["mean"]), 2),
+                                        "Δ": round(float(sa["mean"]) - float(sb["mean"]), 2),
+                                    }
+                                )
+                            df = pl.DataFrame(rows) if rows else pl.DataFrame()
+                            st.markdown("**Approx: HCP belief shift**")
+                            st.caption(f"Before: `{before if before else '(opening)'}` + call `{last_call}`; After: `{current_auction}`.")
+                            if df.is_empty():
+                                st.write("Could not compute a stable before/after HCP shift for this context.")
+                            else:
+                                render_aggrid(
+                                    df,
+                                    key=f"auction_builder_qa_q9_shift_{qa_curr_ctx}",
+                                    height=calc_grid_height(len(df), max_height=220),
+                                    table_name="auction_builder_qa_q9_shift",
+                                    fit_columns_to_view=True,
+                                    show_sql_expander=False,
+                                )
+                    elif qid == "Q10":
+                        st.markdown("**Approx: top expected completed auctions**")
+                        st.caption("Heuristic: chains the most-supported next bids (by matching-deal mass) and then appends trailing passes to complete the auction.")
+                        df = _qa_answer_q10_expected_completed_auctions()
+                        if df.is_empty():
+                            st.write("Could not estimate completed auctions from next-bid mass in this context.")
+                        else:
+                            render_aggrid(
+                                df,
+                                key=f"auction_builder_qa_q10_completed_{qa_curr_ctx}",
+                                height=calc_grid_height(len(df), max_height=240),
+                                table_name="auction_builder_qa_q10_completed",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                    elif qid == "Q11":
+                        st.markdown("**Approx: most surprising calls so far**")
+                        df = _qa_answer_q11_surprises()
+                        if df.is_empty():
+                            st.write("No calls yet.")
+                        else:
+                            render_aggrid(
+                                df,
+                                key=f"auction_builder_qa_q11_surprise_{qa_curr_ctx}",
+                                height=calc_grid_height(len(df), max_height=220),
+                                table_name="auction_builder_qa_q11_surprise",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                    elif qid == "Q12":
+                        st.markdown("**Approx: top expected next bids (at this decision point)**")
+                        df = _qa_answer_q12_top_next_bids()
+                        if df.is_empty():
+                            st.write("No next-bid mass available.")
+                        else:
+                            render_aggrid(
+                                df,
+                                key=f"auction_builder_qa_q12_next_bids_{qa_curr_ctx}",
+                                height=calc_grid_height(len(df), max_height=220),
+                                table_name="auction_builder_qa_q12_next_bids",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                    else:
+                        st.info("Question not recognized.")
+                except Exception as e:
+                    st.error(f"Could not answer: {e}")
 
             # -----------------------------------------------------------------
             # Bid Categories (Phase 4): attach category names per bt_index.
@@ -7847,6 +8504,15 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                 advanced_rows: list[dict[str, Any]] = []
                 include_phase2a_adv = bool(pinned_deal_index_val is not None)
+                
+                # Helper to determine bucket from original row
+                def get_bucket_from_row(r: dict[str, Any]) -> str:
+                    if r.get("_matches") is True and not r.get("_rejected"):
+                        return "Valid"
+                    elif r.get("_rejected"):
+                        return "Rejected"
+                    else:
+                        return "Invalid"
 
                 with st.spinner("Computing advanced ranking (bid-details + Phase2a)..."):
                     for r in candidate_rows:
@@ -7882,6 +8548,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "TopPar%": None,
                                     "n": r.get("Deals", None) or r.get("Matches", None),
                                     "Degraded": "api_error",
+                                    "Source": get_bucket_from_row(r),
                                 }
                             )
                             continue
@@ -7906,6 +8573,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "TopPar%": None,
                                     "n": details.get("matched_deals_total", r.get("Deals", None) or r.get("Matches", None)),
                                     "Degraded": str(details.get("degraded_mode") or "bid_details_error"),
+                                    "Source": get_bucket_from_row(r),
                                 }
                             )
                             continue
@@ -8026,6 +8694,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "n": details.get("matched_deals_total_excluding_pinned", details.get("matched_deals_total")),
                                 "Sampled": details.get("matched_deals_sampled"),
                                 "Degraded": details.get("degraded_mode"),
+                                "Source": get_bucket_from_row(r),
                             }
                         )
 
@@ -8067,6 +8736,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "n": pr.get("Deals", None) or pr.get("Matches", None),
                                 "Sampled": None,
                                 "Degraded": "synthetic_pass",
+                                "Source": get_bucket_from_row(pr) if pr else "Valid",
                             }
                         ]
                     )
@@ -8090,6 +8760,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         show_sql_expander=False,
                         sort_model=[{"colId": "Score", "sort": "desc"}],
                         tooltip_cols=["Error", "Degraded", "Flags", "TopPar"],
+                        row_bucket_col="Source",
                     )
                     if adv_selected:
                         sel_bid = str((adv_selected[0] or {}).get("Bid", "") or "").strip().upper()
@@ -8106,7 +8777,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 
                 with sug_col:
                     if suggested_bids_rows:
-                        st.markdown("**Best Bids Ranked by Model Score**")
+                        st.markdown("**Best Bids Ranked by Cheating Model**")
                         # Build enriched rows with Score, is_vul, Result, Dbl columns
                         enriched_sug_rows = []
                         dealer_actual = str(pinned_deal.get("Dealer", "N")).upper() if pinned_deal else "N"
@@ -8237,19 +8908,19 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             except Exception:
                                 pass
 
-                        # Update AI Model display: full greedy completion.
+                        # Update Cheater Model display: full greedy completion.
                         try:
-                            # IMPORTANT: AI Model should be invariant to the current built auction.
+                            # IMPORTANT: Cheater Model should be invariant to the current built auction.
                             # Compute it once per pinned deal from the opening (empty prefix).
                             if best_auc_ss_key not in st.session_state:
                                 best_complete = _greedy_best_auction_complete("", max_steps=40)
                                 if isinstance(best_complete, str) and best_complete.strip():
                                     st.session_state[best_auc_ss_key] = best_complete.strip()
-                                    best_auction_placeholder.info(f"AI Model: `{best_complete.strip()}`")
+                                    best_auction_placeholder.info(f"Cheater Model: `{best_complete.strip()}`")
                             else:
                                 cached_best = st.session_state.get(best_auc_ss_key)
                                 if isinstance(cached_best, str) and cached_best.strip():
-                                    best_auction_placeholder.info(f"AI Model: `{cached_best.strip()}`")
+                                    best_auction_placeholder.info(f"Cheater Model: `{cached_best.strip()}`")
                         except Exception:
                             pass
                         sug_pdf = to_aggrid_safe_pandas(sug_df)
@@ -8296,7 +8967,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         )
                         handle_bid_selection(sug_resp, "suggested")
                     else:
-                        st.markdown("**Best Bids Ranked by Model Score**")
+                        st.markdown("**Best Bids Ranked by Cheating Model**")
                         st.caption("No suggested bids available")
                 
                 with par_col:
@@ -9799,7 +10470,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # So evaluate using the actual dealer and the displayed seat.
                 dealer = pinned_deal.get("Dealer", "N")
                 # If this step was a client-side "Pass with no criteria" OR was selected from a valid-bids
-                # grid (Best Bids Ranked by Model Score), treat it as passing to maintain consistency.
+                # grid (Best Bids Ranked by Cheating Model), treat it as passing to maintain consistency.
                 # Also apply the "always_valid_pass" setting: if enabled and this is a Pass bid,
                 # skip criteria evaluation to match the behavior when manually selecting bids.
                 is_pass_bid = str(step.get("bid", "")).strip().upper() in ("P", "PASS")
@@ -10052,7 +10723,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     except Exception:
                         pass
 
-                # Compute AI Model row (greedy completion) when available
+                # Compute Cheater Model row (greedy completion) when available
                 best_auction_text: str | None = None
                 best_bt_index: int | None = None
                 best_bid: str | None = None
@@ -10268,7 +10939,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     completion_rows.append(
                         {
                             "BT Index": best_bt_index,
-                            "Source": "AI Model",
+                            "Source": "Cheater Model",
                             "Auction": best_auction_text,
                             "Bid": best_bid,
                             "Declarer": best_declarer,

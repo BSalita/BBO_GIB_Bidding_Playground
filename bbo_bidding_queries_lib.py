@@ -145,6 +145,226 @@ def pattern_matches(pattern: str, text: str) -> bool:
 # Auction/Contract Parsing
 # ---------------------------------------------------------------------------
 
+_STRAIN_ORDER = {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}  # CDHSN
+
+
+def _normalize_auction_token(tok: str) -> str | None:
+    """Normalize a single auction call token to canonical form.
+
+    Canonical tokens:
+    - Pass: "P"
+    - Double: "X"
+    - Redouble: "XX"
+    - Contract: "1C".."7N" (where "N" means NT)
+    """
+    t = str(tok or "").strip()
+    if not t:
+        return None
+    tl = t.lower()
+    if tl in ("p", "pass"):
+        return "P"
+    if tl in ("x", "d", "dbl", "double"):
+        return "X"
+    if tl in ("xx", "r", "rdbl", "redouble"):
+        return "XX"
+
+    # Normalize suit symbols if present
+    suit_map = {"♣": "C", "♦": "D", "♥": "H", "♠": "S"}
+    if any(sym in t for sym in suit_map):
+        for sym, rep in suit_map.items():
+            t = t.replace(sym, rep)
+        tl = t.lower()
+
+    # Contract bids: level + strain (C/D/H/S/N/NT)
+    if tl[0].isdigit() and len(tl) >= 2:
+        level_s = tl[0]
+        strain_raw = tl[1:].strip()
+        if strain_raw in ("n", "nt"):
+            return f"{level_s}N"
+        if strain_raw and strain_raw[0] in ("c", "d", "h", "s"):
+            return f"{level_s}{strain_raw[0].upper()}"
+    # Unknown token
+    return t.upper()
+
+
+def _contract_key(tok: str) -> tuple[int, str] | None:
+    """Return (level, strain) for a contract token like '3N' or '4H'."""
+    t = str(tok or "").strip().upper()
+    if len(t) < 2 or not t[0].isdigit():
+        return None
+    try:
+        level = int(t[0])
+    except Exception:
+        return None
+    strain = t[1:].strip().upper()
+    strain = "N" if strain == "NT" else strain
+    if strain not in _STRAIN_ORDER:
+        return None
+    if not (1 <= level <= 7):
+        return None
+    return (level, strain)
+
+
+def _contract_gt(a: tuple[int, str] | None, b: tuple[int, str] | None) -> bool:
+    """Strictly greater contract ordering by level then strain (CDHSN)."""
+    if a is None:
+        return False
+    if b is None:
+        return True
+    return (int(a[0]), int(_STRAIN_ORDER[a[1]])) > (int(b[0]), int(_STRAIN_ORDER[b[1]]))
+
+
+def validate_auction(
+    auction: str | list[str] | tuple[str, ...],
+    *,
+    require_complete: bool = False,
+) -> dict[str, object]:
+    """Validate a bridge auction sequence.
+
+    Rules enforced:
+    - Contract bids must strictly increase (level, then CDHSN).
+    - Double ("X") only after a contract, by opponents of the last contract bidder,
+      and only if that contract is not already doubled/redoubled.
+    - Redouble ("XX") only after a double, by the side that made the last contract.
+    - Auction completion:
+      - Passed out: P-P-P-P
+      - Otherwise: 3 consecutive passes after any contract/double/redouble.
+
+    Returns a dict:
+      { "valid": bool, "complete": bool, "error": str|None, "calls": list[str] }
+    """
+    # Tokenize input
+    if isinstance(auction, str):
+        auc_norm = normalize_auction_input(auction)
+        raw_calls = [t for t in auc_norm.split("-") if t.strip()]
+    else:
+        raw_calls = [str(t) for t in list(auction) if str(t).strip()]
+
+    calls: list[str] = []
+    for t in raw_calls:
+        nt = _normalize_auction_token(t)
+        if nt is None:
+            continue
+        calls.append(nt)
+
+    # Empty auction is a valid prefix (not complete unless require_complete=False and caller doesn't care).
+    if not calls:
+        return {"valid": (not require_complete), "complete": False, "error": "empty auction" if require_complete else None, "calls": calls}
+
+    last_contract: tuple[int, str] | None = None
+    last_contract_side: int | None = None  # 0=NS (seats 1/3), 1=EW (seats 2/4) in seat-1 view
+    dbl_state = 0  # 0 none, 1 doubled, 2 redoubled (applies to last_contract)
+
+    consecutive_passes = 0
+    has_contract = False
+
+    def _side_for_index(i: int) -> int:
+        # seat i is (i % 4) + 1; partnership: odd seats (1/3) vs even seats (2/4)
+        seat = (i % 4) + 1
+        return 0 if seat in (1, 3) else 1
+
+    for i, tok in enumerate(calls):
+        side = _side_for_index(i)
+
+        if tok == "P":
+            consecutive_passes += 1
+            continue
+
+        # Non-pass breaks the pass run
+        consecutive_passes = 0
+
+        ck = _contract_key(tok)
+        if ck is not None:
+            # New contract bid
+            if not _contract_gt(ck, last_contract):
+                return {"valid": False, "complete": False, "error": f"contract not increasing at bid position {i+1}: {tok}", "calls": calls}
+            last_contract = ck
+            last_contract_side = side
+            dbl_state = 0
+            has_contract = True
+            continue
+
+        if tok == "X":
+            if last_contract is None or last_contract_side is None:
+                return {"valid": False, "complete": False, "error": f"double without contract at bid position {i+1}", "calls": calls}
+            if dbl_state != 0:
+                return {"valid": False, "complete": False, "error": f"double when already doubled/redoubled at bid position {i+1}", "calls": calls}
+            if side == last_contract_side:
+                return {"valid": False, "complete": False, "error": f"double by declaring side at bid position {i+1}", "calls": calls}
+            dbl_state = 1
+            continue
+
+        if tok == "XX":
+            if last_contract is None or last_contract_side is None:
+                return {"valid": False, "complete": False, "error": f"redouble without contract at bid position {i+1}", "calls": calls}
+            if dbl_state != 1:
+                return {"valid": False, "complete": False, "error": f"redouble without a double at bid position {i+1}", "calls": calls}
+            if side != last_contract_side:
+                return {"valid": False, "complete": False, "error": f"redouble by defending side at bid position {i+1}", "calls": calls}
+            dbl_state = 2
+            continue
+
+        return {"valid": False, "complete": False, "error": f"unknown call at bid position {i+1}: {tok}", "calls": calls}
+
+    # Completion check
+    complete = False
+    if not has_contract:
+        # Pass-out requires exactly 4 passes (more passes is nonsense).
+        complete = (len(calls) == 4 and all(t == "P" for t in calls))
+        if require_complete and not complete:
+            return {"valid": False, "complete": False, "error": "pass-out requires exactly 4 passes", "calls": calls}
+    else:
+        # 3 trailing passes after any non-pass action.
+        trailing = 0
+        for t in reversed(calls):
+            if t == "P":
+                trailing += 1
+            else:
+                break
+        complete = trailing >= 3
+        if require_complete and not complete:
+            return {"valid": False, "complete": False, "error": "auction not complete (needs trailing passes)", "calls": calls}
+
+    return {"valid": True, "complete": bool(complete), "error": None, "calls": calls}
+
+
+def is_valid_auction(
+    auction: str | list[str] | tuple[str, ...],
+    *,
+    require_complete: bool = False,
+) -> bool:
+    """Single source of truth: return True iff the auction is legal (and complete if required)."""
+    r = validate_auction(auction, require_complete=require_complete)
+    return bool(r.get("valid", False))
+
+
+def is_auction_valid(
+    auction: str | list[str] | tuple[str, ...],
+    *,
+    require_complete: bool = False,
+) -> bool:
+    """Check if an auction is valid (legal bridge auction sequence).
+    
+    Validates:
+    - Contract bids must strictly increase (level, then CDHSN strain order)
+    - Double ("X") only after a contract, by opponents of the last contract bidder,
+      and only if that contract is not already doubled/redoubled
+    - Redouble ("XX") only after a double, by the side that made the last contract
+    - Proper handling of passes, doubles, and redoubles
+    - Legal continuation of the auction
+    
+    Args:
+        auction: Auction string (e.g., "1C-1D") or list/tuple of calls
+        require_complete: If True, also require the auction to be complete
+            (3 consecutive passes after a contract, or 4 passes for pass-out)
+    
+    Returns:
+        True if the auction is valid (and complete if require_complete=True), False otherwise
+    """
+    r = validate_auction(auction, require_complete=require_complete)
+    return bool(r.get("valid", False))
+
+
 def normalize_auction_input(auction: str) -> str:
     """Normalize a user-entered auction *string* into canonical dash-separated form.
 
