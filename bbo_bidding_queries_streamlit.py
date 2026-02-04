@@ -10735,6 +10735,44 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 best_dd_tricks: int | None = None
                 best_dd_score: int | None = None
                 best_ev: float | None = None
+
+                # Ensure Cheater Model appears even if user never clicked the suggested-bids grid.
+                # (That UI path normally computes/caches `best_auc_ss_key`.)
+                try:
+                    cached_best_auc = st.session_state.get(best_auc_ss_key)
+                except Exception:
+                    cached_best_auc = None
+                if not (isinstance(cached_best_auc, str) and cached_best_auc.strip()):
+                    # Prefer server-side implementation (more reliable; doesn't depend on UI grids being clicked).
+                    with st.spinner("Computing Cheater Model (greedy completion)..."):
+                        best_complete: str | None = None
+                        try:
+                            row_idx = pinned_deal.get("_row_idx")
+                            payload = {
+                                "auction_prefix": "",
+                                "deal_row_idx": int(row_idx) if row_idx is not None else None,
+                                "seed": int(seed) if isinstance(seed, (int, float)) else 42,
+                                "max_depth": 40,
+                                "permissive_pass": bool(st.session_state.get("always_valid_pass", True)),
+                            }
+                            resp = api_post("/greedy-model-path", payload, timeout=30)
+                            gp = resp.get("greedy_path")
+                            best_complete = str(gp).strip() if gp is not None else None
+                            if not best_complete:
+                                best_complete = None
+                        except Exception:
+                            best_complete = None
+
+                        if isinstance(best_complete, str) and best_complete.strip():
+                            try:
+                                st.session_state[best_auc_ss_key] = best_complete.strip()
+                            except Exception:
+                                pass
+                            # Also update the placeholder at the top of the page, if present.
+                            try:
+                                best_auction_placeholder.info(f"Cheater Model: `{best_complete.strip()}`")
+                            except Exception:
+                                pass
                 try:
                     best_auction_text = st.session_state.get(best_auc_ss_key)
                     if isinstance(best_auction_text, str):
@@ -10866,6 +10904,31 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     # Convert to NS-positive.
                     return (-declarer_score) if declarer_dir in ("E", "W") else declarer_score
 
+                def _result_from_auction_and_dd_tricks(
+                    auction: str | None,
+                    dd_tricks: int | None,
+                ) -> int | None:
+                    """Return over/under tricks (e.g., +1, 0, -2) from auction + DD tricks."""
+                    if not auction:
+                        return None
+                    if dd_tricks is None:
+                        return None
+                    auc = str(auction).strip().upper()
+                    if not auc:
+                        return None
+                    toks = [t.strip().upper() for t in auc.split("-") if t.strip()]
+                    # Passed out => 0 tricks delta
+                    if toks and all(t == "P" for t in toks):
+                        return 0
+                    c = parse_contract_from_auction(auc)
+                    if not c:
+                        return None
+                    level_i, _strain_i, _pos_i = c
+                    try:
+                        return int(dd_tricks) - (int(level_i) + 6)
+                    except Exception:
+                        return None
+
                 dd_score_final_ns: int | None = None
                 try:
                     v = _to_ns(dd_score_final, declarer_dir)
@@ -10940,43 +11003,47 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     if ad >= 4000:
                         imp = 24
                     return int(sign * imp)
-                completion_rows = [
-                    {
-                        "BT Index": actual_bt_index,
-                        "Source": "Actual",
-                        "Auction": actual_auction or None,
-                        "Bid": actual_bid,
-                        "Declarer": actual_declarer,
-                        "DD_Tricks": actual_dd_tricks,
-                        "DD_Score_NS": actual_dd_score_ns,
-                        "EV_NS": actual_ev_ns,
-                        "Score_NS": _score_ns_from_auction_and_dd_tricks(
-                            str(actual_auction) if actual_auction else None,
-                            dealer,
-                            actual_dd_tricks,
-                            pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
-                        ),
-                    },
-                    {
-                        "BT Index": built_bt_index,
-                        "Source": "Built",
-                        "Auction": auction_text or None,
-                        "Bid": final_contract,
-                        "Declarer": declarer_dir or None,
-                        "DD_Tricks": dd_tricks_final,
-                        "DD_Score_NS": dd_score_final_ns,
-                        "EV_NS": built_ev_ns,
-                        "Score_NS": _score_ns_from_auction_and_dd_tricks(
-                            str(auction_text) if auction_text else None,
-                            dealer,
-                            dd_tricks_final,
-                            pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
-                        ),
-                    },
-                ]
+                actual_row = {
+                    "BT Index": actual_bt_index,
+                    "Source": "Actual",
+                    "Auction": actual_auction or None,
+                    "Bid": actual_bid,
+                    "Declarer": actual_declarer,
+                    "Tricks": actual_dd_tricks,
+                    "Result": _result_from_auction_and_dd_tricks(actual_auction, actual_dd_tricks),
+                    "DD_Score_NS": actual_dd_score_ns,
+                    "EV_NS": actual_ev_ns,
+                    "Score_NS": _score_ns_from_auction_and_dd_tricks(
+                        str(actual_auction) if actual_auction else None,
+                        dealer,
+                        actual_dd_tricks,
+                        pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
+                    ),
+                }
+                built_row = {
+                    "BT Index": built_bt_index,
+                    "Source": "Built",
+                    "Auction": auction_text or None,
+                    "Bid": final_contract,
+                    "Declarer": declarer_dir or None,
+                    "Tricks": dd_tricks_final,
+                    "Result": _result_from_auction_and_dd_tricks(auction_text, dd_tricks_final),
+                    "DD_Score_NS": dd_score_final_ns,
+                    "EV_NS": built_ev_ns,
+                    "Score_NS": _score_ns_from_auction_and_dd_tricks(
+                        str(auction_text) if auction_text else None,
+                        dealer,
+                        dd_tricks_final,
+                        pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
+                    ),
+                }
+                ai_model_row = dict(built_row)
+                ai_model_row["Source"] = "AI Model"
+                completion_rows = [actual_row, built_row, ai_model_row]
+                # Always include a Cheater Model row (even if unavailable), so the UI is stable.
+                best_dd_score_ns: int | None = None
+                best_ev_ns: float | None = None
                 if best_auction_text:
-                    best_dd_score_ns: int | None = None
-                    best_ev_ns: float | None = None
                     try:
                         v = _to_ns(best_dd_score, best_declarer)
                         best_dd_score_ns = int(v) if v is not None else None
@@ -10987,24 +11054,27 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         best_ev_ns = float(v) if v is not None else None
                     except Exception:
                         best_ev_ns = None
-                    completion_rows.append(
-                        {
-                            "BT Index": best_bt_index,
-                            "Source": "Cheater Model",
-                            "Auction": best_auction_text,
-                            "Bid": best_bid,
-                            "Declarer": best_declarer,
-                            "DD_Tricks": best_dd_tricks,
-                            "DD_Score_NS": best_dd_score_ns,
-                            "EV_NS": best_ev_ns,
-                            "Score_NS": _score_ns_from_auction_and_dd_tricks(
-                                str(best_auction_text),
-                                dealer,
-                                best_dd_tricks,
-                                pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
-                            ),
-                        }
-                    )
+                completion_rows.append(
+                    {
+                        "BT Index": best_bt_index if best_auction_text else None,
+                        "Source": "Cheater Model",
+                        "Auction": best_auction_text,
+                        "Bid": best_bid if best_auction_text else "(unavailable)",
+                        "Declarer": best_declarer,
+                        "Tricks": best_dd_tricks,
+                        "Result": _result_from_auction_and_dd_tricks(best_auction_text, best_dd_tricks),
+                        "DD_Score_NS": best_dd_score_ns,
+                        "EV_NS": best_ev_ns,
+                        "Score_NS": _score_ns_from_auction_and_dd_tricks(
+                            str(best_auction_text),
+                            dealer,
+                            best_dd_tricks,
+                            pinned_deal.get("Vul", pinned_deal.get("Vulnerability")),
+                        )
+                        if best_auction_text
+                        else None,
+                    }
+                )
 
                 # Add IMPs column: IMPs gained/lost vs Actual row's Score_NS
                 actual_score_ns: int | None = None
@@ -11027,14 +11097,37 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     else:
                         rr["IMPs"] = _score_diff_to_imps(int(s_i) - int(actual_score_ns))
 
-                render_aggrid(
+                # Add row-color bucket based on BT membership.
+                # If not in the BT table, use Invalid's color.
+                for rr in completion_rows:
+                    rr["Bucket"] = "Valid" if (rr.get("BT Index") is not None) else "Invalid"
+
+                completion_df = order_columns(
                     pl.DataFrame(completion_rows),
+                    priority_cols=[
+                        "BT Index",
+                        "Source",
+                        "Auction",
+                        "Bid",
+                        "Declarer",
+                        "DD_Score_NS",
+                        "EV_NS",
+                        # Keep these immediately before Score_NS (per UI request)
+                        "Tricks",
+                        "Result",
+                        "Score_NS",
+                        "IMPs",
+                    ],
+                )
+                render_aggrid(
+                    completion_df,
                     key="auction_builder_complete_summary",
                     height=140,
                     table_name="auction_builder_complete_summary",
                     fit_columns_to_view=True,
                     show_sql_expander=False,
                     tooltip_cols=["Auction"],
+                    row_bucket_col="Bucket",
                 )
             else:
                 # Without a pinned deal, show seat/pair (direction depends on dealer which we don't have).
@@ -11055,8 +11148,17 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "DD_Score": None,
                         "Avg_EV_NV": avg_ev_final_nv,
                         "Avg_EV_V": avg_ev_final_v,
+                        # Row-color bucket based on BT membership
+                        "Bucket": "Valid" if (built_bt_index is not None) else "Invalid",
                     },
                 ]
+                # Include AI Model row (same values as Built) for UI consistency.
+                try:
+                    ai_model_row = dict(completion_rows[0])
+                    ai_model_row["Source"] = "AI Model"
+                    completion_rows.append(ai_model_row)
+                except Exception:
+                    pass
                 render_aggrid(
                     pl.DataFrame(completion_rows),
                     key="auction_builder_complete_summary",
@@ -11065,6 +11167,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     fit_columns_to_view=True,
                     show_sql_expander=False,
                     tooltip_cols=["Auction"],
+                    row_bucket_col="Bucket",
                 )
         elif pinned_deal and current_path:
             # Auction not complete, but show pinned deal status
