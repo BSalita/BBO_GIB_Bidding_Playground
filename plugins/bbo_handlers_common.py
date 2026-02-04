@@ -1511,6 +1511,87 @@ def seat_to_direction(dealer: str, seat: int) -> str:
     return DIRECTIONS_LIST[(dealer_i + seat_i - 1) % 4]
 
 
+# ===========================================================================
+# Canonical board context (dealer + vulnerability)
+# ===========================================================================
+
+def normalize_dealer_strict(dealer: Any) -> str:
+    """Normalize dealer to N/E/S/W or raise.
+
+    Canonical (per BIDDING_MODEL_IMPLEMENTATION.md):
+    - Never guess a dealer. If unknown, callers should set degraded_mode="dealer_unknown".
+    """
+    d = str(dealer).strip().upper()
+    if d not in DIRECTIONS_LIST:
+        raise ValueError(f"Invalid dealer: {dealer!r}. Expected one of {DIRECTIONS_LIST}.")
+    return d
+
+
+def normalize_board_vulnerable(vulnerable: Any) -> str:
+    """Normalize board vulnerability to {'None','NS','EW','All'} or raise.
+
+    Accepts common aliases:
+    - 'N_S'/'NS', 'E_W'/'EW', 'BOTH'/'ALL', 'NONE'
+    """
+    v = str(vulnerable).strip().upper()
+    if v in {"NONE", "0", ""}:
+        return "None"
+    if v in {"NS", "N_S"}:
+        return "NS"
+    if v in {"EW", "E_W"}:
+        return "EW"
+    if v in {"ALL", "BOTH"}:
+        return "All"
+    raise ValueError(f"Invalid vulnerable: {vulnerable!r}. Expected one of None/NS/EW/All (or common aliases).")
+
+
+def seat_is_vulnerable(board_vul: str, seat_dir: str) -> bool:
+    """Return True if seat_dir is vulnerable under board_vul.
+
+    Args:
+        board_vul: normalized by normalize_board_vulnerable()
+        seat_dir: 'N'|'E'|'S'|'W'
+    """
+    s = str(seat_dir).strip().upper()
+    if s not in DIRECTIONS_LIST:
+        raise ValueError(f"Invalid seat_dir: {seat_dir!r}. Expected N/E/S/W.")
+    if board_vul == "All":
+        return True
+    if board_vul == "None":
+        return False
+    if board_vul == "NS":
+        return s in {"N", "S"}
+    if board_vul == "EW":
+        return s in {"E", "W"}
+    raise ValueError(f"Invalid board_vul: {board_vul!r}. Expected normalized None/NS/EW/All.")
+
+
+def seat_vul_bucket(board_vul: str, seat_dir: str) -> str:
+    """Return 'V' or 'NV' for a seat under board vulnerability."""
+    return "V" if seat_is_vulnerable(board_vul, seat_dir) else "NV"
+
+
+def compute_seat_to_act(*, dealer: str, auction_full: str) -> dict[str, Any]:
+    """Compute acting seat at end of Auction_full.
+
+    Returns:
+        - dealer: normalized dealer
+        - calls: list[str] (uppercased tokens)
+        - seat_to_act_seat: int (1..4 dealer-relative seat number)
+        - seat_to_act_dir: str (N/E/S/W absolute direction)
+    """
+    d = normalize_dealer_strict(dealer)
+    toks = [t.strip().upper() for t in str(auction_full or "").split("-") if t.strip()]
+    seat_num = (len(toks) % 4) + 1
+    seat_dir = seat_to_direction(d, seat_num)
+    return {
+        "dealer": d,
+        "calls": toks,
+        "seat_to_act_seat": seat_num,
+        "seat_to_act_dir": seat_dir,
+    }
+
+
 def format_seat_notation(
     dealer: str,
     seat: int,

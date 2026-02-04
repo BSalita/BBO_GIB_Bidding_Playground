@@ -24,6 +24,7 @@ import re
 import statistics
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 import duckdb  # pyright: ignore[reportMissingImports]
@@ -50,6 +51,24 @@ from bbo_bidding_queries_lib import (
     build_distribution_sql_for_bt,
     build_distribution_sql_for_deals,
     add_suit_length_columns,
+)
+
+from bbo_bid_ranking_lib import (
+    get_avg_ev_par_precomputed_nv_v,
+    preload_precomputed_ev_par_stats,
+    compute_vul_split_par_ev_at_bid,
+    compute_ev_all_combos_for_matched_deals,
+)
+
+from bbo_bid_details_lib import (
+    BidDetailsConfig,
+    compute_bid_details_from_sample,
+    compute_phase2a_auction_conditioned_posteriors,
+)
+from bbo_explanation_lib import (
+    compute_eeo_from_bid_details,
+    render_counterfactual_why_not,
+    render_recommendation_explanation,
 )
 
 from mlBridge.mlBridgeBiddingLib import DIRECTIONS
@@ -130,6 +149,11 @@ from plugins.bbo_handlers_common import (
     parse_sl_comparison_numeric,
     eval_comparison,
     annotate_criterion_with_value,
+    # Canonical board context helpers (dealer/vulnerability)
+    normalize_dealer_strict,
+    normalize_board_vulnerable,
+    compute_seat_to_act,
+    seat_vul_bucket,
 )
 
 
@@ -185,6 +209,82 @@ def _cache_put(d: dict, key: Any, val: Any, max_items: int) -> None:
             d.pop(oldest, None)
         except Exception:
             d.clear()
+
+
+_CACHE_MAX_BID_DETAILS = 2_000
+_BID_DETAILS_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
+_BID_DETAILS_CACHE_LOCK = threading.Lock()
+
+_CACHE_MAX_EXPLAIN_BID = 2_000
+_EXPLAIN_BID_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
+_EXPLAIN_BID_CACHE_LOCK = threading.Lock()
+
+
+def _lru_get(cache: "OrderedDict[tuple[Any, ...], dict[str, Any]]", key: tuple[Any, ...], lock: threading.Lock) -> dict[str, Any] | None:
+    try:
+        with lock:
+            v = cache.get(key)
+            if v is None:
+                return None
+            # Move to end (most recently used)
+            cache.move_to_end(key)
+            return v
+    except Exception:
+        return None
+
+
+def _lru_put(
+    cache: "OrderedDict[tuple[Any, ...], dict[str, Any]]",
+    key: tuple[Any, ...],
+    val: dict[str, Any],
+    max_items: int,
+    lock: threading.Lock,
+) -> None:
+    try:
+        with lock:
+            cache[key] = val
+            cache.move_to_end(key)
+            while len(cache) > int(max_items):
+                try:
+                    cache.popitem(last=False)
+                except Exception:
+                    cache.clear()
+                    break
+    except Exception:
+        # Fail-fast: caching is an optimization, never a correctness requirement.
+        return
+
+
+def _resolve_deal_row_by_deal_index(state: Dict[str, Any], deal_index: int) -> dict[str, Any] | None:
+    """Resolve a deal row by its user-facing `index` column value (not row position)."""
+    deal_df = state.get("deal_df")
+    if not isinstance(deal_df, pl.DataFrame) or deal_df.is_empty():
+        return None
+    if "index" not in deal_df.columns:
+        return None
+
+    idx = int(deal_index)
+    # Fast path: monotonic index → row position via binary search + take rows.
+    try:
+        idx_arr = state.get("deal_index_arr")
+        is_mono = bool(state.get("deal_index_monotonic", False))
+        if is_mono and idx_arr is not None:
+            pos = int(np.searchsorted(idx_arr, idx))
+            if 0 <= pos < len(idx_arr) and int(idx_arr[pos]) == idx:
+                one = _take_rows_by_index(deal_df, [pos])
+                if isinstance(one, pl.DataFrame) and one.height == 1:
+                    return dict(one.row(0, named=True))
+    except Exception:
+        pass
+
+    # Fallback: filter scan (slow on huge deal_df; kept for correctness).
+    try:
+        one = deal_df.filter(pl.col("index") == idx).head(1)
+        if one.height == 1:
+            return dict(one.row(0, named=True))
+    except Exception:
+        return None
+    return None
 
 
 def _bt_file_path_for_sql(state: Dict[str, Any]) -> str:
@@ -957,129 +1057,128 @@ def handle_find_bt_auctions_by_contracts(
                 except Exception:
                     par_indices = []
 
-        if not par_indices:
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            return {"auctions": [], "elapsed_ms": round(elapsed_ms, 1), "total_completed_searched": 0}
-
-        # Fetch minimal completed-auction rows for these bt_index values.
-        # Prefer bt_stats_df (has matching_deal_count), else bt_completed_agg_df, else seat1 (slow).
-        if bt_stats_df is not None and bt_stats_df.height > 0:
-            subset = bt_stats_df.filter(pl.col("bt_index").is_in(par_indices))
-        elif bt_completed_agg_df is not None and bt_completed_agg_df.height > 0:
-            subset = bt_completed_agg_df.filter(pl.col("bt_index").is_in(par_indices))
-        else:
-            if bt_seat1_df is None:
-                raise ValueError("bt_seat1_df not loaded")
-            subset = bt_seat1_df.filter(pl.col("bt_index").is_in(par_indices) & pl.col("is_completed_auction"))
-
-        # Ensure Auction exists for prefix filtering + contract parsing.
-        if "Auction" not in subset.columns:
-            lookup: pl.DataFrame | None = None
-            if bt_completed_agg_df is not None and bt_completed_agg_df.height > 0 and "Auction" in bt_completed_agg_df.columns:
-                lookup = bt_completed_agg_df.filter(pl.col("bt_index").is_in(par_indices)).select(["bt_index", "Auction"])
-            elif bt_seat1_df is not None and bt_seat1_df.height > 0 and "Auction" in bt_seat1_df.columns:
-                lookup = bt_seat1_df.filter(pl.col("bt_index").is_in(par_indices)).select(["bt_index", "Auction"])
-            if lookup is None:
-                raise ValueError("Auction column missing and no bt_index→Auction lookup available")
-            subset = subset.join(lookup, on="bt_index", how="left").drop_nulls(subset=["Auction"])
-
-        # Apply prefix filter (small subset).
-        auction_prefix = str(auction_prefix or "").strip().upper()
-        if auction_prefix:
-            prefix_with_sep = auction_prefix if auction_prefix.endswith("-") else auction_prefix + "-"
-            subset = subset.filter(
-                pl.col("Auction").str.to_uppercase().str.starts_with(prefix_with_sep)
-                | pl.col("Auction").str.to_uppercase().eq(auction_prefix)
-            )
-
-        # Normalize dealer (same semantics as slow path).
-        dealer = str(dealer).upper()
-        if dealer not in DIRECTIONS:
-            dealer = "N"
-
-        # Build response rows by parsing only the returned auctions (near-instant).
-        auctions = subset["Auction"].to_list()
-        bt_indices = subset["bt_index"].to_list()
-        deals_list = subset["matching_deal_count"].to_list() if "matching_deal_count" in subset.columns else None
-
-        matches: list[dict[str, Any]] = []
-        for i, auc in enumerate(auctions):
-            parsed = parse_contract_from_auction(auc)
-            if not parsed:
-                continue
-            l, s, d_count = parsed
-            d_str = "XX" if d_count == 2 else ("X" if d_count == 1 else "")
-            decl = get_declarer_for_auction(auc, "N")  # opener is North (seat-1 view)
-            if not decl:
-                continue
-
-            is_opener_pair = decl in ("N", "S")
-            if dealer in ("N", "S"):
-                opener_pair = "NS"
-                opponent_pair = "EW"
+        # If the precomputed Par_Indexes table doesn't contain this deal, do NOT return
+        # "no matches" yet; fall through to the contract-based scan below.
+        if par_indices:
+            # Fetch minimal completed-auction rows for these bt_index values.
+            # Prefer bt_stats_df (has matching_deal_count), else bt_completed_agg_df, else seat1 (slow).
+            if bt_stats_df is not None and bt_stats_df.height > 0:
+                subset = bt_stats_df.filter(pl.col("bt_index").is_in(par_indices))
+            elif bt_completed_agg_df is not None and bt_completed_agg_df.height > 0:
+                subset = bt_completed_agg_df.filter(pl.col("bt_index").is_in(par_indices))
             else:
-                opener_pair = "EW"
-                opponent_pair = "NS"
-            actual_pair = opener_pair if is_opener_pair else opponent_pair
-            decl_seat = 1 if decl == "N" else (2 if decl == "E" else (3 if decl == "S" else (4 if decl == "W" else None)))
+                if bt_seat1_df is None:
+                    raise ValueError("bt_seat1_df not loaded")
+                subset = bt_seat1_df.filter(pl.col("bt_index").is_in(par_indices) & pl.col("is_completed_auction"))
 
-            bt_i = bt_indices[i]
-            if bt_i is None:
-                continue
+            # Ensure Auction exists for prefix filtering + contract parsing.
+            if "Auction" not in subset.columns:
+                lookup: pl.DataFrame | None = None
+                if bt_completed_agg_df is not None and bt_completed_agg_df.height > 0 and "Auction" in bt_completed_agg_df.columns:
+                    lookup = bt_completed_agg_df.filter(pl.col("bt_index").is_in(par_indices)).select(["bt_index", "Auction"])
+                elif bt_seat1_df is not None and bt_seat1_df.height > 0 and "Auction" in bt_seat1_df.columns:
+                    lookup = bt_seat1_df.filter(pl.col("bt_index").is_in(par_indices)).select(["bt_index", "Auction"])
+                if lookup is None:
+                    raise ValueError("Auction column missing and no bt_index→Auction lookup available")
+                subset = subset.join(lookup, on="bt_index", how="left").drop_nulls(subset=["Auction"])
 
-            matches.append(
-                {
-                    "bt_index": int(bt_i),
-                    "Auction": auc,
-                    "Contract": f"{l}{s}{d_str}{decl}",
-                    "Pair": actual_pair,
-                    "Deals": int(deals_list[i]) if (deals_list is not None and deals_list[i] is not None) else None,
-                    "decl": decl,
-                    "decl_seat": decl_seat,
-                }
-            )
+            # Apply prefix filter (small subset).
+            auction_prefix = str(auction_prefix or "").strip().upper()
+            if auction_prefix:
+                prefix_with_sep = auction_prefix if auction_prefix.endswith("-") else auction_prefix + "-"
+                subset = subset.filter(
+                    pl.col("Auction").str.to_uppercase().str.starts_with(prefix_with_sep)
+                    | pl.col("Auction").str.to_uppercase().eq(auction_prefix)
+                )
 
-        # Attach avg_ev_nv/avg_ev_v from bt_ev_stats_df (same as slow path).
-        bt_ev_stats_df = state.get("bt_ev_stats_df")
-        if bt_ev_stats_df is not None and matches:
-            try:
-                bt_idx_list_fast: list[int] = []
-                for mm in matches:
-                    bt_val = mm.get("bt_index")
-                    if bt_val is None:
-                        continue
-                    bt_idx_list_fast.append(int(bt_val))
-                bt_idx_list_fast = list(dict.fromkeys(bt_idx_list_fast))
-                if bt_idx_list_fast:
-                    ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_idx_list_fast))
-                    ev_map_fast: dict[int, dict[str, Any]] = {}
-                    for ev_row in ev_subset.iter_rows(named=True):
-                        try:
-                            ev_map_fast[int(ev_row["bt_index"])] = dict(ev_row)
-                        except Exception:
+            # Normalize dealer (same semantics as slow path).
+            dealer = str(dealer).upper()
+            if dealer not in DIRECTIONS:
+                dealer = "N"
+
+            # Build response rows by parsing only the returned auctions (near-instant).
+            auctions = subset["Auction"].to_list()
+            bt_indices = subset["bt_index"].to_list()
+            deals_list = subset["matching_deal_count"].to_list() if "matching_deal_count" in subset.columns else None
+
+            matches: list[dict[str, Any]] = []
+            for i, auc in enumerate(auctions):
+                parsed = parse_contract_from_auction(auc)
+                if not parsed:
+                    continue
+                l, s, d_count = parsed
+                d_str = "XX" if d_count == 2 else ("X" if d_count == 1 else "")
+                decl = get_declarer_for_auction(auc, "N")  # opener is North (seat-1 view)
+                if not decl:
+                    continue
+
+                is_opener_pair = decl in ("N", "S")
+                if dealer in ("N", "S"):
+                    opener_pair = "NS"
+                    opponent_pair = "EW"
+                else:
+                    opener_pair = "EW"
+                    opponent_pair = "NS"
+                actual_pair = opener_pair if is_opener_pair else opponent_pair
+                decl_seat = 1 if decl == "N" else (2 if decl == "E" else (3 if decl == "S" else (4 if decl == "W" else None)))
+
+                bt_i = bt_indices[i]
+                if bt_i is None:
+                    continue
+
+                matches.append(
+                    {
+                        "bt_index": int(bt_i),
+                        "Auction": auc,
+                        "Contract": f"{l}{s}{d_str}{decl}",
+                        "Pair": actual_pair,
+                        "Deals": int(deals_list[i]) if (deals_list is not None and deals_list[i] is not None) else None,
+                        "decl": decl,
+                        "decl_seat": decl_seat,
+                    }
+                )
+
+            # Attach avg_ev_nv/avg_ev_v from bt_ev_stats_df (same as slow path).
+            bt_ev_stats_df = state.get("bt_ev_stats_df")
+            if bt_ev_stats_df is not None and matches:
+                try:
+                    bt_idx_list_fast: list[int] = []
+                    for mm in matches:
+                        bt_val = mm.get("bt_index")
+                        if bt_val is None:
                             continue
-                    for m in matches:
-                        bt_i = m.get("bt_index")
-                        seat_i = m.get("decl_seat")
-                        if bt_i is None or seat_i is None:
-                            m["avg_ev_nv"] = None
-                            m["avg_ev_v"] = None
-                            continue
-                        row = ev_map_fast.get(int(bt_i), {}) or {}
-                        nv_key = f"Avg_EV_S{int(seat_i)}_NV"
-                        v_key = f"Avg_EV_S{int(seat_i)}_V"
-                        if nv_key in row:
-                            m["avg_ev_nv"] = row.get(nv_key)
-                            m["avg_ev_v"] = row.get(v_key)
-                        else:
-                            aggregate = row.get(f"Avg_EV_S{int(seat_i)}")
-                            m["avg_ev_nv"] = aggregate
-                            m["avg_ev_v"] = aggregate
-            except Exception:
-                pass
+                        bt_idx_list_fast.append(int(bt_val))
+                    bt_idx_list_fast = list(dict.fromkeys(bt_idx_list_fast))
+                    if bt_idx_list_fast:
+                        ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_idx_list_fast))
+                        ev_map_fast: dict[int, dict[str, Any]] = {}
+                        for ev_row in ev_subset.iter_rows(named=True):
+                            try:
+                                ev_map_fast[int(ev_row["bt_index"])] = dict(ev_row)
+                            except Exception:
+                                continue
+                        for m in matches:
+                            bt_i = m.get("bt_index")
+                            seat_i = m.get("decl_seat")
+                            if bt_i is None or seat_i is None:
+                                m["avg_ev_nv"] = None
+                                m["avg_ev_v"] = None
+                                continue
+                            row = ev_map_fast.get(int(bt_i), {}) or {}
+                            nv_key = f"Avg_EV_S{int(seat_i)}_NV"
+                            v_key = f"Avg_EV_S{int(seat_i)}_V"
+                            if nv_key in row:
+                                m["avg_ev_nv"] = row.get(nv_key)
+                                m["avg_ev_v"] = row.get(v_key)
+                            else:
+                                aggregate = row.get(f"Avg_EV_S{int(seat_i)}")
+                                m["avg_ev_nv"] = aggregate
+                                m["avg_ev_v"] = aggregate
+                except Exception:
+                    pass
 
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        return {"auctions": matches, "elapsed_ms": round(elapsed_ms, 1), "total_completed_searched": int(len(par_indices))}
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return {"auctions": matches, "elapsed_ms": round(elapsed_ms, 1), "total_completed_searched": int(len(par_indices))}
 
     if bt_stats_df is not None and bt_stats_df.height > 0:
         completed_df = bt_stats_df
@@ -6321,6 +6420,8 @@ def _build_criteria_mask_for_dealer(
     dealer: str,
     criteria_by_seat: Dict[int, List[str]],
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, pl.DataFrame]],
+    *,
+    dealer_for_criteria: str | None = None,
 ) -> Tuple[Optional[pl.Series], List[str]]:
     """Build a mask matching criteria for a specific dealer.
 
@@ -6361,9 +6462,13 @@ def _build_criteria_mask_for_dealer(
         
     all_seats_mask = dealer_mask
     invalid_criteria: List[str] = []
+
+    dealer_crit = str(dealer_for_criteria or dealer).upper()
+    if dealer_crit not in DIRECTIONS:
+        dealer_crit = str(dealer).upper() if str(dealer).upper() in DIRECTIONS else "N"
     
     for seat, criteria_list in criteria_by_seat.items():
-        seat_criteria_df = deal_criteria_by_seat_dfs.get(seat, {}).get(dealer)
+        seat_criteria_df = deal_criteria_by_seat_dfs.get(seat, {}).get(dealer_crit)
         
         if seat_criteria_df is None or seat_criteria_df.is_empty():
             return None, []
@@ -6379,7 +6484,7 @@ def _build_criteria_mask_for_dealer(
                         invalid_criteria.append(crit)
                     continue
                 left_s, op, right_s = parsed
-                seat_dir = _seat_dir_for_dealer(dealer, seat)
+                seat_dir = _seat_dir_for_dealer(dealer_crit, seat)
                 left_e = _sl_len_expr(seat_dir, left_s)
                 right_e = _sl_len_expr(seat_dir, right_s)
                 if op == ">=":
@@ -6413,10 +6518,24 @@ def _build_criteria_mask_for_dealer(
     return all_seats_mask, invalid_criteria
 
 
+def _rotate_dealer_dir(dealer: str, n_seats: int) -> str:
+    """Rotate a dealer direction by `n_seats` (N->E->S->W)."""
+    try:
+        dirs = ["N", "E", "S", "W"]
+        d = str(dealer or "N").strip().upper()
+        i = dirs.index(d) if d in dirs else 0
+        k = int(n_seats or 0) % 4
+        return dirs[(i + k) % 4]
+    except Exception:
+        return str(dealer or "N").strip().upper()
+
+
 def _build_criteria_mask_for_all_seats(
     deal_df: pl.DataFrame,
     bt_row: Dict[str, Any],
     deal_criteria_by_seat_dfs: Dict[int, Dict[str, pl.DataFrame]],
+    *,
+    dealer_rotation: int = 0,
 ) -> Tuple[Optional[pl.Series], List[str]]:
     """Build a mask matching ALL 4 seats' criteria against the deal DataFrame.
     
@@ -6437,9 +6556,19 @@ def _build_criteria_mask_for_all_seats(
     global_mask: pl.Series | None = None
     all_invalid_criteria: List[str] = []
     
+    rot = int(dealer_rotation or 0) % 4
     for dealer in DIRECTIONS:
+        # Leading-pass support:
+        # If the auction prefix has k leading passes, the "opener" is seat (k+1) relative to
+        # the real dealer. BT criteria are seat-1 canonical, so we evaluate criteria under a
+        # dealer that is rotated by k seats, while still restricting rows to the real dealer.
+        crit_dealer = _rotate_dealer_dir(dealer, rot) if rot else dealer
         dealer_mask, invalid_criteria = _build_criteria_mask_for_dealer(
-            deal_df, dealer, criteria_by_seat, deal_criteria_by_seat_dfs
+            deal_df,
+            dealer,
+            criteria_by_seat,
+            deal_criteria_by_seat_dfs,
+            dealer_for_criteria=crit_dealer,
         )
         
         if invalid_criteria:
@@ -7053,6 +7182,8 @@ LIMIT {max_deals}"""
 def handle_list_next_bids(
     state: Dict[str, Any],
     auction: str,
+    dealer: Optional[str] = None,
+    vulnerable: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Fast lookup of available next bids using Gemini-3.2 CSR index.
     
@@ -7076,6 +7207,8 @@ def handle_list_next_bids(
         t0,
         include_deal_counts=True,
         include_ev_stats=True,
+        dealer=dealer,
+        vulnerable=vulnerable,
     )
     
     # Add extra metadata for the response if missing
@@ -7272,32 +7405,16 @@ def handle_rank_bids_by_ev(
                     next_bid_rows = next_bid_rows.join(agg_df, on="bt_index", how="left")
     
     # =========================================================================
-    # PRE-LOAD: EV stats from GPU pipeline (optional optimization) - NV/V split
+    # PRE-LOAD: EV stats from GPU pipeline (optional optimization) - NV/V split (library-first)
     # =========================================================================
-    # If bt_ev_stats_df is available, pre-load Avg_EV and Avg_Par for all next bids.
-    # This gives instant ranking without computing from deals.
     bt_ev_stats_df = state.get("bt_ev_stats_df")
     ev_stats_lookup: Dict[int, Dict[str, Any]] = {}
     if bt_ev_stats_df is not None and next_bid_rows.height > 0:
         bt_indices = next_bid_rows["bt_index"].unique().to_list()
-        bt_indices = [int(x) for x in bt_indices if x is not None]
-        if bt_indices:
-            ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_indices))
-            for ev_row in ev_subset.iter_rows(named=True):
-                ev_data: Dict[str, Any] = {}
-                for s in range(1, 5):
-                    # Try NV/V split columns first (new format)
-                    for vul in ["NV", "V"]:
-                        ev_key = f"Avg_EV_S{s}_{vul}"
-                        par_key = f"Avg_Par_S{s}_{vul}"
-                        if ev_key in ev_row:
-                            ev_data[ev_key] = ev_row.get(ev_key)
-                            ev_data[par_key] = ev_row.get(par_key)
-                    # Fall back to old aggregate columns
-                    if f"Avg_EV_S{s}_NV" not in ev_data:
-                        ev_data[f"Avg_EV_S{s}"] = ev_row.get(f"Avg_EV_S{s}")
-                        ev_data[f"Avg_Par_S{s}"] = ev_row.get(f"Avg_Par_S{s}")
-                ev_stats_lookup[int(ev_row["bt_index"])] = ev_data
+        ev_stats_lookup = preload_precomputed_ev_par_stats(
+            bt_ev_stats_df,
+            bt_indices=[int(x) for x in bt_indices if x is not None],
+        )
 
     # =========================================================================
     # PRE-FILTER: Opening seat alignment
@@ -7390,22 +7507,11 @@ def handle_rank_bids_by_ev(
         bid_auction = row.get("Auction", "")
         
         # Get pre-computed EV/Par from GPU pipeline (if available) - used in all exit paths
-        # Now with NV/V splits matching the bid_rankings rows
+        # (supports NV/V split with aggregate fallback)
         precomputed = ev_stats_lookup.get(bt_index, {}) if bt_index is not None else {}
-        # Try NV/V split columns first
-        avg_ev_precomputed_nv = precomputed.get(f"Avg_EV_S{next_seat}_NV")
-        avg_ev_precomputed_v = precomputed.get(f"Avg_EV_S{next_seat}_V")
-        avg_par_precomputed_nv = precomputed.get(f"Avg_Par_S{next_seat}_NV")
-        avg_par_precomputed_v = precomputed.get(f"Avg_Par_S{next_seat}_V")
-        # Fall back to aggregate if NV/V not available
-        if avg_ev_precomputed_nv is None:
-            aggregate_ev = precomputed.get(f"Avg_EV_S{next_seat}")
-            avg_ev_precomputed_nv = aggregate_ev
-            avg_ev_precomputed_v = aggregate_ev
-        if avg_par_precomputed_nv is None:
-            aggregate_par = precomputed.get(f"Avg_Par_S{next_seat}")
-            avg_par_precomputed_nv = aggregate_par
-            avg_par_precomputed_v = aggregate_par
+        avg_ev_precomputed_nv, avg_ev_precomputed_v, avg_par_precomputed_nv, avg_par_precomputed_v = (
+            get_avg_ev_par_precomputed_nv_v(precomputed, seat=int(next_seat))
+        )
         
         # Build criteria mask using optimized parent mask where possible
         global_mask = None
@@ -7538,206 +7644,19 @@ def handle_rank_bids_by_ev(
         if bid_strain == "NT":
             bid_strain = "N"
         
-        # Compute stats by vulnerability relative to the *next bidder seat* (seat-based, not direction-based)
-        nv_count = 0
-        v_count = 0
-        nv_par_sum = 0.0
-        v_par_sum = 0.0
-        ev_nv_sum = 0.0
-        ev_nv_sum_sq = 0.0
-        ev_nv_n = 0
-        ev_v_sum = 0.0
-        ev_v_sum_sq = 0.0
-        ev_v_n = 0
+        # Compute stats by vulnerability relative to the *next bidder seat* (library-first).
+        split_stats = compute_vul_split_par_ev_at_bid(matched_df, next_seat=int(next_seat))
+        nv_count = int(split_stats.get("nv_count") or 0)
+        v_count = int(split_stats.get("v_count") or 0)
+        avg_par_nv = split_stats.get("avg_par_nv")
+        avg_par_v = split_stats.get("avg_par_v")
+        ev_score_nv = split_stats.get("ev_score_nv")
+        ev_score_v = split_stats.get("ev_score_v")
+        ev_std_nv = split_stats.get("ev_std_nv")
+        ev_std_v = split_stats.get("ev_std_v")
         
-        # We can compute EV-at-bid from historical Score even if ParScore isn't loaded.
-        # Par-related aggregates require ParScore, but EV/Std should not be blocked by it.
-        if "Vul" in matched_df.columns and "Dealer" in matched_df.columns:
-            # Determine the next bidder direction per deal using the seat mapping.
-            dealer_to_bidder = _seat_direction_map(next_seat)
-            bidder_expr = pl.col("Dealer").replace(dealer_to_bidder)
-
-            # Vulnerability relative to bidder's side
-            is_bidder_ns = bidder_expr.is_in(["N", "S"])
-            is_vul_expr = pl.when(is_bidder_ns).then(pl.col("Vul").is_in(["N_S", "Both"])) \
-                            .otherwise(pl.col("Vul").is_in(["E_W", "Both"]))
-            nv_mask = ~is_vul_expr
-            v_mask = is_vul_expr
-            
-            nv_df = matched_df.filter(nv_mask)
-            v_df = matched_df.filter(v_mask)
-            
-            nv_count = nv_df.height
-            v_count = v_df.height
-            
-            if nv_count > 0:
-                # ParScore is NS-oriented; convert to "par from bidder's side" so it is
-                # comparable to EV which is computed relative to the bidder's partnership.
-                bidder_nv_df = nv_df.with_columns(bidder_expr.alias("_Bidder"))
-                if "ParScore" in bidder_nv_df.columns:
-                    nv_par = (
-                        bidder_nv_df
-                        .with_columns(
-                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
-                            .then(pl.col("ParScore"))
-                            .otherwise(-pl.col("ParScore"))
-                            .alias("_ParForBidder")
-                        )["_ParForBidder"]
-                        .drop_nulls()
-                    )
-                    if nv_par.len() > 0:
-                        par_sum = nv_par.sum()
-                        nv_par_sum = float(par_sum) if par_sum is not None else 0
-                
-                # EV-at-bid (and EV std) should be available even when per-contract EV columns
-                # are not loaded into deal_df (they are very wide).
-                #
-                # Policy: compute "EV at Bid" from historical *Score* from the bidder's side
-                # (NS score flipped for EW bidder). This matches the UI definition:
-                # "average score achieved when that bid becomes the final contract".
-                if "Score" in bidder_nv_df.columns:
-                    score_for_bidder = (
-                        bidder_nv_df
-                        .with_columns(
-                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
-                            .then(pl.col("Score").cast(pl.Float64, strict=False))
-                            .otherwise(-pl.col("Score").cast(pl.Float64, strict=False))
-                            .alias("_ScoreForBidder")
-                        )["_ScoreForBidder"]
-                        .drop_nulls()
-                    )
-                    n = int(score_for_bidder.len())
-                    if n > 0:
-                        s = float(score_for_bidder.sum() or 0.0)
-                        ss = float(((score_for_bidder * score_for_bidder).sum()) or 0.0)
-                        ev_nv_sum += s
-                        ev_nv_sum_sq += ss
-                        ev_nv_n += n
-            
-            if v_count > 0:
-                bidder_v_df = v_df.with_columns(bidder_expr.alias("_Bidder"))
-                if "ParScore" in bidder_v_df.columns:
-                    v_par = (
-                        bidder_v_df
-                        .with_columns(
-                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
-                            .then(pl.col("ParScore"))
-                            .otherwise(-pl.col("ParScore"))
-                            .alias("_ParForBidder")
-                        )["_ParForBidder"]
-                        .drop_nulls()
-                    )
-                    if v_par.len() > 0:
-                        par_sum = v_par.sum()
-                        v_par_sum = float(par_sum) if par_sum is not None else 0
-                
-                if "Score" in bidder_v_df.columns:
-                    score_for_bidder = (
-                        bidder_v_df
-                        .with_columns(
-                            pl.when(pl.col("_Bidder").is_in(["N", "S"]))
-                            .then(pl.col("Score").cast(pl.Float64, strict=False))
-                            .otherwise(-pl.col("Score").cast(pl.Float64, strict=False))
-                            .alias("_ScoreForBidder")
-                        )["_ScoreForBidder"]
-                        .drop_nulls()
-                    )
-                    n = int(score_for_bidder.len())
-                    if n > 0:
-                        s = float(score_for_bidder.sum() or 0.0)
-                        ss = float(((score_for_bidder * score_for_bidder).sum()) or 0.0)
-                        ev_v_sum += s
-                        ev_v_sum_sq += ss
-                        ev_v_n += n
-        
-        # Compute averages
-        avg_par_nv = round(nv_par_sum / nv_count, 0) if nv_count > 0 else None
-        avg_par_v = round(v_par_sum / v_count, 0) if v_count > 0 else None
-        
-        # Compute EV mean and std (sample stddev)
-        ev_score_nv = round(ev_nv_sum / ev_nv_n, 1) if ev_nv_n > 0 else None
-        if ev_nv_n > 1:
-            var = (ev_nv_sum_sq - (ev_nv_sum * ev_nv_sum) / ev_nv_n) / (ev_nv_n - 1)
-            ev_std_nv = round(var ** 0.5, 1) if var >= 0 else None
-        else:
-            ev_std_nv = None
-
-        ev_score_v = round(ev_v_sum / ev_v_n, 1) if ev_v_n > 0 else None
-        if ev_v_n > 1:
-            var = (ev_v_sum_sq - (ev_v_sum * ev_v_sum) / ev_v_n) / (ev_v_n - 1)
-            ev_std_v = round(var ** 0.5, 1) if var >= 0 else None
-        else:
-            ev_std_v = None
-        
-        # Compute EV and Makes % for all level-strain-vul-seat combinations (560 columns)
-        # IMPORTANT: S1..S4 are SEATS RELATIVE TO DEALER (Seat 1 = Dealer), not fixed N/E/S/W.
-        # We must therefore compute the declarer direction per deal using (Dealer + Seat).
-        # Use vectorized Polars expressions for performance.
-        ev_all_combos: Dict[str, Optional[float]] = {}
-        if matched_df.height > 0:
-            # Initialize keys to None for stable schema
-            for level in range(1, 8):
-                for strain in ["C", "D", "H", "S", "N"]:
-                    for vul_state in ["NV", "V"]:
-                        for seat in [1, 2, 3, 4]:
-                            ev_all_combos[f"EV_Score_{level}{strain}_{vul_state}_S{seat}"] = None
-                            ev_all_combos[f"Makes_Pct_{level}{strain}_{vul_state}_S{seat}"] = None
-
-            if "Dealer" in matched_df.columns and "Vul" in matched_df.columns:
-                for seat in [1, 2, 3, 4]:
-                    dealer_to_decl = _seat_direction_map(seat)
-                    seat_df0 = matched_df.with_columns(
-                        pl.col("Dealer").replace(dealer_to_decl).alias("_DeclDir")
-                    )
-
-                    is_decl_ns = pl.col("_DeclDir").is_in(["N", "S"])
-                    is_vul_expr = pl.when(is_decl_ns).then(pl.col("Vul").is_in(["N_S", "Both"])) \
-                                    .otherwise(pl.col("Vul").is_in(["E_W", "Both"]))
-
-                    for vul_state in ["NV", "V"]:
-                        seat_df = seat_df0.filter(is_vul_expr if vul_state == "V" else ~is_vul_expr)
-                        if seat_df.height == 0:
-                            continue
-
-                        exprs: List[pl.Expr] = []
-                        for level in range(1, 8):
-                            for strain in ["C", "D", "H", "S", "N"]:
-                                ev_key = f"EV_Score_{level}{strain}_{vul_state}_S{seat}"
-                                makes_key = f"Makes_Pct_{level}{strain}_{vul_state}_S{seat}"
-
-                                # EV: pick correct EV column per-deal based on _DeclDir, then mean
-                                w_ev = None
-                                for d in ["N", "E", "S", "W"]:
-                                    pair = "NS" if d in ["N", "S"] else "EW"
-                                    col = f"EV_{pair}_{d}_{strain}_{level}_{vul_state}"
-                                    if col in seat_df.columns:
-                                        if w_ev is None:
-                                            w_ev = pl.when(pl.col("_DeclDir") == d).then(pl.col(col))
-                                        else:
-                                            w_ev = w_ev.when(pl.col("_DeclDir") == d).then(pl.col(col))
-                                if w_ev is not None:
-                                    exprs.append(w_ev.otherwise(None).mean().alias(ev_key))
-
-                                # Makes %: pick correct DD_Score per-deal based on _DeclDir, then mean(made)*100
-                                w_dd = None
-                                for d in ["N", "E", "S", "W"]:
-                                    col = f"DD_Score_{level}{strain}_{d}"
-                                    if col in seat_df.columns:
-                                        if w_dd is None:
-                                            w_dd = pl.when(pl.col("_DeclDir") == d).then(pl.col(col))
-                                        else:
-                                            w_dd = w_dd.when(pl.col("_DeclDir") == d).then(pl.col(col))
-                                if w_dd is not None:
-                                    exprs.append(((w_dd.otherwise(None) >= 0).mean() * 100).alias(makes_key))
-
-                        if exprs:
-                            row = seat_df.select(exprs).row(0, named=True)
-                            for k, v in row.items():
-                                if v is not None:
-                                    if k.startswith("EV_Score_"):
-                                        ev_all_combos[k] = round(float(v), 1)
-                                    else:
-                                        ev_all_combos[k] = round(float(v), 1)
+        # Compute EV and Makes % for all level-strain-vul-seat combinations (560 columns) (library-first).
+        ev_all_combos = compute_ev_all_combos_for_matched_deals(matched_df)
         
         # Store large EV/Makes blob once per bid (used by Streamlit "Contract EV Rankings")
         ev_all_combos_by_bid[bid_name] = ev_all_combos
@@ -8140,7 +8059,12 @@ def handle_contract_ev_deals(
             opening_seat_mask = deal_df["bid"].str.starts_with(prefix) & not_extra_pass
 
     # Criteria mask for this bt_row
-    global_mask, _invalid = _build_criteria_mask_for_all_seats(deal_df, bt_row, deal_criteria_by_seat_dfs)
+    global_mask, untracked_criteria = _build_criteria_mask_for_all_seats(
+        deal_df,
+        bt_row,
+        deal_criteria_by_seat_dfs,
+        dealer_rotation=int(expected_passes or 0),
+    )
     if global_mask is None or not global_mask.any():
         return {"deals": [], "total_matches": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
     if opening_seat_mask is not None:
@@ -8276,6 +8200,617 @@ def handle_contract_ev_deals(
     }
 
 
+# ---------------------------------------------------------------------------
+# Bid Details – Stable schema (selected-bid drilldown)
+# ---------------------------------------------------------------------------
+
+
+def handle_bid_details(
+    state: Dict[str, Any],
+    auction: str,
+    bid: str,
+    max_deals: int,
+    seed: Optional[int],
+    vul_filter: Optional[str] = None,
+    *,
+    deal_index: Optional[int] = None,
+    topk: int = 10,
+    include_phase2a: bool = True,
+) -> Dict[str, Any]:
+    """Return stable selected-bid details for (auction prefix + candidate bid).
+
+    Includes:
+    - Top-K par contracts + entropy
+    - ParScore summary stats
+    - Suit-length / fit / HCP histograms (phase2a)
+    - Range percentiles for pinned deal (if deal_index provided)
+    - Pinned-deal exclusion from aggregates (if deal_index is in the matched set)
+    - Server-side caching (LRU)
+    """
+    t0 = time.perf_counter()
+
+    bid_norm = str(bid or "").strip().upper()
+    if not bid_norm:
+        raise ValueError("bid is required")
+
+    auction_input = normalize_auction_input(auction)
+    expected_passes = _count_leading_passes(auction_input)
+    auction_for_lookup = auction_input.rstrip("-") if auction_input else ""
+    auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
+    auction_for_traversal = auction_normalized.rstrip("-") if auction_normalized else ""
+
+    # Seat of next bidder relative to dealer (Seat 1 = dealer), INCLUDING leading passes.
+    call_tokens = [t for t in auction_for_lookup.split("-") if t] if auction_for_lookup else []
+    next_seat = (len(call_tokens) % 4) + 1
+
+    cache_key = (
+        "bid-details-v1",
+        auction_input,
+        bid_norm,
+        int(max_deals),
+        int(seed or 0),
+        str(vul_filter or ""),
+        int(deal_index) if deal_index is not None else None,
+        int(topk),
+        bool(include_phase2a),
+    )
+    cached = _lru_get(_BID_DETAILS_CACHE, cache_key, _BID_DETAILS_CACHE_LOCK)
+    if cached is not None:
+        out = dict(cached)
+        out["cache"] = {"hit": True}
+        out["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        return out
+
+    deal_df = state["deal_df"]
+    bt_seat1_df = state.get("bt_seat1_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs") or {}
+
+    if bt_seat1_df is None:
+        raise ValueError("bt_seat1_df not loaded")
+
+    # Match BT row for (auction prefix + selected next bid)
+    bt_row: Optional[Dict[str, Any]] = None
+    child_bt_index: Optional[int] = None
+
+    if not auction_input:
+        # Opening bids: MUST use bt_openings_df (fast). Do not scan bt_seat1_df (461M rows).
+        bt_openings_df = state.get("bt_openings_df")
+        if not isinstance(bt_openings_df, pl.DataFrame) or bt_openings_df.is_empty():
+            raise ValueError(
+                "bt_openings_df is missing/empty; refusing to scan bt_seat1_df for opening bids. "
+                "Restart the API server and ensure initialization completes successfully."
+            )
+        seat1_df = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
+        bid_df = seat1_df.filter(pl.col("Auction") == bid_norm)
+        if bid_df.height == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            out = {
+                "auction_input": auction_input,
+                "auction_normalized": auction_normalized,
+                "bid": bid_norm,
+                "child_bt_index": None,
+                "matched_deals_total": 0,
+                "matched_deals_sampled": 0,
+                "pinned_deal_excluded": False,
+                "error": f"Opening bid '{bid_norm}' not found in bt_openings_df",
+                "elapsed_ms": round(elapsed_ms, 1),
+                "cache": {"hit": False},
+            }
+            _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+            return out
+        bt_row = dict(bid_df.row(0, named=True))
+        if "candidate_bid" not in bt_row and bt_row.get("Auction"):
+            bt_row["candidate_bid"] = bt_row["Auction"]
+        child_bt_index = None
+        try:
+            v = bt_row.get("bt_index")
+            child_bt_index = int(v) if v is not None else None
+        except Exception:
+            child_bt_index = None
+    else:
+        is_passes_only = not auction_normalized or auction_normalized.lower() in ("p", "")
+        if is_passes_only and expected_passes > 0:
+            # Leading-pass support (pass-only prefix):
+            # We cannot traverse BT along opening passes (seat-1 canonical), so we treat the
+            # prefix as "opening bids" while using expected_passes to:
+            # - filter deals by exact leading-pass count (opening_seat_mask below)
+            # - rotate criteria evaluation (dealer_rotation=expected_passes)
+            bt_openings_df = state.get("bt_openings_df")
+            if not isinstance(bt_openings_df, pl.DataFrame) or bt_openings_df.is_empty():
+                raise ValueError(
+                    "bt_openings_df is missing/empty; cannot resolve pass-only prefix without Auction scans. "
+                    "Restart the API server and ensure initialization completes successfully."
+                )
+            seat1_df = bt_openings_df.filter(pl.col("seat") == 1) if "seat" in bt_openings_df.columns else bt_openings_df
+            bid_df = seat1_df.filter(pl.col("Auction") == bid_norm)
+            if bid_df.height == 0:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                out = {
+                    "auction_input": auction_input,
+                    "auction_normalized": auction_normalized,
+                    "bid": bid_norm,
+                    "child_bt_index": None,
+                    "matched_deals_total": 0,
+                    "matched_deals_sampled": 0,
+                    "pinned_deal_excluded": False,
+                    "error": f"Opening bid '{bid_norm}' not found in bt_openings_df (pass-only prefix mode)",
+                    "elapsed_ms": round(elapsed_ms, 1),
+                    "cache": {"hit": False},
+                }
+                _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+                return out
+            bt_row = dict(bid_df.row(0, named=True))
+            if "candidate_bid" not in bt_row and bt_row.get("Auction"):
+                bt_row["candidate_bid"] = bt_row["Auction"]
+            child_bt_index = None
+            try:
+                v = bt_row.get("bt_index")
+                child_bt_index = int(v) if v is not None else None
+            except Exception:
+                child_bt_index = None
+        # If we didn't resolve bt_row via the pass-only opening-bids fast-path above,
+        # resolve it via traversal from the non-pass prefix.
+        if bt_row is None:
+            parent_bt_index = _resolve_bt_index_by_traversal(state, auction_for_traversal)
+            if parent_bt_index is None:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                out = {
+                    "auction_input": auction_input,
+                    "auction_normalized": auction_normalized,
+                    "bid": bid_norm,
+                    "child_bt_index": None,
+                    "matched_deals_total": 0,
+                    "matched_deals_sampled": 0,
+                    "pinned_deal_excluded": False,
+                    "error": f"Auction '{auction_for_traversal}' not found in BT (traversal failed)",
+                    "elapsed_ms": round(elapsed_ms, 1),
+                    "cache": {"hit": False},
+                }
+                _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+                return out
+
+            next_indices = _get_next_bid_indices_for_parent(state, parent_bt_index)
+            if not next_indices:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                out = {
+                    "auction_input": auction_input,
+                    "auction_normalized": auction_normalized,
+                    "bid": bid_norm,
+                    "child_bt_index": None,
+                    "matched_deals_total": 0,
+                    "matched_deals_sampled": 0,
+                    "pinned_deal_excluded": False,
+                    "message": "No next bids found (auction may be completed)",
+                    "elapsed_ms": round(elapsed_ms, 1),
+                    "cache": {"hit": False},
+                }
+                _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+                return out
+
+            file_path = _bt_file_path_for_sql(state)
+            in_list = ", ".join(str(int(x)) for x in next_indices if x is not None)
+            conn = duckdb.connect(":memory:")
+            try:
+                q = f"""
+                    SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr
+                    FROM read_parquet('{file_path}')
+                    WHERE bt_index IN ({in_list})
+                """
+                idx_df = conn.execute(q).pl()
+            finally:
+                conn.close()
+
+            if idx_df.is_empty() or "candidate_bid" not in idx_df.columns:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                out = {
+                    "auction_input": auction_input,
+                    "auction_normalized": auction_normalized,
+                    "bid": bid_norm,
+                    "child_bt_index": None,
+                    "matched_deals_total": 0,
+                    "matched_deals_sampled": 0,
+                    "pinned_deal_excluded": False,
+                    "error": "BT lookup returned no candidate rows for this parent",
+                    "elapsed_ms": round(elapsed_ms, 1),
+                    "cache": {"hit": False},
+                }
+                _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+                return out
+
+            hit_df = idx_df.filter(pl.col("candidate_bid").cast(pl.Utf8).str.to_uppercase() == bid_norm)
+            if hit_df.height == 0:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                out = {
+                    "auction_input": auction_input,
+                    "auction_normalized": auction_normalized,
+                    "bid": bid_norm,
+                    "child_bt_index": None,
+                    "matched_deals_total": 0,
+                    "matched_deals_sampled": 0,
+                    "pinned_deal_excluded": False,
+                    "error": f"Bid '{bid_norm}' not found among next-bid candidates for this auction",
+                    "elapsed_ms": round(elapsed_ms, 1),
+                    "cache": {"hit": False},
+                }
+                _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+                return out
+
+            bt_row = dict(hit_df.row(0, named=True))
+            child_bt_index = None
+            try:
+                v = bt_row.get("bt_index")
+                child_bt_index = int(v) if v is not None else None
+            except Exception:
+                child_bt_index = None
+
+    if bt_row is None:
+        raise ValueError("Internal error: bt_row resolution failed")
+
+    bt_row = _apply_all_rules_to_bt_row(dict(bt_row), state)
+
+    # Opening-seat alignment filter (matches handle_rank_bids_by_ev semantics).
+    opening_seat_mask = None
+    if "bid" in deal_df.columns:
+        if expected_passes == 0:
+            opening_seat_mask = ~deal_df["bid"].str.starts_with("p-")
+        else:
+            prefix = "p-" * expected_passes
+            not_extra_pass = ~deal_df["bid"].str.starts_with("p-" * (expected_passes + 1))
+            opening_seat_mask = deal_df["bid"].str.starts_with(prefix) & not_extra_pass
+
+    # Track criteria referenced by the BT row but not present in deal bitmaps.
+    untracked_criteria: list[str] = []
+    # BT-level annotations for this node ("Expr" column); not necessarily used for deal matching.
+    bt_expr: list[str] = []
+    # Acting-seat criteria at this node (seat relative to dealer for this prefix).
+    bt_acting_criteria: list[str] = []
+
+    # Extract BT metadata before masking (so it exists even on early returns).
+    try:
+        raw_expr = bt_row.get("Expr") if isinstance(bt_row, dict) else None
+        if isinstance(raw_expr, list):
+            bt_expr = [str(x) for x in raw_expr if x is not None and str(x).strip()]
+        elif raw_expr is not None:
+            bt_expr = [str(raw_expr)]
+        bt_expr = bt_expr[:50]
+    except Exception:
+        bt_expr = []
+
+    try:
+        # BT criteria are seat-1 canonical (opener = seat 1). When the auction prefix has
+        # leading passes, the real "next_seat" (dealer-relative) must be rotated back into
+        # BT-canonical seat numbering to retrieve the intended criteria list.
+        bt_seat = ((int(next_seat) - 1 - int(expected_passes or 0)) % 4) + 1
+        k = f"Agg_Expr_Seat_{int(bt_seat)}"
+        raw = bt_row.get(k) if isinstance(bt_row, dict) else None
+        if isinstance(raw, list):
+            bt_acting_criteria = [str(x) for x in raw if x is not None and str(x).strip()]
+        elif raw is not None:
+            bt_acting_criteria = [str(raw)]
+        bt_acting_criteria = bt_acting_criteria[:50]
+    except Exception:
+        bt_acting_criteria = []
+
+    # Leading-pass support: rotate dealer when evaluating criteria (seat alignment),
+    # matching Auction Builder semantics.
+    global_mask, untracked_criteria = _build_criteria_mask_for_all_seats(
+        deal_df,
+        bt_row,
+        deal_criteria_by_seat_dfs,
+        dealer_rotation=int(expected_passes or 0),
+    )
+
+    # Normalize untracked criteria list (stable, UI-friendly)
+    try:
+        untracked_criteria = [str(x) for x in (untracked_criteria or []) if x is not None and str(x).strip()]
+        untracked_criteria = list(dict.fromkeys(untracked_criteria))
+    except Exception:
+        untracked_criteria = []
+    if global_mask is None or not global_mask.any():
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        out = {
+            "auction_input": auction_input,
+            "auction_normalized": auction_normalized,
+            "bid": bid_norm,
+            "child_bt_index": child_bt_index,
+            "matched_deals_total": 0,
+            "matched_deals_sampled": 0,
+            "pinned_deal_excluded": False,
+            "message": "No matched deals for this bid (criteria mask empty)",
+            "elapsed_ms": round(elapsed_ms, 1),
+            "cache": {"hit": False},
+        }
+        _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+        return out
+
+    if opening_seat_mask is not None:
+        global_mask = global_mask & opening_seat_mask
+        if not global_mask.any():
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            out = {
+                "auction_input": auction_input,
+                "auction_normalized": auction_normalized,
+                "bid": bid_norm,
+                "child_bt_index": child_bt_index,
+                "matched_deals_total": 0,
+                "matched_deals_sampled": 0,
+                "pinned_deal_excluded": False,
+                "message": "No matched deals after opening-seat alignment filter",
+                "elapsed_ms": round(elapsed_ms, 1),
+                "cache": {"hit": False},
+            }
+            _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+            return out
+
+    matched_df = deal_df.filter(global_mask)
+    if matched_df.height == 0:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        out = {
+            "auction_input": auction_input,
+            "auction_normalized": auction_normalized,
+            "bid": bid_norm,
+            "child_bt_index": child_bt_index,
+            "matched_deals_total": 0,
+            "matched_deals_sampled": 0,
+            "pinned_deal_excluded": False,
+            "message": "No matched deals for this bid",
+            "elapsed_ms": round(elapsed_ms, 1),
+            "cache": {"hit": False},
+        }
+        _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+        return out
+
+    # Optional vulnerability filter (exact data value: None/Both/N_S/E_W).
+    if vul_filter and vul_filter != "all" and "Vul" in matched_df.columns:
+        data_vul = _VUL_UI_TO_DATA.get(vul_filter, vul_filter)
+        matched_df = matched_df.filter(pl.col("Vul") == data_vul)
+        if matched_df.height == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            out = {
+                "auction_input": auction_input,
+                "auction_normalized": auction_normalized,
+                "bid": bid_norm,
+                "child_bt_index": child_bt_index,
+                "matched_deals_total": 0,
+                "matched_deals_sampled": 0,
+                "pinned_deal_excluded": False,
+                "message": f"No matched deals after vul_filter={vul_filter!r}",
+                "elapsed_ms": round(elapsed_ms, 1),
+                "cache": {"hit": False},
+            }
+            _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+            return out
+
+    matched_total_pre_excl = int(matched_df.height)
+
+    pinned_row: dict[str, Any] | None = None
+    pinned_in_matches = False
+    seat_dir: str | None = None
+    degraded_mode: str | None = None
+    degraded_reasons: list[str] = []
+
+    if deal_index is not None:
+        pinned_row = _resolve_deal_row_by_deal_index(state, int(deal_index))
+        if pinned_row is not None:
+            try:
+                dealer = str(pinned_row.get("Dealer", "N")).upper()
+                seat_dir = seat_to_direction(dealer, int(next_seat))
+            except Exception:
+                seat_dir = None
+        # Exclude pinned from aggregates ONLY if it is present in the matched set.
+        if "index" in matched_df.columns:
+            try:
+                pinned_in_matches = matched_df.filter(pl.col("index") == int(deal_index)).height > 0
+            except Exception:
+                pinned_in_matches = False
+            if pinned_in_matches:
+                matched_df = matched_df.filter(pl.col("index") != int(deal_index))
+
+    matched_total_post_excl = int(matched_df.height)
+
+    # Explicit degraded modes (schema-stable; caller can surface warnings in UI).
+    # These are intentionally simple thresholds for MVP phase2a posteriors.
+    if matched_total_post_excl < 50:
+        degraded_mode = "very_sparse_matches"
+        degraded_reasons.append(f"n_excluding_pinned<{50}")
+    elif matched_total_post_excl < 200:
+        degraded_mode = "sparse_matches"
+        degraded_reasons.append(f"n_excluding_pinned<{200}")
+
+    effective_seed = _effective_seed(seed)
+    max_deals_i = max(1, int(max_deals))
+    if matched_df.height > max_deals_i:
+        matched_df = matched_df.sample(n=max_deals_i, seed=effective_seed)
+
+    # Select only required columns for the computation (keep memory bounded).
+    cols: list[str] = ["index", "Dealer", "ParScore", "ParContracts"]
+    # Phase2a posteriors (auction-conditioned) require full directional numeric columns and hands.
+    if include_phase2a:
+        for d in ["N", "E", "S", "W"]:
+            cols.append(f"HCP_{d}")
+            cols.append(f"Total_Points_{d}")
+            cols.append(f"Hand_{d}")
+            for su in ["S", "H", "D", "C"]:
+                cols.append(f"SL_{d}_{su}")
+
+    cols = [c for c in cols if c in matched_df.columns]
+    deals_sample_df = matched_df.select(cols)
+
+    cfg = BidDetailsConfig(topk=int(topk), include_phase2a=bool(include_phase2a), include_honor_location=False)
+    computed = compute_bid_details_from_sample(deals_sample_df, seat_dir=seat_dir or "N", pinned_row=None, cfg=cfg)
+
+    # Phase2a: auction-conditioned posteriors (SELF/PARTNER/LHO/RHO) + threat/keycard/onside.
+    phase2a = None
+    if include_phase2a:
+        try:
+            # IMPORTANT:
+            # - We exclude the pinned deal from aggregates (to avoid leaking it into means / posteriors).
+            # - But Phase2a range percentiles need the pinned row's values to compare against the
+            #   auction-conditioned SELF posterior.
+            #
+            # To support this without changing the library surface, we append the pinned row back
+            # into the Phase2a input when available (even if it is not in the matched set after
+            # opening-seat alignment). This matches Auction Builder semantics: the user is asking
+            # "how typical is my pinned hand under this bid's posterior?" even for hypothetical
+            # pass prefixes.
+            phase2a_df = deals_sample_df
+            if pinned_row is not None and deal_index is not None:
+                try:
+                    pinned_df = pl.DataFrame([pinned_row])
+                    pinned_df = pinned_df.select([c for c in cols if c in pinned_df.columns])
+                    if pinned_df.height == 1 and "index" in pinned_df.columns:
+                        phase2a_df = pl.concat([phase2a_df, pinned_df], how="diagonal_relaxed")
+                except Exception:
+                    phase2a_df = deals_sample_df
+
+            phase2a = compute_phase2a_auction_conditioned_posteriors(
+                phase2a_df,
+                next_seat=int(next_seat),
+                pinned_deal_index=int(deal_index) if deal_index is not None else None,
+                include_keycards=True,
+                include_onside=True,
+            )
+        except Exception as e:
+            degraded_mode = degraded_mode or "phase2a_unavailable"
+            degraded_reasons.append(f"phase2a_error:{e}")
+            phase2a = None
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    out = {
+        "auction_input": auction_input,
+        "auction_normalized": auction_normalized,
+        "auction_for_traversal": auction_for_traversal,
+        "bid": bid_norm,
+        "next_seat": int(next_seat),
+        "seat_dir": seat_dir,
+        "child_bt_index": child_bt_index,
+        # BT-level annotations for this node (not necessarily used for deal matching).
+        "bt_expr": bt_expr,
+        "bt_acting_criteria": bt_acting_criteria,
+        "bt_acting_criteria_count": int(len(bt_acting_criteria)),
+        "untracked_criteria": untracked_criteria,
+        "untracked_criteria_count": int(len(untracked_criteria)),
+        "matched_deals_total": int(matched_total_pre_excl),
+        "matched_deals_total_excluding_pinned": int(matched_total_post_excl),
+        "matched_deals_sampled": int(deals_sample_df.height),
+        "pinned_deal_index": int(deal_index) if deal_index is not None else None,
+        "pinned_deal_excluded": bool(pinned_in_matches),
+        "degraded_mode": degraded_mode,
+        "degraded_reasons": degraded_reasons,
+        "cache": {"hit": False},
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+    out.update(computed)
+    if phase2a is not None:
+        # Keep top-level stable pointer for consumers; phase2a is the new preferred surface.
+        out["phase2a"] = phase2a
+        # Promote role-based percentiles to the stable top-level key when available.
+        if isinstance(phase2a, dict) and phase2a.get("range_percentiles") is not None:
+            out["range_percentiles"] = phase2a.get("range_percentiles")
+
+    _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Explain Bid – EEO + templates + counterfactual (no RAG)
+# ---------------------------------------------------------------------------
+
+
+def handle_explain_bid(
+    state: Dict[str, Any],
+    auction: str,
+    bid: str,
+    max_deals: int,
+    seed: Optional[int],
+    vul_filter: Optional[str] = None,
+    *,
+    deal_index: Optional[int] = None,
+    topk: int = 10,
+    include_phase2a: bool = True,
+    why_not_bid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Explain a selected bid using computed evidence only (no RAG yet)."""
+    t0 = time.perf_counter()
+
+    bid_norm = str(bid or "").strip().upper()
+    if not bid_norm:
+        raise ValueError("bid is required")
+    alt_norm = str(why_not_bid or "").strip().upper() or None
+
+    auction_input = normalize_auction_input(auction)
+    cache_key = (
+        "explain-bid-v1",
+        auction_input,
+        bid_norm,
+        alt_norm,
+        int(max_deals),
+        int(seed or 0),
+        str(vul_filter or ""),
+        int(deal_index) if deal_index is not None else None,
+        int(topk),
+        bool(include_phase2a),
+    )
+
+    cached = _lru_get(_EXPLAIN_BID_CACHE, cache_key, _EXPLAIN_BID_CACHE_LOCK)
+    if cached is not None:
+        out = dict(cached)
+        out["cache"] = {"hit": True}
+        out["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        return out
+
+    # Reuse bid-details evidence (with its own cache + pinned exclusion).
+    bid_details = handle_bid_details(
+        state=state,
+        auction=auction_input,
+        bid=bid_norm,
+        max_deals=max_deals,
+        seed=seed,
+        vul_filter=vul_filter,
+        deal_index=deal_index,
+        topk=topk,
+        include_phase2a=include_phase2a,
+    )
+    eeo = compute_eeo_from_bid_details(bid_details)
+    expl = render_recommendation_explanation(bid=bid_norm, eeo=eeo)
+
+    counterfactual = None
+    alt_details = None
+    alt_eeo = None
+    if alt_norm:
+        alt_details = handle_bid_details(
+            state=state,
+            auction=auction_input,
+            bid=alt_norm,
+            max_deals=max_deals,
+            seed=seed,
+            vul_filter=vul_filter,
+            deal_index=deal_index,
+            topk=topk,
+            include_phase2a=include_phase2a,
+        )
+        alt_eeo = compute_eeo_from_bid_details(alt_details)
+        counterfactual = render_counterfactual_why_not(bid=bid_norm, alt_bid=alt_norm, eeo=eeo, alt_eeo=alt_eeo)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    out = {
+        "auction_input": auction_input,
+        "bid": bid_norm,
+        "why_not_bid": alt_norm,
+        "eeo": eeo,
+        "explanation": expl,
+        "counterfactual": counterfactual,
+        "bid_details": bid_details,
+        "why_not_bid_details": alt_details,
+        "why_not_eeo": alt_eeo,
+        "cache": {"hit": False},
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+    _lru_put(_EXPLAIN_BID_CACHE, cache_key, dict(out), _CACHE_MAX_EXPLAIN_BID, _EXPLAIN_BID_CACHE_LOCK)
+    return out
+
+
 def handle_new_rules_lookup(
     state: Dict[str, Any],
     auction: str,
@@ -8357,6 +8892,8 @@ def _handle_list_next_bids_walk_fallback(
     *,
     include_deal_counts: bool = True,
     include_ev_stats: bool = True,
+    dealer: Optional[str] = None,
+    vulnerable: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Gemini-3.2 optimized version: Uses CSR index and O(log n) Polars lookup.
     
@@ -8440,29 +8977,39 @@ def _handle_list_next_bids_walk_fallback(
                 # The parent row's Agg_Expr_Seat_N columns contain cumulative criteria
                 base_mask = _compute_cumulative_deal_mask(state, parent_row, 4)
 
-    # 5. Build EV stats lookup (if available) - now with NV/V splits
-    # Pre-load EV stats for all bt_indices in one go (O(n) filter is faster than repeated lookups)
+    # Optional board context: dealer + board vulnerability -> acting seat + seat-vul bucket.
+    # This lets the API return a single "selected" Avg_Par/Avg_EV without making the client choose NV/V.
+    context: dict[str, Any] | None = None
+    try:
+        if dealer is not None or vulnerable is not None:
+            if dealer is None or vulnerable is None:
+                raise ValueError("Both dealer and vulnerable must be provided together (or neither).")
+            dealer_n = normalize_dealer_strict(dealer)
+            board_vul = normalize_board_vulnerable(vulnerable)
+            act = compute_seat_to_act(dealer=dealer_n, auction_full=auction_input)
+            seat_to_act_dir = str(act["seat_to_act_dir"])
+            seat_to_act_seat = int(act["seat_to_act_seat"])
+            seat_vul = seat_vul_bucket(board_vul, seat_to_act_dir)
+            context = {
+                "dealer": dealer_n,
+                "vulnerable": board_vul,
+                "seat_to_act_dir": seat_to_act_dir,
+                "seat_to_act_seat": seat_to_act_seat,
+                "seat_vul": seat_vul,
+            }
+    except Exception as e:
+        context = {
+            "error": f"invalid_context:{e}",
+            "dealer": dealer,
+            "vulnerable": vulnerable,
+        }
+
+    # 5. Build EV/Par stats lookup (if available) - NV/V splits (library-first)
     bt_ev_stats_df = state.get("bt_ev_stats_df")
     ev_lookup: Dict[int, Dict[str, Any]] = {}
     if include_ev_stats and bt_ev_stats_df is not None and next_bid_rows.height > 0:
         bt_indices = next_bid_rows["bt_index"].unique().to_list()
-        bt_indices = [int(x) for x in bt_indices if x is not None]
-        if bt_indices:
-            ev_subset = bt_ev_stats_df.filter(pl.col("bt_index").is_in(bt_indices))
-            for ev_row in ev_subset.iter_rows(named=True):
-                # Load NV/V split columns (new format) or fall back to aggregate (old format)
-                ev_data: Dict[str, Any] = {}
-                for s in range(1, 5):
-                    # Try new NV/V split columns first
-                    nv_col = f"Avg_EV_S{s}_NV"
-                    v_col = f"Avg_EV_S{s}_V"
-                    if nv_col in ev_row:
-                        ev_data[nv_col] = ev_row.get(nv_col)
-                        ev_data[v_col] = ev_row.get(v_col)
-                    else:
-                        # Fall back to old aggregate column (for backwards compatibility)
-                        ev_data[f"Avg_EV_S{s}"] = ev_row.get(f"Avg_EV_S{s}")
-                ev_lookup[int(ev_row["bt_index"])] = ev_data
+        ev_lookup = preload_precomputed_ev_par_stats(bt_ev_stats_df, bt_indices=[int(x) for x in bt_indices if x is not None])
 
     # 6. Build final response with on-demand deal counts
     next_bids = []
@@ -8496,22 +9043,22 @@ def _handle_list_next_bids_walk_fallback(
         next_indices_list = row.get("next_bid_indices") or []
         is_dead_end = not is_complete and len(next_indices_list) == 0
         
-        # Get Avg_EV for the next seat from precomputed stats (NV/V split)
-        avg_ev_nv = None
-        avg_ev_v = None
+        # Get Avg_EV / Avg_Par for the next seat from precomputed stats (NV/V split with aggregate fallback)
+        avg_ev_nv: float | None = None
+        avg_ev_v: float | None = None
+        avg_par_nv: float | None = None
+        avg_par_v: float | None = None
         if include_ev_stats and idx is not None and idx in ev_lookup:
             ev_data = ev_lookup[idx]
-            # Try NV/V split columns first (new format)
-            nv_key = f"Avg_EV_S{next_seat}_NV"
-            v_key = f"Avg_EV_S{next_seat}_V"
-            if nv_key in ev_data:
-                avg_ev_nv = ev_data.get(nv_key)
-                avg_ev_v = ev_data.get(v_key)
-            else:
-                # Fall back to aggregate (old format) - use for both NV and V
-                aggregate = ev_data.get(f"Avg_EV_S{next_seat}")
-                avg_ev_nv = aggregate
-                avg_ev_v = aggregate
+            avg_ev_nv, avg_ev_v, avg_par_nv, avg_par_v = get_avg_ev_par_precomputed_nv_v(ev_data, seat=int(next_seat))
+
+        # Convenience selection when context is provided (aligns with canonical doc).
+        avg_ev = None
+        avg_par = None
+        if context and context.get("seat_vul") in ("NV", "V"):
+            seat_vul = str(context["seat_vul"])
+            avg_ev = avg_ev_v if seat_vul == "V" else avg_ev_nv
+            avg_par = avg_par_v if seat_vul == "V" else avg_par_nv
             
         next_bids.append({
             "bid": str(row.get("candidate_bid")).upper(),
@@ -8524,6 +9071,11 @@ def _handle_list_next_bids_walk_fallback(
             "matching_deal_count": deal_count,
             "avg_ev_nv": avg_ev_nv,
             "avg_ev_v": avg_ev_v,
+            "avg_par_nv": avg_par_nv,
+            "avg_par_v": avg_par_v,
+            # Convenience columns (selected by board context when provided)
+            "avg_ev": avg_ev,
+            "avg_par": avg_par,
             "can_complete": bool(bt_can_complete[int(idx)]) if (bt_can_complete is not None and idx is not None and int(idx) < len(bt_can_complete)) else None,
         })
     
@@ -8542,7 +9094,10 @@ def _handle_list_next_bids_walk_fallback(
     next_bids.sort(key=sort_key)
     
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    return {"auction_input": auction_input, "next_bids": next_bids, "elapsed_ms": round(elapsed_ms, 1)}
+    resp: dict[str, Any] = {"auction_input": auction_input, "next_bids": next_bids, "elapsed_ms": round(elapsed_ms, 1)}
+    if context is not None:
+        resp["context"] = context
+    return resp
 
 
 def _handle_resolve_auction_path_fallback(

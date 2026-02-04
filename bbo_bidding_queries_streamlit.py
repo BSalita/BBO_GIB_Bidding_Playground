@@ -54,6 +54,8 @@ from plugins.bbo_handlers_common import (
     format_par_contracts as _format_par_contracts,
 )
 
+from bbo_explanation_lib import compute_eeo_from_bid_details
+
 
 API_BASE = "http://127.0.0.1:8000"
 
@@ -1165,7 +1167,10 @@ def render_aggrid(
         "ParContracts": 155, "EV": 75,
         # Auction Summary columns
         "Bid Num": 115, "Direction": 125, "Seat": 90, "Bid": 80, "BT Index": 120,
-        "Matches": 115, "Deals": 100, "Avg_EV": 105, "EV_NV": 100, "EV_V": 90, "Criteria Count": 150, "Complete": 110,
+        "Matches": 115, "Deals": 100,
+        "Avg_EV": 105, "EV_NV": 100, "EV_V": 90,
+        "Avg_Par": 110, "Par_NV": 100, "Par_V": 90,
+        "Criteria Count": 150, "Complete": 110,
         # Rankings-style stats columns (NV/V split)
         "Matches_NV": 130, "Matches_V": 125,
         "Avg Par_NV": 130, "Avg Par_V": 125,
@@ -4771,7 +4776,7 @@ def render_rank_by_ev():
     # Call API (single endpoint provides both bid rankings and DD analysis)
     # =========================================================================
     # Cache version: increment when API response format changes
-    CACHE_VERSION = 26  # v26: bust cache for EV-at-bid/EV-std population
+    CACHE_VERSION = 27  # v27: bust cache for contract EV blob EV_Score population
     
     # Always fetch all columns from API; filter display based on checkboxes
     # This prevents cache busting when output options change
@@ -4793,6 +4798,14 @@ def render_rank_by_ev():
     @st.cache_data(ttl=3600, show_spinner=False)
     def fetch_contract_ev_deals(p: Dict[str, Any]) -> Dict[str, Any]:
         return api_post("/contract-ev-deals", p)
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_bid_details(p: Dict[str, Any]) -> Dict[str, Any]:
+        return api_post("/bid-details", p)
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_explain_bid(p: Dict[str, Any]) -> Dict[str, Any]:
+        return api_post("/explain-bid", p)
     
     desc = f"responses to '{auction_input}'" if auction_input else "opening bids"
     
@@ -4893,6 +4906,150 @@ def render_rank_by_ev():
         # Contract EV Rankings (for selected next bid only)
         # ---------------------------------------------------------------------
         if selected_bid_name:
+            # -----------------------------------------------------------------
+            # MVP-2/3: Stable selected-bid details + EEO + templated explanations
+            # -----------------------------------------------------------------
+            # Make the expander self-describing: this is about the SELECTED BID row above.
+            # (These are *par-contract* outcomes across matched deals, not the actual final contract reached in play.)
+            exp_bid = str(selected_bid_name or "").strip().upper()
+            exp_auc = None
+            try:
+                if selected_bid_rows is not None and len(selected_bid_rows) > 0 and selected_bid is not None:
+                    exp_auc = selected_bid.get("Full Auction")
+            except Exception:
+                exp_auc = None
+            exp_title = f"🧾 Selected bid: {exp_bid} — par posterior + explanation"
+            if exp_auc:
+                exp_title = f"🧾 Selected bid: {exp_bid} (auction: {exp_auc}) — par posterior + explanation"
+
+            with st.expander(exp_title, expanded=False):
+                try:
+                    st.caption(
+                        "This section summarizes the *par-contract posterior* across deals that match the criteria for the selected bid. "
+                        "It does not mean the auction will reach these contracts in real play."
+                    )
+                    details_payload = {
+                        "auction": auction_input,
+                        "bid": selected_bid_name,
+                        "max_deals": int(max_deals),
+                        "seed": seed,
+                        "vul_filter": vul_filter if vul_filter != "all" else None,
+                        "topk": 10,
+                        "include_phase2a": True,
+                        "_cache_version": CACHE_VERSION,
+                    }
+                    details = fetch_bid_details(details_payload)
+                    _st_info_elapsed("Bid details", details)
+
+                    ps = details.get("par_score") or {}
+                    pc = details.get("par_contracts") or {}
+                    degraded_mode = details.get("degraded_mode")
+                    degraded_reasons = details.get("degraded_reasons") or []
+                    if degraded_mode:
+                        st.warning(f"Degraded mode: `{degraded_mode}` ({'; '.join(str(x) for x in degraded_reasons if x)})")
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Matched deals (total)", f"{int(details.get('matched_deals_total') or 0):,}")
+                    c2.metric("Matched deals (sampled)", f"{int(details.get('matched_deals_sampled') or 0):,}")
+                    c3.metric("Mean ParScore", f"{float(ps.get('mean') or 0.0):.1f}" if ps.get("mean") is not None else "NA")
+                    c4.metric("Entropy (nats)", f"{float(pc.get('contract_entropy_full_nats') or 0.0):.3f}" if pc.get("contract_entropy_full_nats") is not None else "NA")
+
+                    topk = pc.get("topk") or []
+                    if topk:
+                        topk_df = pl.DataFrame(topk)
+                        # Keep compact columns
+                        keep = [c for c in ["contract", "pair", "declarer", "prob", "avg_par_score"] if c in topk_df.columns]
+                        if keep:
+                            topk_df = topk_df.select(keep)
+                        # Rename for clarity (these are par contracts, not "the contract we bid").
+                        try:
+                            rename_map = {
+                                "contract": "ParContract",
+                                "pair": "Pair",
+                                "declarer": "Declarer",
+                                "prob": "Prob",
+                                "avg_par_score": "Avg_ParScore",
+                            }
+                            cols_present = {c: rename_map[c] for c in topk_df.columns if c in rename_map}
+                            if cols_present:
+                                topk_df = topk_df.rename(cols_present)
+                            if "Prob" in topk_df.columns:
+                                topk_df = topk_df.with_columns((pl.col("Prob") * 100).round(1).alias("Prob_%")).drop("Prob")
+                        except Exception:
+                            pass
+                        # Render as AgGrid (consistent UI).
+                        render_aggrid(
+                            topk_df,
+                            key=f"bid_details_topk_{exp_bid}_{CACHE_VERSION}",
+                            height=calc_grid_height(len(topk_df), max_height=250),
+                            table_name="bid_details_topk",
+                            fit_columns_to_view=True,
+                            show_sql_expander=False,
+                        )
+                    else:
+                        st.info("No par-contract distribution available for this selection.")
+
+                    # Counterfactual selection
+                    all_bids = sorted({str(r.get("bid") or "").strip().upper() for r in bid_rankings if r.get("bid")})
+                    why_not = st.selectbox(
+                        "Why not… (optional)",
+                        options=["(none)"] + all_bids,
+                        index=0,
+                        key=f"why_not_{CACHE_VERSION}",
+                    )
+                    explain_payload = {
+                        "auction": auction_input,
+                        "bid": selected_bid_name,
+                        "why_not_bid": None if why_not == "(none)" else why_not,
+                        "max_deals": int(max_deals),
+                        "seed": seed,
+                        "vul_filter": vul_filter if vul_filter != "all" else None,
+                        "topk": 10,
+                        "include_phase2a": True,
+                        "_cache_version": CACHE_VERSION,
+                    }
+                    expl = fetch_explain_bid(explain_payload)
+                    ex = expl.get("explanation") or {}
+                    st.write(ex.get("text") or "No explanation returned.")
+                    cf = expl.get("counterfactual") or {}
+                    if cf.get("text"):
+                        st.write(cf.get("text"))
+
+                    # Phase 2a: auction-conditioned posteriors
+                    phase2a = details.get("phase2a") or {}
+                    roles = (phase2a.get("roles") or {}) if isinstance(phase2a, dict) else {}
+                    threats = (phase2a.get("threats") or {}) if isinstance(phase2a, dict) else {}
+                    keycards = (phase2a.get("keycards") or {}) if isinstance(phase2a, dict) else {}
+                    onside = (phase2a.get("onside") or {}) if isinstance(phase2a, dict) else {}
+                    rp = details.get("range_percentiles") or {}
+
+                    if roles:
+                        st.markdown("**Phase 2a: Auction-conditioned posteriors (SELF/PARTNER/LHO/RHO)**")
+                        # Show compact threat + onside summaries (tables are too big for now)
+                        if threats:
+                            tdf = pl.DataFrame(
+                                [{"Suit": su, **(threats.get(su) or {})} for su in ["S", "H", "D", "C"] if su in threats]
+                            )
+                            render_aggrid(
+                                tdf,
+                                key=f"phase2a_threats_{exp_bid}_{CACHE_VERSION}",
+                                height=calc_grid_height(len(tdf), max_height=220),
+                                table_name="phase2a_threats",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                        if isinstance(rp, dict) and rp.get("deal_index") is not None:
+                            st.caption(
+                                f"Pinned-deal percentiles are computed vs the SELF posterior (after pinned exclusion). "
+                                f"deal_index={rp.get('deal_index')}, role={rp.get('role')}"
+                            )
+                        if keycards:
+                            st.caption("Keycards are computed per-suit (treating each suit as potential trump).")
+                        if onside:
+                            st.caption("Onside convention: p_onside = P(honor with LHO), p_offside = P(honor with RHO).")
+                except Exception as e:
+                    st.warning(f"Could not load selected-bid details/explanation: {e}")
+
             # Seat number (1-4) from the clicked row; used to filter contract table to that seat only.
             selected_next_seat = None
             try:
@@ -5211,13 +5368,6 @@ def render_rank_by_ev():
         
         score_col = f"DD_Score_{level}{strain}_{declarer}"
         
-        # Convert contract to bid format for filtering
-        # e.g., "1NT" -> "1N", "4S" -> "4S"
-        expected_bid = f"{level}{strain}"
-        
-        # Get deal indices that matched this bid's criteria (O(1) lookup)
-        valid_indices = set(matched_by_bid.get(expected_bid, []))
-        
         # Define vulnerability subsets for THIS declarer
         if declarer in ["N", "S"]:
             nv_vuls = ["None", "E_W"]
@@ -5238,7 +5388,7 @@ def render_rank_by_ev():
         # Filter deals to match the same population used for the aggregated
         # Contract Rankings by EV row:
         # - vulnerability subset for the declarer's side (NV vs V)
-        # - deals must have a non-null DD_Score for the selected contract when available
+        # - add the selected contract's DD_Score as a dedicated column and sort by it
         #
         # IMPORTANT: do NOT filter by Dealer here. For non-opening auctions the declarer
         # is not necessarily the dealer, and the backend aggregation does not filter by Dealer.
@@ -5250,13 +5400,28 @@ def render_rank_by_ev():
             score_ok = (d.get(score_col) is not None) if score_col in d else True
             
             if vul_ok and score_ok:
-                new_filtered.append(d)
+                # Attach selected-contract DD score for stable sorting/display.
+                rr = dict(d)
+                rr["DD_Score_Selected"] = rr.get(score_col)
+                new_filtered.append(rr)
         
+        # Sort by selected DD score desc (best for this contract first), then by index asc.
+        try:
+            new_filtered.sort(
+                key=lambda r: (
+                    float(r.get("DD_Score_Selected")) if isinstance(r.get("DD_Score_Selected"), (int, float)) else float("-inf"),
+                    -float(r.get("index")) if isinstance(r.get("index"), (int, float)) else 0.0,
+                ),
+                reverse=True,
+            )
+        except Exception:
+            pass
+
         filtered_deals = new_filtered
-        selection_msg = f" (Stats for {level}{strain_alias} by {declarer} ({vul_state}))"
+        selection_msg = f" (Deals for {level}{strain_alias} by {declarer} ({vul_state}))"
     
     if filtered_deals and has_selection:
-        st.subheader(f"📈 Deals matching {sel_level}{sel_strain} by {sel_declarer} ({sel_vul}) ({len(filtered_deals)} deals)")
+        st.subheader(f"📈 Deals for {sel_level}{sel_strain} by {sel_declarer} ({sel_vul}) ({len(filtered_deals)} deals)")
         
         shown_count = len(filtered_deals)
         if total_matches > shown_count and not has_selection:
@@ -5274,10 +5439,17 @@ def render_rank_by_ev():
             drop_score_cols = [c for c in dd_df.columns if c.startswith("DD_")]
             if drop_score_cols:
                 dd_df = dd_df.drop(drop_score_cols)
+
+        # Keep the selected-contract DD score visible even if DD_* columns are hidden.
+        if "DD_Score_Selected" in dd_df.columns:
+            try:
+                dd_df = dd_df.with_columns(pl.col("DD_Score_Selected").cast(pl.Float64, strict=False))
+            except Exception:
+                pass
         
         # Order columns sensibly
         # DD_Score and EV_Score show the score/EV for the matching BT bid specifically
-        priority_cols = ["index", "Dealer", "Vul"]
+        priority_cols = ["index", "Dealer", "Vul", "DD_Score_Selected"]
         hand_cols = ["Hand_N", "Hand_E", "Hand_S", "Hand_W"] if include_hands else []
         # Keep key score columns near the front for readability
         # - DD_Score_Declarer: deal's actual contract score (if present)
@@ -6137,7 +6309,16 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         
         try:
             # Use fast /list-next-bids endpoint which uses next_bid_indices for O(1) lookup
-            data = api_post("/list-next-bids", {"auction": prefix or ""}, timeout=DEFAULT_API_TIMEOUT)
+            payload: dict[str, Any] = {"auction": prefix or ""}
+            # If a pinned deal exists, pass board context so the API can compute seat_to_act + seat_vul
+            # and return convenience avg_par/avg_ev fields aligned with BIDDING_MODEL_IMPLEMENTATION.md.
+            try:
+                if pinned_deal:
+                    payload["dealer"] = pinned_deal.get("Dealer")
+                    payload["vulnerable"] = pinned_deal.get("Vul", pinned_deal.get("Vulnerability"))
+            except Exception:
+                pass
+            data = api_post("/list-next-bids", payload, timeout=DEFAULT_API_TIMEOUT)
             # Store elapsed for display outside spinner
             st.session_state["_auction_builder_bids_elapsed_ms"] = data.get("_client_elapsed_ms") or data.get("elapsed_ms")
             
@@ -6166,6 +6347,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     # Precomputed EV split by vulnerability (optional, may be missing/None)
                     "avg_ev_nv": item.get("avg_ev_nv"),
                     "avg_ev_v": item.get("avg_ev_v"),
+                    "avg_par_nv": item.get("avg_par_nv"),
+                    "avg_par_v": item.get("avg_par_v"),
+                    # Convenience (selected by board context if present)
+                    "avg_ev": item.get("avg_ev"),
+                    "avg_par": item.get("avg_par"),
                 })
             
             # Already sorted by the API
@@ -6783,6 +6969,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Add Avg_EV with NV/V split from GPU pipeline
                 avg_ev_nv = opt.get("avg_ev_nv")
                 avg_ev_v = opt.get("avg_ev_v")
+                avg_par_nv = opt.get("avg_par_nv")
+                avg_par_v = opt.get("avg_par_v")
                 # IMPORTANT: Normalize EV sign by partnership (NS positive).
                 # BT seat-1 view: Seat 1/3 = NS, Seat 2/4 = EW. For EW seats, flip sign so values
                 # are comparable across seats/steps.
@@ -6803,6 +6991,23 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         row_data["Avg_EV"] = round(ev_sign * float(chosen), 1) if chosen is not None else None
                     except Exception:
                         row_data["Avg_EV"] = None
+
+                # -----------------------------------------------------------------
+                # Par is first-class (mirror EV behavior)
+                # -----------------------------------------------------------------
+                row_data["Par_NV"] = round(ev_sign * float(avg_par_nv), 1) if avg_par_nv is not None else None
+                row_data["Par_V"] = round(ev_sign * float(avg_par_v), 1) if avg_par_v is not None else None
+                row_data["Avg_Par"] = None
+                if pinned_deal and seat_direction and matches_count and matches_count > 0:
+                    try:
+                        vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper()
+                        ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                        ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+                        is_vul = (seat_direction in ("N", "S") and ns_vul) or (seat_direction in ("E", "W") and ew_vul)
+                        chosen_par = avg_par_v if is_vul else avg_par_nv
+                        row_data["Avg_Par"] = round(ev_sign * float(chosen_par), 1) if chosen_par is not None else None
+                    except Exception:
+                        row_data["Avg_Par"] = None
 
                 # -----------------------------------------------------------------
                 # Contract + DD (based on last contract bid, not current call)
@@ -7097,12 +7302,18 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 gb.configure_column("Matches", width=115, minWidth=105)    # 7 chars
                 gb.configure_column("Deals", width=100, minWidth=90)       # 5 chars
                 gb.configure_column("Avg_EV", width=105, minWidth=95, headerName="Avg EV")   # 6 chars
+                if "Avg_Par" in pdf.columns:
+                    gb.configure_column("Avg_Par", width=110, minWidth=100, headerName="Avg Par")
                 if "EV_Contract" in pdf.columns:
                     gb.configure_column("EV_Contract", width=120, minWidth=110, headerName="EV Contract")
                 if "EV_Contract_Pre" in pdf.columns:
                     gb.configure_column("EV_Contract_Pre", width=140, minWidth=125, headerName="EV Contract Pre")
                 gb.configure_column("EV_NV", width=100, minWidth=90, headerName="EV NV")    # 5 chars
                 gb.configure_column("EV_V", width=90, minWidth=80, headerName="EV V")       # 4 chars
+                if "Par_NV" in pdf.columns:
+                    gb.configure_column("Par_NV", width=100, minWidth=90, headerName="Par NV")
+                if "Par_V" in pdf.columns:
+                    gb.configure_column("Par_V", width=90, minWidth=80, headerName="Par V")
                 gb.configure_column(
                     "Criteria",
                     flex=1,
@@ -7122,13 +7333,19 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     gb.configure_column("Failure", hide=True)
 
                 # Display rules:
-                # - Pinned deal: show Avg_EV, hide EV_NV/EV_V
-                # - No pinned deal: hide Avg_EV, show EV_NV/EV_V
+                # - Pinned deal: show Avg_EV/Avg_Par, hide EV_NV/EV_V and Par_NV/Par_V
+                # - No pinned deal: hide Avg_EV/Avg_Par, show EV_NV/EV_V and Par_NV/Par_V
                 if pinned_deal:
                     gb.configure_column("EV_NV", hide=True)
                     gb.configure_column("EV_V", hide=True)
+                    if "Par_NV" in pdf.columns:
+                        gb.configure_column("Par_NV", hide=True)
+                    if "Par_V" in pdf.columns:
+                        gb.configure_column("Par_V", hide=True)
                 else:
                     gb.configure_column("Avg_EV", hide=True)
+                    if "Avg_Par" in pdf.columns:
+                        gb.configure_column("Avg_Par", hide=True)
                     if "EV_Contract" in pdf.columns:
                         gb.configure_column("EV_Contract", hide=True)
                     if "EV_Contract_Pre" in pdf.columns:
@@ -7462,7 +7679,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         # Use render_aggrid's pass/fail row styling with a constant True marker.
                         par_matches_df = par_matches_df.with_columns(pl.lit(True).alias("_passes"))
 
-                        st.info(f"Found {len(par_matches)} matching auctions in {float(par_elapsed):.1f}ms.")
+                        st.info(f"Found {len(par_matches)} matching auctions in {format_elapsed(float(par_elapsed))}.")
 
                         selected_rows = render_aggrid(
                             par_matches_df,
@@ -7486,6 +7703,403 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     else:
                         no_match_msg = f"No matching auctions found starting with '{current_auction}'." if current_auction else "No matching auctions found in the BT for these ParContracts."
                         st.info(no_match_msg)
+
+                # -------------------------------------------------------------------
+                # Advanced Best Next Bids (Phase 1 + Phase 2a evidence)
+                # -------------------------------------------------------------------
+                st.subheader("🏅 Best Next Bids (Advanced)")
+                st.caption(
+                    "This table ranks candidate next bids using evidence from the selected bid-details schema "
+                    "(Par posterior utility + ambiguity + tail risk) and, when a deal is pinned, Phase 2a "
+                    "auction-conditioned posteriors (how typical your pinned hand is for that bid + opponent-fit threat). "
+                    "Click a row to apply that bid to the auction."
+                )
+
+                try:
+                    deal_idx_key = int(pinned_deal.get("index", 0) or 0) if pinned_deal else 0
+                except Exception:
+                    deal_idx_key = 0
+
+                adv_controls = st.columns([1.0, 1.0, 1.2, 1.2], gap="small")
+                with adv_controls[0]:
+                    adv_top_n = st.slider(
+                        "Analyze top N valid bids",
+                        min_value=5,
+                        max_value=30,
+                        value=12,
+                        step=1,
+                        key=f"ab_adv_topn_{deal_idx_key}_{current_auction}",
+                    )
+                with adv_controls[1]:
+                    adv_max_deals = st.selectbox(
+                        "Sample deals per bid",
+                        options=[200, 500, 1000],
+                        index=1,
+                        key=f"ab_adv_maxdeals_{deal_idx_key}_{current_auction}",
+                        help="Controls runtime. Larger samples stabilize posteriors but cost more.",
+                    )
+                with adv_controls[2]:
+                    w_desc = st.slider(
+                        "Pinned typicality bonus (pts)",
+                        min_value=0,
+                        max_value=400,
+                        value=150,
+                        step=10,
+                        key=f"ab_adv_wdesc_{deal_idx_key}_{current_auction}",
+                        help="Adds points when the pinned hand is typical for that bid's Phase2a SELF posterior.",
+                    )
+                with adv_controls[3]:
+                    w_threat = st.slider(
+                        "Opponent-fit threat penalty (pts)",
+                        min_value=0,
+                        max_value=400,
+                        value=120,
+                        step=10,
+                        key=f"ab_adv_wthreat_{deal_idx_key}_{current_auction}",
+                        help="Subtracts points when Phase2a suggests opponents often have big fits (max over suits).",
+                    )
+
+                @st.cache_data(ttl=3600, show_spinner=False)
+                def _ab_fetch_bid_details(
+                    auction: str,
+                    bid: str,
+                    *,
+                    max_deals: int,
+                    seed: int,
+                    vul_filter: str | None,
+                    deal_index: int | None,
+                    include_phase2a: bool,
+                    topk: int,
+                    cache_version: int,
+                ) -> Dict[str, Any]:
+                    return api_post(
+                        "/bid-details",
+                        {
+                            "auction": auction,
+                            "bid": bid,
+                            "max_deals": int(max_deals),
+                            "seed": int(seed),
+                            "vul_filter": vul_filter,
+                            "deal_index": deal_index,
+                            "include_phase2a": bool(include_phase2a),
+                            "topk": int(topk),
+                            "_ab_adv_cache_version": int(cache_version),
+                        },
+                        timeout=30,
+                    )
+
+                # Seed candidates from the already-built bid rows (cheap).
+                # Prefer "Valid" bids when pinned-match evaluation is available; otherwise fall back to
+                # any non-rejected BT-backed bids.
+                def _seed_key(r: dict[str, Any]) -> tuple[float, float, float]:
+                    def _f(x: Any) -> float:
+                        try:
+                            if x is None or x == "":
+                                return float("-inf")
+                            return float(x)
+                        except Exception:
+                            return float("-inf")
+
+                    return (_f(r.get("Avg_EV")), _f(r.get("Deals")), _f(r.get("Matches")))
+
+                AB_ADV_CACHE_VERSION = 2  # bump to invalidate Streamlit-side cached bid-details
+
+                # 1) Prefer bids that match the pinned deal ("Valid" bucket).
+                candidate_rows = list(valid_rows or [])
+                # 2) If none are "Valid" (common at opening / early seat before criteria-eval is ready),
+                # fall back to any bid row that is not rejected and has a BT Index.
+                if not candidate_rows:
+                    candidate_rows = [
+                        rr
+                        for rr in (bid_rows or [])
+                        if not bool(rr.get("_rejected"))
+                    ]
+                candidate_rows = sorted(candidate_rows, key=_seed_key, reverse=True)
+                # Keep a permissive-pass candidate for fallback display (Pass is not BT-backed, so we
+                # cannot call /bid-details for it, but it is still a legitimate next bid in Auction Builder).
+                pass_rows = [
+                    rr
+                    for rr in (candidate_rows or [])
+                    if str(rr.get("Bid", "") or "").strip().upper().split(" ")[0] in {"P", "PASS"}
+                ]
+                # Advanced ranking requires BT-backed evidence. Exclude Pass + any row without BT Index.
+                candidate_rows = [
+                    rr
+                    for rr in candidate_rows
+                    if str(rr.get("Bid", "") or "").strip().upper().split(" ")[0] not in {"P", "PASS"}
+                    and (rr.get("BT Index") is not None)
+                ][: int(adv_top_n)]
+
+                pinned_deal_index_val: int | None = None
+                if pinned_deal and pinned_deal.get("index") is not None:
+                    try:
+                        pinned_deal_index_val = int(pinned_deal.get("index"))
+                    except Exception:
+                        pinned_deal_index_val = None
+
+                vul_filter_val: str | None = None
+                if pinned_deal:
+                    try:
+                        v = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", "")) or "").strip()
+                        vul_filter_val = v if v else None
+                    except Exception:
+                        vul_filter_val = None
+
+                advanced_rows: list[dict[str, Any]] = []
+                include_phase2a_adv = bool(pinned_deal_index_val is not None)
+
+                with st.spinner("Computing advanced ranking (bid-details + Phase2a)..."):
+                    for r in candidate_rows:
+                        bid0 = str(r.get("Bid", "") or "").strip().upper().split(" ")[0]
+                        if not bid0:
+                            continue
+                        try:
+                            details = _ab_fetch_bid_details(
+                                current_auction,
+                                bid0,
+                                max_deals=int(adv_max_deals),
+                                seed=int(seed),
+                                vul_filter=vul_filter_val,
+                                deal_index=pinned_deal_index_val,
+                                include_phase2a=include_phase2a_adv,
+                                topk=10,
+                                cache_version=AB_ADV_CACHE_VERSION,
+                            )
+                        except Exception as e:
+                            advanced_rows.append(
+                                {
+                                    "Bid": bid0,
+                                    "Error": str(e),
+                                    "Score": None,
+                                    "U": None,
+                                    "MeanPar": None,
+                                    "P>=0%": None,
+                                    "Ent": None,
+                                    "Tail": None,
+                                    "Desc": None,
+                                    "Threat6+%": None,
+                                    "TopPar": None,
+                                    "TopPar%": None,
+                                    "n": r.get("Deals", None) or r.get("Matches", None),
+                                    "Degraded": "api_error",
+                                }
+                            )
+                            continue
+
+                        # /bid-details returns HTTP 200 for some "errors" (schema-stable), so handle that explicitly.
+                        if details.get("error") or details.get("message"):
+                            advanced_rows.append(
+                                {
+                                    "Bid": bid0,
+                                    "Error": str(details.get("error") or details.get("message")),
+                                    "BTI": details.get("child_bt_index"),
+                                    "Flags": "",
+                                    "Score": None,
+                                    "U": None,
+                                    "MeanPar": None,
+                                    "P>=0%": None,
+                                    "Ent": None,
+                                    "Tail": None,
+                                    "Desc": None,
+                                    "Threat6+%": None,
+                                    "TopPar": None,
+                                    "TopPar%": None,
+                                    "n": details.get("matched_deals_total", r.get("Deals", None) or r.get("Matches", None)),
+                                    "Degraded": str(details.get("degraded_mode") or "bid_details_error"),
+                                }
+                            )
+                            continue
+
+                        par_score = details.get("par_score") or {}
+                        par_contracts = details.get("par_contracts") or {}
+
+                        mean_par = par_score.get("mean")
+                        p_ok = par_score.get("p_par_ge_0")
+                        tail = par_score.get("tail_risk_mean_neg")
+                        entropy = par_contracts.get("contract_entropy_full_nats")
+
+                        eeo = {}
+                        try:
+                            eeo = compute_eeo_from_bid_details(details)
+                        except Exception:
+                            eeo = {}
+                        utility = eeo.get("utility")
+
+                        # Surface "BT-level flags" (e.g. Forcing_*) even if they don't change the posterior.
+                        flags_s = ""
+                        try:
+                            crit = details.get("bt_acting_criteria") or []
+                            if isinstance(crit, list):
+                                flags = [str(x) for x in crit if isinstance(x, str) and x.strip().startswith("Forcing_")]
+                                if flags:
+                                    flags_s = ", ".join(flags[:6])
+                        except Exception:
+                            flags_s = ""
+
+                        # Phase2a threat summaries
+                        opp_threat = None
+                        fit_us_best = None
+                        try:
+                            threat = (details.get("phase2a") or {}).get("threat") or {}
+                            vals = []
+                            fit_vals = []
+                            for su in ["S", "H", "D", "C"]:
+                                t_su = threat.get(su) or {}
+                                v = t_su.get("p_them_6plus")
+                                if isinstance(v, (int, float)):
+                                    vals.append(float(v))
+                                fv = t_su.get("e_fit_us")
+                                if isinstance(fv, (int, float)):
+                                    fit_vals.append(float(fv))
+                            if vals:
+                                opp_threat = max(vals)
+                            if fit_vals:
+                                fit_us_best = max(fit_vals)
+                        except Exception:
+                            opp_threat = None
+                            fit_us_best = None
+
+                        # Pinned-hand typicality vs Phase2a SELF posterior percentiles (0..1, higher is better)
+                        desc_score = None
+                        hcp_pct = None
+                        try:
+                            rp = details.get("range_percentiles")
+                            if isinstance(rp, dict) and rp.get("role") == "self":
+                                pcts = []
+                                h = (rp.get("hcp") or {}).get("percentile")
+                                if isinstance(h, (int, float)):
+                                    hcp_pct = float(h)
+                                    pcts.append(float(h))
+                                sl = rp.get("suit_lengths") or {}
+                                for su in ["S", "H", "D", "C"]:
+                                    p = ((sl.get(su) or {}).get("percentile"))
+                                    if isinstance(p, (int, float)):
+                                        pcts.append(float(p))
+                                if pcts:
+                                    dev = sum(abs(p - 50.0) for p in pcts) / len(pcts)
+                                    desc_score = max(0.0, min(1.0, 1.0 - (dev / 50.0)))
+                        except Exception:
+                            desc_score = None
+                            hcp_pct = None
+
+                        # Top par contract for quick interpretation
+                        top_contract = None
+                        top_prob = None
+                        try:
+                            topk = (par_contracts.get("topk") or [])
+                            if topk:
+                                top_contract = (topk[0] or {}).get("contract")
+                                top_prob = (topk[0] or {}).get("prob")
+                        except Exception:
+                            top_contract = None
+                            top_prob = None
+
+                        # Composite Score (transparent & adjustable)
+                        score = None
+                        try:
+                            base = float(utility) if utility is not None else float(mean_par)
+                            # Bonus: centered at 0 when no pinned deal (or missing percentiles)
+                            desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
+                            threat_term = float(opp_threat) if opp_threat is not None else 0.0
+                            score = base + float(w_desc) * desc_term - float(w_threat) * threat_term
+                        except Exception:
+                            score = None
+
+                        advanced_rows.append(
+                            {
+                                "Bid": bid0,
+                                "Error": "",
+                                "BTI": details.get("child_bt_index"),
+                                "Flags": flags_s,
+                                "Score": score,
+                                "U": utility,
+                                "MeanPar": mean_par,
+                                "P>=0%": (float(p_ok) * 100.0) if isinstance(p_ok, (int, float)) else None,
+                                "Ent": entropy,
+                                "Tail": tail,
+                                "Desc": desc_score,
+                                "HCP%ile": hcp_pct,
+                                "Threat6+%": (float(opp_threat) * 100.0) if isinstance(opp_threat, (int, float)) else None,
+                                "FitUs": fit_us_best,
+                                "TopPar": top_contract,
+                                "TopPar%": (float(top_prob) * 100.0) if isinstance(top_prob, (int, float)) else None,
+                                "n": details.get("matched_deals_total_excluding_pinned", details.get("matched_deals_total")),
+                                "Sampled": details.get("matched_deals_sampled"),
+                                "Degraded": details.get("degraded_mode"),
+                            }
+                        )
+
+                adv_df = pl.DataFrame(advanced_rows) if advanced_rows else pl.DataFrame()
+                # Fallback: if the only reasonable option is Pass (common for seat-1 when opening),
+                # show a single synthetic row so the UI isn't empty.
+                if adv_df.is_empty() and pass_rows:
+                    pr = pass_rows[0]
+                    # Prefer "contract EV" if computed, else DD score, else zero.
+                    pass_score = None
+                    try:
+                        v = pr.get("EV_Contract")
+                        pass_score = float(v) if isinstance(v, (int, float)) else None
+                    except Exception:
+                        pass_score = None
+                    if pass_score is None:
+                        try:
+                            v = pr.get("DD_Score_Contract")
+                            pass_score = float(v) if isinstance(v, (int, float)) else 0.0
+                        except Exception:
+                            pass_score = 0.0
+                    adv_df = pl.DataFrame(
+                        [
+                            {
+                                "Bid": "P",
+                                "Error": "Synthetic row: Pass is not BT-backed (no /bid-details evidence).",
+                                "Score": pass_score,
+                                "U": None,
+                                "MeanPar": pr.get("Avg_Par"),
+                                "P>=0%": None,
+                                "Ent": None,
+                                "Tail": None,
+                                "Desc": None,
+                                "HCP%ile": None,
+                                "Threat6+%": None,
+                                "FitUs": None,
+                                "TopPar": None,
+                                "TopPar%": None,
+                                "n": pr.get("Deals", None) or pr.get("Matches", None),
+                                "Sampled": None,
+                                "Degraded": "synthetic_pass",
+                            }
+                        ]
+                    )
+                if not adv_df.is_empty():
+                    # Rank column for readability
+                    try:
+                        adv_df = adv_df.sort("Score", descending=True, nulls_last=True)
+                        adv_df = adv_df.with_row_index("Rank", offset=1)
+                    except Exception:
+                        pass
+
+                    adv_selected = render_aggrid(
+                        adv_df,
+                        key=f"auction_builder_advanced_best_{deal_idx_key}_{current_auction}_{seed}_{adv_top_n}_{adv_max_deals}",
+                        height=calc_grid_height(len(adv_df), max_height=340),
+                        table_name="auction_builder_advanced_best_next_bids",
+                        update_on=["selectionChanged"],
+                        # IMPORTANT: don't force-fit ALL columns; it can squish them so much they look blank.
+                        # We want a full-width table with horizontal scroll instead.
+                        fit_columns_to_view=False,
+                        show_sql_expander=False,
+                        sort_model=[{"colId": "Score", "sort": "desc"}],
+                        tooltip_cols=["Error", "Degraded", "Flags", "TopPar"],
+                    )
+                    if adv_selected:
+                        sel_bid = str((adv_selected[0] or {}).get("Bid", "") or "").strip().upper()
+                        if sel_bid:
+                            next_auc = f"{current_auction}-{sel_bid}" if current_auction else sel_bid
+                            next_auc = normalize_auction_input(next_auc).upper() if next_auc else ""
+                            st.session_state["_auction_builder_pending_set_auction"] = next_auc
+                            st.rerun()
+                else:
+                    st.info("No valid bids available to rank.")
 
                 # Display 3-column layout: 5 Suggested Bids | Best Par Bids | Best EV Bids
                 sug_col, par_col, ev_col = st.columns(3)
@@ -8669,12 +9283,18 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     gb_rej.configure_column("Matches", width=115, minWidth=105)    # 7 chars
                     gb_rej.configure_column("Deals", width=100, minWidth=90)       # 5 chars
                     gb_rej.configure_column("Avg_EV", width=105, minWidth=95, headerName="Avg EV")   # 6 chars
+                    if "Avg_Par" in rejected_pdf.columns:
+                        gb_rej.configure_column("Avg_Par", width=110, minWidth=100, headerName="Avg Par")
                     if "EV_Contract" in rejected_pdf.columns:
                         gb_rej.configure_column("EV_Contract", width=120, minWidth=110, headerName="EV Contract")
                     if "EV_Contract_Pre" in rejected_pdf.columns:
                         gb_rej.configure_column("EV_Contract_Pre", width=140, minWidth=125, headerName="EV Contract Pre")
                     gb_rej.configure_column("EV_NV", width=100, minWidth=90, headerName="EV NV")    # 5 chars
                     gb_rej.configure_column("EV_V", width=90, minWidth=80, headerName="EV V")       # 4 chars
+                    if "Par_NV" in rejected_pdf.columns:
+                        gb_rej.configure_column("Par_NV", width=100, minWidth=90, headerName="Par NV")
+                    if "Par_V" in rejected_pdf.columns:
+                        gb_rej.configure_column("Par_V", width=90, minWidth=80, headerName="Par V")
                     if "DD_[NESW]_[CDHSN]" in rejected_pdf.columns:
                         gb_rej.configure_column("DD_[NESW]_[CDHSN]", width=135, minWidth=120, headerName="DD")
                     if "DD_Score_Contract" in rejected_pdf.columns:
@@ -8683,13 +9303,19 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     gb_rej.configure_column("Criteria", flex=1, minWidth=120, tooltipField="Criteria")
 
                     # Display rules (match valid/invalid grids):
-                    # - Pinned deal: show Avg_EV, hide EV_NV/EV_V
-                    # - No pinned deal: hide Avg_EV, show EV_NV/EV_V
+                    # - Pinned deal: show Avg_EV/Avg_Par, hide EV_NV/EV_V and Par_NV/Par_V
+                    # - No pinned deal: hide Avg_EV/Avg_Par, show EV_NV/EV_V and Par_NV/Par_V
                     if pinned_deal:
                         gb_rej.configure_column("EV_NV", hide=True)
                         gb_rej.configure_column("EV_V", hide=True)
+                        if "Par_NV" in rejected_pdf.columns:
+                            gb_rej.configure_column("Par_NV", hide=True)
+                        if "Par_V" in rejected_pdf.columns:
+                            gb_rej.configure_column("Par_V", hide=True)
                     else:
                         gb_rej.configure_column("Avg_EV", hide=True)
+                        if "Avg_Par" in rejected_pdf.columns:
+                            gb_rej.configure_column("Avg_Par", hide=True)
                         if "EV_Contract" in rejected_pdf.columns:
                             gb_rej.configure_column("EV_Contract", hide=True)
                         if "EV_Contract_Pre" in rejected_pdf.columns:
@@ -9106,9 +9732,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             # Get NV/V split EV from the step (populated at selection time)
             avg_ev_nv = step.get("avg_ev_nv")
             avg_ev_v = step.get("avg_ev_v")
+            # For Par, use sampled stats (computed from matched deals for this partial auction).
+            step_stats = step_stats_map_all.get(partial_auction, {}) if isinstance(step_stats_map_all, dict) else {}
+            avg_par_nv = step_stats.get("avg_par_nv")
+            avg_par_v = step_stats.get("avg_par_v")
             deal_par = pinned_deal.get("ParScore", pinned_deal.get("Par_Score")) if pinned_deal else None
             deal_ev = pinned_deal.get("EV_Score_Declarer", pinned_deal.get("EV_Score")) if pinned_deal else None
             avg_ev: float | None = None
+            avg_par: float | None = None
             ev_sign = -1.0 if seat_1_to_4 in (2, 4) else 1.0
             bid_dir: str | None = None
             if pinned_deal:
@@ -9123,8 +9754,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     is_vul = (bid_dir in ("N", "S") and ns_vul) or (bid_dir in ("E", "W") and ew_vul)
                     chosen = avg_ev_v if is_vul else avg_ev_nv
                     avg_ev = round(ev_sign * float(chosen), 1) if chosen is not None else None
+                    chosen_par = avg_par_v if is_vul else avg_par_nv
+                    avg_par = round(ev_sign * float(chosen_par), 1) if chosen_par is not None else None
                 except Exception:
                     avg_ev = None
+                    avg_par = None
             row = {
                 "Bid Num": bid_num,
                 "Direction": bid_dir if pinned_deal else None,
@@ -9139,6 +9773,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 "Avg_EV": avg_ev,
                 "EV_NV": round(ev_sign * float(avg_ev_nv), 1) if avg_ev_nv is not None else None,
                 "EV_V": round(ev_sign * float(avg_ev_v), 1) if avg_ev_v is not None else None,
+                "Avg_Par": avg_par,
+                "Par_NV": round(ev_sign * float(avg_par_nv), 1) if avg_par_nv is not None else None,
+                "Par_V": round(ev_sign * float(avg_par_v), 1) if avg_par_v is not None else None,
                 "Criteria Count": len(step.get("agg_expr", [])),
                 # Display columns are truncated; *_full columns back tooltips.
                 "Agg_Expr_full": criteria_str,
@@ -9706,6 +10343,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 "Avg_EV",   # Avg EV for this bid, chosen based on pinned vul (only meaningful when pinned)
                 "EV_NV",    # Pre-computed average EV (Not Vulnerable)
                 "EV_V",     # Pre-computed average EV (Vulnerable)
+                "Avg_Par",  # Avg Par for this bid, chosen based on pinned vul (meaningful when pinned)
+                "Par_NV",   # Avg Par (Not Vulnerable)
+                "Par_V",    # Avg Par (Vulnerable)
                 "Criteria Count",
                 "Agg_Expr",
                 "Categories",
@@ -9724,9 +10364,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         summary_hide_cols = ["Agg_Expr_full", "Categories_full", "_passes"]
         summary_hide_cols += ["_partial_auction"]
         if pinned_deal:
-            summary_hide_cols += ["EV_NV", "EV_V", "Avg_EV"]
+            summary_hide_cols += ["EV_NV", "EV_V", "Avg_EV", "Par_NV", "Par_V"]
         else:
-            summary_hide_cols += ["Avg_EV"]
+            summary_hide_cols += ["Avg_EV", "Avg_Par"]
 
         # Display Current Auction summary table
         st.markdown("**Current Auction**")

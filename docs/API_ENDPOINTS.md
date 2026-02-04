@@ -2,6 +2,10 @@
 
 This document lists the FastAPI routes exposed by the BBO Bidding Queries API server.
 
+For a Swagger/OpenAPI view:
+- Live Swagger UI (server running): `http://127.0.0.1:8000/docs`
+- Static export into repo: `docs/OPENAPI.md` (generates `docs/openapi.json` and `docs/openapi.summary.md`)
+
 ### Base URL
 
 - Local dev: `http://127.0.0.1:8000`
@@ -11,6 +15,7 @@ This document lists the FastAPI routes exposed by the BBO Bidding Queries API se
 - **Request/response**: JSON (unless noted).
 - **Errors**: FastAPI-style `{"detail": ...}` with appropriate HTTP status codes.
 - **Hot-reload metadata**: many endpoints attach `_reload_info` in the JSON response.
+- **Stable detail/explanation schemas**: `/bid-details` and `/explain-bid` are intended to stay schema-stable for UI consumption.
 
 ### Endpoints
 
@@ -54,8 +59,18 @@ This document lists the FastAPI routes exposed by the BBO Bidding Queries API se
 | POST | `/list-next-bids` | `ListNextBidsRequest` | Next-bid options from BT (`next_bid_indices`). |
 | POST | `/rank-bids-by-ev` | `RankBidsByEVRequest` | Rank next bids by EV across matching deals. |
 | POST | `/contract-ev-deals` | `ContractEVDealsRequest` | Deals matching a chosen next-bid + contract EV row. |
+| POST | `/bid-details` | `BidDetailsRequest` | Stable selected-bid details: top-K par contracts + entropy + Phase 2a auction-conditioned posteriors; server-side caching; pinned-deal exclusion; degraded modes. |
+| POST | `/explain-bid` | `ExplainBidRequest` | EEO + templated explanation + optional counterfactual (“why not X?”), backed by computed evidence from `/bid-details` (no RAG yet). |
 | POST | `/best-auctions-lookahead` | `BestAuctionsLookaheadRequest` | Server-side search for best completed auctions (DD/EV). |
 | POST | `/best-auctions-lookahead/start` | `BestAuctionsLookaheadStartRequest` | Async version (returns `job_id`). |
 | GET | `/best-auctions-lookahead/status/{job_id}` | path param `job_id` | Poll async job status/results. |
 | POST | `/deal-matched-bt-sample` | `DealMatchedBTSampleRequest` | Sample matched BT rows for a pinned deal (GPU-verified index). |
+
+### Notes: `/bid-details` and `/explain-bid`
+
+- **Pinned-deal exclusion**: If `deal_index` is provided, `/bid-details` excludes that deal from aggregates when it’s present in the matched set, and returns:
+  - `pinned_deal_excluded`
+  - `matched_deals_total_excluding_pinned`
+- **Phase 2a**: `/bid-details` returns `phase2a` with SELF/PARTNER/LHO/RHO rotated posteriors (dealer varies per deal).
+- **Degraded modes**: `/bid-details` may set `degraded_mode` + `degraded_reasons` when match counts are sparse or phase2a cannot be computed.
 

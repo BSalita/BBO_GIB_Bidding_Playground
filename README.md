@@ -15,6 +15,11 @@ python bbo_bidding_queries_api.py
 streamlit run bbo_bidding_queries_streamlit.py
 ```
 
+## Swagger / OpenAPI
+
+- Live docs (when server is running): `http://127.0.0.1:8000/docs`
+- Static export: see `docs/OPENAPI.md` (generates `docs/openapi.json` and `docs/openapi.summary.md`)
+
 ## Architecture
 
 ```
@@ -55,7 +60,7 @@ The rule learning pipeline is implemented via Jupyter notebooks:
 - **`bbo_filter_new_rules.ipynb`** - Filters rules by quality thresholds and merges with base rules
 - **`bbo_bt_compile_rules.py`** - Compiles learned rules back into the main bidding table
 
-See `Data_Pipeline.md` for the complete pipeline documentation.
+See `docs/Data_Pipeline.md` for the complete pipeline documentation.
 
 ## Performance Notes
 

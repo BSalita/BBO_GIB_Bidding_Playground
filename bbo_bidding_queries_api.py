@@ -1232,6 +1232,10 @@ class AuctionDDAnalysisRequest(BaseModel):
 class ListNextBidsRequest(BaseModel):
     """Request for List Next Bids: fast lookup of available next bids using BT's next_bid_indices."""
     auction: str = ""  # Auction prefix (empty = opening bids)
+    # Optional board context (recommended for correct seat/vulnerability selection).
+    # If provided, server returns derived context fields and convenience avg_par/avg_ev for the acting seat.
+    dealer: Optional[str] = None  # N/E/S/W
+    vulnerable: Optional[str] = None  # None/NS/EW/All (PBN-style; aliases accepted in UI)
 
 
 class RankBidsByEVRequest(BaseModel):
@@ -1255,6 +1259,31 @@ class ContractEVDealsRequest(BaseModel):
     max_deals: int = 500
     seed: Optional[int] = 0
     include_hands: bool = True
+
+
+class BidDetailsRequest(BaseModel):
+    """Request for stable selected-bid details (top-K par contracts + entropy + histograms + percentiles)."""
+    auction: str = ""           # Auction prefix (empty = opening bids)
+    bid: str                    # Selected next bid (e.g. "2H")
+    max_deals: int = 5000       # Max deals to sample for distributions/histograms
+    seed: Optional[int] = 0     # 0 = non-reproducible
+    vul_filter: Optional[str] = None  # Optional exact Vul filter (None/Both/NS/EW)
+    deal_index: Optional[int] = None  # Optional pinned deal `index` (excluded from aggregates)
+    topk: int = 10
+    include_phase2a: bool = True
+
+
+class ExplainBidRequest(BaseModel):
+    """Request for EEO + templated explanation (+ optional 'why not X?')."""
+    auction: str = ""
+    bid: str
+    why_not_bid: Optional[str] = None
+    max_deals: int = 5000
+    seed: Optional[int] = 0
+    vul_filter: Optional[str] = None
+    deal_index: Optional[int] = None
+    topk: int = 10
+    include_phase2a: bool = True
 
 
 class BestAuctionsLookaheadRequest(BaseModel):
@@ -3686,6 +3715,8 @@ def list_next_bids(req: ListNextBidsRequest) -> Dict[str, Any]:
         resp = handler_module.handle_list_next_bids(
             state=state,
             auction=req.auction,
+            dealer=req.dealer,
+            vulnerable=req.vulnerable,
         )
         if reload_info:
             resp["_reload_info"] = reload_info
@@ -3739,6 +3770,53 @@ def contract_ev_deals(req: ContractEVDealsRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("contract-ev-deals", e)
+
+
+@app.post("/bid-details")
+def bid_details(req: BidDetailsRequest) -> Dict[str, Any]:
+    """Stable selected-bid details (top-K par contracts + entropy + histograms + percentiles)."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_bid_details(
+            state=state,
+            auction=req.auction,
+            bid=req.bid,
+            max_deals=req.max_deals,
+            seed=req.seed,
+            vul_filter=req.vul_filter,
+            deal_index=req.deal_index,
+            topk=req.topk,
+            include_phase2a=req.include_phase2a,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log_and_raise("bid-details", e)
+
+
+@app.post("/explain-bid")
+def explain_bid(req: ExplainBidRequest) -> Dict[str, Any]:
+    """EEO + templated explanations + optional counterfactual ('why not X?')."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_explain_bid(
+            state=state,
+            auction=req.auction,
+            bid=req.bid,
+            why_not_bid=req.why_not_bid,
+            max_deals=req.max_deals,
+            seed=req.seed,
+            vul_filter=req.vul_filter,
+            deal_index=req.deal_index,
+            topk=req.topk,
+            include_phase2a=req.include_phase2a,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log_and_raise("explain-bid", e)
 
 
 @app.post("/best-auctions-lookahead")
