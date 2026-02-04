@@ -1317,6 +1317,18 @@ class GreedyModelPathRequest(BaseModel):
     permissive_pass: bool = True
 
 
+class AiModelAdvancedPathStartRequest(BaseModel):
+    """Request to start an async AI Model (Advanced) path job (avoid client timeouts)."""
+    deal_row_idx: int
+    seed: int = 0
+    max_steps: int = 40
+    top_n: int = 12
+    max_deals: int = 500
+    w_desc: float = 150.0
+    w_threat: float = 120.0
+    permissive_pass: bool = True
+
+
 class DealMatchedBTSampleRequest(BaseModel):
     """Sample BT rows that match a specific deal using the GPU-verified deal→BT index."""
     # Primary key used by criteria bitmaps and deal_to_bt indices (row position in deals file).
@@ -2922,6 +2934,25 @@ def deal_criteria_eval_batch(req: DealCriteriaEvalBatchRequest) -> Dict[str, Any
         _log_and_raise("deal-criteria-eval-batch", e)
 
 
+@app.post("/deal-criteria-pass-batch")
+def deal_criteria_pass_batch(req: DealCriteriaEvalBatchRequest) -> Dict[str, Any]:
+    """Fast pass/fail-only criteria evaluation for one deal across many checks."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    deal_row_idx = int(req.deal_row_idx)
+    if req.deal_index is not None:
+        deal_row_idx = _resolve_deal_row_idx_from_index(state, int(req.deal_index))
+    try:
+        resp = handler_module.handle_deal_criteria_pass_batch(
+            state=state,
+            deal_row_idx=deal_row_idx,
+            dealer=str(req.dealer),
+            checks=[c.model_dump() for c in req.checks],
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("deal-criteria-pass-batch", e)
+
+
 @app.post("/deals-by-index")
 def deals_by_index(req: DealsByIndexRequest) -> Dict[str, Any]:
     """Fetch deal rows by user-facing `index` values using monotonic fast-path."""
@@ -3892,6 +3923,41 @@ def best_auctions_lookahead_start(req: BestAuctionsLookaheadStartRequest) -> Dic
 @app.get("/best-auctions-lookahead/status/{job_id}")
 def best_auctions_lookahead_status(job_id: str) -> Dict[str, Any]:
     """Poll status/results for an async best-auctions job."""
+    reload_info = _reload_plugins()
+    _ensure_ready()
+    job = CORE.get_job(str(job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+    return _attach_hot_reload_info(job, reload_info)
+
+
+@app.post("/ai-model-advanced-path/start")
+def ai_model_advanced_path_start(req: AiModelAdvancedPathStartRequest) -> Dict[str, Any]:
+    """Start AI Model (Advanced top-1 greedy) asynchronously (avoids client timeouts)."""
+    state, reload_info, handler_module = _prepare_handler_call()
+
+    job_id = str(uuid.uuid4())
+
+    def _run() -> Dict[str, Any]:
+        return handler_module.handle_ai_model_advanced_path(
+            state=state,
+            deal_row_idx=int(req.deal_row_idx),
+            seed=int(req.seed or 0),
+            max_steps=int(req.max_steps),
+            top_n=int(req.top_n),
+            max_deals=int(req.max_deals),
+            w_desc=float(req.w_desc),
+            w_threat=float(req.w_threat),
+            permissive_pass=bool(req.permissive_pass),
+        )
+
+    CORE.start_job(job_id=job_id, payload=req.model_dump(), run_fn=_run)
+    return _attach_hot_reload_info({"job_id": job_id, "status": "running"}, reload_info)
+
+
+@app.get("/ai-model-advanced-path/status/{job_id}")
+def ai_model_advanced_path_status(job_id: str) -> Dict[str, Any]:
+    """Poll status/results for an async AI Model (Advanced) job."""
     reload_info = _reload_plugins()
     _ensure_ready()
     job = CORE.get_job(str(job_id))

@@ -219,6 +219,14 @@ _CACHE_MAX_EXPLAIN_BID = 2_000
 _EXPLAIN_BID_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
 _EXPLAIN_BID_CACHE_LOCK = threading.Lock()
 
+# Cache for per-prefix "next BT rows" expansion.
+# This is a major speed win for any logic that scores many candidate bids at the same auction prefix
+# (e.g. AI Model greedy path): without this, each candidate triggers a DuckDB read_parquet query over
+# the same small IN-list of bt_index values.
+_CACHE_MAX_NEXT_BT_ROWS = 10_000
+_NEXT_BT_ROWS_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
+_NEXT_BT_ROWS_CACHE_LOCK = threading.Lock()
+
 
 def _lru_get(cache: "OrderedDict[tuple[Any, ...], dict[str, Any]]", key: tuple[Any, ...], lock: threading.Lock) -> dict[str, Any] | None:
     try:
@@ -253,6 +261,65 @@ def _lru_put(
     except Exception:
         # Fail-fast: caching is an optimization, never a correctness requirement.
         return
+
+
+def _get_next_bt_rows_for_parent(state: Dict[str, Any], parent_bt_index: int) -> dict[str, dict[str, Any]]:
+    """
+    Return a mapping: CANDIDATE_BID (upper) -> minimal BT row dict, for all children of `parent_bt_index`.
+
+    This is intentionally cached because many callers (notably AI Model scoring) request multiple bids
+    for the same prefix in a tight loop. Doing DuckDB read_parquet once per bid is extremely expensive.
+    """
+    key = (int(parent_bt_index),)
+    cached = _lru_get(_NEXT_BT_ROWS_CACHE, key, _NEXT_BT_ROWS_CACHE_LOCK)
+    if cached is not None:
+        # cached is already a dict[str, dict[str, Any]]
+        return cached  # type: ignore[return-value]
+
+    next_indices = _get_next_bid_indices_for_parent(state, int(parent_bt_index))
+    if not next_indices:
+        out: dict[str, dict[str, Any]] = {}
+        _lru_put(_NEXT_BT_ROWS_CACHE, key, out, _CACHE_MAX_NEXT_BT_ROWS, _NEXT_BT_ROWS_CACHE_LOCK)
+        return out
+
+    file_path = _bt_file_path_for_sql(state)
+    in_list = ", ".join(str(int(x)) for x in next_indices if x is not None)
+
+    # DuckDB is still used on cache miss (small IN-list query). We cache the expansion per parent.
+    conn = duckdb.connect(":memory:")
+    try:
+        q = f"""
+            SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr
+            FROM read_parquet('{file_path}')
+            WHERE bt_index IN ({in_list})
+        """
+        idx_df = conn.execute(q).pl()
+    finally:
+        conn.close()
+
+    rows: dict[str, dict[str, Any]] = {}
+    if not idx_df.is_empty():
+        # Normalize keying by `candidate_bid` when present; fall back to `Auction` (opening rows).
+        for r in idx_df.iter_rows(named=True):
+            try:
+                cand = r.get("candidate_bid")
+                if cand is None or str(cand).strip() == "":
+                    cand = r.get("Auction")
+                b = str(cand).strip().upper() if cand is not None else ""
+                if not b:
+                    continue
+                rows[b] = {
+                    "bt_index": r.get("bt_index"),
+                    "Auction": r.get("Auction"),
+                    "candidate_bid": b,
+                    "is_completed_auction": r.get("is_completed_auction"),
+                    "Expr": r.get("Expr"),
+                }
+            except Exception:
+                continue
+
+    _lru_put(_NEXT_BT_ROWS_CACHE, key, rows, _CACHE_MAX_NEXT_BT_ROWS, _NEXT_BT_ROWS_CACHE_LOCK)
+    return rows
 
 
 def _resolve_deal_row_by_deal_index(state: Dict[str, Any], deal_index: int) -> dict[str, Any] | None:
@@ -2168,6 +2235,103 @@ def handle_deal_criteria_failures_batch(
         "dealer": dealer,
         "results": results
     }
+
+
+def handle_deal_criteria_pass_batch(
+    state: Dict[str, Any],
+    deal_row_idx: int,
+    dealer: str,
+    checks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Fast pass/fail only version of /deal-criteria-eval-batch.
+
+    This is optimized for callers that only need a boolean:
+    - No annotation of failures
+    - Short-circuits on first failure/untracked
+    - Uses row-dict lookups for bitmap criteria (faster than column indexing)
+    """
+    deal_df = state.get("deal_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+    if deal_df is None:
+        raise ValueError("deal_df not loaded")
+
+    try:
+        deal_row = deal_df.row(int(deal_row_idx), named=True)
+    except (IndexError, ValueError) as e:
+        raise ValueError(f"Invalid deal_row_idx {deal_row_idx}: {e}")
+
+    dealer_n = str(dealer or "N").upper()
+
+    # Cache per (seat,dealer) row dict for this deal to avoid repeated Polars overhead.
+    row_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
+
+    def _criteria_row_for(seat: int) -> Dict[str, Any] | None:
+        key = (int(seat), dealer_n)
+        if key in row_cache:
+            return row_cache[key] or None
+        df = (deal_criteria_by_seat_dfs.get(int(seat), {}) or {}).get(dealer_n)
+        if df is None:
+            row_cache[key] = {}
+            return None
+        try:
+            r = df.row(int(deal_row_idx), named=True)
+        except Exception:
+            r = {}
+        row_cache[key] = r
+        return r
+
+    results: List[Dict[str, Any]] = []
+    for chk in (checks or []):
+        seat = int(chk.get("seat") or 0)
+        criteria_list = chk.get("criteria") or []
+        if seat < 1 or seat > 4:
+            results.append({"seat": seat, "passes": False})
+            continue
+
+        crit_row = _criteria_row_for(seat)
+        passes = True
+
+        for crit in (criteria_list or []):
+            if crit is None:
+                continue
+            crit_s = str(crit)
+
+            # Dynamic SL first.
+            sl_result = evaluate_sl_criterion(crit_s, dealer_n, seat, deal_row, fail_on_missing=False)
+            if sl_result is True:
+                continue
+            if sl_result is False:
+                passes = False
+                break
+            # SL criterion that can't be evaluated => untracked => fail (matches UI "passes = no failed and no untracked").
+            if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
+                passes = False
+                break
+
+            # Bitmap lookup via row dict.
+            if crit_row is None:
+                passes = False
+                break
+            if crit_s not in crit_row:
+                passes = False
+                break
+            try:
+                if not bool(crit_row.get(crit_s)):
+                    passes = False
+                    break
+            except Exception:
+                passes = False
+                break
+
+        results.append(
+            {
+                "seat": seat,
+                "seat_dir": seat_to_direction(dealer_n, seat),
+                "passes": bool(passes),
+            }
+        )
+
+    return {"deal_row_idx": int(deal_row_idx), "dealer": dealer_n, "results": results}
 
 
 # ---------------------------------------------------------------------------
@@ -8216,6 +8380,9 @@ def handle_bid_details(
     deal_index: Optional[int] = None,
     topk: int = 10,
     include_phase2a: bool = True,
+    phase2a_include_keycards: bool = True,
+    phase2a_include_onside: bool = True,
+    include_timing: bool = False,
 ) -> Dict[str, Any]:
     """Return stable selected-bid details for (auction prefix + candidate bid).
 
@@ -8228,6 +8395,8 @@ def handle_bid_details(
     - Server-side caching (LRU)
     """
     t0 = time.perf_counter()
+    t_mark = t0
+    timing: dict[str, float] = {}
 
     bid_norm = str(bid or "").strip().upper()
     if not bid_norm:
@@ -8253,12 +8422,16 @@ def handle_bid_details(
         int(deal_index) if deal_index is not None else None,
         int(topk),
         bool(include_phase2a),
+        bool(phase2a_include_keycards),
+        bool(phase2a_include_onside),
     )
     cached = _lru_get(_BID_DETAILS_CACHE, cache_key, _BID_DETAILS_CACHE_LOCK)
     if cached is not None:
         out = dict(cached)
         out["cache"] = {"hit": True}
         out["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        if include_timing:
+            out["timing"] = {"cached": 1.0}
         return out
 
     deal_df = state["deal_df"]
@@ -8387,20 +8560,8 @@ def handle_bid_details(
                 _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
                 return out
 
-            file_path = _bt_file_path_for_sql(state)
-            in_list = ", ".join(str(int(x)) for x in next_indices if x is not None)
-            conn = duckdb.connect(":memory:")
-            try:
-                q = f"""
-                    SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr
-                    FROM read_parquet('{file_path}')
-                    WHERE bt_index IN ({in_list})
-                """
-                idx_df = conn.execute(q).pl()
-            finally:
-                conn.close()
-
-            if idx_df.is_empty() or "candidate_bid" not in idx_df.columns:
+            rows_by_bid = _get_next_bt_rows_for_parent(state, int(parent_bt_index))
+            if not rows_by_bid:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 out = {
                     "auction_input": auction_input,
@@ -8410,15 +8571,15 @@ def handle_bid_details(
                     "matched_deals_total": 0,
                     "matched_deals_sampled": 0,
                     "pinned_deal_excluded": False,
-                    "error": "BT lookup returned no candidate rows for this parent",
+                    "error": "BT lookup returned no candidate rows for this parent (cached expansion empty)",
                     "elapsed_ms": round(elapsed_ms, 1),
                     "cache": {"hit": False},
                 }
                 _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
                 return out
 
-            hit_df = idx_df.filter(pl.col("candidate_bid").cast(pl.Utf8).str.to_uppercase() == bid_norm)
-            if hit_df.height == 0:
+            bt_row = rows_by_bid.get(bid_norm)
+            if bt_row is None:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 out = {
                     "auction_input": auction_input,
@@ -8434,8 +8595,7 @@ def handle_bid_details(
                 }
                 _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
                 return out
-
-            bt_row = dict(hit_df.row(0, named=True))
+            bt_row = dict(bt_row)
             child_bt_index = None
             try:
                 v = bt_row.get("bt_index")
@@ -8447,6 +8607,10 @@ def handle_bid_details(
         raise ValueError("Internal error: bt_row resolution failed")
 
     bt_row = _apply_all_rules_to_bt_row(dict(bt_row), state)
+    if include_timing:
+        now = time.perf_counter()
+        timing["bt_lookup_ms"] = (now - t_mark) * 1000
+        t_mark = now
 
     # Opening-seat alignment filter (matches handle_rank_bids_by_ev semantics).
     opening_seat_mask = None
@@ -8499,6 +8663,10 @@ def handle_bid_details(
         deal_criteria_by_seat_dfs,
         dealer_rotation=int(expected_passes or 0),
     )
+    if include_timing:
+        now = time.perf_counter()
+        timing["criteria_mask_ms"] = (now - t_mark) * 1000
+        t_mark = now
 
     # Normalize untracked criteria list (stable, UI-friendly)
     try:
@@ -8520,6 +8688,8 @@ def handle_bid_details(
             "elapsed_ms": round(elapsed_ms, 1),
             "cache": {"hit": False},
         }
+        if include_timing:
+            out["timing"] = dict(timing)
         _lru_put(_BID_DETAILS_CACHE, cache_key, dict(out), _CACHE_MAX_BID_DETAILS, _BID_DETAILS_CACHE_LOCK)
         return out
 
@@ -8543,6 +8713,10 @@ def handle_bid_details(
             return out
 
     matched_df = deal_df.filter(global_mask)
+    if include_timing:
+        now = time.perf_counter()
+        timing["filter_matches_ms"] = (now - t_mark) * 1000
+        t_mark = now
     if matched_df.height == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         out = {
@@ -8621,6 +8795,10 @@ def handle_bid_details(
     max_deals_i = max(1, int(max_deals))
     if matched_df.height > max_deals_i:
         matched_df = matched_df.sample(n=max_deals_i, seed=effective_seed)
+    if include_timing:
+        now = time.perf_counter()
+        timing["sample_ms"] = (now - t_mark) * 1000
+        t_mark = now
 
     # Select only required columns for the computation (keep memory bounded).
     cols: list[str] = ["index", "Dealer", "ParScore", "ParContracts"]
@@ -8629,15 +8807,22 @@ def handle_bid_details(
         for d in ["N", "E", "S", "W"]:
             cols.append(f"HCP_{d}")
             cols.append(f"Total_Points_{d}")
-            cols.append(f"Hand_{d}")
             for su in ["S", "H", "D", "C"]:
                 cols.append(f"SL_{d}_{su}")
+        # Hand columns are only required when keycards/onside summaries are requested.
+        if bool(phase2a_include_keycards) or bool(phase2a_include_onside):
+            for d in ["N", "E", "S", "W"]:
+                cols.append(f"Hand_{d}")
 
     cols = [c for c in cols if c in matched_df.columns]
     deals_sample_df = matched_df.select(cols)
 
     cfg = BidDetailsConfig(topk=int(topk), include_phase2a=bool(include_phase2a), include_honor_location=False)
     computed = compute_bid_details_from_sample(deals_sample_df, seat_dir=seat_dir or "N", pinned_row=None, cfg=cfg)
+    if include_timing:
+        now = time.perf_counter()
+        timing["bid_details_compute_ms"] = (now - t_mark) * 1000
+        t_mark = now
 
     # Phase2a: auction-conditioned posteriors (SELF/PARTNER/LHO/RHO) + threat/keycard/onside.
     phase2a = None
@@ -8667,13 +8852,17 @@ def handle_bid_details(
                 phase2a_df,
                 next_seat=int(next_seat),
                 pinned_deal_index=int(deal_index) if deal_index is not None else None,
-                include_keycards=True,
-                include_onside=True,
+                include_keycards=bool(phase2a_include_keycards),
+                include_onside=bool(phase2a_include_onside),
             )
         except Exception as e:
             degraded_mode = degraded_mode or "phase2a_unavailable"
             degraded_reasons.append(f"phase2a_error:{e}")
             phase2a = None
+    if include_timing:
+        now = time.perf_counter()
+        timing["phase2a_ms"] = (now - t_mark) * 1000
+        t_mark = now
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     out = {
@@ -8700,6 +8889,9 @@ def handle_bid_details(
         "cache": {"hit": False},
         "elapsed_ms": round(elapsed_ms, 1),
     }
+    if include_timing:
+        timing["total_ms"] = elapsed_ms
+        out["timing"] = dict(timing)
     out.update(computed)
     if phase2a is not None:
         # Keep top-level stable pointer for consumers; phase2a is the new preferred surface.
@@ -10612,3 +10804,374 @@ def _is_auction_complete_list(bids: List[str]) -> bool:
         if b not in ("P", "X", "XX") and b and b[0].isdigit():
             last_c = i
     return last_c >= 0 and len(bids) >= last_c + 4 and all(b == "P" for b in bids[-3:])
+
+
+def handle_ai_model_advanced_path(
+    state: Dict[str, Any],
+    *,
+    deal_row_idx: int,
+    seed: int = 0,
+    max_steps: int = 40,
+    top_n: int = 12,
+    max_deals: int = 500,
+    w_desc: float = 150.0,
+    w_threat: float = 120.0,
+    permissive_pass: bool = True,
+) -> Dict[str, Any]:
+    """Compute the 'AI Model (Advanced top-1 greedy)' completed auction in-process.
+
+    Semantics mirror the Streamlit AI Model path builder:
+    - At each step, consider next bids from BT.
+    - Keep only bids that match the pinned deal's criteria (boolean pass), and are not rejected.
+    - If no bids match, choose Pass (if permissive_pass and Pass is available), otherwise stop.
+    - If exactly one bid matches, take it without scoring.
+    - Else score top-N using bid-details evidence (utility + typicality - threat), pick best.
+
+    Returns:
+      - auction: completed (or best-effort) auction string
+      - steps_detail: per-step timings + counts
+    """
+    import concurrent.futures
+
+    t0 = time.perf_counter()
+    deal_df = state.get("deal_df")
+    if deal_df is None:
+        return {"auction": "", "steps": 0, "elapsed_ms": 0, "error": "deal_df not loaded"}
+
+    try:
+        deal_row = deal_df.row(int(deal_row_idx), named=True)
+    except Exception as e:
+        return {"auction": "", "steps": 0, "elapsed_ms": 0, "error": f"invalid_deal_row_idx:{e}"}
+
+    dealer_actual = str(deal_row.get("Dealer", "N")).upper()
+    board_vul = deal_row.get("Vul", deal_row.get("Vulnerability"))
+    deal_index = deal_row.get("index")
+    try:
+        deal_index_i = int(deal_index) if deal_index is not None else None
+    except Exception:
+        deal_index_i = None
+
+    def _strip_leading_passes_tokens(tokens: List[str]) -> Tuple[List[str], int]:
+        n = 0
+        for t in tokens:
+            if str(t).upper() == "P":
+                n += 1
+            else:
+                break
+        if n >= len(tokens):
+            return [], int(n)
+        return tokens[n:], int(n)
+
+    def _next_display_seat_from_tokens(tokens: List[str]) -> int:
+        return (len(tokens) % 4) + 1
+
+    def _bt_seat_from_display_seat(seat_1_to_4: int, leading_passes: int) -> int:
+        k = int(leading_passes or 0) % 4
+        return ((int(seat_1_to_4) - 1 - k) % 4) + 1
+
+    def _rotate_dealer_by(dealer: str, offset: int) -> str:
+        try:
+            directions = ["N", "E", "S", "W"]
+            d = str(dealer or "N").upper()
+            i = directions.index(d) if d in directions else 0
+            k = int(offset or 0) % 4
+            return directions[(i + k) % 4]
+        except Exception:
+            return str(dealer or "N").upper()
+
+    tokens: List[str] = []
+    steps_detail: List[Dict[str, Any]] = []
+
+    for _step_i in range(int(max_steps)):
+        if _is_auction_complete_list(tokens):
+            break
+
+        t_step0 = time.perf_counter()
+        seat_display = _next_display_seat_from_tokens(tokens)
+        bt_tokens, leading_passes = _strip_leading_passes_tokens(tokens)
+        bt_prefix = "-".join(bt_tokens) if bt_tokens else ""
+        dealer_rot = _rotate_dealer_by(dealer_actual, leading_passes)
+        seat_bt = _bt_seat_from_display_seat(seat_display, leading_passes)
+
+        # Next bids from BT (fast CSR).
+        #
+        # IMPORTANT performance: we do NOT need expensive per-bid deal counts here.
+        # Those counts can cost seconds and dominate pass steps. We only need:
+        # - bid, bt_index, agg_expr, dead-end/can-complete flags
+        # - precomputed avg_ev/avg_par (cheap lookup)
+        auction_input = normalize_auction_input(bt_prefix)
+        auction_normalized = re.sub(r"(?i)^(p-)+", "", auction_input) if auction_input else ""
+        resp = _handle_list_next_bids_walk_fallback(
+            state,
+            auction_input,
+            auction_normalized,
+            time.perf_counter(),
+            include_deal_counts=False,
+            include_ev_stats=True,
+            dealer=dealer_rot,
+            vulnerable=board_vul,
+        )
+        next_bids = resp.get("next_bids", []) or []
+
+        # Ensure Pass exists when permissive.
+        if permissive_pass:
+            has_p = any(str(x.get("bid", "")).strip().upper() in ("P", "PASS") for x in next_bids)
+            if not has_p:
+                next_bids = list(next_bids) + [
+                    {
+                        "bid": "P",
+                        "bt_index": None,
+                        "expr": [],
+                        "agg_expr": [],
+                        "can_complete": True,
+                        "is_completed_auction": False,
+                        "is_dead_end": False,
+                        "matching_deal_count": 0,
+                        "avg_ev": None,
+                        "avg_par": None,
+                    }
+                ]
+
+        # Candidate filtering (structural only).
+        candidates: List[Dict[str, Any]] = []
+        pass_opt: Dict[str, Any] | None = None
+        for opt in next_bids:
+            bid0 = str(opt.get("bid", "") or "").strip().upper()
+            if not bid0:
+                continue
+            if bid0 in ("P", "PASS"):
+                pass_opt = opt
+                continue
+            bt_idx = opt.get("bt_index")
+            if bt_idx is None:
+                continue
+            crits = opt.get("agg_expr", []) or []
+            is_dead_end = bool(opt.get("is_dead_end", False))
+            has_empty_criteria = not crits
+            # Do NOT reject on can_complete yet; only after pass.
+            if is_dead_end or has_empty_criteria:
+                continue
+            candidates.append(opt)
+
+        step_rec: Dict[str, Any] = {
+            "step": int(_step_i + 1),
+            "seat": int(seat_display),
+            "bt_prefix": str(bt_prefix),
+            "leading_passes": int(leading_passes),
+            "dealer_rot": str(dealer_rot),
+            "seat_bt": int(seat_bt),
+            "opts": int(len(next_bids)),
+            "cand": int(len(candidates)),
+        }
+
+        if not candidates:
+            # No BT-backed candidates: Pass if possible.
+            if pass_opt is None:
+                break
+            tokens.append("P")
+            step_rec["choice"] = "P"
+            step_rec["pass"] = 0
+            step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
+            steps_detail.append(step_rec)
+            continue
+
+        # Criteria pass batch for these candidates.
+        checks = [{"seat": int(seat_bt), "criteria": list((o.get("agg_expr") or []))} for o in candidates]
+        passed_opts: List[Dict[str, Any]] = []
+        try:
+            pass_resp = handle_deal_criteria_pass_batch(state, int(deal_row_idx), dealer_rot, checks)
+            results = pass_resp.get("results", []) or []
+            for i_res, r0 in enumerate(results[: len(candidates)]):
+                if not bool((r0 or {}).get("passes", False)):
+                    continue
+                opt = candidates[i_res]
+                can_complete = opt.get("can_complete")
+                can_complete_b = bool(can_complete) if can_complete is not None else True
+                if not can_complete_b:
+                    continue
+                passed_opts.append(opt)
+        except Exception:
+            passed_opts = []
+
+        step_rec["pass"] = int(len(passed_opts))
+
+        if not passed_opts:
+            # Semantics: choose Pass when nothing matches.
+            if pass_opt is None:
+                break
+            tokens.append("P")
+            step_rec["choice"] = "P"
+            step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
+            steps_detail.append(step_rec)
+            continue
+
+        # If only one passing bid, take it (no scoring).
+        if len(passed_opts) == 1:
+            bid1 = str(passed_opts[0].get("bid", "") or "").strip().upper()
+            if not bid1:
+                break
+            tokens.append(bid1)
+            step_rec["choice"] = bid1
+            step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
+            steps_detail.append(step_rec)
+            continue
+
+        # Score top-N passing bids via bid-details.
+        def _seed_key(o: Dict[str, Any]) -> Tuple[float, float, float]:
+            def _f(x: Any) -> float:
+                try:
+                    if x is None or x == "":
+                        return float("-inf")
+                    return float(x)
+                except Exception:
+                    return float("-inf")
+            return (_f(o.get("avg_ev")), _f(o.get("matching_deal_count")), _f(o.get("matching_deal_count")))
+
+        passed_sorted = sorted(passed_opts, key=_seed_key, reverse=True)[: max(1, int(top_n))]
+        auction_full = "-".join(tokens)
+
+        def _score_one(opt: Dict[str, Any]) -> Tuple[float, str, float, float, bool]:
+            bid1 = str(opt.get("bid", "") or "").strip().upper()
+            if not bid1:
+                return float("-inf"), "", 0.0, 0.0, False
+            details = handle_bid_details(
+                state=state,
+                auction=str(auction_full or ""),
+                bid=bid1,
+                max_deals=int(max_deals),
+                seed=int(seed or 0),
+                vul_filter=str(board_vul or "") if board_vul is not None else None,
+                deal_index=deal_index_i,
+                topk=1,
+                include_phase2a=True,
+                # Performance-critical: AI Model scoring currently consumes only:
+                # - phase2a.threat (fit-based)
+                # - phase2a.range_percentiles
+                # It does NOT use keycards/onside, which require parsing Hand_* strings.
+                # Disable them to preserve bid choice while drastically reducing CPU.
+                phase2a_include_keycards=False,
+                phase2a_include_onside=False,
+                include_timing=True,
+            )
+            d_ms = 0.0
+            p2_ms = 0.0
+            hit = bool((details.get("cache") or {}).get("hit", False))
+            try:
+                d_ms = float(details.get("elapsed_ms") or 0.0)
+            except Exception:
+                d_ms = 0.0
+            try:
+                p2_ms = float(((details.get("timing") or {}).get("phase2a_ms")) or 0.0)
+            except Exception:
+                p2_ms = 0.0
+            if details.get("error") or details.get("message"):
+                return float("-inf"), bid1, d_ms, p2_ms, hit
+
+            par_score = details.get("par_score") or {}
+            mean_par = par_score.get("mean")
+
+            eeo = {}
+            try:
+                eeo = compute_eeo_from_bid_details(details)
+            except Exception:
+                eeo = {}
+            utility = eeo.get("utility")
+
+            opp_threat = None
+            try:
+                threat = (details.get("phase2a") or {}).get("threat") or {}
+                vals = []
+                for su in ["S", "H", "D", "C"]:
+                    t_su = threat.get(su) or {}
+                    v = t_su.get("p_them_6plus")
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+                if vals:
+                    opp_threat = max(vals)
+            except Exception:
+                opp_threat = None
+
+            desc_score = None
+            try:
+                rp = details.get("range_percentiles")
+                if isinstance(rp, dict) and rp.get("role") == "self":
+                    pcts = []
+                    h = (rp.get("hcp") or {}).get("percentile")
+                    if isinstance(h, (int, float)):
+                        pcts.append(float(h))
+                    sl = rp.get("suit_lengths") or {}
+                    for su in ["S", "H", "D", "C"]:
+                        p = ((sl.get(su) or {}).get("percentile"))
+                        if isinstance(p, (int, float)):
+                            pcts.append(float(p))
+                    if pcts:
+                        dev = sum(abs(p - 50.0) for p in pcts) / len(pcts)
+                        desc_score = max(0.0, min(1.0, 1.0 - (dev / 50.0)))
+            except Exception:
+                desc_score = None
+
+            try:
+                base = float(utility) if utility is not None else float(mean_par)
+                desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
+                threat_term = float(opp_threat) if opp_threat is not None else 0.0
+                score_val = base + float(w_desc) * desc_term - float(w_threat) * threat_term
+                return float(score_val), bid1, d_ms, p2_ms, hit
+            except Exception:
+                return float("-inf"), bid1, d_ms, p2_ms, hit
+
+        best_bid = ""
+        best_score = float("-inf")
+        max_workers = min(10, max(1, len(passed_sorted)))
+        bd_calls = 0
+        bd_ms_sum = 0.0
+        bd_p2_ms_sum = 0.0
+        bd_hits = 0
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_score_one, opt) for opt in passed_sorted]
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        sc, b, d_ms, p2_ms, hit = fut.result()
+                    except Exception:
+                        continue
+                    bd_calls += 1
+                    bd_ms_sum += float(d_ms or 0.0)
+                    bd_p2_ms_sum += float(p2_ms or 0.0)
+                    bd_hits += 1 if hit else 0
+                    if b and sc > best_score:
+                        best_score = sc
+                        best_bid = b
+        except Exception:
+            for opt in passed_sorted:
+                sc, b, d_ms, p2_ms, hit = _score_one(opt)
+                bd_calls += 1
+                bd_ms_sum += float(d_ms or 0.0)
+                bd_p2_ms_sum += float(p2_ms or 0.0)
+                bd_hits += 1 if hit else 0
+                if b and sc > best_score:
+                    best_score = sc
+                    best_bid = b
+
+        if not best_bid:
+            best_bid = str(passed_sorted[0].get("bid", "") or "").strip().upper()
+        if not best_bid:
+            break
+
+        tokens.append(best_bid)
+        step_rec["choice"] = best_bid
+        step_rec["scored_n"] = int(len(passed_sorted))
+        step_rec["bid_details_calls"] = int(bd_calls)
+        step_rec["bid_details_cache_hits"] = int(bd_hits)
+        step_rec["bid_details_elapsed_ms_sum"] = round(float(bd_ms_sum), 1)
+        step_rec["bid_details_phase2a_ms_sum"] = round(float(bd_p2_ms_sum), 1)
+        step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
+        steps_detail.append(step_rec)
+
+    out_auc = "-".join(tokens)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "auction": out_auc,
+        "steps": int(len(tokens)),
+        "steps_detail": steps_detail,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
