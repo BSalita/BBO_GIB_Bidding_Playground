@@ -10210,7 +10210,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
         # Include bt_index from last step in header (use 'is not None' since bt_index=0 is valid)
         summary_bt_index = current_path[-1].get("bt_index") if current_path else None
-        summary_header = f"📋 Bid-by-Bid Summary (bt_index: {summary_bt_index})" if summary_bt_index is not None else "📋 Bid-by-Bid Summary"
+        summary_header = (
+            f"📋 Completed Auction Summary (bt_index: {summary_bt_index})"
+            if summary_bt_index is not None
+            else "📋 Completed Auction Summary"
+        )
         st.subheader(summary_header)
         if rehydrate_elapsed_ms is not None:
             st.info(f"Loaded auction criteria in {rehydrate_elapsed_ms/1000:.2f}s")
@@ -10889,6 +10893,53 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     actual_ev_ns = float(v) if v is not None else None
                 except Exception:
                     actual_ev_ns = None
+
+                def _score_diff_to_imps(diff: int | float | None) -> int | None:
+                    """Convert score diff (NS points) to IMPs (NS-positive)."""
+                    if diff is None:
+                        return None
+                    try:
+                        d = int(round(float(diff)))
+                    except Exception:
+                        return None
+                    sign = -1 if d < 0 else 1
+                    ad = abs(d)
+                    # Standard WBF IMP table thresholds (approx; gaps don't matter in practice).
+                    # 0-19 => 0, 20-49 => 1, 50-89 => 2, ...
+                    thresholds: list[tuple[int, int]] = [
+                        (20, 1),
+                        (50, 2),
+                        (90, 3),
+                        (130, 4),
+                        (170, 5),
+                        (220, 6),
+                        (270, 7),
+                        (320, 8),
+                        (370, 9),
+                        (430, 10),
+                        (500, 11),
+                        (600, 12),
+                        (750, 13),
+                        (900, 14),
+                        (1100, 15),
+                        (1300, 16),
+                        (1500, 17),
+                        (1750, 18),
+                        (2000, 19),
+                        (2250, 20),
+                        (2500, 21),
+                        (3000, 22),
+                        (3500, 23),
+                    ]
+                    imp = 0
+                    for lo, val in thresholds:
+                        if ad >= lo:
+                            imp = val
+                        else:
+                            break
+                    if ad >= 4000:
+                        imp = 24
+                    return int(sign * imp)
                 completion_rows = [
                     {
                         "BT Index": actual_bt_index,
@@ -10954,6 +11005,28 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             ),
                         }
                     )
+
+                # Add IMPs column: IMPs gained/lost vs Actual row's Score_NS
+                actual_score_ns: int | None = None
+                try:
+                    for rr in completion_rows:
+                        if str(rr.get("Source", "")).strip().lower() == "actual":
+                            v = rr.get("Score_NS")
+                            actual_score_ns = int(v) if v is not None else None
+                            break
+                except Exception:
+                    actual_score_ns = None
+                for rr in completion_rows:
+                    try:
+                        s = rr.get("Score_NS")
+                        s_i = int(s) if s is not None else None
+                    except Exception:
+                        s_i = None
+                    if actual_score_ns is None or s_i is None:
+                        rr["IMPs"] = None
+                    else:
+                        rr["IMPs"] = _score_diff_to_imps(int(s_i) - int(actual_score_ns))
+
                 render_aggrid(
                     pl.DataFrame(completion_rows),
                     key="auction_builder_complete_summary",
