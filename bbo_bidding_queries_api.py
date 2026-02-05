@@ -94,12 +94,136 @@ from bbo_bidding_queries_lib import (
 # ---------------------------------------------------------------------------
 
 import importlib
+import sys
 
 # Library-first core (shared state + plugin hot-reload)
 from bbo_bidding_core import CoreNotReadyError, CoreService
 
 # Track mtime of plugins directory for hot-reload
 _PLUGINS_DIR = pathlib.Path(__file__).parent / "plugins"
+# Repo root (used for local-import mtime checks)
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent
+
+# ---------------------------------------------------------------------------
+# "Out of sync" code-change notifier (API file + local imports)
+# ---------------------------------------------------------------------------
+
+_CODE_SYNC_BASELINE_MTIME: Dict[str, float] = {}
+_CODE_SYNC_NOTIFIED: set[str] = set()
+_CODE_SYNC_LAST_CHECK_T: float = 0.0
+_CODE_SYNC_CHECK_INTERVAL_S: float = 2.0  # keep overhead low (reload is called per-request)
+
+
+def _iter_local_import_files() -> list[pathlib.Path]:
+    """Return repo-local imported module source files (excluding plugins)."""
+    out: list[pathlib.Path] = []
+    try:
+        for m in list(sys.modules.values()):
+            try:
+                f = getattr(m, "__file__", None)
+            except Exception:
+                f = None
+            if not f:
+                continue
+            try:
+                p = pathlib.Path(str(f)).resolve()
+            except Exception:
+                continue
+            if p.suffix.lower() != ".py":
+                continue
+            # Only watch our repo-local code.
+            try:
+                p.relative_to(_REPO_ROOT)
+            except Exception:
+                continue
+            # Plugins are hot-reloaded separately; don't spam for them.
+            try:
+                p.relative_to(_PLUGINS_DIR.resolve())
+                continue
+            except Exception:
+                pass
+            out.append(p)
+    except Exception:
+        return []
+
+    # Always include this API module file itself.
+    try:
+        out.append(pathlib.Path(__file__).resolve())
+    except Exception:
+        pass
+
+    # Dedup + stable order
+    uniq: dict[str, pathlib.Path] = {}
+    for p in out:
+        uniq[str(p)] = p
+    return [uniq[k] for k in sorted(uniq.keys())]
+
+
+def _get_code_sync_status() -> Dict[str, Any]:
+    """Return code sync status: which local files (if any) changed since server start."""
+    files = _iter_local_import_files()
+    changed: list[Dict[str, Any]] = []
+    for p in files:
+        sp = str(p)
+        try:
+            mtime = float(p.stat().st_mtime)
+        except Exception:
+            continue
+        if sp not in _CODE_SYNC_BASELINE_MTIME:
+            # Baseline is "server start (first observation)".
+            _CODE_SYNC_BASELINE_MTIME[sp] = mtime
+            continue
+        baseline = float(_CODE_SYNC_BASELINE_MTIME.get(sp) or 0.0)
+        if mtime <= baseline:
+            continue
+        try:
+            rel = str(p.relative_to(_REPO_ROOT))
+        except Exception:
+            rel = sp
+        changed.append({
+            "file": rel,
+            "baseline_mtime": baseline,
+            "current_mtime": mtime,
+        })
+    return {
+        "out_of_sync": bool(changed),
+        "changed_files": changed,
+        "files_monitored": len(files),
+    }
+
+
+def _notify_if_api_out_of_sync() -> None:
+    """Print a console warning if API code has changed on disk since server start."""
+    global _CODE_SYNC_LAST_CHECK_T
+    try:
+        now = time.perf_counter()
+    except Exception:
+        now = 0.0
+
+    try:
+        if _CODE_SYNC_LAST_CHECK_T and (now - float(_CODE_SYNC_LAST_CHECK_T)) < float(_CODE_SYNC_CHECK_INTERVAL_S):
+            return
+    except Exception:
+        # If timing math fails, fall through and check.
+        pass
+    _CODE_SYNC_LAST_CHECK_T = float(now)
+
+    status = _get_code_sync_status()
+    for f in status.get("changed_files", []):
+        sp = str(f.get("file", ""))
+        if not sp:
+            continue
+        if sp in _CODE_SYNC_NOTIFIED:
+            continue
+        _CODE_SYNC_NOTIFIED.add(sp)
+        baseline = f.get("baseline_mtime", 0.0)
+        mtime = f.get("current_mtime", 0.0)
+        print(
+            "[hot-reload] API process is OUT OF SYNC with source. "
+            f"File changed since server start: {sp} (mtime {baseline:.0f} -> {mtime:.0f}). "
+            "Restart the API server to load changes."
+        )
+
 # Global, long-lived core instance for this process.
 CORE = CoreService(plugins_dir=_PLUGINS_DIR)
 
@@ -108,6 +232,8 @@ PLUGINS: Dict[str, Any] = CORE.plugins
 
 def _reload_plugins() -> dict[str, object]:
     """Hot-reload plugins (delegates to CoreService)."""
+    # Dev UX: notify if API/main code changed (plugins are reloaded separately).
+    _notify_if_api_out_of_sync()
     return CORE.reload_plugins()
 
 # Initialize plugins on startup
@@ -2616,6 +2742,16 @@ def get_status() -> StatusResponse:
         )
 
 
+@app.get("/code-sync-status")
+def get_code_sync_status() -> Dict[str, Any]:
+    """Check if API source code has changed on disk since server start.
+    
+    Returns:
+        out_of_sync: True if any monitored file changed
+        changed_files: List of {file, baseline_mtime, current_mtime} for changed files
+        files_monitored: Number of repo-local files being watched
+    """
+    return _get_code_sync_status()
 
 
 @app.post("/init", response_model=InitResponse)

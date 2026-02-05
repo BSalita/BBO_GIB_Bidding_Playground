@@ -8336,74 +8336,80 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     par_elapsed = st.session_state.get(par_elapsed_key, 0)
                     if par_matches:
                         # Enrich server-provided rows with deal-specific scores and UI-consistent stats.
-                        dealer_actual = str(pinned_deal.get("Dealer", "N")).upper() if pinned_deal else "N"
+                        # Use a cache key so enrichment only runs once per deal/auction combination.
+                        enrich_cache_key = f"_par_matches_enriched_{deal_idx}_{seed}_{current_auction}"
+                        if enrich_cache_key not in st.session_state:
+                          with st.spinner("Enriching par-matching auctions..."):
+                            dealer_actual = str(pinned_deal.get("Dealer", "N")).upper() if pinned_deal else "N"
 
-                        # Precompute vul flags (used for Avg_EV from NV/V split)
-                        vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper() if pinned_deal else ""
-                        ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
-                        ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
+                            # Precompute vul flags (used for Avg_EV from NV/V split)
+                            vul = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))).upper() if pinned_deal else ""
+                            ns_vul = vul in ("N_S", "NS", "BOTH", "ALL")
+                            ew_vul = vul in ("E_W", "EW", "BOTH", "ALL")
 
-                        enriched_rows: list[dict[str, Any]] = []
-                        auc_list: list[str] = []
-                        for r in par_matches:
-                            rr = dict(r or {})
-                            auc = str(rr.get("Auction") or "").strip()
-                            if not auc:
-                                continue
-                            auc_list.append(auc)
+                            enriched_rows: list[dict[str, Any]] = []
+                            auc_list: list[str] = []
+                            for r in par_matches:
+                                rr = dict(r or {})
+                                auc = str(rr.get("Auction") or "").strip()
+                                if not auc:
+                                    continue
+                                auc_list.append(auc)
 
-                            # Deal-specific scoring for the pinned deal
-                            dd_score: int | None = None
-                            ev_score: float | None = None
-                            try:
-                                dd_v = get_dd_score_for_auction(auc, dealer_actual, pinned_deal)
-                                dd_score = int(dd_v) if dd_v is not None else None
-                            except Exception:
-                                dd_score = None
-                            try:
-                                ev_v = get_ev_for_auction(auc, dealer_actual, pinned_deal)
-                                ev_score = round(float(ev_v), 1) if ev_v is not None else None
-                            except Exception:
-                                ev_score = None
-                            rr["DD Score"] = dd_score
-                            rr["EV Score"] = ev_score
-
-                            # Avg_EV: use server-provided NV/V split (from bt_ev_stats_df) when available.
-                            avg_ev_nv = rr.get("avg_ev_nv")
-                            avg_ev_v = rr.get("avg_ev_v")
-                            pair = str(rr.get("Pair") or "").upper()
-                            rr["Avg_EV"] = None
-                            if avg_ev_nv is not None or avg_ev_v is not None:
+                                # Deal-specific scoring for the pinned deal
+                                dd_score: int | None = None
+                                ev_score: float | None = None
                                 try:
-                                    is_vul = (pair == "NS" and ns_vul) or (pair == "EW" and ew_vul)
-                                    chosen = avg_ev_v if is_vul else avg_ev_nv
-                                    if chosen is not None:
-                                        # Normalize sign to NS-positive convention.
-                                        sign = 1.0 if pair == "NS" else (-1.0 if pair == "EW" else 1.0)
-                                        rr["Avg_EV"] = round(sign * float(chosen), 1)
+                                    dd_v = get_dd_score_for_auction(auc, dealer_actual, pinned_deal)
+                                    dd_score = int(dd_v) if dd_v is not None else None
                                 except Exception:
-                                    rr["Avg_EV"] = None
+                                    dd_score = None
+                                try:
+                                    ev_v = get_ev_for_auction(auc, dealer_actual, pinned_deal)
+                                    ev_score = round(float(ev_v), 1) if ev_v is not None else None
+                                except Exception:
+                                    ev_score = None
+                                rr["DD Score"] = dd_score
+                                rr["EV Score"] = ev_score
 
-                            enriched_rows.append(rr)
+                                # Avg_EV: use server-provided NV/V split (from bt_ev_stats_df) when available.
+                                avg_ev_nv = rr.get("avg_ev_nv")
+                                avg_ev_v = rr.get("avg_ev_v")
+                                pair = str(rr.get("Pair") or "").upper()
+                                rr["Avg_EV"] = None
+                                if avg_ev_nv is not None or avg_ev_v is not None:
+                                    try:
+                                        is_vul = (pair == "NS" and ns_vul) or (pair == "EW" and ew_vul)
+                                        chosen = avg_ev_v if is_vul else avg_ev_nv
+                                        if chosen is not None:
+                                            # Normalize sign to NS-positive convention.
+                                            sign = 1.0 if pair == "NS" else (-1.0 if pair == "EW" else 1.0)
+                                            rr["Avg_EV"] = round(sign * float(chosen), 1)
+                                    except Exception:
+                                        rr["Avg_EV"] = None
 
-                        # Matches: exact auction counts (batch), same endpoint used by bid options.
-                        counts_cache_key = f"_par_matches_counts_{deal_idx}_{seed}_{current_auction}"
-                        if counts_cache_key not in st.session_state:
-                            st.session_state[counts_cache_key] = {}
-                        par_counts: dict[str, int] = st.session_state[counts_cache_key]
-                        _fetch_auction_pattern_counts(
-                            auc_list, par_counts, pattern_style="completed_only", timeout=15
-                        )
+                                enriched_rows.append(rr)
 
-                        for rr in enriched_rows:
-                            a = str(rr.get("Auction") or "").strip()
-                            rr["Matches"] = int(par_counts.get(a, 0) or 0)
+                            # Matches: exact auction counts (batch), same endpoint used by bid options.
+                            counts_cache_key = f"_par_matches_counts_{deal_idx}_{seed}_{current_auction}"
+                            if counts_cache_key not in st.session_state:
+                                st.session_state[counts_cache_key] = {}
+                            par_counts: dict[str, int] = st.session_state[counts_cache_key]
+                            _fetch_auction_pattern_counts(
+                                auc_list, par_counts, pattern_style="completed_only", timeout=15
+                            )
 
-                        par_matches_df = pl.DataFrame(enriched_rows)
-                        # UI request: color ALL rows green.
-                        # Use render_aggrid's pass/fail row styling with a constant True marker.
-                        par_matches_df = par_matches_df.with_columns(pl.lit(True).alias("_passes"))
+                            for rr in enriched_rows:
+                                a = str(rr.get("Auction") or "").strip()
+                                rr["Matches"] = int(par_counts.get(a, 0) or 0)
 
+                            par_matches_df = pl.DataFrame(enriched_rows)
+                            # UI request: color ALL rows green.
+                            # Use render_aggrid's pass/fail row styling with a constant True marker.
+                            par_matches_df = par_matches_df.with_columns(pl.lit(True).alias("_passes"))
+                            st.session_state[enrich_cache_key] = par_matches_df
+
+                        par_matches_df = st.session_state[enrich_cache_key]
                         st.info(f"Found {len(par_matches)} matching auctions in {format_elapsed(float(par_elapsed))}.")
 
                         selected_rows = render_aggrid(
@@ -8573,6 +8579,24 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 advanced_rows: list[dict[str, Any]] = []
                 include_phase2a_adv = bool(pinned_deal_index_val is not None)
                 
+                # Perspective/sign: bid-details ParScore is NS-positive. For bidding recommendations we want
+                # scores from the perspective of the *acting seat* at this auction prefix.
+                acting_dir_adv: str | None = None
+                acting_sign_adv: float = 1.0  # +1 for NS, -1 for EW (default NS if unknown)
+                try:
+                    if pinned_deal:
+                        dealer_actual = str(pinned_deal.get("Dealer", "N") or "N").strip().upper()
+                    else:
+                        dealer_actual = "N"
+                    seat_1_to_4_adv = _next_display_seat_from_auction(current_auction)
+                    directions = ["N", "E", "S", "W"]
+                    dealer_idx = directions.index(dealer_actual) if dealer_actual in directions else 0
+                    acting_dir_adv = directions[(dealer_idx + int(seat_1_to_4_adv) - 1) % 4]
+                    acting_sign_adv = 1.0 if acting_dir_adv in ("N", "S") else -1.0
+                except Exception:
+                    acting_dir_adv = None
+                    acting_sign_adv = 1.0
+                
                 # Helper to determine bucket from original row
                 def get_bucket_from_row(r: dict[str, Any]) -> str:
                     if r.get("_matches") is True and not r.get("_rejected"):
@@ -8654,12 +8678,19 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         tail = par_score.get("tail_risk_mean_neg")
                         entropy = par_contracts.get("contract_entropy_full_nats")
 
-                        eeo = {}
+                        # "Utility" for ranking: use the same MVP form as compute_eeo_from_bid_details,
+                        # but apply the acting-seat sign to the MEAN term only (penalties always subtract).
+                        utility = None
                         try:
-                            eeo = compute_eeo_from_bid_details(details)
+                            lam = 0.5
+                            mu = 0.25
+                            m = float(mean_par) if mean_par is not None else None
+                            t = float(tail) if isinstance(tail, (int, float)) else 0.0
+                            e = float(entropy) if isinstance(entropy, (int, float)) else 0.0
+                            if m is not None:
+                                utility = float(acting_sign_adv) * float(m) - lam * float(t) - mu * float(e)
                         except Exception:
-                            eeo = {}
-                        utility = eeo.get("utility")
+                            utility = None
 
                         # Surface "BT-level flags" (e.g. Forcing_*) even if they don't change the posterior.
                         flags_s = ""
@@ -8733,7 +8764,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         # Composite Score (transparent & adjustable)
                         score = None
                         try:
-                            base = float(utility) if utility is not None else float(mean_par)
+                            # Base: signed utility when available; else signed mean ParScore.
+                            if utility is not None:
+                                base = float(utility)
+                            else:
+                                base = float(acting_sign_adv) * float(mean_par)
                             # Bonus: centered at 0 when no pinned deal (or missing percentiles)
                             desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                             threat_term = float(opp_threat) if opp_threat is not None else 0.0
@@ -8749,7 +8784,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "Flags": flags_s,
                                 "Score": score,
                                 "U": utility,
-                                "MeanPar": mean_par,
+                                "MeanPar": (float(acting_sign_adv) * float(mean_par)) if isinstance(mean_par, (int, float)) else mean_par,
                                 "P>=0%": (float(p_ok) * 100.0) if isinstance(p_ok, (int, float)) else None,
                                 "Ent": entropy,
                                 "Tail": tail,
@@ -8767,47 +8802,83 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         )
 
                 adv_df = pl.DataFrame(advanced_rows) if advanced_rows else pl.DataFrame()
-                # Fallback: if the only reasonable option is Pass (common for seat-1 when opening),
-                # show a single synthetic row so the UI isn't empty.
-                if adv_df.is_empty() and pass_rows:
-                    pr = pass_rows[0]
-                    # Prefer "contract EV" if computed, else DD score, else zero.
-                    pass_score = None
+                # Always offer a synthetic Pass row (selectable) when permissive-pass is enabled.
+                # Pass is not BT-backed, so we cannot call /bid-details for it; we approximate a Score
+                # using the best proxy available in the already-built bid row.
+                try:
+                    include_synth_pass = bool(st.session_state.get("always_valid_pass", True))
+                except Exception:
+                    include_synth_pass = True
+
+                if include_synth_pass:
+                    # Prefer the best Pass row (if present) by the same seed ordering used elsewhere.
+                    pr = None
                     try:
-                        v = pr.get("EV_Contract")
-                        pass_score = float(v) if isinstance(v, (int, float)) else None
+                        if pass_rows:
+                            pr = sorted(pass_rows, key=_seed_key, reverse=True)[0]
                     except Exception:
-                        pass_score = None
-                    if pass_score is None:
-                        try:
-                            v = pr.get("DD_Score_Contract")
-                            pass_score = float(v) if isinstance(v, (int, float)) else 0.0
-                        except Exception:
-                            pass_score = 0.0
-                    adv_df = pl.DataFrame(
-                        [
-                            {
-                                "Bid": "P",
-                                "Error": "Synthetic row: Pass is not BT-backed (no /bid-details evidence).",
-                                "Score": pass_score,
-                                "U": None,
-                                "MeanPar": pr.get("Avg_Par"),
-                                "P>=0%": None,
-                                "Ent": None,
-                                "Tail": None,
-                                "Desc": None,
-                                "HCP%ile": None,
-                                "Threat6+%": None,
-                                "FitUs": None,
-                                "TopPar": None,
-                                "TopPar%": None,
-                                "n": pr.get("Deals", None) or pr.get("Matches", None),
-                                "Sampled": None,
-                                "Degraded": "synthetic_pass",
-                                "Source": get_bucket_from_row(pr) if pr else "Valid",
-                            }
+                        pr = pass_rows[0] if pass_rows else None
+
+                    def _pick_pass_score_and_note(row: dict[str, Any] | None) -> tuple[float, str]:
+                        if not isinstance(row, dict):
+                            return 0.0, "default 0.0"
+                        # Prefer: explicit contract EV (if present), then Avg_EV, then Avg_Par, then DD score.
+                        candidates: list[tuple[str, Any]] = [
+                            ("EV_Contract", row.get("EV_Contract")),
+                            ("EV Contract", row.get("EV Contract")),
+                            ("Avg_EV", row.get("Avg_EV")),
+                            ("Avg_Par", row.get("Avg_Par")),
+                            ("DD_Score_Contract", row.get("DD_Score_Contract")),
+                            ("DD Score", row.get("DD Score")),
                         ]
-                    )
+                        for k, v in candidates:
+                            try:
+                                if isinstance(v, (int, float)):
+                                    return float(v), f"proxy from {k}"
+                            except Exception:
+                                pass
+                        return 0.0, "default 0.0"
+
+                    pass_score, pass_note = _pick_pass_score_and_note(pr)
+                    try:
+                        pass_score = float(acting_sign_adv) * float(pass_score)
+                    except Exception:
+                        pass_score = pass_score
+                    pass_row_dict = {
+                        "Bid": "P",
+                        "Error": f"Synthetic row: Pass is not BT-backed (no /bid-details evidence); {pass_note}.",
+                        "Score": pass_score,
+                        "U": None,
+                        "MeanPar": (
+                            (float(acting_sign_adv) * float(pr.get("Avg_Par")))
+                            if isinstance(pr, dict) and isinstance(pr.get("Avg_Par"), (int, float))
+                            else (pr.get("Avg_Par") if isinstance(pr, dict) else None)
+                        ),
+                        "P>=0%": None,
+                        "Ent": None,
+                        "Tail": None,
+                        "Desc": None,
+                        "HCP%ile": None,
+                        "Threat6+%": None,
+                        "FitUs": None,
+                        "TopPar": None,
+                        "TopPar%": None,
+                        "n": (pr.get("Deals", None) if isinstance(pr, dict) else None)
+                        or (pr.get("Matches", None) if isinstance(pr, dict) else None),
+                        "Sampled": None,
+                        "Degraded": "synthetic_pass",
+                        "Source": get_bucket_from_row(pr) if pr else "Valid",
+                    }
+
+                    try:
+                        pass_df = pl.DataFrame([pass_row_dict])
+                        if adv_df.is_empty():
+                            adv_df = pass_df
+                        else:
+                            adv_df = pl.concat([adv_df, pass_df], how="diagonal_relaxed")
+                    except Exception:
+                        # If concatenation fails for any reason, leave adv_df unchanged.
+                        pass
                 if not adv_df.is_empty():
                     # Rank column for readability
                     try:
@@ -11977,16 +12048,35 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "IMPs",
                     ],
                 )
-                render_aggrid(
+                completion_sel = render_aggrid(
                     completion_df,
                     key="auction_builder_complete_summary",
                     height=140,
                     table_name="auction_builder_complete_summary",
+                    update_on=["selectionChanged", "cellClicked"],
                     fit_columns_to_view=True,
                     show_sql_expander=False,
                     tooltip_cols=["Auction"],
                     row_bucket_col="Bucket",
                 )
+                # Clicking a row should update the Auction Builder + Bid-by-Bid detail to that source's auction.
+                try:
+                    if completion_sel:
+                        row0 = completion_sel[0] or {}
+                        sel_auc = str(row0.get("Auction") or "").strip()
+                        sel_source = str(row0.get("Source") or "").strip()
+                        if sel_auc:
+                            # Avoid infinite reruns by only acting on changes.
+                            last_key = "_auction_builder_complete_summary_last_selected"
+                            last_val = st.session_state.get(last_key)
+                            if last_val != (sel_source, sel_auc):
+                                st.session_state[last_key] = (sel_source, sel_auc)
+                                st.session_state["_auction_builder_detail_source"] = sel_source
+                                st.session_state["_auction_builder_detail_auction"] = sel_auc
+                                st.session_state["_auction_builder_pending_set_auction"] = sel_auc
+                                st.rerun()
+                except Exception:
+                    pass
             else:
                 # Without a pinned deal, show seat/pair (direction depends on dealer which we don't have).
                 decl = "—"
@@ -12022,6 +12112,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     key="auction_builder_complete_summary",
                     height=95,
                     table_name="auction_builder_complete_summary",
+                    update_on=["selectionChanged", "cellClicked"],
                     fit_columns_to_view=True,
                     show_sql_expander=False,
                     tooltip_cols=["Auction"],
@@ -12073,8 +12164,17 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         else:
             summary_hide_cols += ["Avg_EV", "Avg_Par"]
 
-        # Display Current Auction summary table
-        st.markdown("**Current Auction**")
+        # Display Bid-by-Bid Detail summary table (optionally labeled by selected completed-auction source).
+        detail_source = None
+        try:
+            stored_auc = str(st.session_state.get("_auction_builder_detail_auction") or "").strip()
+            stored_src = str(st.session_state.get("_auction_builder_detail_source") or "").strip()
+            if stored_auc and stored_src and stored_auc == str(current_auction or "").strip():
+                detail_source = stored_src
+        except Exception:
+            detail_source = None
+
+        st.subheader(f"📋 Bid-by-Bid Detail — {detail_source}" if detail_source else "📋 Bid-by-Bid Detail")
         summary_selection = render_aggrid(
             summary_df,
             key="auction_builder_summary",
