@@ -347,6 +347,22 @@ def _expr_to_criteria_list(expr: Any) -> list[str]:
     return out
 
 
+def _is_underspecified_criteria(criteria_list: list[str]) -> bool:
+    """Check if criteria list is underspecified (missing both HCP and Total_Points).
+    
+    Returns True if neither 'HCP' nor 'Total_Points' appears in any criteria expression.
+    This filters out BT entries that only have shape-based criteria (like 'Biddable_H')
+    without point-count requirements, which often produce ridiculous bid recommendations.
+    """
+    if not criteria_list:
+        return False  # Empty criteria is handled separately by has_empty_criteria
+    for crit in criteria_list:
+        crit_upper = str(crit).upper()
+        if "HCP" in crit_upper or "TOTAL_POINTS" in crit_upper:
+            return False
+    return True
+
+
 def _to_scalar_auction_text(x: Any) -> str | None:
     """Best-effort: turn a grid cell into a single auction string (or None).
 
@@ -7648,6 +7664,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # Rule: any Pass with empty criteria is ALWAYS routed to Valid (never Rejected).
                 pass_no_criteria = bool(is_pass and (not criteria_list))
                 has_empty_criteria = (not criteria_list)
+                # Reject bids with underspecified criteria (missing HCP and Total_Points)
+                has_underspecified_criteria = _is_underspecified_criteria(criteria_list)
                 can_complete = opt.get("can_complete")
                 can_complete_b = bool(can_complete) if can_complete is not None else True
                 has_zero_deals = deal_count == 0
@@ -7656,7 +7674,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # - "Matches" (pattern-based) and "Deals" (criteria-based) can be 0 even for a valid bid.
                 #   Do NOT use those as rejection/invalid reasons.
                 # - Keep rejection for structural/data-quality issues only.
-                is_rejected = is_dead_end or has_empty_criteria
+                is_rejected = is_dead_end or has_empty_criteria or has_underspecified_criteria
                 if pass_no_criteria:
                     is_rejected = False
                 if pass_always_valid:
@@ -7668,6 +7686,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     failure_reasons.append("dead end")
                 if has_empty_criteria:
                     failure_reasons.append("missing criteria")
+                if has_underspecified_criteria:
+                    failure_reasons.append("underspecified (no HCP/Total_Points)")
                 if (show_failed_criteria and matches_pinned is True and not can_complete_b):
                     # Bid matches current criteria but cannot reach a completed auction anywhere downstream.
                     if not (pass_no_criteria or pass_always_valid):
@@ -10275,7 +10295,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 handle_bid_selection(grid_response, "generic")
     
     # Summary DataFrame
-    if current_path:
+    if current_path or pinned_deal:
         def _truncate_60(s: Any) -> str:
             """Return a string truncated to 60 chars (with ...)."""
             txt = "" if s is None else str(s)
@@ -10370,7 +10390,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             Uses server-side bitmap evaluation when _row_idx is available for accurate
             evaluation of all criteria types. PBN deals cannot be evaluated.
             """
-            if not criteria_list or not deal:
+            if not deal:
+                return True, []
+            
+            # WORKAROUND: Invalidate bids with underspecified criteria (missing HCP and Total_Points)
+            if _is_underspecified_criteria(criteria_list):
+                return False, ["underspecified (no HCP/Total_Points)"]
+
+            if not criteria_list:
                 return True, []
             
             dealer_s = str(dealer).upper()
@@ -10629,9 +10656,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     row["Failed_Criteria"] = "; ".join(failed)  # Show all failures
                     pinned_all_pass = False
             else:
-                # When no pinned deal, color based on bt_index presence
-                # Green = has bt_index (in BT), Red = no bt_index (e.g., leading passes)
-                row["_passes"] = step.get("bt_index") is not None
+                # When no pinned deal, color based on bt_index presence and underspecified status
+                # Green = has bt_index (in BT) and not underspecified, Red = no bt_index or underspecified
+                row["_passes"] = (step.get("bt_index") is not None) and not _is_underspecified_criteria(step.get("agg_expr", []))
             
             # Sampled-deal stats (computed and cached for all steps).
             row["Matches_NV"] = None
@@ -10655,7 +10682,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             summary_rows.append(row)
         
         # Show auction complete status and pinned deal match summary
-        if is_complete:
+        # NEW: Show comparison summary even for incomplete auctions if a pinned deal is present.
+        if is_complete or pinned_deal:
             def _final_contract_from_calls(calls: list[str]) -> str:
                 """Return final contract string like '4S', '4Sx', '4Sxx', or 'Passed out'."""
                 last_contract: str | None = None
