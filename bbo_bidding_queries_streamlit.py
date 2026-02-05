@@ -6248,27 +6248,24 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             ai_model_perf_placeholder.caption(perf_s.strip())
         cached_ai_times = st.session_state.get(ai_model_times_ss_key)
         if isinstance(cached_ai_times, list) and cached_ai_times:
-            # Render a compact list: "<bid>: <ms> ms"
-            parts: list[str] = []
-            for t in cached_ai_times[:60]:
+            lines = ["AI Model Step Details:"]
+            for j, t in enumerate(cached_ai_times[:60], start=1):
                 if not isinstance(t, dict):
                     continue
-                bid_s = str(t.get("bid", "") or "").strip().upper()
+                b = str(t.get("bid", "") or "").strip().upper()
                 ms = t.get("elapsed_ms")
+                score = t.get("score")
+                sign = t.get("acting_sign")
                 try:
                     ms_f = float(ms) if ms is not None else None
                 except Exception:
                     ms_f = None
-                if bid_s and ms_f is not None:
-                    opts = t.get("options")
-                    cands = t.get("candidates")
-                    passed = t.get("passed")
-                    extra = ""
-                    if opts is not None or cands is not None or passed is not None:
-                        extra = f" (opts={opts}, cand={cands}, pass={passed})"
-                    parts.append(f"{bid_s}: {ms_f:.0f} ms{extra}")
-            if parts:
-                ai_model_times_placeholder.caption("AI Model elapsed per bid: " + " | ".join(parts))
+                if b and ms_f is not None:
+                    score_s = f"{score:.1f}" if score is not None else "?"
+                    sign_s = f"{sign:+.0f}" if sign is not None else "?"
+                    lines.append(f"- {j}. `{b}`: {ms_f:.0f} ms | Score: {score_s} (Sign: {sign_s})")
+            if len(lines) > 1:
+                ai_model_times_placeholder.markdown("\n".join(lines))
     except Exception:
         pass
 
@@ -6670,7 +6667,10 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 can_complete = opt.get("can_complete")
                 can_complete_b = bool(can_complete) if can_complete is not None else True
 
-                is_rejected = is_dead_end or has_empty_criteria
+                # WORKAROUND: Invalidate bids with underspecified criteria (missing HCP and Total_Points)
+                is_underspecified = _is_underspecified_criteria(criteria_list)
+
+                is_rejected = is_dead_end or has_empty_criteria or is_underspecified
                 if pass_no_criteria:
                     is_rejected = False
                 if pass_always_valid:
@@ -8784,12 +8784,13 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         # Composite Score (transparent & adjustable)
                         score = None
                         try:
-                            # Base: signed utility when available; else signed mean ParScore.
-                            if utility is not None:
-                                base = float(utility)
-                            else:
-                                base = float(acting_sign_adv) * float(mean_par)
-                            # Bonus: centered at 0 when no pinned deal (or missing percentiles)
+                            # Reconstruct utility from perspective of acting side.
+                            # "utility" from eeo is NS-relative (Mean_NS - Penalties).
+                            # We want Acting-relative score.
+                            # Base: Acting_Sign * Mean_Par (NS).
+                            base = float(acting_sign_adv) * float(mean_par)
+                            
+                            # Add description/threat terms (always additive to quality)
                             desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                             threat_term = float(opp_threat) if opp_threat is not None else 0.0
                             score = base + float(w_desc) * desc_term - float(w_threat) * threat_term
@@ -11286,6 +11287,20 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                         t_step0 = time.perf_counter()
                         seat_1_to_4 = _next_display_seat_from_auction(auc)
+                        
+                        # PERSPECTIVE: determine acting side sign (+1 for NS, -1 for EW acting)
+                        acting_sign = 1.0
+                        try:
+                            # Use pinned deal dealer or default to North
+                            dealer_actual = str(pinned_deal.get("Dealer", "N") if pinned_deal else "N").upper()
+                            directions = ["N", "E", "S", "W"]
+                            dealer_idx = directions.index(dealer_actual) if dealer_actual in directions else 0
+                            # Seat 1 is dealer, Seat 2 is LHO, etc.
+                            acting_dir = directions[(dealer_idx + int(seat_1_to_4) - 1) % 4]
+                            acting_sign = 1.0 if acting_dir in ("N", "S") else -1.0
+                        except Exception:
+                            acting_sign = 1.0
+
                         # We allow leading opening passes in the display auction. For BT lookups we strip
                         # those passes (seat-1 canonical), then rotate the dealer + map the seat for any
                         # pinned-deal criteria evaluation. This matches the main Auction Builder logic.
@@ -11369,10 +11384,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             bid_str = str(opt.get("bid", "") or "").strip().upper()
                             if not bid_str:
                                 continue
+                            
+                            # WORKAROUND: Separately track Pass so it can be handled as a fallback 
+                            # if BT-backed candidates fail criteria.
                             if bid_str in ("P", "PASS"):
                                 pass_opt = opt
-                                continue
-                            if opt.get("bt_index") is None:
+                                # Fall through to add to candidates so it competes in scoring
+                            
+                            if opt.get("bt_index") is None and bid_str not in ("P", "PASS"):
                                 continue
 
                             criteria_list = opt.get("agg_expr", []) or []
@@ -11385,7 +11404,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             # IMPORTANT: do NOT reject on can_complete yet. In the UI, "cannot complete"
                             # only rejects bids that OTHERWISE match the pinned deal.
                             is_rejected = is_dead_end or has_empty_criteria
-                            if is_rejected:
+                            if is_rejected and bid_str not in ("P", "PASS"):
                                 continue
                             candidates.append(opt)
 
@@ -11441,9 +11460,16 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 checks: list[dict[str, Any]] = []
                                 opt_by_i: list[dict[str, Any]] = []
                                 for opt in candidates_sorted:
+                                    bid_s = str(opt.get("bid", "") or "").strip().upper()
+                                    if bid_s in ("P", "PASS"):
+                                        # Pass always passes criteria check
+                                        passed_opts.append(opt)
+                                        continue
+
                                     criteria_list = opt.get("agg_expr", []) or []
                                     if not criteria_list:
-                                        # If we got here, we already filtered empty criteria out; keep safe anyway.
+                                        # Non-pass with empty criteria is rejected in main UI, 
+                                        # but here we follow pool_opts logic.
                                         continue
                                     checks.append({"seat": int(seat_bt), "criteria": list(criteria_list)})
                                     opt_by_i.append(opt)
@@ -11565,6 +11591,50 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             bid0 = str(opt.get("bid", "") or "").strip().upper()
                             if not bid0:
                                 return None, opt
+                            
+                            # Handle Pass (not BT-backed)
+                            if bid0 in ("P", "PASS"):
+                                score_val: float | None = None
+                                
+                                # 1. Try exact EV from pinned deal (matches UI behavior)
+                                if pinned_deal:
+                                    try:
+                                        next_auc = f"{auc}-{bid0}" if auc else bid0
+                                        # Inline completion logic to avoid scope issues
+                                        toks = [t.strip().upper() for t in str(next_auc or "").split("-") if t.strip()]
+                                        trailing = 0
+                                        for t in reversed(toks):
+                                            if t == "P": trailing += 1
+                                            else: break
+                                        has_non_pass = any(t != "P" for t in toks)
+                                        needed = max(0, 4 - len(toks)) if not has_non_pass else max(0, 3 - trailing)
+                                        completed_auc = "-".join(toks + ["P"] * needed)
+                                        
+                                        dealer_ev = str(pinned_deal.get("Dealer", "N")).upper()
+                                        # Use precomputed EV if available, or compute from DD if possible
+                                        ev_raw = get_ev_for_auction_pre(completed_auc, dealer_ev, pinned_deal)
+                                        if ev_raw is not None:
+                                            score_val = float(ev_raw)
+                                    except Exception:
+                                        pass
+                                
+                                # 2. Fallback to avg_ev proxy
+                                if score_val is None:
+                                    val = _safe_float(opt.get("avg_ev"))
+                                    if val == float("-inf"):
+                                        score_val = 0.0
+                                    else:
+                                        score_val = val
+                                        
+                                # 3. Apply perspective flip (NS-positive -> Acting-side positive)
+                                # Pass score is usually from EV_Contract (NS-relative).
+                                final_score = float(acting_sign) * float(score_val)
+                                try:
+                                    # Debug print to console for tracking
+                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | RawScore: {score_val} | ActingSign: {acting_sign} | Final: {final_score}")
+                                except: pass
+                                return final_score, opt
+
                             details = _fetch_details_cached(bid0)
                             if not details or (details.get("error") or details.get("message")):
                                 return None, opt
@@ -11613,10 +11683,19 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 desc_score = None
 
                             try:
-                                base = float(utility) if utility is not None else float(mean_par)
+                                # Reconstruct utility from perspective of acting side.
+                                # "utility" from eeo is NS-relative (Mean_NS - Penalties).
+                                # We want Acting-relative score.
+                                # Base: Acting_Sign * Mean_Par (NS).
+                                base = float(acting_sign) * float(mean_par)
+                                
                                 desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                                 threat_term = float(opp_threat) if opp_threat is not None else 0.0
                                 score_val = base + float(w_desc) * desc_term - float(w_threat) * threat_term
+                                try:
+                                    # Debug print to console for tracking
+                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | RawMean: {mean_par} | ActingSign: {acting_sign} | Base: {base} | Final: {score_val}")
+                                except: pass
                                 return float(score_val), opt
                             except Exception:
                                 return None, opt
@@ -11646,6 +11725,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 best_opt = opt
                         if best_opt is None:
                             best_opt = passed_opts[0]
+                            best_score = 0.0
 
                         next_bid = str(best_opt.get("bid", "") or "").strip().upper()
                         if not next_bid:
@@ -11654,7 +11734,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         auc = f"{auc}-{next_bid}" if auc else next_bid
                         auc = normalize_auction_input(auc).upper() if auc else ""
                         elapsed_ms = (time.perf_counter() - t_step0) * 1000
-                        debug_step.update({"choice": next_bid})
+                        debug_step.update({"choice": next_bid, "score": best_score, "acting_sign": acting_sign})
                         elapsed_steps.append({"bid": next_bid, "elapsed_ms": round(elapsed_ms, 1), **debug_step})
                         if best_is_complete:
                             break
@@ -11679,18 +11759,22 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         pass
                     try:
                         if elapsed_steps:
-                            lines = ["AI Model elapsed per bid:"]
+                            lines = ["AI Model Step Details:"]
                             for j, t in enumerate(elapsed_steps[:60], start=1):
                                 if not isinstance(t, dict):
                                     continue
                                 b = str(t.get("bid", "") or "").strip().upper()
                                 ms = t.get("elapsed_ms")
+                                score = t.get("score")
+                                sign = t.get("acting_sign")
                                 try:
                                     ms_f = float(ms) if ms is not None else None
                                 except Exception:
                                     ms_f = None
                                 if b and ms_f is not None:
-                                    lines.append(f"- {j}. `{b}`: {ms_f:.0f} ms")
+                                    score_s = f"{score:.1f}" if score is not None else "?"
+                                    sign_s = f"{sign:+.0f}" if sign is not None else "?"
+                                    lines.append(f"- {j}. `{b}`: {ms_f:.0f} ms | Score: {score_s} (Sign: {sign_s})")
                             ai_model_times_placeholder.markdown("\n".join(lines))
                     except Exception:
                         pass

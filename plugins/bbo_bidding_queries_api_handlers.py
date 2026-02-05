@@ -10879,6 +10879,16 @@ def handle_ai_model_advanced_path(
         except Exception:
             return str(dealer or "N").upper()
 
+    def _is_underspecified_criteria(criteria_list: list[str]) -> bool:
+        """Check if criteria list is underspecified (missing both HCP and Total_Points)."""
+        if not criteria_list:
+            return False
+        for crit in criteria_list:
+            crit_upper = str(crit).upper()
+            if "HCP" in crit_upper or "TOTAL_POINTS" in crit_upper:
+                return False
+        return True
+
     tokens: List[str] = []
     steps_detail: List[Dict[str, Any]] = []
 
@@ -10939,8 +10949,10 @@ def handle_ai_model_advanced_path(
             bid0 = str(opt.get("bid", "") or "").strip().upper()
             if not bid0:
                 continue
+            # Handle Pass specially: store it for later fallback AND add to candidates to compete in scoring
             if bid0 in ("P", "PASS"):
                 pass_opt = opt
+                candidates.append(opt)
                 continue
             bt_idx = opt.get("bt_index")
             if bt_idx is None:
@@ -10948,6 +10960,11 @@ def handle_ai_model_advanced_path(
             crits = opt.get("agg_expr", []) or []
             is_dead_end = bool(opt.get("is_dead_end", False))
             has_empty_criteria = not crits
+            
+            # WORKAROUND: Invalidate bids with underspecified criteria (missing HCP and Total_Points)
+            if _is_underspecified_criteria(crits):
+                continue
+
             # Do NOT reject on can_complete yet; only after pass.
             if is_dead_end or has_empty_criteria:
                 continue
@@ -10976,22 +10993,39 @@ def handle_ai_model_advanced_path(
             continue
 
         # Criteria pass batch for these candidates.
-        checks = [{"seat": int(seat_bt), "criteria": list((o.get("agg_expr") or []))} for o in candidates]
+        # Pass always passes criteria check.
+        checks = [
+            {"seat": int(seat_bt), "criteria": list((o.get("agg_expr") or []))}
+            for o in candidates
+            if str(o.get("bid", "")).strip().upper() not in ("P", "PASS")
+        ]
+        
         passed_opts: List[Dict[str, Any]] = []
         try:
             pass_resp = handle_deal_criteria_pass_batch(state, int(deal_row_idx), dealer_rot, checks)
             results = pass_resp.get("results", []) or []
-            for i_res, r0 in enumerate(results[: len(candidates)]):
-                if not bool((r0 or {}).get("passes", False)):
+            
+            # Re-merge results with candidates (Pass automatically passes)
+            check_idx = 0
+            for opt in candidates:
+                bid0 = str(opt.get("bid", "")).strip().upper()
+                if bid0 in ("P", "PASS"):
+                    passed_opts.append(opt)
                     continue
-                opt = candidates[i_res]
-                can_complete = opt.get("can_complete")
-                can_complete_b = bool(can_complete) if can_complete is not None else True
-                if not can_complete_b:
-                    continue
-                passed_opts.append(opt)
+                
+                # Check result for non-pass
+                if check_idx < len(results):
+                    r0 = results[check_idx]
+                    check_idx += 1
+                    if bool((r0 or {}).get("passes", False)):
+                        can_complete = opt.get("can_complete")
+                        can_complete_b = bool(can_complete) if can_complete is not None else True
+                        if can_complete_b:
+                            passed_opts.append(opt)
         except Exception:
-            passed_opts = []
+            # Fallback: if batch fail, assume all pass? Or fail safe?
+            # Let's keep Pass at minimum.
+            passed_opts = [o for o in candidates if str(o.get("bid", "")).strip().upper() in ("P", "PASS")]
 
         step_rec["pass"] = int(len(passed_opts))
 
@@ -11006,6 +11040,12 @@ def handle_ai_model_advanced_path(
             continue
 
         # If only one passing bid, take it (no scoring).
+        # EXCEPTION: If the one passing bid is Pass, but we also have Pass in candidates...
+        # Actually we just want to ensure we score if there's a choice.
+        # But if only 1 valid move, we must take it.
+        # Wait - if 'Pass' is the only valid move, we take it.
+        # If '2D' is the only valid move, we take it.
+        # If 'Pass' and '2D' are valid, we score both.
         if len(passed_opts) == 1:
             bid1 = str(passed_opts[0].get("bid", "") or "").strip().upper()
             if not bid1:
@@ -11015,6 +11055,19 @@ def handle_ai_model_advanced_path(
             step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
             steps_detail.append(step_rec)
             continue
+        
+        # PERSPECTIVE: determine acting side sign (+1 for NS, -1 for EW acting)
+        acting_sign = 1.0
+        try:
+            # Use deal_row dealer
+            dealer_actual = str(deal_row.get("Dealer", "N")).upper()
+            directions = ["N", "E", "S", "W"]
+            dealer_idx = directions.index(dealer_actual) if dealer_actual in directions else 0
+            # Seat 1 is dealer, Seat 2 is LHO, etc.
+            acting_dir = directions[(dealer_idx + int(seat_display) - 1) % 4]
+            acting_sign = 1.0 if acting_dir in ("N", "S") else -1.0
+        except Exception:
+            acting_sign = 1.0
 
         # Score top-N passing bids via bid-details.
         def _seed_key(o: Dict[str, Any]) -> Tuple[float, float, float]:
@@ -11034,6 +11087,49 @@ def handle_ai_model_advanced_path(
             bid1 = str(opt.get("bid", "") or "").strip().upper()
             if not bid1:
                 return float("-inf"), "", 0.0, 0.0, False
+            
+            # Handle Pass (not BT-backed)
+            if bid1 in ("P", "PASS"):
+                score_val: float | None = None
+                
+                # 1. Try exact EV from pinned deal
+                try:
+                    # Construct potential full auction with Pass
+                    # We are at `auction_full` + `bid1`
+                    current_toks = tokens + [bid1]
+                    
+                    # Logic to complete auction with passes
+                    # (Mirror _append_passes_to_complete)
+                    trailing = 0
+                    for t in reversed(current_toks):
+                        if t == "P": trailing += 1
+                        else: break
+                    has_non_pass = any(t != "P" for t in current_toks)
+                    needed = max(0, 4 - len(current_toks)) if not has_non_pass else max(0, 3 - trailing)
+                    completed_auc = "-".join(current_toks + ["P"] * needed)
+                    
+                    # Use precomputed EV if available
+                    ev_raw = get_ev_for_auction_pre(completed_auc, dealer_actual, deal_row)
+                    if ev_raw is not None:
+                        score_val = float(ev_raw)
+                except Exception:
+                    pass
+                
+                # 2. Fallback to avg_ev proxy
+                if score_val is None:
+                    try:
+                        val = float(opt.get("avg_ev")) if opt.get("avg_ev") is not None else float("-inf")
+                        if val == float("-inf"):
+                            score_val = 0.0
+                        else:
+                            score_val = val
+                    except:
+                        score_val = 0.0
+                
+                # 3. Apply perspective flip
+                final_score = float(acting_sign) * float(score_val)
+                return final_score, bid1, 0.0, 0.0, False
+
             details = handle_bid_details(
                 state=state,
                 auction=str(auction_full or ""),
@@ -11111,7 +11207,12 @@ def handle_ai_model_advanced_path(
                 desc_score = None
 
             try:
-                base = float(utility) if utility is not None else float(mean_par)
+                # Reconstruct utility from perspective of acting side.
+                # "utility" from eeo is NS-relative (Mean_NS - Penalties).
+                # We want Acting-relative score.
+                # Base: Acting_Sign * Mean_Par (NS).
+                base = float(acting_sign) * float(mean_par)
+                
                 desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                 threat_term = float(opp_threat) if opp_threat is not None else 0.0
                 score_val = base + float(w_desc) * desc_term - float(w_threat) * threat_term
@@ -11159,6 +11260,8 @@ def handle_ai_model_advanced_path(
 
         tokens.append(best_bid)
         step_rec["choice"] = best_bid
+        step_rec["score"] = best_score
+        step_rec["acting_sign"] = acting_sign
         step_rec["scored_n"] = int(len(passed_sorted))
         step_rec["bid_details_calls"] = int(bd_calls)
         step_rec["bid_details_cache_hits"] = int(bd_hits)
