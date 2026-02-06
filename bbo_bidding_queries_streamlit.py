@@ -6119,6 +6119,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             help="Maximum deals to show in matching deals list"
         )
 
+        max_bt_criteria_deals = st.number_input(
+            "Max BT Criteria Deals",
+            value=2000,
+            min_value=1,
+            max_value=20000,
+            help="Maximum deals to show for BT criteria-matching deal sets (backs the 'Deals' column for a next bid).",
+        )
+
         max_best_auctions = st.number_input(
             "Max Best Auctions",
             value=25,
@@ -8650,7 +8658,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "Error": str(e),
                                     "Score": None,
                                     "U": None,
-                                    "MeanPar": None,
+                                    "ParMean_NS": None,
+                                    "ParMean_Act": None,
                                     "P>=0%": None,
                                     "Ent": None,
                                     "Tail": None,
@@ -8675,7 +8684,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "Flags": "",
                                     "Score": None,
                                     "U": None,
-                                    "MeanPar": None,
+                                    "ParMean_NS": None,
+                                    "ParMean_Act": None,
                                     "P>=0%": None,
                                     "Ent": None,
                                     "Tail": None,
@@ -8803,9 +8813,15 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "Error": "",
                                 "BTI": details.get("child_bt_index"),
                                 "Flags": flags_s,
+                                # Show the bid-details vulnerability filter in effect (explains mean shifts).
+                                "VulFilter": vul_filter_val,
                                 "Score": score,
                                 "U": utility,
-                                "MeanPar": (float(acting_sign_adv) * float(mean_par)) if isinstance(mean_par, (int, float)) else mean_par,
+                                # Make ParScore mean explicit (users expect to see this).
+                                # - ParMean_NS: raw par_score.mean from /bid-details (NS-positive).
+                                # - ParMean_Act: acting-seat perspective (positive = good for bidder).
+                                "ParMean_NS": float(mean_par) if isinstance(mean_par, (int, float)) else mean_par,
+                                "ParMean_Act": (float(acting_sign_adv) * float(mean_par)) if isinstance(mean_par, (int, float)) else mean_par,
                                 "P>=0%": (float(p_ok) * 100.0) if isinstance(p_ok, (int, float)) else None,
                                 "Ent": entropy,
                                 "Tail": tail,
@@ -8815,6 +8831,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "FitUs": fit_us_best,
                                 "TopPar": top_contract,
                                 "TopPar%": (float(top_prob) * 100.0) if isinstance(top_prob, (int, float)) else None,
+                                # Show sample sizes used by /bid-details.
                                 "n": details.get("matched_deals_total_excluding_pinned", details.get("matched_deals_total")),
                                 "Sampled": details.get("matched_deals_sampled"),
                                 "Degraded": details.get("degraded_mode"),
@@ -8868,9 +8885,15 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     pass_row_dict = {
                         "Bid": "P",
                         "Error": f"Synthetic row: Pass is not BT-backed (no /bid-details evidence); {pass_note}.",
+                        "VulFilter": vul_filter_val,
                         "Score": pass_score,
                         "U": None,
-                        "MeanPar": (
+                        "ParMean_NS": (
+                            float(pr.get("Avg_Par"))
+                            if isinstance(pr, dict) and isinstance(pr.get("Avg_Par"), (int, float))
+                            else (pr.get("Avg_Par") if isinstance(pr, dict) else None)
+                        ),
+                        "ParMean_Act": (
                             (float(acting_sign_adv) * float(pr.get("Avg_Par")))
                             if isinstance(pr, dict) and isinstance(pr.get("Avg_Par"), (int, float))
                             else (pr.get("Avg_Par") if isinstance(pr, dict) else None)
@@ -11689,12 +11712,30 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 # Base: Acting_Sign * Mean_Par (NS).
                                 base = float(acting_sign) * float(mean_par)
                                 
+                                # Bayesian Shrinkage for low-N bids
+                                # N < 5 is penalized by shrinking score towards 0.
+                                # Effective_Score = (Total_Score + K*Prior) / (N + K)
+                                # Assuming Prior=0.
+                                matched_n = float(details.get("matched_deals_total_excluding_pinned") or details.get("matched_deals_total") or 0.0)
+                                shrinkage_k = 5.0
+                                # Apply shrinkage to the base par score (which is the main driver of variance)
+                                # Note: base can be negative. Shrinking towards 0 is conservative.
+                                # But if base is huge positive (600), shrinking it reduces it.
+                                # If base is huge negative (-800), shrinking it makes it closer to 0 (less bad).
+                                # Wait - shrinking a negative score makes it "better". 
+                                # Is "less bad" what we want for uncertain negative bids?
+                                # A bid that is -800 on 1 hand might be -100 on average.
+                                # A bid that is +600 on 1 hand might be +100 on average.
+                                # So shrinking towards 0 is correct: we distrust extremes from small samples.
+                                base_shrunk = (base * matched_n) / (matched_n + shrinkage_k)
+                                
                                 desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                                 threat_term = float(opp_threat) if opp_threat is not None else 0.0
-                                score_val = base + float(w_desc) * desc_term - float(w_threat) * threat_term
+                                # Use shunk base
+                                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term
                                 try:
                                     # Debug print to console for tracking
-                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | RawMean: {mean_par} | ActingSign: {acting_sign} | Base: {base} | Final: {score_val}")
+                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | N: {matched_n} | RawMean: {mean_par} | ActingSign: {acting_sign} | Base: {base} | ShrunkBase: {base_shrunk} | Final: {score_val}")
                                 except: pass
                                 return float(score_val), opt
                             except Exception:
@@ -12302,8 +12343,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         # Handle row selection - show matching deals for selected step
         # render_aggrid returns a list of selected rows directly
         selected_step_auction: str | None = None
+        selected_step_row: dict[str, Any] | None = None
         if summary_selection and len(summary_selection) > 0:
             row0 = summary_selection[0] or {}
+            if isinstance(row0, dict):
+                selected_step_row = dict(row0)
             # Prefer the exact partial auction stored in the row (robust to sorts/filters).
             sel_partial = row0.get("_partial_auction")
             if isinstance(sel_partial, str) and sel_partial.strip():
@@ -12325,7 +12369,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
         # Matching Deals section - shown when a row is selected or when auction is complete
         if selected_step_auction is not None:
             display_auction = selected_step_auction
-            st.subheader("🎯 Matching Deals")
+            st.subheader("🎯 Deals Where Auction Matches Actual Auction")
             # Check if the selected auction is a *completed* auction.
             #
             # IMPORTANT:
@@ -12335,10 +12379,20 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
             is_selected_complete = display_auction.upper().endswith("-P-P-P") or (
                 bool(is_complete) and display_auction == current_auction
             )
+            # NOTE: These are always matching against the deal dataset's *actual auction* column.
+            # We vary only the *pattern* based on which auction (Actual/Built/AI/Cheater) the user
+            # selected in Completed Auction Summary.
+            src_label = str(detail_source or "Selected").strip() or "Selected"
             if is_selected_complete:
-                st.caption(f"Deals where the actual auction matches: **{display_auction}**")
+                if src_label.upper() == "ACTUAL":
+                    st.caption(f"Deals where the deal's actual auction matches: **{display_auction}**")
+                else:
+                    st.caption(f"Deals where the deal's actual auction matches the {src_label} auction: **{display_auction}**")
             else:
-                st.caption(f"Deals where the actual auction starts with: **{display_auction}**")
+                if src_label.upper() == "ACTUAL":
+                    st.caption(f"Deals where the deal's actual auction starts with: **{display_auction}**")
+                else:
+                    st.caption(f"Deals where the deal's actual auction starts with the {src_label} prefix: **{display_auction}**")
             
             # Use display_auction for cache key (changes when row is selected)
             display_deals_cache_key = f"auction_builder_deals_{display_auction}_{max_matching_deals}_{seed}"
@@ -12495,6 +12549,74 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     except Exception as e:
                         st.error(f"Error fetching deals: {e}")
 
+            # -------------------------------------------------------------------
+            # NEW: BT criteria-matching deals (backs the 'Deals' column).
+            # -------------------------------------------------------------------
+            try:
+                if pinned_deal and selected_step_row is not None:
+                    deals_raw = selected_step_row.get("Deals")
+                    try:
+                        deals_i = int(deals_raw) if deals_raw not in ("", None) else None
+                    except Exception:
+                        deals_i = None
+
+                    toks = [t.strip().upper() for t in str(display_auction or "").split("-") if t.strip()]
+                    last_call = toks[-1] if toks else ""
+                    is_contract_like = bool(last_call and len(last_call) >= 2 and last_call[0].isdigit())
+                    if deals_i is not None and deals_i > 0 and is_contract_like and len(toks) >= 1:
+                        prefix_before = "-".join(toks[:-1]).strip("-")
+                        bid_call = last_call
+
+                        # Parity with BT: strip leading passes from the prefix before traversal.
+                        try:
+                            bt_prefix, _lp = _strip_leading_passes(prefix_before)
+                        except Exception:
+                            bt_prefix = prefix_before
+
+                        st.subheader("🧩 Deals Matching Auction Criteria")
+                        st.caption(
+                            f"Deals where BT criteria say the next bid `{bid_call}` is valid after prefix `{bt_prefix}`. "
+                            f"(Expected count from 'Deals' column: **{deals_i:,}**.)"
+                        )
+
+                        bt_cache_key = f"auction_builder_bt_criteria_deals__{bt_prefix}__{bid_call}__{int(max_bt_criteria_deals)}__{int(seed)}"
+                        if bt_cache_key not in st.session_state:
+                            st.session_state[bt_cache_key] = None
+
+                        if st.session_state.get(bt_cache_key) is None:
+                            with st.spinner("Fetching BT criteria-matching deals..."):
+                                resp = api_post(
+                                    "/deals-matching-next-bid-criteria",
+                                    {
+                                        "auction_prefix": bt_prefix,
+                                        "bid": bid_call,
+                                        "max_rows": int(max_bt_criteria_deals),
+                                        "seed": int(seed),
+                                    },
+                                    timeout=60,
+                                )
+                                st.session_state[bt_cache_key] = resp
+
+                        resp = st.session_state.get(bt_cache_key) or {}
+                        rows = resp.get("rows") or []
+                        total_count = resp.get("total_count")
+                        if rows:
+                            try:
+                                total_s = f"{int(total_count):,}" if isinstance(total_count, (int, float)) else "?"
+                            except Exception:
+                                total_s = "?"
+                            st.info(f"Showing **{len(rows):,}** of **{total_s}** BT criteria-matching deals.")
+                            render_aggrid(
+                                pl.DataFrame(rows),
+                                key=f"auction_builder_bt_criteria_deals_grid_{bt_prefix}_{bid_call}",
+                                height=calc_grid_height(len(rows), max_height=400),
+                                table_name="auction_builder_bt_criteria_deals",
+                            )
+                        else:
+                            st.info("No deals returned for this BT criteria set (or request failed).")
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Main UI – function selector and controls
@@ -12504,10 +12626,10 @@ st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
 func_choice = st.sidebar.selectbox(
     "Function",
     [
+        "Auction Builder",               # Build auction step-by-step with BT lookups
         "Deals by Auction Pattern",      # Primary: find deals matching auction criteria
         "Analyze Actual Auctions",       # Group deals by bid column, analyze outcomes
         "Bidding Arena",                 # Head-to-head model comparison
-        "Auction Builder",               # Build auction step-by-step with BT lookups
         "Auction Criteria Debugger",     # Debug why an auction is rejected
         "New Rules Metrics",             # View detailed rule discovery metrics
         "Wrong Bid Analysis",            # Wrong bid statistics and leaderboard

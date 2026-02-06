@@ -1364,6 +1364,15 @@ class ListNextBidsRequest(BaseModel):
     vulnerable: Optional[str] = None  # None/NS/EW/All (PBN-style; aliases accepted in UI)
 
 
+class DealsMatchingNextBidCriteriaRequest(BaseModel):
+    """Request deals that comprise the BT criteria-based 'Deals' count for a next bid."""
+    auction_prefix: str = ""  # Auction prefix (BT-canonical; leading passes should be stripped)
+    bid: str                  # Candidate next bid (e.g. "5C")
+    max_rows: int = 5000      # Max rows to return (may sample if total_count > max_rows)
+    seed: Optional[int] = 0
+    columns: Optional[list[str]] = None  # Optional override of output columns
+
+
 class RankBidsByEVRequest(BaseModel):
     """Request for Rank Next Bids by EV: rank all possible next bids after an auction by EV."""
     auction: str = ""  # Auction prefix (empty = opening bids)
@@ -3913,6 +3922,26 @@ def list_next_bids(req: ListNextBidsRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         _log_and_raise("list-next-bids", e)
+
+
+@app.post("/deals-matching-next-bid-criteria")
+def deals_matching_next_bid_criteria(req: DealsMatchingNextBidCriteriaRequest) -> Dict[str, Any]:
+    """Return the deals that comprise the BT criteria-based 'Deals' count for a next bid."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_deals_matching_next_bid_criteria(
+            state=state,
+            auction_prefix=str(req.auction_prefix or ""),
+            bid=str(req.bid or ""),
+            max_rows=int(req.max_rows),
+            seed=int(req.seed or 0),
+            columns=list(req.columns) if req.columns else None,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log_and_raise("deals-matching-next-bid-criteria", e)
 
 
 @app.post("/rank-bids-by-ev")

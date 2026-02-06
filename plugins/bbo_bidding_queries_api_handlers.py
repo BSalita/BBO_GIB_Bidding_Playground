@@ -648,6 +648,75 @@ def _compute_deal_count_with_base_mask(
     return int(final_mask.sum())
 
 
+def _compute_deal_mask_with_base_mask(
+    state: dict[str, Any],
+    base_mask: "pl.Series | None",
+    bt_row: dict[str, Any],
+    seat: int,
+) -> "pl.Series | None":
+    """Compute deal mask by intersecting base_mask with new seat's criteria.
+
+    This mirrors `_compute_deal_count_with_base_mask`, but returns the boolean mask so callers
+    can sample the actual deals that comprise the "Deals" count shown in the UI.
+    """
+    deal_df = state.get("deal_df")
+    deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
+    if deal_df is None:
+        return None
+
+    seat_i = max(1, min(4, int(seat)))
+    criteria_list = bt_row.get(f"Agg_Expr_Seat_{seat_i}") or []
+
+    # If no new criteria, return the base mask (or all deals if no base mask).
+    if not criteria_list:
+        if base_mask is not None:
+            return base_mask
+        try:
+            return pl.Series([True] * int(deal_df.height))
+        except Exception:
+            return None
+
+    seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat_i, {})
+    if not seat_criteria_for_seat:
+        return base_mask
+
+    # Find valid criteria
+    sample_criteria_df = None
+    for dealer in DIRECTIONS:
+        sample_criteria_df = seat_criteria_for_seat.get(dealer)
+        if sample_criteria_df is not None and not sample_criteria_df.is_empty():
+            break
+    if sample_criteria_df is None:
+        return base_mask
+
+    available_cols = set(sample_criteria_df.columns)
+    valid_criteria = [c for c in criteria_list if c in available_cols]
+    if not valid_criteria:
+        return base_mask
+
+    dealer_series = deal_df["Dealer"]
+    new_seat_mask: pl.Series | None = None
+    for dealer in DIRECTIONS:
+        dealer_mask = dealer_series == dealer
+        if not dealer_mask.any():
+            continue
+        seat_criteria_df = seat_criteria_for_seat.get(dealer)
+        if seat_criteria_df is None or seat_criteria_df.is_empty():
+            continue
+        combined = dealer_mask
+        for crit in valid_criteria:
+            combined = combined & seat_criteria_df[crit]
+            if not combined.any():
+                combined = None
+                break
+        if combined is not None:
+            new_seat_mask = combined if new_seat_mask is None else (new_seat_mask | combined)
+
+    if new_seat_mask is None:
+        return None
+    return (base_mask & new_seat_mask) if base_mask is not None else new_seat_mask
+
+
 def _compute_seat_stats_for_bt_row(
     state: dict[str, Any],
     bt_row: dict[str, Any],
@@ -7382,6 +7451,169 @@ def handle_list_next_bids(
     return resp
 
 
+def handle_deals_matching_next_bid_criteria(
+    state: Dict[str, Any],
+    *,
+    auction_prefix: str,
+    bid: str,
+    max_rows: int = 5000,
+    seed: int = 0,
+    columns: list[str] | None = None,
+) -> Dict[str, Any]:
+    """Return deals that comprise the BT criteria-based "Deals" count for a next bid.
+
+    This mirrors the semantics used by `/list-next-bids` when `include_deal_counts=True`:
+    - Build a base mask from the parent BT node's cumulative criteria (all seats).
+    - AND the candidate next bid's acting-seat criteria mask.
+
+    IMPORTANT:
+    - This is NOT "deals whose actual auction includes this bid".
+    - This is "deals where BT criteria say this bid is valid at this prefix".
+    """
+    t0 = time.perf_counter()
+    deal_df = state.get("deal_df")
+    bt_seat1_file = state.get("bt_seat1_file")
+    if not isinstance(deal_df, pl.DataFrame) or deal_df.is_empty():
+        raise ValueError("deal_df not loaded")
+    if not bt_seat1_file:
+        raise ValueError("bt_seat1_file not loaded")
+
+    prefix = normalize_auction_input(auction_prefix or "").rstrip("-")
+    bid_norm = str(bid or "").strip().upper()
+    if not bid_norm:
+        raise ValueError("bid is required")
+
+    # Only BT-backed bids here (Pass/doubles have no BT row).
+    if bid_norm in ("P", "PASS", "X", "D", "DBL", "DOUBLE", "XX", "R", "RDBL", "REDOUBLE"):
+        return {
+            "auction_prefix": prefix,
+            "bid": bid_norm,
+            "total_count": 0,
+            "rows": [],
+            "message": f"Bid {bid_norm!r} is not BT-backed for criteria deal sets.",
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    # Parent bt_index
+    parent_bt_index = -1 if not prefix else _resolve_bt_index_by_traversal(state, prefix)
+    if parent_bt_index is None:
+        return {
+            "auction_prefix": prefix,
+            "bid": bid_norm,
+            "total_count": 0,
+            "rows": [],
+            "error": f"Auction prefix {prefix!r} not found in BT (traversal failed)",
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    # Next seat (BT canonical, assumes prefix has no leading passes)
+    next_seat = 1 if not prefix else (len(prefix.split("-")) % 4) + 1
+
+    # Base mask from parent cumulative criteria (for accurate "Deals" semantics).
+    base_mask: pl.Series | None = None
+    if parent_bt_index >= 0:
+        agg_data = _load_agg_expr_for_bt_indices([int(parent_bt_index)], bt_seat1_file)
+        if int(parent_bt_index) in agg_data:
+            parent_row: Dict[str, Any] = {"bt_index": int(parent_bt_index)}
+            parent_row.update(agg_data[int(parent_bt_index)])
+            parent_row = _apply_all_rules_to_bt_row(parent_row, state)
+            base_mask = _compute_cumulative_deal_mask(state, parent_row, 4)
+
+    # Resolve candidate bt_row for this next bid from parent's children.
+    if parent_bt_index < 0:
+        return {
+            "auction_prefix": prefix,
+            "bid": bid_norm,
+            "total_count": 0,
+            "rows": [],
+            "error": "Opening prefix not supported for criteria-deals endpoint (use list-next-bids + bid-details instead).",
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    rows_by_bid = _get_next_bt_rows_for_parent(state, int(parent_bt_index))
+    if not rows_by_bid:
+        return {
+            "auction_prefix": prefix,
+            "bid": bid_norm,
+            "total_count": 0,
+            "rows": [],
+            "error": "BT lookup returned no candidate rows for this parent (cached expansion empty)",
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+    bt_row = rows_by_bid.get(bid_norm)
+    if bt_row is None:
+        return {
+            "auction_prefix": prefix,
+            "bid": bid_norm,
+            "total_count": 0,
+            "rows": [],
+            "error": f"Bid {bid_norm!r} not found among next-bid candidates for this auction prefix",
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    # Ensure Agg_Expr columns exist (Expr is acting-seat per-step criteria).
+    row_dict = dict(bt_row)
+    for s in range(1, 5):
+        col_s = f"Agg_Expr_Seat_{s}"
+        if col_s not in row_dict or row_dict[col_s] is None:
+            row_dict[col_s] = row_dict.get("Expr") if s == int(next_seat) else []
+    row_with_rules = _apply_all_rules_to_bt_row(row_dict, state)
+
+    final_mask = _compute_deal_mask_with_base_mask(state, base_mask, row_with_rules, int(next_seat))
+    if final_mask is None or not final_mask.any():
+        return {
+            "auction_prefix": prefix,
+            "bid": bid_norm,
+            "total_count": 0,
+            "rows": [],
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    matched_df = deal_df.filter(final_mask)
+    total_count = int(matched_df.height)
+
+    # Column selection (keep payload bounded)
+    default_cols = [
+        "_row_idx",
+        "index",
+        "Dealer",
+        "Vul",
+        "Hand_N",
+        "Hand_E",
+        "Hand_S",
+        "Hand_W",
+        "ParScore",
+        "Contract",
+        "Result",
+        "Score",
+        "bid",
+    ]
+    cols = columns or default_cols
+    # Ensure _row_idx exists
+    if "_row_idx" not in matched_df.columns:
+        matched_df = matched_df.with_row_index("_row_idx")
+    cols_in = [c for c in cols if c in matched_df.columns]
+    if cols_in:
+        matched_df = matched_df.select(cols_in)
+
+    max_rows_i = max(1, int(max_rows or 0))
+    if max_rows_i and matched_df.height > max_rows_i:
+        try:
+            matched_df = matched_df.sample(n=max_rows_i, seed=int(seed or 0))
+        except Exception:
+            matched_df = matched_df.head(max_rows_i)
+
+    rows_out = matched_df.to_dicts()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "auction_prefix": prefix,
+        "bid": bid_norm,
+        "total_count": total_count,
+        "rows": rows_out,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Rank Next Bids by EV – Rank next bids after an auction by Expected Value
 # ---------------------------------------------------------------------------
@@ -11213,9 +11445,15 @@ def handle_ai_model_advanced_path(
                 # Base: Acting_Sign * Mean_Par (NS).
                 base = float(acting_sign) * float(mean_par)
                 
+                # Bayesian Shrinkage for low-N bids
+                matched_n = float(details.get("matched_deals_total_excluding_pinned") or details.get("matched_deals_total") or 0.0)
+                shrinkage_k = 5.0
+                base_shrunk = (base * matched_n) / (matched_n + shrinkage_k)
+                
                 desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                 threat_term = float(opp_threat) if opp_threat is not None else 0.0
-                score_val = base + float(w_desc) * desc_term - float(w_threat) * threat_term
+                # Use shrunk base
+                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term
                 return float(score_val), bid1, d_ms, p2_ms, hit
             except Exception:
                 return float("-inf"), bid1, d_ms, p2_ms, hit
