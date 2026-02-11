@@ -1,35 +1,61 @@
 """
-BT EV/Par Statistics + Inverted Index - GPU Accelerated (NV/V Split)
+BT EV/Par Statistics + Hand Stats + DD Means - GPU Accelerated (NV/V Split)
 
-Takes 6 hours to run on a RTX 5080 with 16GB VRAM. 100GB of RAM.
+Installation: (has been problematic)
+  pip uninstall torch torchvision
+  pip install -U torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
-Computes per-BT-row aggregate statistics SPLIT BY VULNERABILITY using 
-GPU-accelerated histogram cube matching.
+Estimated runtime: ~12-16 hours on RTX 5080 with 16GB VRAM. ~100-115GB peak RAM.
+
+Single-pass architecture (2026-02-10, optimized from v2 two-pass):
+  8 vul-split cubes, 47 ops/batch — EV + hand stats + DD means in one traversal.
+  NV+V stats are summed in the combination step.  Combined cubes eliminated.
+  Cube tensors uploaded to GPU once per (direction, vul) and reused across all
+  BT-row chunks — eliminates hundreds of redundant CPU→GPU transfers.
+  Batch size 4000 (up from 1000) for better GPU utilization.
+
+Memory optimization (2026-02-07):
+  Processes one cube at a time instead of all 8 simultaneously.
+  With 461M BT rows, this reduces peak RAM from ~1.1 TB to ~96 GB per task
+  (~100-115 GB total including bounds cache + cubes + overhead).
+  dd_sums use int32 (max value ≈ 208M, fits int32) saving ~37 GB per task.
+  dim_sums use int32 and min/max use uint8 to further reduce RAM + checkpoint IO.
+
+Computes per-BT-row aggregate statistics using GPU-accelerated histogram cube
+matching. Consolidates work previously done by bbo_bt_compute_stats.py and
+bbo_build_cube.py into a single pipeline.
 
 Features:
 - GPU acceleration via PyTorch (RTX 5080)
 - Histogram cube for efficient aggregation (16M deals → ~7K buckets per vul)
-- Vulnerability split: separate NV and V statistics per seat
+- Vulnerability split: separate NV and V statistics for EV/Par/Count per seat
+- Hand statistics: mean/std/min/max for HCP, SL, Total_Points per seat (not vul-split)
+- DD trick means: average DD tricks per declarer per strain per seat (seat-relative, not vul-split)
+- Total_Points criteria matching (6th cube dimension, deterministic from HCP+SL)
 - Progress indicators (tqdm)
 - Restartable via checkpoints
 - Memory-efficient chunked processing
 
-Expected runtime: ~7 hours for stats only
+Expected runtime: ~12-16 hours (single merged pass on 8 vul-split cubes)
 
-Output Schema (24 columns):
+Output Schema (~205 columns):
 - bt_index: BT row identifier
 - Count_S{1-4}_NV, Count_S{1-4}_V: Deal counts per seat, split by vulnerability
 - Avg_Par_S{1-4}_NV, Avg_Par_S{1-4}_V: Average ParScore per seat, split by vulnerability
 - Avg_EV_S{1-4}_NV, Avg_EV_S{1-4}_V: Average EV per seat, split by vulnerability
+- matching_deal_count_S{1-4}: Combined deal count per seat (NV+V, all directions)
+- {HCP,SL_C,SL_D,SL_H,SL_S,Total_Points}_{mean,std}_S{1-4}: Hand stat means/stds (Float32)
+- {HCP,SL_C,SL_D,SL_H,SL_S,Total_Points}_{min,max}_S{1-4}: Hand stat min/max (UInt8)
+- DD_S{1-4}_{C,D,H,S,N}_mean_S{1-4}: Mean DD tricks per declarer-seat/strain (Float32, seat-relative)
 
 Output Files:
-- bt_ev_par_stats_gpu.parquet: Per-BT stats with NV/V splits
+- bt_ev_par_stats_gpu_v3.parquet: Per-BT stats with NV/V splits + hand stats + seat-relative DD means
 
 Usage:
-    python bbo_bt_ev_gpu.py                           # Stats only (~7 hrs)
+    python bbo_bt_ev_gpu.py                           # Full pipeline (~12-16 hours)
     python bbo_bt_ev_gpu.py --resume                  # Resume from checkpoint
     python bbo_bt_ev_gpu.py --max-bt-rows 1000000     # Test run
-    python bbo_bt_ev_gpu.py --build-index             # DEPRECATED - do not use
+    python bbo_bt_ev_gpu.py --build-index             # DEPRECATED/disabled (ignored)
 
 -------------------------------------------------------------------------------
 INVERTED INDEX: DEPRECATED - To be removed in future version
@@ -111,17 +137,37 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 DIRECTIONS = ["N", "E", "S", "W"]
-METRICS = ["HCP", "SL_S", "SL_H", "SL_D", "SL_C"]  # 5 dimensions for cube
+METRICS = ["HCP", "SL_S", "SL_H", "SL_D", "SL_C", "Total_Points"]  # 6 dimensions for cube
 CHECKPOINT_INTERVAL = 1_000_000  # Save every 1M BT rows
-BATCH_SIZE = 1_000  # BT rows per GPU batch (tune based on VRAM)
+BATCH_SIZE = 4_000  # BT rows per GPU batch — larger batches reduce per-batch Python/CUDA overhead
 BT_CHUNK_SIZE = 5_000_000  # Process BT in 5M row chunks to avoid memory explosion
+BOUNDS_VALIDATE_ROWS = 2_000  # Fail-fast sample check for bounds extraction correctness
+
+# DD trick columns: 4 declarers x 5 strains = 20 columns
+DD_DECLARERS = ["N", "E", "S", "W"]
+DD_STRAINS = ["C", "D", "H", "S", "N"]  # N = NoTrump
+DD_COLS = [f"DD_{decl}_{strain}" for decl in DD_DECLARERS for strain in DD_STRAINS]
 
 # Default paths
 DEFAULT_DEALS_FILE = Path("E:/bridge/data/bbo/data/bbo_mldf_augmented.parquet")
 DEFAULT_BT_FILE = Path("E:/bridge/data/bbo/bidding/bbo_bt_seat1.parquet")
-DEFAULT_OUTPUT_FILE = Path("E:/bridge/data/bbo/bidding/bt_ev_par_stats_gpu.parquet")
+DEFAULT_OUTPUT_FILE = Path("E:/bridge/data/bbo/bidding/bt_ev_par_stats_gpu_v3.parquet")
 DEFAULT_CHECKPOINT_DIR = Path("E:/bridge/data/bbo/bidding/checkpoints_ev_gpu")
 DEFAULT_INDEX_DIR = Path("E:/bridge/data/bbo/bidding/inverted_index")
+
+# Pipeline identity + required checkpoint contents (resume safety)
+PIPELINE_VERSION = "ev_gpu_v3_single_pass_opt_2026-02-11"
+REQUIRED_VUL_RESULT_KEYS = {
+    "bt_indices",
+    "counts",
+    "par_sums",
+    "ev_sums",
+    "dim_sums",
+    "dim_sq_sums",
+    "dim_mins",
+    "dim_maxs",
+    "dd_sums",
+}
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -210,6 +256,31 @@ class CheckpointManager:
         """Save checkpoint state."""
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2, default=str)
+
+    def results_file_vul(self, direction: str, vul: str, seat: int) -> Path:
+        return self.results_dir / f"results_{direction}_{vul}_S{seat}.npz"
+
+    def peek_results_vul_keys(self, direction: str, vul: str, seat: int) -> Optional[set[str]]:
+        """Return key set in a vul checkpoint without loading arrays."""
+        filename = self.results_file_vul(direction, vul, seat)
+        if not filename.exists():
+            return None
+        try:
+            with np.load(filename) as data:
+                return set(data.files)
+        except Exception as e:
+            log(f"  WARNING: Failed to read checkpoint keys: {filename} ({e})")
+            return None
+
+    def has_results_vul(
+        self,
+        direction: str,
+        vul: str,
+        seat: int,
+        required_keys: set[str] = REQUIRED_VUL_RESULT_KEYS,
+    ) -> bool:
+        keys = self.peek_results_vul_keys(direction, vul, seat)
+        return keys is not None and required_keys.issubset(keys)
     
     def save_results(self, direction: str, seat: int, bt_indices: np.ndarray,
                      counts: np.ndarray, par_sums: np.ndarray, ev_sums: np.ndarray) -> None:
@@ -230,18 +301,62 @@ class CheckpointManager:
         return None
     
     def save_results_vul(self, direction: str, vul: str, seat: int, bt_indices: np.ndarray,
-                         counts: np.ndarray, par_sums: np.ndarray, ev_sums: np.ndarray) -> None:
-        """Save intermediate results for a direction/vul/seat."""
+                         counts: np.ndarray, par_sums: np.ndarray, ev_sums: np.ndarray,
+                         dim_sums: Optional[np.ndarray] = None,
+                         dim_sq_sums: Optional[np.ndarray] = None,
+                         dim_mins: Optional[np.ndarray] = None,
+                         dim_maxs: Optional[np.ndarray] = None,
+                         dd_sums: Optional[np.ndarray] = None) -> None:
+        """Save intermediate results for a direction/vul/seat.
+        
+        Extended arrays (all optional for backward compat):
+            dim_sums: (6, n_bt) int32 — weighted sums of 6 cube dimensions
+            dim_sq_sums: (6, n_bt) int64 — weighted sums of squared dimensions
+            dim_mins: (6, n_bt) uint8 — min of each dimension (255 sentinel = no data)
+            dim_maxs: (6, n_bt) uint8 — max of each dimension (0 sentinel = no data)
+            dd_sums: (20, n_bt) int32 — sums of DD trick values
+        """
         filename = self.results_dir / f"results_{direction}_{vul}_S{seat}.npz"
-        np.savez_compressed(filename, 
-                           bt_indices=bt_indices,
-                           counts=counts,
-                           par_sums=par_sums,
-                           ev_sums=ev_sums)
+        save_dict = dict(
+            bt_indices=bt_indices, counts=counts,
+            par_sums=par_sums, ev_sums=ev_sums,
+        )
+        if dim_sums is not None:
+            save_dict["dim_sums"] = dim_sums
+        if dim_sq_sums is not None:
+            save_dict["dim_sq_sums"] = dim_sq_sums
+        if dim_mins is not None:
+            save_dict["dim_mins"] = dim_mins
+        if dim_maxs is not None:
+            save_dict["dim_maxs"] = dim_maxs
+        if dd_sums is not None:
+            save_dict["dd_sums"] = dd_sums
+        np.savez_compressed(filename, **save_dict)  # type: ignore[arg-type]
     
     def load_results_vul(self, direction: str, vul: str, seat: int) -> Optional[Dict]:
         """Load intermediate results if exists (with vul state)."""
         filename = self.results_dir / f"results_{direction}_{vul}_S{seat}.npz"
+        if filename.exists():
+            data = np.load(filename)
+            return {k: data[k] for k in data.files}
+        return None
+    
+    def save_results_combined(self, direction: str, seat: int, bt_indices: np.ndarray,
+                              counts: np.ndarray,
+                              dim_sums: np.ndarray, dim_sq_sums: np.ndarray,
+                              dim_mins: np.ndarray, dim_maxs: np.ndarray,
+                              dd_sums: np.ndarray) -> None:
+        """Save combined (non-vul-split) stats for a direction/seat."""
+        filename = self.results_dir / f"stats_combined_{direction}_S{seat}.npz"
+        np.savez_compressed(filename,
+                            bt_indices=bt_indices, counts=counts,
+                            dim_sums=dim_sums, dim_sq_sums=dim_sq_sums,
+                            dim_mins=dim_mins, dim_maxs=dim_maxs,
+                            dd_sums=dd_sums)
+    
+    def load_results_combined(self, direction: str, seat: int) -> Optional[Dict]:
+        """Load combined stats if exists."""
+        filename = self.results_dir / f"stats_combined_{direction}_S{seat}.npz"
         if filename.exists():
             data = np.load(filename)
             return {k: data[k] for k in data.files}
@@ -270,6 +385,17 @@ class CheckpointManager:
 # Histogram Cube Builder
 # ---------------------------------------------------------------------------
 
+def _compute_dp(sl: int) -> int:
+    """Compute distribution points for a single suit length."""
+    if sl == 0:
+        return 3
+    elif sl == 1:
+        return 2
+    elif sl == 2:
+        return 1
+    return 0
+
+
 def build_histogram_cube(
     deals_file: Path,
     direction: str,
@@ -279,8 +405,16 @@ def build_histogram_cube(
     """
     Build histogram cube for a direction.
     
-    Groups deals by (HCP, SL_S, SL_H, SL_D, SL_C) and pre-aggregates
-    count, ParScore sum, and EV sum.
+    Groups deals by (HCP, SL_S, SL_H, SL_D, SL_C, Total_Points) and pre-aggregates
+    count, ParScore sum, EV sum, and DD trick sums.
+    
+    Total_Points is the 6th cube dimension. Since TP = HCP + distribution_points
+    and DP is deterministic from suit lengths, adding TP as a GROUP BY column
+    adds zero new buckets. This enables TP criteria matching (previously silently
+    ignored) and TP statistics computation.
+    
+    DD trick sums (20 columns) are aggregated per bucket for computing mean DD
+    tricks per BT node in the GPU kernel.
     
     Args:
         deals_file: Path to deals parquet file
@@ -290,18 +424,21 @@ def build_histogram_cube(
                    - N/S directions: NV = Vul NOT IN ('N_S', 'Both'), V = Vul IN ('N_S', 'Both')
                    - E/W directions: NV = Vul NOT IN ('E_W', 'Both'), V = Vul IN ('E_W', 'Both')
     
-    Returns DataFrame with ~200K-500K unique buckets.
+    Returns DataFrame with ~200K-500K unique buckets (same as before since TP is deterministic).
     """
     t0 = time.time()
     
-    # Columns needed
+    # 6 dimension columns (including Total_Points)
     dim_cols = [f"HCP_{direction}", f"SL_{direction}_S", f"SL_{direction}_H",
                 f"SL_{direction}_D", f"SL_{direction}_C"]
-    value_cols = ["ParScore", "EV_Score_Declarer"]
+    tp_col = f"Total_Points_{direction}"
     
     # Check if columns exist
     schema = pl.scan_parquet(deals_file).collect_schema()
     available_cols = schema.names()
+    
+    # Total_Points: load from parquet if available, otherwise compute from HCP + DP
+    has_tp = tp_col in available_cols
     
     # Use available ParScore/EV columns
     par_col = "ParScore" if "ParScore" in available_cols else None
@@ -311,6 +448,11 @@ def build_histogram_cube(
         log(f"  WARNING: ParScore column not found, using zeros")
     if ev_col is None:
         log(f"  WARNING: EV_Score_Declarer column not found, using zeros")
+    
+    # DD trick columns (deal-level, same across all directions)
+    available_dd_cols = [col for col in DD_COLS if col in available_cols]
+    if len(available_dd_cols) < 20:
+        log(f"  WARNING: Only {len(available_dd_cols)}/20 DD trick columns found")
     
     # Build aggregation expressions
     agg_exprs = [pl.len().alias("count")]
@@ -323,12 +465,19 @@ def build_histogram_cube(
     else:
         agg_exprs.append(pl.lit(0).alias("ev_sum"))
     
+    # DD trick sums
+    for dd_col in available_dd_cols:
+        agg_exprs.append(pl.col(dd_col).cast(pl.Int64).sum().alias(f"{dd_col}_sum"))
+    
     # Select columns to read
     read_cols = dim_cols.copy()
+    if has_tp:
+        read_cols.append(tp_col)
     if par_col:
         read_cols.append(par_col)
     if ev_col:
         read_cols.append(ev_col)
+    read_cols.extend(available_dd_cols)
     
     # Add Vul column if filtering by vulnerability
     if vul_filter and "Vul" in available_cols:
@@ -338,6 +487,29 @@ def build_histogram_cube(
     query = pl.scan_parquet(deals_file).select(read_cols)
     if max_deals:
         query = query.head(max_deals)
+    
+    # Compute Total_Points if not in parquet
+    if not has_tp:
+        sl_s_col = f"SL_{direction}_S"
+        sl_h_col = f"SL_{direction}_H"
+        sl_d_col = f"SL_{direction}_D"
+        sl_c_col = f"SL_{direction}_C"
+        
+        def _dp_expr(col_name: str) -> pl.Expr:
+            c = pl.col(col_name)
+            return (
+                pl.when(c == 0).then(3)
+                .when(c == 1).then(2)
+                .when(c == 2).then(1)
+                .otherwise(0)
+            )
+        
+        query = query.with_columns(
+            (pl.col(f"HCP_{direction}")
+             + _dp_expr(sl_s_col) + _dp_expr(sl_h_col)
+             + _dp_expr(sl_d_col) + _dp_expr(sl_c_col)
+            ).cast(pl.UInt8).alias(tp_col)
+        )
     
     # Apply vulnerability filter if specified
     if vul_filter and "Vul" in available_cols:
@@ -354,25 +526,31 @@ def build_histogram_cube(
         else:  # NV
             query = query.filter(~pl.col("Vul").is_in(vul_values))
     
+    # GROUP BY 6 dimensions (including Total_Points)
+    group_cols = dim_cols + [tp_col]
+    
     cube = (
         query
-        .group_by(dim_cols)
+        .group_by(group_cols)
         .agg(agg_exprs)
         .collect()
     )
     
     # Rename columns for consistency
-    cube = cube.rename({
+    rename_map = {
         dim_cols[0]: "HCP",
         dim_cols[1]: "SL_S",
         dim_cols[2]: "SL_H",
         dim_cols[3]: "SL_D",
         dim_cols[4]: "SL_C",
-    })
+        tp_col: "Total_Points",
+    }
+    cube = cube.rename(rename_map)
     
     vul_suffix = f"_{vul_filter}" if vul_filter else ""
     elapsed = time.time() - t0
-    log(f"  Built cube for {direction}{vul_suffix}: {cube.height:,} buckets in {fmt_time(elapsed)}")
+    log(f"  Built cube for {direction}{vul_suffix}: {cube.height:,} buckets, "
+        f"{len(available_dd_cols)} DD cols in {fmt_time(elapsed)}")
     
     return cube
 
@@ -394,17 +572,18 @@ def parse_bt_criteria(expr_str: str) -> Dict[str, Tuple[int, int]]:
         "SL_H": [0, 13],
         "SL_D": [0, 13],
         "SL_C": [0, 13],
+        "Total_Points": [0, 50],
     }
     
     if not expr_str or expr_str == "None" or expr_str == "null":
         return {k: (v[0], v[1]) for k, v in bounds.items()}
     
     # Parse >= and <=
-    for match in re.finditer(r"(HCP|SL_[SHDC])\s*>=\s*(\d+)", expr_str):
+    for match in re.finditer(r"(HCP|SL_[SHDC]|Total_Points)\s*>=\s*(\d+)", expr_str):
         metric, val = match.groups()
         bounds[metric][0] = max(bounds[metric][0], int(val))
     
-    for match in re.finditer(r"(HCP|SL_[SHDC])\s*<=\s*(\d+)", expr_str):
+    for match in re.finditer(r"(HCP|SL_[SHDC]|Total_Points)\s*<=\s*(\d+)", expr_str):
         metric, val = match.groups()
         bounds[metric][1] = min(bounds[metric][1], int(val))
     
@@ -417,39 +596,33 @@ def extract_bt_bounds_polars(bt_df: pl.DataFrame, seat: int) -> Dict[str, np.nda
     
     MEMORY-EFFICIENT: Uses Polars regex extraction, no Python object creation.
     
-    Returns dict with lo/hi arrays for each metric.
+    Returns dict with lo/hi arrays for each metric (including Total_Points).
     """
     expr_col = f"Agg_Expr_Seat_{seat}"
     n = bt_df.height
     
-    if expr_col not in bt_df.columns:
-        log(f"  WARNING: {expr_col} not found, using defaults")
-        return {
-            "HCP_lo": np.zeros(n, dtype=np.int16),
-            "HCP_hi": np.full(n, 40, dtype=np.int16),
-            "SL_S_lo": np.zeros(n, dtype=np.int16),
-            "SL_S_hi": np.full(n, 13, dtype=np.int16),
-            "SL_H_lo": np.zeros(n, dtype=np.int16),
-            "SL_H_hi": np.full(n, 13, dtype=np.int16),
-            "SL_D_lo": np.zeros(n, dtype=np.int16),
-            "SL_D_hi": np.full(n, 13, dtype=np.int16),
-            "SL_C_lo": np.zeros(n, dtype=np.int16),
-            "SL_C_hi": np.full(n, 13, dtype=np.int16),
-        }
-    
-    # Join list of strings into single string per row (stays in Polars, no Python objects!)
-    joined = bt_df.select(
-        pl.col(expr_col).list.join(" AND ").alias("expr_str")
-    )
-    
-    # Default bounds
+    # Default bounds for all 6 dimensions
     defaults = {
         "HCP": (0, 40),
         "SL_S": (0, 13),
         "SL_H": (0, 13),
         "SL_D": (0, 13),
         "SL_C": (0, 13),
+        "Total_Points": (0, 50),
     }
+    
+    if expr_col not in bt_df.columns:
+        log(f"  WARNING: {expr_col} not found, using defaults")
+        result = {}
+        for metric, (default_lo, default_hi) in defaults.items():
+            result[f"{metric}_lo"] = np.full(n, default_lo, dtype=np.int16)
+            result[f"{metric}_hi"] = np.full(n, default_hi, dtype=np.int16)
+        return result
+    
+    # Join list of strings into single string per row (stays in Polars, no Python objects!)
+    joined = bt_df.select(
+        pl.col(expr_col).list.join(" AND ").alias("expr_str")
+    )
     
     # Build extraction expressions using Polars regex
     extract_exprs = []
@@ -486,18 +659,281 @@ def extract_bt_bounds_polars(bt_df: pl.DataFrame, seat: int) -> Dict[str, np.nda
     return result
 
 
+def _validate_bt_bounds_sample(
+    bt_df: pl.DataFrame,
+    seat: int,
+    bounds: Dict[str, np.ndarray],
+    sample_n: int = BOUNDS_VALIDATE_ROWS,
+) -> None:
+    """Fail-fast correctness check for bounds extraction.
+
+    Compares Polars-extracted bounds against the Python regex parser on a small
+    sample.  This catches cases where multiple constraints for the same metric
+    appear in a single expression (e.g. two '>=' clauses) which would otherwise
+    be silently mis-parsed.
+    """
+    expr_col = f"Agg_Expr_Seat_{seat}"
+    if expr_col not in bt_df.columns:
+        return
+
+    n_rows = bt_df.height
+    if n_rows <= 0:
+        return
+
+    n = int(min(sample_n, n_rows))
+    if n <= 0:
+        return
+
+    # Validate two slices (front + back) to increase coverage without sampling.
+    offsets = [0]
+    if n_rows > n:
+        offsets.append(max(0, n_rows - n))
+
+    for off in offsets:
+        sample_lists = (
+            bt_df.select(pl.col(expr_col).slice(off, n))
+            .to_series()
+            .to_list()
+        )
+        for i, parts in enumerate(sample_lists):
+            # parts is typically List[str]
+            expr_str = " AND ".join(parts) if isinstance(parts, list) else (str(parts) if parts else "")
+            py_bounds = parse_bt_criteria(expr_str)
+            row_idx = off + i
+            for metric in METRICS:
+                lo_key = f"{metric}_lo"
+                hi_key = f"{metric}_hi"
+                pol_lo = int(bounds[lo_key][row_idx])
+                pol_hi = int(bounds[hi_key][row_idx])
+                py_lo, py_hi = py_bounds[metric]
+                if pol_lo != py_lo or pol_hi != py_hi:
+                    raise ValueError(
+                        f"Bounds extraction mismatch seat={seat} row={row_idx} metric={metric}: "
+                        f"polars=({pol_lo},{pol_hi}) python=({py_lo},{py_hi}) expr={parts!r}"
+                    )
+
+
 def extract_bt_bounds(bt_df: pl.DataFrame, seat: int) -> Dict[str, np.ndarray]:
     """
     Extract bounds arrays from BT DataFrame for a specific seat.
     
     Uses Polars-based extraction for memory efficiency.
     """
-    return extract_bt_bounds_polars(bt_df, seat)
+    bounds = extract_bt_bounds_polars(bt_df, seat)
+    _validate_bt_bounds_sample(bt_df, seat, bounds)
+    return bounds
 
 
 # ---------------------------------------------------------------------------
 # GPU Matching
 # ---------------------------------------------------------------------------
+
+
+def prepare_cube_gpu(
+    cube: pl.DataFrame,
+    device: Any,
+    compute_stats: bool = True,
+) -> Dict[str, Any]:
+    """Upload cube data to GPU tensors once.  Reuse across all chunks/seats.
+
+    Returns a dict of GPU-resident tensors that ``query_cube_batch`` consumes.
+    """
+    cube_gpu: Dict[str, Any] = {}
+
+    # 6 dimension columns (int16)
+    dims = {}
+    for metric in METRICS:
+        if metric in cube.columns:
+            dims[metric] = torch.tensor(
+                cube[metric].to_numpy(), device=device, dtype=torch.int16
+            )
+    cube_gpu["dims"] = dims
+
+    cube_count = torch.tensor(cube["count"].to_numpy(), device=device, dtype=torch.int64)
+    cube_gpu["count"] = cube_count
+    cube_gpu["par"] = torch.tensor(cube["par_sum"].to_numpy(), device=device, dtype=torch.int64)
+    cube_gpu["ev"] = torch.tensor(cube["ev_sum"].to_numpy(), device=device, dtype=torch.int64)
+
+    # DD trick sum columns
+    dd_sum_cols = [c for c in cube.columns if c.startswith("DD_") and c.endswith("_sum")]
+    cube_gpu["dd_sum_cols"] = dd_sum_cols
+    dd_gpu = []
+    if compute_stats:
+        for col in dd_sum_cols:
+            dd_gpu.append(
+                torch.tensor(cube[col].to_numpy(), device=device, dtype=torch.int64)
+            )
+    cube_gpu["dd"] = dd_gpu
+
+    # Precomputed weighted dimension values (for mean/std)
+    weighted_dims: List[Optional[Any]] = []
+    weighted_sq_dims: List[Optional[Any]] = []
+    if compute_stats:
+        for metric in METRICS:
+            if metric in dims:
+                d = dims[metric].to(torch.int64)
+                weighted_dims.append(d * cube_count)
+                weighted_sq_dims.append(d * d * cube_count)
+            else:
+                weighted_dims.append(None)
+                weighted_sq_dims.append(None)
+    cube_gpu["weighted_dims"] = weighted_dims
+    cube_gpu["weighted_sq_dims"] = weighted_sq_dims
+    cube_gpu["n_buckets"] = cube.height
+
+    return cube_gpu
+
+
+def free_cube_gpu(cube_gpu: Dict[str, Any], empty_cache: bool = True) -> None:
+    """Release GPU tensors held by a prepared cube."""
+    for v in cube_gpu.get("dims", {}).values():
+        del v
+    for k in ("count", "par", "ev"):
+        if k in cube_gpu:
+            del cube_gpu[k]
+    for t in cube_gpu.get("dd", []):
+        del t
+    for t in cube_gpu.get("weighted_dims", []):
+        if t is not None:
+            del t
+    for t in cube_gpu.get("weighted_sq_dims", []):
+        if t is not None:
+            del t
+    cube_gpu.clear()
+    if empty_cache:
+        torch.cuda.empty_cache()
+
+
+def query_cube_batch(
+    cube_gpu: Dict[str, Any],
+    bt_bounds: Dict[str, np.ndarray],
+    bt_indices: np.ndarray,
+    device: Any,
+    batch_size: int = BATCH_SIZE,
+    compute_stats: bool = True,
+) -> Dict[str, Any]:
+    """Run GPU matching against a *pre-uploaded* cube (from ``prepare_cube_gpu``).
+
+    Same semantics as the old ``gpu_query_cube`` but avoids re-uploading cube
+    tensors on every call.
+    """
+    n_bt = len(bt_indices)
+
+    cube_dims_gpu = cube_gpu["dims"]
+    cube_count = cube_gpu["count"]
+    cube_par = cube_gpu["par"]
+    cube_ev = cube_gpu["ev"]
+    cube_dd_gpu = cube_gpu["dd"]
+    weighted_dims = cube_gpu["weighted_dims"]
+    weighted_sq_dims = cube_gpu["weighted_sq_dims"]
+    dd_sum_cols = cube_gpu["dd_sum_cols"]
+    n_dd = len(dd_sum_cols)
+    n_dims = len(METRICS)
+
+    # Upload BT bounds to GPU
+    bounds_lo_gpu = {}
+    bounds_hi_gpu = {}
+    for metric in METRICS:
+        lo_key = f"{metric}_lo"
+        hi_key = f"{metric}_hi"
+        if lo_key in bt_bounds:
+            bounds_lo_gpu[metric] = torch.tensor(bt_bounds[lo_key], device=device, dtype=torch.int16)
+            bounds_hi_gpu[metric] = torch.tensor(bt_bounds[hi_key], device=device, dtype=torch.int16)
+
+    # Result arrays (CPU)
+    # counts fit in int32 (<= ~16M deals per cube); keep int32 to reduce RAM/IO.
+    result_counts = np.zeros(n_bt, dtype=np.int32)
+    result_par = np.zeros(n_bt, dtype=np.int64)
+    result_ev = np.zeros(n_bt, dtype=np.int64)
+
+    result_dim_sums: np.ndarray = np.empty(0)
+    result_dim_sq_sums: np.ndarray = np.empty(0)
+    result_dim_mins: np.ndarray = np.empty(0)
+    result_dim_maxs: np.ndarray = np.empty(0)
+    result_dd_sums: np.ndarray = np.empty(0)
+    if compute_stats:
+        # dim_sums fit in int32 per (direction,vul) cube; dim_sq_sums must stay int64
+        result_dim_sums = np.zeros((n_dims, n_bt), dtype=np.int32)
+        result_dim_sq_sums = np.zeros((n_dims, n_bt), dtype=np.int64)
+        # Store min/max as uint8 with sentinels: min=255 (no data), max=0 (no data)
+        result_dim_mins = np.full((n_dims, n_bt), 255, dtype=np.uint8)
+        result_dim_maxs = np.zeros((n_dims, n_bt), dtype=np.uint8)
+        # dd_sums fit in int32 (<= 13 * deals_in_cube)
+        result_dd_sums = np.zeros((n_dd, n_bt), dtype=np.int32)
+
+    sentinel_min_i16 = torch.tensor(9999, dtype=torch.int16, device=device)
+    sentinel_max_i16 = torch.tensor(-1, dtype=torch.int16, device=device)
+
+    # Process in batches
+    with torch.inference_mode():
+        for i in range(0, n_bt, batch_size):
+            end = min(i + batch_size, n_bt)
+
+            # Build 6D mask: (batch_size, n_buckets)
+            mask = None
+            for metric in METRICS:
+                if metric not in cube_dims_gpu or metric not in bounds_lo_gpu:
+                    continue
+                batch_lo = bounds_lo_gpu[metric][i:end].unsqueeze(1)
+                batch_hi = bounds_hi_gpu[metric][i:end].unsqueeze(1)
+                dim_check = (cube_dims_gpu[metric] >= batch_lo) & (cube_dims_gpu[metric] <= batch_hi)
+                mask = dim_check if mask is None else (mask & dim_check)
+
+            if mask is None:
+                continue
+
+            # ---- EV aggregations (count, par, ev) — always computed ----
+            mask_int = mask.to(torch.int64)
+            result_counts[i:end] = (mask_int * cube_count).sum(dim=1).to(torch.int32).cpu().numpy()
+            result_par[i:end] = (mask_int * cube_par).sum(dim=1).cpu().numpy()
+            result_ev[i:end] = (mask_int * cube_ev).sum(dim=1).cpu().numpy()
+
+            if compute_stats:
+                # ---- Hand stats: weighted sums / squared sums ----
+                for dim_idx in range(n_dims):
+                    if weighted_dims[dim_idx] is not None:
+                        result_dim_sums[dim_idx, i:end] = (
+                            (mask_int * weighted_dims[dim_idx]).sum(dim=1).to(torch.int32).cpu().numpy()
+                        )
+                        result_dim_sq_sums[dim_idx, i:end] = (
+                            (mask_int * weighted_sq_dims[dim_idx]).sum(dim=1).cpu().numpy()
+                        )
+
+                # ---- Hand stats: min / max ----
+                for dim_idx, metric in enumerate(METRICS):
+                    if metric not in cube_dims_gpu:
+                        continue
+                    cube_dim = cube_dims_gpu[metric]
+
+                    masked_min = torch.where(mask, cube_dim, sentinel_min_i16)
+                    mins_u8 = torch.clamp(masked_min.min(dim=1).values, 0, 255).to(torch.uint8)
+                    result_dim_mins[dim_idx, i:end] = mins_u8.cpu().numpy()
+
+                    masked_max = torch.where(mask, cube_dim, sentinel_max_i16)
+                    maxs_u8 = torch.clamp(masked_max.max(dim=1).values, 0, 255).to(torch.uint8)
+                    result_dim_maxs[dim_idx, i:end] = maxs_u8.cpu().numpy()
+
+                    del masked_min, masked_max, mins_u8, maxs_u8
+
+                # ---- DD trick sums ----
+                for dd_idx in range(n_dd):
+                    result_dd_sums[dd_idx, i:end] = (
+                        (mask_int * cube_dd_gpu[dd_idx]).sum(dim=1).to(torch.int32).cpu().numpy()
+                    )
+
+    result: Dict[str, Any] = {
+        "counts": result_counts,
+        "par_sums": result_par,
+        "ev_sums": result_ev,
+    }
+    if compute_stats:
+        result["dim_sums"] = result_dim_sums
+        result["dim_sq_sums"] = result_dim_sq_sums
+        result["dim_mins"] = result_dim_mins
+        result["dim_maxs"] = result_dim_maxs
+        result["dd_sums"] = result_dd_sums
+    return result
+
 
 def gpu_query_cube(
     cube: pl.DataFrame,
@@ -509,114 +945,23 @@ def gpu_query_cube(
     pbar: Optional[ProgressBar] = None,
     collect_index: bool = False,
     index_file: Optional[Path] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    compute_stats: bool = True,
+) -> Dict[str, Any]:
+    """Legacy wrapper — uploads cube to GPU, queries, and frees.
+
+    NOTE: collect_index argument is ignored in v3 pipeline.
+    
+    New code should use ``prepare_cube_gpu`` + ``query_cube_batch`` directly
+    to keep the cube resident across multiple calls.
     """
-    Query histogram cube for all BT rows using GPU.
-    
-    Returns (counts, par_sums, ev_sums) for each BT row.
-    
-    If collect_index=True, also streams (bucket_idx, bt_idx) pairs to index_file.
-    """
-    n_bt = len(bt_indices)
-    n_buckets = cube.height
-    
-    # Move cube data to GPU
-    cube_hcp = torch.tensor(cube["HCP"].to_numpy(), device=device, dtype=torch.int16)
-    cube_sl_s = torch.tensor(cube["SL_S"].to_numpy(), device=device, dtype=torch.int16)
-    cube_sl_h = torch.tensor(cube["SL_H"].to_numpy(), device=device, dtype=torch.int16)
-    cube_sl_d = torch.tensor(cube["SL_D"].to_numpy(), device=device, dtype=torch.int16)
-    cube_sl_c = torch.tensor(cube["SL_C"].to_numpy(), device=device, dtype=torch.int16)
-    cube_count = torch.tensor(cube["count"].to_numpy(), device=device, dtype=torch.int64)
-    cube_par = torch.tensor(cube["par_sum"].to_numpy(), device=device, dtype=torch.int64)
-    cube_ev = torch.tensor(cube["ev_sum"].to_numpy(), device=device, dtype=torch.int64)
-    
-    # Move BT bounds to GPU
-    hcp_lo = torch.tensor(bt_bounds["HCP_lo"], device=device, dtype=torch.int16)
-    hcp_hi = torch.tensor(bt_bounds["HCP_hi"], device=device, dtype=torch.int16)
-    sl_s_lo = torch.tensor(bt_bounds["SL_S_lo"], device=device, dtype=torch.int16)
-    sl_s_hi = torch.tensor(bt_bounds["SL_S_hi"], device=device, dtype=torch.int16)
-    sl_h_lo = torch.tensor(bt_bounds["SL_H_lo"], device=device, dtype=torch.int16)
-    sl_h_hi = torch.tensor(bt_bounds["SL_H_hi"], device=device, dtype=torch.int16)
-    sl_d_lo = torch.tensor(bt_bounds["SL_D_lo"], device=device, dtype=torch.int16)
-    sl_d_hi = torch.tensor(bt_bounds["SL_D_hi"], device=device, dtype=torch.int16)
-    sl_c_lo = torch.tensor(bt_bounds["SL_C_lo"], device=device, dtype=torch.int16)
-    sl_c_hi = torch.tensor(bt_bounds["SL_C_hi"], device=device, dtype=torch.int16)
-    
-    # Results
-    result_counts = np.zeros(n_bt, dtype=np.int64)
-    result_par = np.zeros(n_bt, dtype=np.int64)
-    result_ev = np.zeros(n_bt, dtype=np.int64)
-    
-    # For inverted index: stream matches to file
-    index_handle = None
-    if collect_index and index_file:
-        index_file.parent.mkdir(parents=True, exist_ok=True)
-        index_handle = open(index_file, 'ab')  # Append binary
-    
-    # Process in batches
-    for i in range(start_idx, n_bt, batch_size):
-        end = min(i + batch_size, n_bt)
-        
-        # Get batch bounds (broadcast to match cube)
-        batch_hcp_lo = hcp_lo[i:end].unsqueeze(1)
-        batch_hcp_hi = hcp_hi[i:end].unsqueeze(1)
-        batch_sl_s_lo = sl_s_lo[i:end].unsqueeze(1)
-        batch_sl_s_hi = sl_s_hi[i:end].unsqueeze(1)
-        batch_sl_h_lo = sl_h_lo[i:end].unsqueeze(1)
-        batch_sl_h_hi = sl_h_hi[i:end].unsqueeze(1)
-        batch_sl_d_lo = sl_d_lo[i:end].unsqueeze(1)
-        batch_sl_d_hi = sl_d_hi[i:end].unsqueeze(1)
-        batch_sl_c_lo = sl_c_lo[i:end].unsqueeze(1)
-        batch_sl_c_hi = sl_c_hi[i:end].unsqueeze(1)
-        
-        # 5D mask: (batch_size, n_buckets)
-        mask = (
-            (cube_hcp >= batch_hcp_lo) & (cube_hcp <= batch_hcp_hi) &
-            (cube_sl_s >= batch_sl_s_lo) & (cube_sl_s <= batch_sl_s_hi) &
-            (cube_sl_h >= batch_sl_h_lo) & (cube_sl_h <= batch_sl_h_hi) &
-            (cube_sl_d >= batch_sl_d_lo) & (cube_sl_d <= batch_sl_d_hi) &
-            (cube_sl_c >= batch_sl_c_lo) & (cube_sl_c <= batch_sl_c_hi)
+    cube_gpu = prepare_cube_gpu(cube, device, compute_stats=compute_stats)
+    try:
+        return query_cube_batch(
+            cube_gpu, bt_bounds, bt_indices, device, batch_size,
+            compute_stats=compute_stats,
         )
-        
-        # Aggregate stats
-        mask_int = mask.to(torch.int64)
-        batch_counts = (mask_int * cube_count).sum(dim=1)
-        batch_par = (mask_int * cube_par).sum(dim=1)
-        batch_ev = (mask_int * cube_ev).sum(dim=1)
-        
-        # Copy back to CPU
-        result_counts[i:end] = batch_counts.cpu().numpy()
-        result_par[i:end] = batch_par.cpu().numpy()
-        result_ev[i:end] = batch_ev.cpu().numpy()
-        
-        # Collect inverted index matches
-        if index_handle is not None:
-            # Find (bt_row, bucket) pairs where mask is True
-            mask_cpu = mask.cpu().numpy()
-            batch_bt_indices = bt_indices[i:end]
-            
-            # Get indices where mask is True: (row_in_batch, bucket_idx)
-            match_rows, match_buckets = np.where(mask_cpu)
-            
-            if len(match_rows) > 0:
-                # Convert batch-relative row to global bt_index
-                matched_bt_indices = batch_bt_indices[match_rows].astype(np.uint32)
-                matched_bucket_indices = match_buckets.astype(np.uint16)
-                
-                # Write as structured array for proper binary format
-                dt = np.dtype([('bucket', np.uint16), ('bt_idx', np.uint32)])
-                pairs = np.empty(len(match_rows), dtype=dt)
-                pairs['bucket'] = matched_bucket_indices
-                pairs['bt_idx'] = matched_bt_indices
-                pairs.tofile(index_handle)
-        
-        if pbar:
-            pbar.update(end - i)
-    
-    if index_handle is not None:
-        index_handle.close()
-    
-    return result_counts, result_par, result_ev
+    finally:
+        free_cube_gpu(cube_gpu)
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +1126,7 @@ def run_pipeline(
     """
     Run the full EV computation pipeline.
     
-    If build_index=True, also builds inverted index (bucket → BT indices).
+    If build_index=True, the inverted index is deprecated/ignored in v3.
     """
     
     pipeline_start = time.time()
@@ -832,11 +1177,61 @@ def run_pipeline(
     else:
         ckpt.clear()
         state = {"completed": [], "last_completed": None}
+
+    # --- Resume safety / pipeline versioning ---
+    if not isinstance(state, dict):
+        state = {"completed": [], "last_completed": None}
+    if not isinstance(state.get("completed"), list):
+        state["completed"] = []
+    if "last_completed" not in state:
+        state["last_completed"] = None
+
+    prev_ver = state.get("pipeline_version")
+    if prev_ver != PIPELINE_VERSION:
+        if resume:
+            log(f"  WARNING: checkpoint pipeline_version={prev_ver!r} → {PIPELINE_VERSION!r}; validating checkpoints")
+        state["pipeline_version"] = PIPELINE_VERSION
+
+    # When resuming, rebuild completion state from what's actually on disk:
+    # - cube_{direction}_{vul}.parquet present → cube task complete
+    # - results_{direction}_{vul}_S{seat}.npz contains REQUIRED_VUL_RESULT_KEYS → query task complete
+    if resume:
+        completed_set = set(state.get("completed", []))
+
+        # Cube files
+        for direction in DIRECTIONS:
+            for vul in ("NV", "V"):
+                cube_file = checkpoint_dir / f"cube_{direction}_{vul}.parquet"
+                if cube_file.exists():
+                    completed_set.add(f"cube_{direction}_{vul}")
+
+        # Query tasks (strip stale ones first, then re-add verified)
+        completed_set = {k for k in completed_set if not str(k).startswith("query_")}
+        n_verified = 0
+        for seat in range(1, 5):
+            for direction in DIRECTIONS:
+                for vul in ("NV", "V"):
+                    task_key = f"query_{direction}_{vul}_S{seat}"
+                    if ckpt.has_results_vul(direction, vul, seat, required_keys=REQUIRED_VUL_RESULT_KEYS):
+                        completed_set.add(task_key)
+                        n_verified += 1
+
+        state["completed"] = sorted(completed_set)
+        if state.get("last_completed") not in completed_set:
+            state["last_completed"] = None
+        ckpt.save_state(state)
+        log(f"  Resume validation: {n_verified}/32 query tasks have full stats checkpoints")
     
     # ---------------------------------------------------------------------------
     # Step 1: Load BT core data (small - just indices)
     # ---------------------------------------------------------------------------
-    log("\n[1/4] Loading BT core data...")
+    # Force disable build_index as it's not supported in v3 pipeline
+    if build_index:
+        log("  WARNING: --build-index is disabled in v3 pipeline. Use bbo_deal_to_bt_verified.parquet.")
+        build_index = False
+
+    total_steps = 5
+    log(f"\n[1/{total_steps}] Loading BT core data...")
     step_start = time.time()
     
     # Only load tiny columns now - expressions loaded per-seat later
@@ -852,184 +1247,227 @@ def run_pipeline(
     log(f"  Loaded {n_bt:,} BT indices in {fmt_time(elapsed)}")
     
     # ---------------------------------------------------------------------------
-    # Step 2: Build histogram cubes (one per direction)
+    # Step 2: Build histogram cubes (8 vul-split only)
     # ---------------------------------------------------------------------------
-    # Build 8 cubes: 2 per direction (NV and V splits)
-    log("\n[2/4] Building histogram cubes (NV/V split)...")
+    # Only 8 vul-split cubes needed — single merged pass computes EV + stats on
+    # the same cubes.  Combined cubes are no longer built; NV+V stats are summed
+    # in the combination step instead.
+    log(f"\n[2/{total_steps}] Building histogram cubes (8 vul-split)...")
     step_start = time.time()
     
     VUL_STATES = ["NV", "V"]
-    cubes = {}  # Key: (direction, vul) tuple
+    
+    cubes_vul = {}  # Key: (direction, vul) tuple
     for direction in DIRECTIONS:
         for vul in VUL_STATES:
             cube_key = f"cube_{direction}_{vul}"
             if cube_key in state.get("completed", []):
                 log(f"  Skipping {direction}_{vul} (already built)")
-                # Load from saved parquet
                 cube_file = checkpoint_dir / f"cube_{direction}_{vul}.parquet"
                 if cube_file.exists():
-                    cubes[(direction, vul)] = pl.read_parquet(cube_file)
+                    cubes_vul[(direction, vul)] = pl.read_parquet(cube_file)
                 else:
-                    cubes[(direction, vul)] = build_histogram_cube(deals_file, direction, max_deals, vul_filter=vul)
+                    cubes_vul[(direction, vul)] = build_histogram_cube(deals_file, direction, max_deals, vul_filter=vul)
             else:
-                cubes[(direction, vul)] = build_histogram_cube(deals_file, direction, max_deals, vul_filter=vul)
-                # Save cube for restart
+                cubes_vul[(direction, vul)] = build_histogram_cube(deals_file, direction, max_deals, vul_filter=vul)
                 cube_file = checkpoint_dir / f"cube_{direction}_{vul}.parquet"
-                cubes[(direction, vul)].write_parquet(cube_file)
+                cubes_vul[(direction, vul)].write_parquet(cube_file)
                 state["completed"].append(cube_key)
                 ckpt.save_state(state)
     
     elapsed = time.time() - step_start
-    log(f"  Cubes built in {fmt_time(elapsed)} (8 cubes: 4 directions x 2 vul states)")
+    log(f"  Cubes built in {fmt_time(elapsed)} (8 vul-split cubes)")
     
     # ---------------------------------------------------------------------------
-    # Step 3: GPU query - organized by SEAT first (memory optimization)
-    # This way we load one Agg_Expr_Seat_X column at a time instead of all 4
-    # Now queries 8 cubes (4 directions x 2 vul states) per seat
+    # Step 3: Merged GPU pass — EV + hand stats + DD means on 8 vul-split cubes
     # ---------------------------------------------------------------------------
-    log("\n[3/4] GPU matching (this is the long step)...")
+    # Single pass computes all 47 ops (3 EV + 6×4 dim + 6×4 dim² + 6 min + 6 max
+    # + 20 DD sums) on each vul-split cube.  The combination step (step 4) sums
+    # NV+V for hand stats and DD means.  This eliminates the 4 combined cubes and
+    # avoids a second traversal of the cube data.
+    #
+    # 32 tasks total: 4 seats × 4 directions × 2 vul states.
+    # Cube tensors are uploaded to GPU once per (direction, vul) and reused across
+    # all BT chunks for that cube.
+    #
+    # Peak RAM per task: ~96 GB (stats accumulators) — same as before but only one
+    # set of accumulators is live at a time.
+    # ---------------------------------------------------------------------------
+    log(f"\n[3/{total_steps}] Merged GPU pass — EV + stats on 8 vul-split cubes...")
     step_start = time.time()
     
-    # Tasks now include vul state: query_{direction}_{vul}_S{seat}
-    total_tasks = len(DIRECTIONS) * len(VUL_STATES) * 4  # 4 seats x 4 directions x 2 vul = 32 tasks
-    completed_tasks = sum(1 for d in DIRECTIONS for v in VUL_STATES for s in range(1, 5) 
-                         if f"query_{d}_{v}_S{s}" in state.get("completed", []))
+    n_dims = len(METRICS)
+    _sample_cube_key = next(iter(cubes_vul))
+    n_dd = sum(1 for c in cubes_vul[_sample_cube_key].columns if c.startswith("DD_") and c.endswith("_sum"))
+    if n_dd != len(DD_DECLARERS) * len(DD_STRAINS):
+        raise RuntimeError(
+            f"Expected {len(DD_DECLARERS) * len(DD_STRAINS)} DD columns but found {n_dd}. "
+            f"DD rotation logic requires exactly 4 declarers × 5 strains = 20 columns."
+        )
+    
+    # Upload cube tensors to GPU once per (direction, vul) and reuse across all seats/chunks.
+    log("  Uploading 8 cubes to GPU (keep resident across all tasks)...")
+    upload_start = time.time()
+    cube_gpu_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for direction in DIRECTIONS:
+        for vul in VUL_STATES:
+            cube_gpu_cache[(direction, vul)] = prepare_cube_gpu(
+                cubes_vul[(direction, vul)],
+                device,
+                compute_stats=True,
+            )
+    log(f"  Cube upload complete in {fmt_time(time.time() - upload_start)}")
+
+    chunk_size = BT_CHUNK_SIZE
+    n_chunks = (n_bt + chunk_size - 1) // chunk_size
+    
+    # 32 tasks: 4 seats × 4 dirs × 2 vul
+    total_tasks = len(DIRECTIONS) * len(VUL_STATES) * 4
+    tasks_done = sum(1 for d in DIRECTIONS for v in VUL_STATES for s in range(1, 5)
+                     if f"query_{d}_{v}_S{s}" in state.get("completed", []))
     
     for seat in range(1, 5):
-        # Check if ALL (direction, vul) pairs for this seat are done
         seat_tasks = [f"query_{d}_{v}_S{seat}" for d in DIRECTIONS for v in VUL_STATES]
         if all(t in state.get("completed", []) for t in seat_tasks):
-            log(f"  Skipping seat {seat} (all direction/vul combos completed)")
+            log(f"  Skipping seat {seat} (all completed)")
             continue
         
-        log(f"  Processing seat {seat} in chunks of {BT_CHUNK_SIZE:,} rows...")
+        log(f"  Seat {seat}: {n_bt:,} BT rows, {n_chunks} chunks of {chunk_size:,}")
         
-        # Initialize result accumulators for all (direction, vul) pairs
-        # Key: (direction, vul) tuple
-        dir_vul_results = {}
-        for d in DIRECTIONS:
-            for v in VUL_STATES:
-                if f"query_{d}_{v}_S{seat}" not in state.get("completed", []):
-                    dir_vul_results[(d, v)] = {
-                        "counts": np.zeros(n_bt, dtype=np.int64),
-                        "par_sums": np.zeros(n_bt, dtype=np.int64),
-                        "ev_sums": np.zeros(n_bt, dtype=np.int64),
-                    }
+        # Cache bounds once per seat (reused across all 8 cubes)
+        log(f"    Loading Agg_Expr_Seat_{seat} bounds...")
+        bounds_start = time.time()
+        seat_df = pl.read_parquet(bt_file, columns=["bt_index", f"Agg_Expr_Seat_{seat}"])
+        if max_bt_rows:
+            seat_df = seat_df.head(max_bt_rows)
+        all_bounds = extract_bt_bounds(seat_df, seat)
+        del seat_df; gc.collect()
+        log(f"    Bounds cached: {sum(a.nbytes for a in all_bounds.values()) / 1e9:.1f} GB "
+            f"in {fmt_time(time.time() - bounds_start)}")
         
-        if not dir_vul_results:
-            log(f"  All direction/vul combos for seat {seat} already completed")
-            continue
-        
-        # Process BT in chunks to avoid memory explosion
-        chunk_size = BT_CHUNK_SIZE
-        n_chunks = (n_bt + chunk_size - 1) // chunk_size
-        
-        for chunk_idx in range(n_chunks):
-            chunk_start = chunk_idx * chunk_size
-            chunk_end = min(chunk_start + chunk_size, n_bt)
-            chunk_len = chunk_end - chunk_start
-            
-            log(f"    Chunk {chunk_idx + 1}/{n_chunks}: rows {chunk_start:,}-{chunk_end:,}")
-            
-            # Load ONLY this chunk's expression column
-            chunk_df = pl.read_parquet(
-                bt_file,
-                columns=["bt_index", f"Agg_Expr_Seat_{seat}"]
-            ).slice(chunk_start, chunk_len)
-            
-            # Parse bounds for this chunk (uses Polars, memory-efficient)
-            chunk_bounds = extract_bt_bounds(chunk_df, seat)
-            chunk_bt_indices = chunk_df["bt_index"].to_numpy()
-            del chunk_df
-            gc.collect()
-            
-            # Query each (direction, vul) cube with this chunk
-            for (direction, vul) in dir_vul_results.keys():
-                cube = cubes[(direction, vul)]
+        for direction in DIRECTIONS:
+            for vul in VUL_STATES:
+                task_key = f"query_{direction}_{vul}_S{seat}"
+                if task_key in state.get("completed", []):
+                    log(f"    Skipping {direction}_{vul}/S{seat} (completed)")
+                    continue
                 
-                # Set up index file for this chunk (if building index)
-                # Index files now include vul state
-                chunk_index_file = None
-                if build_index and index_dir:
-                    raw_index_dir = index_dir / "raw" / f"{direction}_{vul}_S{seat}"
-                    raw_index_dir.mkdir(parents=True, exist_ok=True)
-                    chunk_index_file = raw_index_dir / f"chunk_{chunk_idx:04d}.bin"
+                pair_start = time.time()
                 
-                # GPU query for this chunk (no progress bar for chunks)
-                counts, par_sums, ev_sums = gpu_query_cube(
-                    cube, chunk_bounds, chunk_bt_indices, device, batch_size,
-                    collect_index=build_index,
-                    index_file=chunk_index_file,
+                # Full accumulators: EV (3 arrays) + stats (dims + DD)
+                results: Dict[str, Any] = {
+                    "counts": np.zeros(n_bt, dtype=np.int32),
+                    "par_sums": np.zeros(n_bt, dtype=np.int64),
+                    "ev_sums": np.zeros(n_bt, dtype=np.int64),
+                    "dim_sums": np.zeros((n_dims, n_bt), dtype=np.int32),
+                    "dim_sq_sums": np.zeros((n_dims, n_bt), dtype=np.int64),
+                    "dim_mins": np.full((n_dims, n_bt), 255, dtype=np.uint8),
+                    "dim_maxs": np.zeros((n_dims, n_bt), dtype=np.uint8),
+                    "dd_sums": np.zeros((n_dd, n_bt), dtype=np.int32),
+                }
+                accum_bytes = sum(a.nbytes for a in results.values())
+                log(f"    {direction}_{vul}/S{seat}: allocated {accum_bytes / 1e9:.1f} GB accumulators")
+                
+                cube_gpu = cube_gpu_cache[(direction, vul)]
+                
+                for chunk_idx in range(n_chunks):
+                    chunk_start = chunk_idx * chunk_size
+                    chunk_end = min(chunk_start + chunk_size, n_bt)
+                    
+                    if chunk_idx % 10 == 0 or chunk_idx == n_chunks - 1:
+                        log(f"      Chunk {chunk_idx + 1}/{n_chunks}")
+                    
+                    chunk_bounds = {k: arr[chunk_start:chunk_end] for k, arr in all_bounds.items()}
+                    chunk_bt = bt_indices[chunk_start:chunk_end]
+                    
+                    chunk_results = query_cube_batch(
+                        cube_gpu, chunk_bounds, chunk_bt, device, batch_size,
+                        compute_stats=True,
+                    )
+                    
+                    results["counts"][chunk_start:chunk_end] = chunk_results["counts"]
+                    results["par_sums"][chunk_start:chunk_end] = chunk_results["par_sums"]
+                    results["ev_sums"][chunk_start:chunk_end] = chunk_results["ev_sums"]
+                    results["dim_sums"][:, chunk_start:chunk_end] = chunk_results["dim_sums"]
+                    results["dim_sq_sums"][:, chunk_start:chunk_end] = chunk_results["dim_sq_sums"]
+                    results["dim_mins"][:, chunk_start:chunk_end] = chunk_results["dim_mins"]
+                    results["dim_maxs"][:, chunk_start:chunk_end] = chunk_results["dim_maxs"]
+                    results["dd_sums"][:, chunk_start:chunk_end] = chunk_results["dd_sums"]
+                    
+                    del chunk_results
+                
+                # Save all results (EV + stats) in one checkpoint
+                ckpt.save_results_vul(
+                    direction, vul, seat, bt_indices,
+                    results["counts"], results["par_sums"], results["ev_sums"],
+                    dim_sums=results["dim_sums"],
+                    dim_sq_sums=results["dim_sq_sums"],
+                    dim_mins=results["dim_mins"],
+                    dim_maxs=results["dim_maxs"],
+                    dd_sums=results["dd_sums"],
                 )
                 
-                # Accumulate into results
-                dir_vul_results[(direction, vul)]["counts"][chunk_start:chunk_end] = counts
-                dir_vul_results[(direction, vul)]["par_sums"][chunk_start:chunk_end] = par_sums
-                dir_vul_results[(direction, vul)]["ev_sums"][chunk_start:chunk_end] = ev_sums
+                state["completed"].append(task_key)
+                state["last_completed"] = task_key
+                tasks_done += 1
+                ckpt.save_state(state)
                 
-                del counts, par_sums, ev_sums
-            
-            # Free chunk data
-            del chunk_bounds, chunk_bt_indices
-            gc.collect()
-            torch.cuda.empty_cache()
+                pair_elapsed = time.time() - pair_start
+                log(f"    {direction}_{vul}/S{seat} done in {fmt_time(pair_elapsed)} "
+                    f"({tasks_done}/{total_tasks} tasks)")
+                
+                del results; gc.collect()
         
-        # Save results for each (direction, vul) pair
-        for (direction, vul), results in dir_vul_results.items():
-            task_key = f"query_{direction}_{vul}_S{seat}"
-            
-            log(f"  Saving {direction}_{vul}/S{seat}...")
-            # Use modified save that includes vul in the key
-            ckpt.save_results_vul(
-                direction, vul, seat, bt_indices,
-                results["counts"], results["par_sums"], results["ev_sums"]
-            )
-            
-            state["completed"].append(task_key)
-            state["last_completed"] = task_key
-            completed_tasks += 1
-        
-        ckpt.save_state(state)
-        log(f"  Seat {seat} completed ({completed_tasks}/{total_tasks} tasks)")
-        
-        # Free all results for this seat
-        del dir_vul_results
-        gc.collect()
+        del all_bounds; gc.collect()
     
-    elapsed = time.time() - step_start
-    log(f"  All GPU queries completed in {fmt_time(elapsed)}")
+    # Release cube tensors after all tasks complete
+    for _cube_gpu in cube_gpu_cache.values():
+        free_cube_gpu(_cube_gpu, empty_cache=False)
+    cube_gpu_cache.clear()
+    torch.cuda.empty_cache()
+
+    gpu_elapsed = time.time() - step_start
+    log(f"  Merged GPU pass completed in {fmt_time(gpu_elapsed)}")
     
     # ---------------------------------------------------------------------------
-    # Step 4: Combine results and compute averages (NV/V split)
+    # Step 4: Combine results and compute averages (NV/V split + hand stats + DD means)
     # ---------------------------------------------------------------------------
-    log("\n[4/4] Combining results (NV/V split)...")
+    log(f"\n[4/{total_steps}] Combining results (NV/V split + hand stats + DD means)...")
     step_start = time.time()
     
     # bt_indices already set from Step 1
     n = len(bt_indices)
     
-    result_cols = {"bt_index": bt_indices}
+    # Determine DD column count from any vul-split cube
+    _sample_cube_key = next(iter(cubes_vul))
+    dd_sum_col_names = [c for c in cubes_vul[_sample_cube_key].columns
+                        if c.startswith("DD_") and c.endswith("_sum")]
+    n_dd = len(dd_sum_col_names)
+    n_dims = len(METRICS)
+    
+    result_cols: Dict[str, Any] = {"bt_index": bt_indices}
     
     for seat in range(1, 5):
+        log(f"  Aggregating seat {seat}...")
+        
+        # ---- Per-vul aggregation (Count, Avg_Par, Avg_EV) from EV checkpoints ----
         for vul in VUL_STATES:
-            log(f"  Aggregating seat {seat} {vul}...")
-            # Aggregate across all directions for this seat/vul combo
-            total_count = np.zeros(n, dtype=np.int64)
+            total_count = np.zeros(n, dtype=np.int32)
             total_par = np.zeros(n, dtype=np.int64)
             total_ev = np.zeros(n, dtype=np.int64)
             
             for direction in DIRECTIONS:
-                # Load results from disk (streaming, not holding all in memory)
                 data = ckpt.load_results_vul(direction, vul, seat)
-                if data is not None:
-                    total_count += data["counts"]
-                    total_par += data["par_sums"]
-                    total_ev += data["ev_sums"]
-                    del data  # Free immediately
-                else:
-                    log(f"    WARNING: Missing results for {direction}_{vul}/S{seat}")
+                if data is None:
+                    raise RuntimeError(f"Missing checkpoint for {direction}_{vul}/S{seat} (cannot combine results)")
+                for k in ("counts", "par_sums", "ev_sums"):
+                    if k not in data:
+                        raise RuntimeError(f"Checkpoint missing key {k!r} for {direction}_{vul}/S{seat}")
+                total_count += data["counts"]
+                total_par += data["par_sums"]
+                total_ev += data["ev_sums"]
+                del data
             
-            # Compute averages (avoid division by zero)
             with np.errstate(divide='ignore', invalid='ignore'):
                 avg_par = np.where(total_count > 0, total_par / total_count, np.nan)
                 avg_ev = np.where(total_count > 0, total_ev / total_count, np.nan)
@@ -1037,17 +1475,131 @@ def run_pipeline(
             result_cols[f"Count_S{seat}_{vul}"] = total_count.astype(np.uint32)
             result_cols[f"Avg_Par_S{seat}_{vul}"] = avg_par.astype(np.float32)
             result_cols[f"Avg_EV_S{seat}_{vul}"] = avg_ev.astype(np.float32)
+        
+        # ---- Combined stats: sum NV + V vul checkpoints across 4 directions ----
+        # Each vul checkpoint now contains stats arrays (dim_sums, dd_sums, etc.)
+        # from the merged pass.  We sum across all 8 (4 dirs × 2 vul) checkpoints.
+        combined_count = np.zeros(n, dtype=np.int32)
+        combined_dim_sums = np.zeros((n_dims, n), dtype=np.int64)
+        combined_dim_sq_sums = np.zeros((n_dims, n), dtype=np.int64)
+        combined_dim_mins = np.full((n_dims, n), 255, dtype=np.uint8)
+        combined_dim_maxs = np.zeros((n_dims, n), dtype=np.uint8)
+        # dd_sums accumulates 8 int32 checkpoints; max per-ckpt ≈ 208M → 8*208M = 1.66B,
+        # which is close to int32 max (2.1B).  Use int64 for safe accumulation.
+        combined_dd_sums = np.zeros((n_dd, n), dtype=np.int64)
+        
+        for direction in DIRECTIONS:
+            for vul in VUL_STATES:
+                data = ckpt.load_results_vul(direction, vul, seat)
+                if data is None:
+                    raise RuntimeError(f"Missing checkpoint for {direction}_{vul}/S{seat} (cannot combine stats)")
+                missing = REQUIRED_VUL_RESULT_KEYS.difference(data.keys())
+                if missing:
+                    raise RuntimeError(
+                        f"Checkpoint for {direction}_{vul}/S{seat} missing required keys: {sorted(missing)}"
+                    )
+                
+                combined_count += data["counts"]
+                combined_dim_sums += data["dim_sums"]
+                combined_dim_sq_sums += data["dim_sq_sums"]
+                combined_dim_mins = np.minimum(combined_dim_mins, data["dim_mins"])
+                combined_dim_maxs = np.maximum(combined_dim_maxs, data["dim_maxs"])
+
+                # Rotate DD sums to seat-relative positions before accumulating.
+                # DD columns are in blocks of 5 (one per declarer): N=0-4, E=5-9, S=10-14, W=15-19.
+                # For the N-cube (dir_idx=0): N is seat S, so no rotation.
+                # For the E-cube (dir_idx=1): E is seat S, rotate by -5 so E→position 0.
+                # For the S-cube (dir_idx=2): S is seat S, rotate by -10.
+                # For the W-cube (dir_idx=3): W is seat S, rotate by -15.
+                dir_idx = DIRECTIONS.index(direction)
+                shift = dir_idx * len(DD_STRAINS)
+                if shift == 0:
+                    combined_dd_sums += data["dd_sums"]
+                else:
+                    # Equivalent to np.roll(dd_sums, -shift, axis=0) but avoids allocating a huge copy.
+                    combined_dd_sums[: n_dd - shift] += data["dd_sums"][shift:]
+                    combined_dd_sums[n_dd - shift :] += data["dd_sums"][:shift]
+                del data
+        
+        # matching_deal_count (combined count across all directions)
+        result_cols[f"matching_deal_count_S{seat}"] = combined_count.astype(np.uint32)
+        
+        # Hand stats: mean, std, min, max for each of 6 dimensions
+        count_1d = combined_count.astype(np.float64)
+        count_2d = count_1d[np.newaxis, :]  # (1, n) for broadcasting with (n_dims, n)
+        has_data = count_1d > 0
+        has_data_2d = has_data[np.newaxis, :]
+        
+        # Column name mapping for output: METRICS index → output name
+        # METRICS = ["HCP", "SL_S", "SL_H", "SL_D", "SL_C", "Total_Points"]
+        metric_output_names = {
+            "HCP": "HCP",
+            "SL_S": "SL_S",
+            "SL_H": "SL_H",
+            "SL_D": "SL_D",
+            "SL_C": "SL_C",
+            "Total_Points": "Total_Points",
+        }
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dim_means = np.where(has_data_2d,
+                                 combined_dim_sums.astype(np.float64) / count_2d,
+                                 np.nan)  # (n_dims, n)
+            dim_mean_sq = np.where(has_data_2d,
+                                   combined_dim_sq_sums.astype(np.float64) / count_2d,
+                                   np.nan)
+            dim_vars = dim_mean_sq - dim_means ** 2
+            dim_stds = np.sqrt(np.maximum(0, dim_vars))
+
+        # Downcast once; store views to avoid per-column copies.
+        dim_means_f32 = dim_means.astype(np.float32)
+        dim_stds_f32 = dim_stds.astype(np.float32)
+        del dim_means, dim_stds, dim_mean_sq, dim_vars
+        
+        for dim_idx, metric in enumerate(METRICS):
+            out_name = metric_output_names[metric]
+            
+            result_cols[f"{out_name}_mean_S{seat}"] = dim_means_f32[dim_idx]
+            result_cols[f"{out_name}_std_S{seat}"] = dim_stds_f32[dim_idx]
+            
+            # Min/max: replace sentinel values with 0 where no data
+            mins = combined_dim_mins[dim_idx].copy()
+            mins[~has_data] = 0
+            result_cols[f"{out_name}_min_S{seat}"] = mins
+            
+            maxs = combined_dim_maxs[dim_idx].copy()
+            maxs[~has_data] = 0
+            result_cols[f"{out_name}_max_S{seat}"] = maxs
+        
+        # DD trick means — compute in float64 then downcast to float32
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dd_means = combined_dd_sums.astype(np.float64) / count_2d
+            dd_means[:, ~has_data] = np.nan  # (n_dd, n)
+        dd_means_f32 = dd_means.astype(np.float32)
+        del dd_means
+        
+        # After rotation, DD positions are seat-relative:
+        #   positions 0-4  = seat S (self) declares strains C,D,H,S,N
+        #   positions 5-9  = seat S+1 (LHO) declares strains C,D,H,S,N
+        #   positions 10-14 = seat S+2 (partner) declares strains C,D,H,S,N
+        #   positions 15-19 = seat S+3 (RHO) declares strains C,D,H,S,N
+        for dd_idx in range(n_dd):
+            decl_seat_offset = dd_idx // len(DD_STRAINS)  # 0=self, 1=next, 2=opp, 3=prev
+            decl_seat = ((seat - 1 + decl_seat_offset) % 4) + 1  # 1-indexed
+            strain = DD_STRAINS[dd_idx % len(DD_STRAINS)]
+            result_cols[f"DD_S{decl_seat}_{strain}_mean_S{seat}"] = dd_means_f32[dd_idx]
     
     result_df = pl.DataFrame(result_cols)
     result_df = result_df.sort("bt_index")
     
+    n_total_cols = len(result_cols)
     elapsed = time.time() - step_start
-    log(f"  Combined {n:,} rows in {fmt_time(elapsed)} (24 columns: 4 seats x 2 vul x 3 metrics)")
+    log(f"  Combined {n:,} rows in {fmt_time(elapsed)} ({n_total_cols} columns: "
+        f"24 EV/Par + {4 * (n_dims * 4 + 1)} hand stats + {4 * n_dd} DD means)")
     
     # ---------------------------------------------------------------------------
     # Step 5: Write stats output
     # ---------------------------------------------------------------------------
-    total_steps = 6 if build_index else 5
     log(f"\n[5/{total_steps}] Writing stats output...")
     step_start = time.time()
     
@@ -1057,22 +1609,6 @@ def run_pipeline(
     file_size = output_file.stat().st_size / 1e6
     elapsed = time.time() - step_start
     log(f"  Written {output_file} ({file_size:.1f} MB) in {fmt_time(elapsed)}")
-    
-    # ---------------------------------------------------------------------------
-    # Step 6: Consolidate inverted index (if enabled)
-    # ---------------------------------------------------------------------------
-    if build_index and index_dir:
-        log(f"\n[6/{total_steps}] Consolidating inverted index...")
-        step_start = time.time()
-        
-        for seat in range(1, 5):
-            for direction in DIRECTIONS:
-                for vul in VUL_STATES:
-                    log(f"  Processing {direction}_{vul}/S{seat}...")
-                    consolidate_inverted_index_vul(index_dir, cubes[(direction, vul)], direction, vul, seat)
-        
-        elapsed = time.time() - step_start
-        log(f"  Index consolidation completed in {fmt_time(elapsed)}")
     
     # ---------------------------------------------------------------------------
     # Summary
@@ -1085,8 +1621,7 @@ def run_pipeline(
     log(f"End:     {fmt_datetime()}")
     log(f"Elapsed: {fmt_time(total_elapsed)}")
     log(f"Stats:   {output_file}")
-    if build_index and index_dir:
-        log(f"Index:   {index_dir}")
+    log(f"Columns: {n_total_cols}")
     log(f"Rows:    {n:,}")
     log("=" * 70)
     
@@ -1098,11 +1633,15 @@ def run_pipeline(
         count_v = row.get('Count_S1_V', 0)
         ev_nv = row.get('Avg_EV_S1_NV')
         ev_v = row.get('Avg_EV_S1_V')
+        hcp_mean = row.get('HCP_mean_S1')
+        match_count = row.get('matching_deal_count_S1', 0)
         ev_nv_str = f"{ev_nv:.1f}" if ev_nv is not None and not (isinstance(ev_nv, float) and ev_nv != ev_nv) else "N/A"
         ev_v_str = f"{ev_v:.1f}" if ev_v is not None and not (isinstance(ev_v, float) and ev_v != ev_v) else "N/A"
+        hcp_str = f"{hcp_mean:.1f}" if hcp_mean is not None and not (isinstance(hcp_mean, float) and hcp_mean != hcp_mean) else "N/A"
         log(f"  bt_index={row['bt_index']}, "
             f"Count_NV={count_nv:,}, Count_V={count_v:,}, "
-            f"EV_NV={ev_nv_str}, EV_V={ev_v_str}")
+            f"EV_NV={ev_nv_str}, EV_V={ev_v_str}, "
+            f"HCP_mean={hcp_str}, match_count={match_count:,}")
 
 
 def main():
@@ -1135,7 +1674,7 @@ def main():
     )
     parser.add_argument(
         "--build-index", action="store_true",
-        help="DEPRECATED: Build inverted index (~500GB+ disk, to be removed)"
+        help="DEPRECATED/disabled: ignored in v3 pipeline"
     )
     parser.add_argument(
         "--max-bt-rows", type=int, default=None,

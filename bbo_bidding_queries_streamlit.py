@@ -63,7 +63,15 @@ from plugins.bbo_handlers_common import (
     format_par_contracts as _format_par_contracts,
 )
 
-from bbo_explanation_lib import compute_eeo_from_bid_details
+from bbo_explanation_lib import (
+    compute_eeo_from_bid_details,
+    compute_guardrail_penalty,
+    expected_from_hist,
+)
+from bbo_hand_eval_lib import (
+    estimate_partnership_tricks,
+    estimate_quick_losers,
+)
 
 
 API_BASE = "http://127.0.0.1:8000"
@@ -5943,6 +5951,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "Total_Points_E",
                         "Total_Points_S",
                         "Total_Points_W",
+                        # Suit lengths per direction (for Actual Stats display)
+                        "SL_S_N", "SL_S_E", "SL_S_S", "SL_S_W",
+                        "SL_H_N", "SL_H_E", "SL_H_S", "SL_H_W",
+                        "SL_D_N", "SL_D_E", "SL_D_S", "SL_D_W",
+                        "SL_C_N", "SL_C_E", "SL_C_S", "SL_C_W",
                         "ParContracts",
                         "ParScore",
                         "EV_Score_Declarer",
@@ -7339,7 +7352,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         else:
                             st.write("No par-contract posterior available.")
                     elif qid == "Q4":
-                        st.markdown("**Pinned deal DD tricks**")
+                        st.markdown("**Actual DD (double-dummy) tricks — pinned deal**")
                         if not pinned_deal:
                             st.warning("Pin a deal index to answer Q4 using double-dummy tricks.")
                         else:
@@ -7353,9 +7366,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             else:
                                 st.write(f"Double-dummy tricks for {decl} in {strain}: **{int(v)}**.")
                     elif qid == "Q5":
-                        st.markdown("**Pinned deal DD tricks grid**")
+                        st.markdown("**Actual DD (double-dummy) tricks grid — pinned deal**")
                         if not pinned_deal:
-                            st.warning("Pin a deal index to show the DD tricks grid (4×5).")
+                            st.warning("Pin a deal index to show the actual DD tricks grid (4×5).")
                         else:
                             rows = []
                             for d in ["N", "E", "S", "W"]:
@@ -7495,6 +7508,70 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 table_name="auction_builder_qa_q12_next_bids",
                                 fit_columns_to_view=True,
                                 show_sql_expander=False,
+                            )
+                    elif qid == "Q13":
+                        st.markdown("**Estimated partnership tricks grid (heuristic model)**")
+                        if not pinned_deal:
+                            st.warning("Pin a deal index to show the estimated tricks grid.")
+                        else:
+                            with st.spinner("Computing estimated tricks grid..."):
+                                # Fetch bid-details to get Phase2a posteriors
+                                details = _qa_fetch_bid_details(current_auction, sel_bid)
+                                p2a = details.get("phase2a") or {}
+                                hcp_hists = details.get("hcp_histograms") or {}
+                                sl_hists = details.get("suit_length_histograms") or {}
+                                fit_us = (p2a.get("fit") or {}).get("us")
+                                fit_them = (p2a.get("fit") or {}).get("them")
+
+                                # Determine acting direction for fit assignment
+                                _directions = ["N", "E", "S", "W"]
+                                _dealer_q13 = str(pinned_deal.get("Dealer", "N")).upper()
+                                _dealer_idx_q13 = _directions.index(_dealer_q13) if _dealer_q13 in _directions else 0
+                                _acting_dir_q13 = _directions[(_dealer_idx_q13 + int(seat_1_to_4) - 1) % 4]
+                                _acting_is_ns = _acting_dir_q13 in ("N", "S")
+
+                                _opposite = {"N": "S", "S": "N", "E": "W", "W": "E"}
+
+                                est_rows: list[dict[str, Any]] = []
+                                for d in _directions:
+                                    hand = str(pinned_deal.get(f"Hand_{d}", "") or "").strip()
+                                    if not hand:
+                                        est_rows.append({"Declarer": d, "C": None, "D": None, "H": None, "S": None, "NT": None})
+                                        continue
+
+                                    partner_d = _opposite[d]
+                                    partner_hcp = hcp_hists.get(partner_d) if isinstance(hcp_hists, dict) else None
+                                    partner_sl = sl_hists.get(partner_d) if isinstance(sl_hists, dict) else None
+
+                                    # Same side as acting seat → fit.us; opposite side → fit.them
+                                    d_is_ns = d in ("N", "S")
+                                    fit = fit_us if (d_is_ns == _acting_is_ns) else fit_them
+
+                                    r: dict[str, Any] = {"Declarer": d}
+                                    for strain_label, strain_arg in [("C", "C"), ("D", "D"), ("H", "H"), ("S", "S"), ("NT", "NT")]:
+                                        _trick_res = estimate_partnership_tricks(
+                                            self_hand=hand,
+                                            partner_hcp_hist=partner_hcp,
+                                            partner_sl_hists=partner_sl,
+                                            fit_us_hists=fit,
+                                            strain=strain_arg,
+                                        )
+                                        r[strain_label] = _trick_res.get("est_tricks")
+                                    est_rows.append(r)
+
+                            df = pl.DataFrame(est_rows)
+                            render_aggrid(
+                                df,
+                                key=f"auction_builder_qa_q13_est_grid_{qa_curr_ctx}",
+                                height=calc_grid_height(len(df), max_height=220),
+                                table_name="auction_builder_qa_q13_est_grid",
+                                fit_columns_to_view=True,
+                                show_sql_expander=False,
+                            )
+                            st.caption(
+                                f"Acting seat: **{_acting_dir_q13}**. "
+                                f"Partner posteriors from Phase2a (bid-details for `{sel_bid}`). "
+                                f"Model: quick tricks + length tricks + fit bonus."
                             )
                     else:
                         st.info("Question not recognized.")
@@ -7818,7 +7895,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     ev_contract_pre = ev_contract_pre
 
                 row_data["Contract"] = contract_str or ""
-                row_data["DD_[NESW]_[CDHSN]"] = dd_val
+                row_data["DD_Tricks"] = dd_val
                 row_data["_dd_col"] = dd_col_name or ""
                 # DD/EV "contract" scores in the UI should be shown as "score for OUR side".
                 # `get_dd_score_for_auction` / `get_ev_for_auction` are declarer-relative:
@@ -7840,19 +7917,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 row_data["EV_Contract"] = ev_contract
                 row_data["EV_Contract_Pre"] = ev_contract_pre
 
-                # If this bid is a pinned-deal match but has no Avg_EV, treat it as rejected.
-                # (User expectation: valid bids should have an actionable EV signal.)
-                if (
-                    show_failed_criteria
-                    and (matches_pinned is True)
-                    and (row_data.get("Avg_EV") is None)
-                ):
-                    if not (pass_no_criteria or pass_always_valid):
-                        is_rejected = True
-                        failure_reasons.append("missing Avg_EV")
-                        failure_str = "; ".join(failure_reasons) if failure_reasons else ""
-                        row_data["_rejected"] = True
-                        row_data["can_complete"] = can_complete
+                # NOTE: Avg_EV is only available for completed auctions (~975K rows).
+                # Non-completed auction nodes (e.g. opening bids like 1C) legitimately
+                # have Avg_EV=None and should NOT be rejected for it.
 
                 # Enforce: Pass with empty criteria is never rejected.
                 if pass_no_criteria:
@@ -8048,8 +8115,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     gb.configure_column("Contract", width=110, minWidth=95)
                 if "can_complete" in pdf.columns:
                     gb.configure_column("can_complete", width=130, minWidth=120, headerName="Can Complete")
-                if "DD_[NESW]_[CDHSN]" in pdf.columns:
-                    gb.configure_column("DD_[NESW]_[CDHSN]", width=135, minWidth=120, headerName="DD")
+                if "DD_Tricks" in pdf.columns:
+                    gb.configure_column("DD_Tricks", width=135, minWidth=120, headerName="DD_Tricks")
                 if "DD_Score_Contract" in pdf.columns:
                     gb.configure_column("DD_Score_Contract", width=135, minWidth=120, headerName="DD Score")
                 gb.configure_column("Matches", width=115, minWidth=105)    # 7 chars
@@ -8518,6 +8585,102 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         help="Subtracts points when Phase2a suggests opponents often have big fits (max over suits).",
                     )
 
+                # Guardrail controls (two rows)
+                with st.expander("Guardrail settings (overbid / underbid / sacrifice)", expanded=False):
+                    guard_row1 = st.columns([1.0, 1.0, 1.0, 1.0, 1.0], gap="small")
+                    with guard_row1[0]:
+                        w_guard = st.slider(
+                            "Master weight",
+                            min_value=0.0,
+                            max_value=3.0,
+                            value=1.0,
+                            step=0.1,
+                            key=f"ab_adv_wguard_{deal_idx_key}_{current_auction}",
+                            help="Multiplier for all guardrail penalties (0 = off, 1 = normal, >1 = stricter).",
+                        )
+                    with guard_row1[1]:
+                        w_guard_overbid = st.slider(
+                            "Overbid / level",
+                            min_value=0,
+                            max_value=200,
+                            value=80,
+                            step=10,
+                            key=f"ab_adv_wguard_overbid_{deal_idx_key}_{current_auction}",
+                            help="OVERBID_VS_PAR: points deducted per level the bid exceeds par.",
+                        )
+                    with guard_row1[2]:
+                        w_guard_tp = st.slider(
+                            "TP shortfall / pt",
+                            min_value=0,
+                            max_value=30,
+                            value=15,
+                            step=1,
+                            key=f"ab_adv_wguard_tp_{deal_idx_key}_{current_auction}",
+                            help="TP_SHORTFALL: points deducted per total-point shortfall below the standard minimum.",
+                        )
+                    with guard_row1[3]:
+                        w_guard_neg = st.slider(
+                            "Neg-par amplifier",
+                            min_value=0.0,
+                            max_value=2.0,
+                            value=0.5,
+                            step=0.1,
+                            key=f"ab_adv_wguard_neg_{deal_idx_key}_{current_auction}",
+                            help="NEG_PAR_HIGH_LEVEL: extra penalty multiplier for negative acting-par at 4+ level.",
+                        )
+                    with guard_row1[4]:
+                        w_guard_strain = st.slider(
+                            "Strain ineff.",
+                            min_value=0,
+                            max_value=200,
+                            value=60,
+                            step=10,
+                            key=f"ab_adv_wguard_strain_{deal_idx_key}_{current_auction}",
+                            help="STRAIN_INEFFICIENCY: flat penalty for bidding 5m when par says 3NT (2 extra tricks for same score).",
+                        )
+                    guard_row2 = st.columns([1.0, 1.0, 1.0, 1.0, 1.0], gap="small")
+                    with guard_row2[0]:
+                        w_guard_underbid = st.slider(
+                            "Underbid / level",
+                            min_value=0,
+                            max_value=200,
+                            value=40,
+                            step=10,
+                            key=f"ab_adv_wguard_underbid_{deal_idx_key}_{current_auction}",
+                            help="UNDERBID_VS_PAR: points deducted per level the bid is below par *owned by our side*.",
+                        )
+                    with guard_row2[1]:
+                        w_guard_tp_surplus = st.slider(
+                            "TP surplus / pt",
+                            min_value=0,
+                            max_value=20,
+                            value=8,
+                            step=1,
+                            key=f"ab_adv_wguard_tp_surplus_{deal_idx_key}_{current_auction}",
+                            help="TP_SURPLUS_UNDERBID: points deducted per TP above the threshold for a higher achievable level.",
+                        )
+                    with guard_row2[2]:
+                        w_guard_sacrifice = st.slider(
+                            "Sacrifice discount %",
+                            min_value=0,
+                            max_value=100,
+                            value=70,
+                            step=5,
+                            key=f"ab_adv_wguard_sacrifice_{deal_idx_key}_{current_auction}",
+                            help="Fraction by which overbid penalties are reduced when par belongs to opponents "
+                            "(sacrifice context). 70% = most of the overbid penalty is forgiven.",
+                        )
+                    with guard_row2[3]:
+                        w_guard_tricks = st.slider(
+                            "Tricks shortfall / trick",
+                            min_value=0,
+                            max_value=80,
+                            value=30,
+                            step=5,
+                            key=f"ab_adv_wguard_tricks_{deal_idx_key}_{current_auction}",
+                            help="TRICKS_SHORTFALL: points deducted per estimated trick below the number required for the contract level.",
+                        )
+
                 @st.cache_data(ttl=3600, show_spinner=False)
                 def _ab_fetch_bid_details(
                     auction: str,
@@ -8657,6 +8820,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "Bid": bid0,
                                     "Error": str(e),
                                     "Score": None,
+                                    "Guard": None,
+                                    "GuardWhy": None,
                                     "U": None,
                                     "ParMean_NS": None,
                                     "ParMean_Act": None,
@@ -8665,11 +8830,18 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "Tail": None,
                                     "Desc": None,
                                     "Threat6+%": None,
+                                    "EstTricks": None,
+                                    "QLosers": None,
+                                    "SelfQT": None,
+                                    "SelfLTC": None,
+                                    "SelfTP": None,
+                                    "PtnrTP": None,
                                     "TopPar": None,
                                     "TopPar%": None,
                                     "n": r.get("Deals", None) or r.get("Matches", None),
                                     "Degraded": "api_error",
                                     "Source": get_bucket_from_row(r),
+                                    "Categories": r.get("Categories", ""),
                                 }
                             )
                             continue
@@ -8683,6 +8855,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "BTI": details.get("child_bt_index"),
                                     "Flags": "",
                                     "Score": None,
+                                    "Guard": None,
+                                    "GuardWhy": None,
                                     "U": None,
                                     "ParMean_NS": None,
                                     "ParMean_Act": None,
@@ -8691,11 +8865,18 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     "Tail": None,
                                     "Desc": None,
                                     "Threat6+%": None,
+                                    "EstTricks": None,
+                                    "QLosers": None,
+                                    "SelfQT": None,
+                                    "SelfLTC": None,
+                                    "SelfTP": None,
+                                    "PtnrTP": None,
                                     "TopPar": None,
                                     "TopPar%": None,
                                     "n": details.get("matched_deals_total", r.get("Deals", None) or r.get("Matches", None)),
                                     "Degraded": str(details.get("degraded_mode") or "bid_details_error"),
                                     "Source": get_bucket_from_row(r),
+                                    "Categories": r.get("Categories", ""),
                                 }
                             )
                             continue
@@ -8791,6 +8972,111 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             top_contract = None
                             top_prob = None
 
+                        # -- Guardrail inputs --
+                        # Self total points (from range_percentiles, available when pinned deal)
+                        self_tp_val = None
+                        try:
+                            rp2 = details.get("range_percentiles")
+                            if isinstance(rp2, dict):
+                                self_tp_val = (rp2.get("total_points") or {}).get("value")
+                                if self_tp_val is not None:
+                                    self_tp_val = float(self_tp_val)
+                        except Exception:
+                            self_tp_val = None
+
+                        # Partner expected TP (from phase2a roles histogram)
+                        partner_tp_hist_val = None
+                        try:
+                            p2a = details.get("phase2a") or {}
+                            partner_tp_hist_val = ((p2a.get("roles") or {}).get("partner") or {}).get("total_points_hist")
+                        except Exception:
+                            partner_tp_hist_val = None
+
+                        # Par contracts topk for guardrail comparison
+                        par_topk_for_guard = None
+                        try:
+                            par_topk_for_guard = (par_contracts.get("topk") or [])
+                        except Exception:
+                            par_topk_for_guard = None
+
+                        # -- Trick / Loser estimation --
+                        est_tricks_val: float | None = None
+                        est_ql_val: float | None = None
+                        est_self_qt_val: float | None = None
+                        est_self_ltc_val: int | None = None
+                        try:
+                            # Extract bid strain
+                            import re as _re_strain
+                            _strain_m = _re_strain.match(r"^[1-7]\s*(NT|N|[CDHS])", bid0)
+                            _bid_strain: str | None = None
+                            if _strain_m:
+                                _bs = _strain_m.group(1).upper()
+                                _bid_strain = "NT" if _bs in ("N", "NT") else _bs
+
+                            # Get self hand string (acting player)
+                            _self_hand_str: str | None = None
+                            if pinned_deal and acting_dir_adv:
+                                _self_hand_str = str(pinned_deal.get(f"Hand_{acting_dir_adv}", "") or "").strip() or None
+
+                            if _bid_strain and _self_hand_str:
+                                # Partner posteriors for trick estimation
+                                _p2a = details.get("phase2a") or {}
+                                _partner_hcp_h = ((_p2a.get("roles") or {}).get("partner") or {}).get("hcp_hist")
+                                _partner_sl_h = ((_p2a.get("roles") or {}).get("partner") or {}).get("sl_hist")
+                                _fit_us_h = (_p2a.get("fit") or {}).get("us")
+
+                                _trick_res = estimate_partnership_tricks(
+                                    self_hand=_self_hand_str,
+                                    partner_hcp_hist=_partner_hcp_h,
+                                    partner_sl_hists=_partner_sl_h,
+                                    fit_us_hists=_fit_us_h,
+                                    strain=_bid_strain,
+                                )
+                                est_tricks_val = _trick_res.get("est_tricks")
+                                est_self_qt_val = _trick_res.get("self_qt")
+                                est_self_ltc_val = _trick_res.get("self_ltc")
+
+                                _ql_res = estimate_quick_losers(
+                                    self_hand=_self_hand_str,
+                                    partner_sl_hists=_partner_sl_h,
+                                    fit_us_hists=_fit_us_h,
+                                    strain=_bid_strain,
+                                )
+                                est_ql_val = _ql_res.get("quick_losers")
+                        except Exception:
+                            est_tricks_val = None
+                            est_ql_val = None
+                            est_self_qt_val = None
+                            est_self_ltc_val = None
+
+                        # Compute guardrail penalty
+                        guard_penalty = 0.0
+                        guard_reasons: list[str] = []
+                        try:
+                            if float(w_guard) > 0:
+                                gp, gr = compute_guardrail_penalty(
+                                    bid=bid0,
+                                    par_contracts_topk=par_topk_for_guard,
+                                    self_total_points=self_tp_val,
+                                    partner_tp_hist=partner_tp_hist_val,
+                                    par_score_mean=mean_par,
+                                    acting_sign=float(acting_sign_adv),
+                                    w_overbid_level=float(w_guard_overbid),
+                                    w_tp_shortfall=float(w_guard_tp),
+                                    w_neg_par_high=float(w_guard_neg),
+                                    w_underbid_level=float(w_guard_underbid),
+                                    w_tp_surplus=float(w_guard_tp_surplus),
+                                    w_strain_ineff=float(w_guard_strain),
+                                    sacrifice_discount=float(w_guard_sacrifice) / 100.0,
+                                    est_tricks=est_tricks_val,
+                                    w_tricks_shortfall=float(w_guard_tricks),
+                                )
+                                guard_penalty = float(gp) * float(w_guard)
+                                guard_reasons = gr
+                        except Exception:
+                            guard_penalty = 0.0
+                            guard_reasons = []
+
                         # Composite Score (transparent & adjustable)
                         score = None
                         try:
@@ -8804,6 +9090,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                             threat_term = float(opp_threat) if opp_threat is not None else 0.0
                             score = base + float(w_desc) * desc_term - float(w_threat) * threat_term
+                            # Subtract guardrail penalty
+                            score -= guard_penalty
                         except Exception:
                             score = None
 
@@ -8816,6 +9104,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 # Show the bid-details vulnerability filter in effect (explains mean shifts).
                                 "VulFilter": vul_filter_val,
                                 "Score": score,
+                                "Guard": round(guard_penalty, 0) if guard_penalty > 0 else None,
+                                "GuardWhy": "; ".join(guard_reasons) if guard_reasons else None,
                                 "U": utility,
                                 # Make ParScore mean explicit (users expect to see this).
                                 # - ParMean_NS: raw par_score.mean from /bid-details (NS-positive).
@@ -8829,6 +9119,12 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "HCP%ile": hcp_pct,
                                 "Threat6+%": (float(opp_threat) * 100.0) if isinstance(opp_threat, (int, float)) else None,
                                 "FitUs": fit_us_best,
+                                "EstTricks": est_tricks_val,
+                                "QLosers": est_ql_val,
+                                "SelfQT": est_self_qt_val,
+                                "SelfLTC": est_self_ltc_val,
+                                "SelfTP": self_tp_val,
+                                "PtnrTP": round(float(expected_from_hist(partner_tp_hist_val)), 1) if expected_from_hist(partner_tp_hist_val) is not None else None,
                                 "TopPar": top_contract,
                                 "TopPar%": (float(top_prob) * 100.0) if isinstance(top_prob, (int, float)) else None,
                                 # Show sample sizes used by /bid-details.
@@ -8836,6 +9132,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 "Sampled": details.get("matched_deals_sampled"),
                                 "Degraded": details.get("degraded_mode"),
                                 "Source": get_bucket_from_row(r),
+                                "Categories": r.get("Categories", ""),
                             }
                         )
 
@@ -8887,6 +9184,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "Error": f"Synthetic row: Pass is not BT-backed (no /bid-details evidence); {pass_note}.",
                         "VulFilter": vul_filter_val,
                         "Score": pass_score,
+                        "Guard": None,
+                        "GuardWhy": None,
                         "U": None,
                         "ParMean_NS": (
                             float(pr.get("Avg_Par"))
@@ -8905,6 +9204,12 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "HCP%ile": None,
                         "Threat6+%": None,
                         "FitUs": None,
+                        "EstTricks": None,
+                        "QLosers": None,
+                        "SelfQT": None,
+                        "SelfLTC": None,
+                        "SelfTP": None,
+                        "PtnrTP": None,
                         "TopPar": None,
                         "TopPar%": None,
                         "n": (pr.get("Deals", None) if isinstance(pr, dict) else None)
@@ -8912,6 +9217,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "Sampled": None,
                         "Degraded": "synthetic_pass",
                         "Source": get_bucket_from_row(pr) if pr else "Valid",
+                        "Categories": pr.get("Categories", "") if isinstance(pr, dict) else "",
                     }
 
                     try:
@@ -8926,10 +9232,38 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 if not adv_df.is_empty():
                     # Rank column for readability
                     try:
-                        adv_df = adv_df.sort("Score", descending=True, nulls_last=True)
+                        # Priority categories: bids with [raise, FitEstablished, SupportShowing] come first
+                        priority_categories = ["raise", "FitEstablished", "SupportShowing"]
+                        
+                        # Create a priority column: 0 for priority bids, 1 for others
+                        def has_priority_category(cats_str: str | None) -> int:
+                            if not cats_str:
+                                return 1
+                            cats_upper = str(cats_str).upper()
+                            for cat in priority_categories:
+                                if cat.upper() in cats_upper:
+                                    return 0
+                            return 1
+                        
+                        # Add priority column
+                        adv_df = adv_df.with_columns(
+                            pl.col("Categories").map_elements(has_priority_category, return_dtype=pl.Int8).alias("_priority")
+                        )
+                        
+                        # Sort: priority first (0), then by Score descending
+                        adv_df = adv_df.sort(["_priority", "Score"], descending=[False, True], nulls_last=True)
+                        
+                        # Remove temporary priority column
+                        adv_df = adv_df.drop("_priority")
+                        
                         adv_df = adv_df.with_row_index("Rank", offset=1)
                     except Exception:
-                        pass
+                        # Fallback to simple Score sort if priority logic fails
+                        try:
+                            adv_df = adv_df.sort("Score", descending=True, nulls_last=True)
+                            adv_df = adv_df.with_row_index("Rank", offset=1)
+                        except Exception:
+                            pass
 
                     adv_selected = render_aggrid(
                         adv_df,
@@ -10106,7 +10440,198 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         },
                     )
                     handle_bid_selection(valid_resp, "valid")
-                
+
+                    # ----------------------------------------------------------
+                    # Seat Stats: Actual (invariant) + Computed (per-bid means)
+                    # ----------------------------------------------------------
+                    _DIRECTIONS_STAT = ["N", "E", "S", "W"]
+                    _DD_DECL = ["N", "E", "S", "W"]
+                    _DD_STRAIN = ["C", "D", "H", "S", "N"]
+                    _DD_FRIENDLY = {"C": "C", "D": "D", "H": "H", "S": "S", "N": "NT"}
+
+                    # -- Actual Deal Stats (invariant, from pinned deal) --
+                    try:
+                        _actual_hand_df: pd.DataFrame | None = None
+                        _actual_dd_df: pd.DataFrame | None = None
+                        if pinned_deal:
+                            _actual_hand_rows: list[dict] = []
+                            _actual_dd_rows: list[dict] = []
+                            # Hand_ strings use dot-notation: S.H.D.C
+                            _HAND_SUIT_ORDER = ["S", "H", "D", "C"]
+                            # Display order: C, D, H, S
+                            _DISPLAY_SUIT_ORDER = ["C", "D", "H", "S"]
+                            for _dir in _DIRECTIONS_STAT:
+                                _hs_row: dict[str, Any] = {"Direction": _dir}
+                                _hcp = pinned_deal.get(f"HCP_{_dir}")
+                                _hs_row["HCP"] = round(float(_hcp), 1) if _hcp is not None else None
+                                _hs_row["HCP_std"] = None  # single deal
+
+                                # Compute suit lengths from Hand_ string (always available)
+                                _hand_str = str(pinned_deal.get(f"Hand_{_dir}", "") or "")
+                                _hand_parts = _hand_str.split(".") if _hand_str else []
+                                _sl_by_suit: dict[str, int | None] = {}
+                                if len(_hand_parts) == 4:
+                                    for _si, _sk in enumerate(_HAND_SUIT_ORDER):
+                                        _sl_by_suit[_sk] = len(_hand_parts[_si])
+                                else:
+                                    for _sk in _DISPLAY_SUIT_ORDER:
+                                        _v = pinned_deal.get(f"SL_{_sk}_{_dir}")
+                                        _sl_by_suit[_sk] = int(_v) if _v is not None else None
+                                for _sk in _DISPLAY_SUIT_ORDER:
+                                    _hs_row[f"SL_{_sk}"] = _sl_by_suit.get(_sk)
+
+                                _tp = pinned_deal.get(f"Total_Points_{_dir}")
+                                _hs_row["Total_Pts"] = round(float(_tp), 1) if _tp is not None else None
+                                _hs_row["TP_std"] = None  # single deal
+                                _actual_hand_rows.append(_hs_row)
+
+                                pass  # DD rows built separately below
+
+                            # DD tricks: 4 rows (declarer) × 5 cols (strain)
+                            for _decl in _DD_DECL:
+                                _dd_row: dict[str, Any] = {"Declarer": _decl}
+                                for _strain in _DD_STRAIN:
+                                    _v = pinned_deal.get(f"DD_{_decl}_{_strain}")
+                                    _dd_row[_strain] = int(float(_v)) if _v is not None else None
+                                _actual_dd_rows.append(_dd_row)
+
+                            if any(v is not None for r in _actual_hand_rows for k, v in r.items() if k != "Direction"):
+                                _actual_hand_df = pd.DataFrame(_actual_hand_rows).set_index("Direction")
+                            if any(v is not None for r in _actual_dd_rows for k, v in r.items() if k != "Declarer"):
+                                _actual_dd_df = pd.DataFrame(_actual_dd_rows).set_index("Declarer")
+
+                            if _actual_hand_df is not None or _actual_dd_df is not None:
+                                with st.expander("Actual Deal Stats (pinned deal)", expanded=False):
+                                    if _actual_hand_df is not None:
+                                        st.markdown("**Hand Stats**")
+                                        st.dataframe(_actual_hand_df, width="stretch")
+                                    if _actual_dd_df is not None:
+                                        st.markdown("**DD Tricks**")
+                                        st.dataframe(_actual_dd_df, width="stretch")
+                    except Exception as _e_actual:
+                        st.caption(f"⚠️ Actual deal stats error: {_e_actual}")
+
+                    # -- Per-deal Stats per bid (from sampled deals matching bt_index) --
+                    try:
+                        _bt_indices_for_stats = [
+                            int(r["BT Index"])
+                            for r in valid_rows
+                            if r.get("BT Index") is not None
+                        ]
+
+                        _deals_by_bt: dict = {}
+                        if _bt_indices_for_stats:
+                            _deals_resp = api_post(
+                                "/sample-deals-for-bt-indices",
+                                {
+                                    "bt_indices": _bt_indices_for_stats,
+                                    "sample_size": 100,
+                                    "seed": int(seed) if seed is not None else None,
+                                },
+                                timeout=30,
+                            )
+                            _deals_by_bt = _deals_resp.get("deals_by_bt", {})
+
+                        if _deals_by_bt:
+                            _bt_to_bid = {
+                                str(int(r["BT Index"])): str(r.get("Bid", "?"))
+                                for r in valid_rows
+                                if r.get("BT Index") is not None
+                            }
+                            # Determine active bidder's direction and shape from pinned deal
+                            _active_dir: str | None = None
+                            _active_shape: list[int] | None = None  # sorted suit lengths
+                            _active_exact_sl: dict[str, int] | None = None  # exact suit lengths by suit
+                            if pinned_deal:
+                                try:
+                                    _dirs = ["N", "E", "S", "W"]
+                                    _dealer = str(pinned_deal.get("Dealer", "N")).upper()
+                                    _d_idx = _dirs.index(_dealer) if _dealer in _dirs else 0
+                                    _active_dir = _dirs[(_d_idx + seat_1_to_4 - 1) % 4]
+                                    _hand_str = str(pinned_deal.get(f"Hand_{_active_dir}", "") or "")
+                                    _parts = _hand_str.split(".") if _hand_str else []
+                                    if len(_parts) == 4:
+                                        _suits = ["S", "H", "D", "C"]
+                                        _active_exact_sl = {s: len(p) for s, p in zip(_suits, _parts)}
+                                        _active_shape = sorted((len(p) for p in _parts), reverse=True)
+                                except Exception:
+                                    pass
+
+                            _DD_STRAINS = ["C", "D", "H", "S", "N"]
+
+                            for _bt_key, _bt_deal_data in _deals_by_bt.items():
+                                _bid_label = _bt_to_bid.get(_bt_key, _bt_key)
+                                _deal_list = _bt_deal_data.get("deals", [])
+                                _total_ct = _bt_deal_data.get("total_count", len(_deal_list))
+                                if not _deal_list:
+                                    continue
+
+                                # Build Hand Stats DF: one row per deal, columns per direction
+                                _hs_rows: list[dict] = []
+                                _dd_rows: list[dict] = []
+                                for _deal in _deal_list:
+                                    _hs_r: dict[str, Any] = {"deal_idx": _deal.get("index")}
+                                    _dd_r: dict[str, Any] = {"deal_idx": _deal.get("index")}
+                                    for _d in ["N", "E", "S", "W"]:
+                                        _hs_r[f"HCP_{_d}"] = _deal.get(f"HCP_{_d}")
+                                        for _suit in ["S", "H", "D", "C"]:
+                                            _hs_r[f"SL_{_suit}_{_d}"] = _deal.get(f"SL_{_suit}_{_d}")
+                                        _hs_r[f"TP_{_d}"] = _deal.get(f"Total_Points_{_d}")
+                                    for _decl in ["N", "E", "S", "W"]:
+                                        for _strain in _DD_STRAINS:
+                                            _dd_r[f"DD_{_decl}_{_strain}"] = _deal.get(f"DD_{_decl}_{_strain}")
+                                    _hs_rows.append(_hs_r)
+                                    _dd_rows.append(_dd_r)
+
+                                _hs_df = pd.DataFrame(_hs_rows)
+                                _dd_df = pd.DataFrame(_dd_rows)
+
+                                # Build shape-filtered DFs
+                                _hs_shape_df: pd.DataFrame | None = None
+                                _dd_shape_df: pd.DataFrame | None = None
+                                _shape_label = ""
+                                if _active_dir and _active_shape and _active_exact_sl:
+                                    _shape_label = "-".join(str(x) for x in _active_shape)
+                                    _shape_mask = []
+                                    for _deal in _deal_list:
+                                        _hand = str(_deal.get(f"Hand_{_active_dir}", "") or "")
+                                        _hp = _hand.split(".") if _hand else []
+                                        if len(_hp) == 4:
+                                            _dl = sorted((len(p) for p in _hp), reverse=True)
+                                            _shape_mask.append(_dl == _active_shape)
+                                        else:
+                                            _shape_mask.append(False)
+                                    if any(_shape_mask):
+                                        _hs_shape_df = _hs_df[_shape_mask].reset_index(drop=True)
+                                        _dd_shape_df = _dd_df[_shape_mask].reset_index(drop=True)
+
+                                with st.expander(
+                                    f"Deal Stats: {_bid_label} (bt_index={_bt_key}, "
+                                    f"{len(_deal_list)}/{_total_ct:,} deals)",
+                                    expanded=False,
+                                ):
+                                    st.markdown(f"**Hand Stats ({len(_hs_df)} deals)**")
+                                    st.dataframe(_hs_df, width="stretch", height=min(400, 35 + len(_hs_df) * 28))
+                                    st.markdown(f"**DD Tricks ({len(_dd_df)} deals)**")
+                                    st.dataframe(_dd_df, width="stretch", height=min(400, 35 + len(_dd_df) * 28))
+
+                                    if _hs_shape_df is not None and len(_hs_shape_df) > 0:
+                                        st.markdown(
+                                            f"**Hand Stats — {_active_dir} shape {_shape_label} "
+                                            f"({len(_hs_shape_df)} deals)**"
+                                        )
+                                        st.dataframe(_hs_shape_df, width="stretch", height=min(400, 35 + len(_hs_shape_df) * 28))
+                                    if _dd_shape_df is not None and len(_dd_shape_df) > 0:
+                                        st.markdown(
+                                            f"**DD Tricks — {_active_dir} shape {_shape_label} "
+                                            f"({len(_dd_shape_df)} deals)**"
+                                        )
+                                        st.dataframe(_dd_shape_df, width="stretch", height=min(400, 35 + len(_dd_shape_df) * 28))
+                                    elif _active_dir and _active_shape:
+                                        st.caption(f"No deals with {_active_dir} shape {_shape_label}")
+                    except Exception as _e_computed:
+                        st.caption(f"⚠️ Deal stats error: {_e_computed}")
+
                 # Rejected bids grid (dead ends, 0 deals, empty criteria)
                 if rejected_rows:
                     st.markdown(f"**⚠️ Rejected Bids ({len(rejected_rows)})**")
@@ -10149,8 +10674,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         gb_rej.configure_column("Par_NV", width=100, minWidth=90, headerName="Par NV")
                     if "Par_V" in rejected_pdf.columns:
                         gb_rej.configure_column("Par_V", width=90, minWidth=80, headerName="Par V")
-                    if "DD_[NESW]_[CDHSN]" in rejected_pdf.columns:
-                        gb_rej.configure_column("DD_[NESW]_[CDHSN]", width=135, minWidth=120, headerName="DD")
+                    if "DD_Tricks" in rejected_pdf.columns:
+                        gb_rej.configure_column("DD_Tricks", width=135, minWidth=120, headerName="DD_Tricks")
                     if "DD_Score_Contract" in rejected_pdf.columns:
                         gb_rej.configure_column("DD_Score_Contract", width=135, minWidth=120, headerName="DD Score")
                     gb_rej.configure_column("Failure", width=115, minWidth=105)    # 7 chars
@@ -11705,6 +12230,84 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             except Exception:
                                 desc_score = None
 
+                            # -- Trick / Loser estimation for AI Model path --
+                            _est_tricks_path: float | None = None
+                            try:
+                                import re as _re_strain2
+                                _strain_m2 = _re_strain2.match(r"^[1-7]\s*(NT|N|[CDHS])", bid0)
+                                _bid_strain2: str | None = None
+                                if _strain_m2:
+                                    _bs2 = _strain_m2.group(1).upper()
+                                    _bid_strain2 = "NT" if _bs2 in ("N", "NT") else _bs2
+                                _self_hand_p: str | None = None
+                                if pinned_deal and acting_dir:
+                                    _self_hand_p = str(pinned_deal.get(f"Hand_{acting_dir}", "") or "").strip() or None
+                                if _bid_strain2 and _self_hand_p:
+                                    _p2a_p = details.get("phase2a") or {}
+                                    _phcp_h = ((_p2a_p.get("roles") or {}).get("partner") or {}).get("hcp_hist")
+                                    _psl_h = ((_p2a_p.get("roles") or {}).get("partner") or {}).get("sl_hist")
+                                    _fit_h = (_p2a_p.get("fit") or {}).get("us")
+                                    _tr = estimate_partnership_tricks(
+                                        self_hand=_self_hand_p,
+                                        partner_hcp_hist=_phcp_h,
+                                        partner_sl_hists=_psl_h,
+                                        fit_us_hists=_fit_h,
+                                        strain=_bid_strain2,
+                                    )
+                                    _est_tricks_path = _tr.get("est_tricks")
+                            except Exception:
+                                _est_tricks_path = None
+
+                            # Guardrail penalty (Streamlit-side AI Model path)
+                            guard_penalty_s = 0.0
+                            try:
+                                _wg = float(locals().get("w_guard", 1.0) or 1.0)
+                                if _wg > 0:
+                                    _self_tp = None
+                                    try:
+                                        _rp2 = details.get("range_percentiles")
+                                        if isinstance(_rp2, dict):
+                                            _self_tp = (_rp2.get("total_points") or {}).get("value")
+                                            if _self_tp is not None:
+                                                _self_tp = float(_self_tp)
+                                    except Exception:
+                                        _self_tp = None
+                                    _ptnr_hist = None
+                                    try:
+                                        _p2a = details.get("phase2a") or {}
+                                        _ptnr_hist = ((_p2a.get("roles") or {}).get("partner") or {}).get("total_points_hist")
+                                    except Exception:
+                                        _ptnr_hist = None
+                                    _ptopk = (details.get("par_contracts") or {}).get("topk") or []
+                                    _wgo = float(locals().get("w_guard_overbid", 80) or 80)
+                                    _wgt = float(locals().get("w_guard_tp", 15) or 15)
+                                    _wgn = float(locals().get("w_guard_neg", 0.5) or 0.5)
+                                    _wgu = float(locals().get("w_guard_underbid", 40) or 40)
+                                    _wgts = float(locals().get("w_guard_tp_surplus", 8) or 8)
+                                    _wgsi = float(locals().get("w_guard_strain", 60) or 60)
+                                    _wgsd = float(locals().get("w_guard_sacrifice", 70) or 70) / 100.0
+                                    _wgtk = float(locals().get("w_guard_tricks", 30) or 30)
+                                    _gp, _ = compute_guardrail_penalty(
+                                        bid=bid0,
+                                        par_contracts_topk=_ptopk,
+                                        self_total_points=_self_tp,
+                                        partner_tp_hist=_ptnr_hist,
+                                        par_score_mean=mean_par,
+                                        acting_sign=float(acting_sign),
+                                        w_overbid_level=_wgo,
+                                        w_tp_shortfall=_wgt,
+                                        w_neg_par_high=_wgn,
+                                        w_underbid_level=_wgu,
+                                        w_tp_surplus=_wgts,
+                                        w_strain_ineff=_wgsi,
+                                        sacrifice_discount=_wgsd,
+                                        est_tricks=_est_tricks_path,
+                                        w_tricks_shortfall=_wgtk,
+                                    )
+                                    guard_penalty_s = float(_gp) * _wg
+                            except Exception:
+                                guard_penalty_s = 0.0
+
                             try:
                                 # Reconstruct utility from perspective of acting side.
                                 # "utility" from eeo is NS-relative (Mean_NS - Penalties).
@@ -11718,24 +12321,16 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 # Assuming Prior=0.
                                 matched_n = float(details.get("matched_deals_total_excluding_pinned") or details.get("matched_deals_total") or 0.0)
                                 shrinkage_k = 5.0
-                                # Apply shrinkage to the base par score (which is the main driver of variance)
-                                # Note: base can be negative. Shrinking towards 0 is conservative.
-                                # But if base is huge positive (600), shrinking it reduces it.
-                                # If base is huge negative (-800), shrinking it makes it closer to 0 (less bad).
-                                # Wait - shrinking a negative score makes it "better". 
-                                # Is "less bad" what we want for uncertain negative bids?
-                                # A bid that is -800 on 1 hand might be -100 on average.
-                                # A bid that is +600 on 1 hand might be +100 on average.
-                                # So shrinking towards 0 is correct: we distrust extremes from small samples.
                                 base_shrunk = (base * matched_n) / (matched_n + shrinkage_k)
                                 
                                 desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                                 threat_term = float(opp_threat) if opp_threat is not None else 0.0
-                                # Use shunk base
-                                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term
+                                # Use shrunk base, subtract guardrail penalty
+                                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term - guard_penalty_s
                                 try:
                                     # Debug print to console for tracking
-                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | N: {matched_n} | RawMean: {mean_par} | ActingSign: {acting_sign} | Base: {base} | ShrunkBase: {base_shrunk} | Final: {score_val}")
+                                    guard_s = f" | Guard: -{guard_penalty_s:.0f}" if guard_penalty_s > 0 else ""
+                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | N: {matched_n} | RawMean: {mean_par} | ActingSign: {acting_sign} | Base: {base} | ShrunkBase: {base_shrunk} | Final: {score_val}{guard_s}")
                                 except: pass
                                 return float(score_val), opt
                             except Exception:
@@ -11866,8 +12461,20 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     ai_max_deals = int(locals().get("adv_max_deals", 500) or 500)
                     ai_w_desc = float(locals().get("w_desc", 150) or 150)
                     ai_w_threat = float(locals().get("w_threat", 120) or 120)
+                    ai_w_guard = float(locals().get("w_guard", 1.0) or 1.0)
+                    ai_w_guard_overbid = float(locals().get("w_guard_overbid", 80) or 80)
+                    ai_w_guard_tp = float(locals().get("w_guard_tp", 15) or 15)
+                    ai_w_guard_neg = float(locals().get("w_guard_neg", 0.5) or 0.5)
+                    ai_w_guard_underbid = float(locals().get("w_guard_underbid", 40) or 40)
+                    ai_w_guard_tp_surplus = float(locals().get("w_guard_tp_surplus", 8) or 8)
+                    ai_w_guard_strain = float(locals().get("w_guard_strain", 60) or 60)
+                    ai_w_guard_sacrifice = float(locals().get("w_guard_sacrifice", 70) or 70) / 100.0
+                    ai_w_guard_tricks = float(locals().get("w_guard_tricks", 30) or 30)
                 except Exception:
                     ai_top_n, ai_max_deals, ai_w_desc, ai_w_threat = 12, 500, 150.0, 120.0
+                    ai_w_guard, ai_w_guard_overbid, ai_w_guard_tp, ai_w_guard_neg = 1.0, 80.0, 15.0, 0.5
+                    ai_w_guard_underbid, ai_w_guard_tp_surplus, ai_w_guard_strain, ai_w_guard_sacrifice = 40.0, 8.0, 60.0, 0.7
+                    ai_w_guard_tricks = 30.0
 
                 # If params changed, clear cached result + job id.
                 ai_params = {
@@ -11878,6 +12485,15 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     "max_deals": int(ai_max_deals),
                     "w_desc": float(ai_w_desc),
                     "w_threat": float(ai_w_threat),
+                    "w_guard": float(ai_w_guard),
+                    "w_guard_overbid": float(ai_w_guard_overbid),
+                    "w_guard_tp": float(ai_w_guard_tp),
+                    "w_guard_neg": float(ai_w_guard_neg),
+                    "w_guard_underbid": float(ai_w_guard_underbid),
+                    "w_guard_tp_surplus": float(ai_w_guard_tp_surplus),
+                    "w_guard_strain": float(ai_w_guard_strain),
+                    "w_guard_sacrifice": float(ai_w_guard_sacrifice),
+                    "w_guard_tricks": float(ai_w_guard_tricks),
                     "permissive_pass": bool(st.session_state.get("always_valid_pass", True)),
                 }
                 try:
@@ -12427,6 +13043,29 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         height=calc_grid_height(len(deals_df), max_height=400),
                         table_name="auction_builder_deals",
                     )
+
+                    # Display actual-auction aggregate stats (hand stats + DD means)
+                    _aa_stats = cached_data.get("actual_auction_stats")
+                    if _aa_stats:
+                        _aa_n = _aa_stats.get("deal_count", total_count)
+                        with st.expander(
+                            f"Actual Auction Stats ({_aa_n:,} deals)",
+                            expanded=False,
+                        ):
+                            _aa_hs = _aa_stats.get("hand_stats")
+                            if _aa_hs:
+                                st.markdown("**Hand Stats Means**")
+                                st.dataframe(
+                                    pd.DataFrame(_aa_hs).set_index("Direction"),
+                                    width="stretch",
+                                )
+                            _aa_dd = _aa_stats.get("dd_means")
+                            if _aa_dd:
+                                st.markdown("**DD Trick Means**")
+                                st.dataframe(
+                                    pd.DataFrame(_aa_dd).set_index("Declarer"),
+                                    width="stretch",
+                                )
                 else:
                     st.info("No deals found matching this auction pattern.")
             elif display_deals_cache_key in st.session_state:
@@ -12442,7 +13081,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             arena_pattern = f"^{auction_upper}.*-P-P-P$"
                         deals_data = api_post(
                             "/sample-deals-by-auction-pattern",
-                            {"pattern": arena_pattern, "sample_size": int(max_matching_deals), "seed": int(seed)},
+                            {"pattern": arena_pattern, "sample_size": int(max_matching_deals), "seed": int(seed), "include_stats": True},
                             timeout=30,
                         )
                         sample_deals = deals_data.get("deals", []) or []
@@ -12527,6 +13166,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             "sample_deals": sample_deals,
                             "display_rows": display_rows,
                             "stats": stats,
+                            "actual_auction_stats": deals_data.get("actual_auction_stats"),
                             "total_count": deals_data.get("total_count", len(sample_deals)),
                             "elapsed_sec": round((deals_data.get("_client_elapsed_ms") or deals_data.get("elapsed_ms") or 0) / 1000, 2),
                         }

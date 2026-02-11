@@ -67,9 +67,11 @@ from bbo_bid_details_lib import (
 )
 from bbo_explanation_lib import (
     compute_eeo_from_bid_details,
+    compute_guardrail_penalty,
     render_counterfactual_why_not,
     render_recommendation_explanation,
 )
+from bbo_hand_eval_lib import estimate_partnership_tricks
 
 from mlBridge.mlBridgeBiddingLib import DIRECTIONS
 import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
@@ -2935,16 +2937,105 @@ def handle_deals_matching_auction(
     return response
 
 
+def _compute_actual_auction_stats(
+    deal_df: "pl.DataFrame",
+    row_mask: "pl.Series",
+) -> Dict[str, Any]:
+    """Compute hand-stat means and DD trick means from *all* deals in ``row_mask``.
+
+    Returns a dict with ``hand_stats`` (4 direction rows) and ``dd_means``
+    (4 declarer rows × 5 strains), suitable for direct JSON serialisation.
+    Runs over the full filtered set (not just the sample) for accuracy.
+    """
+    import numpy as np
+
+    n_deals = int(row_mask.sum())
+    if n_deals == 0:
+        return {}
+
+    deal_indices = np.where(row_mask.to_numpy())[0]
+
+    def _mean(arr: np.ndarray, idx: np.ndarray):
+        vals = arr[idx]
+        if np.issubdtype(vals.dtype, np.floating):
+            valid = vals[~np.isnan(vals)]
+        else:
+            valid = vals.astype(np.float64)
+        return round(float(np.mean(valid)), 1) if len(valid) > 0 else None
+
+    # -- Hand stats: 4 rows (direction) × stat columns --
+    # Column naming: HCP_{dir}, Total_Points_{dir} but SL_{dir}_{suit}
+    _DIRS = ["N", "E", "S", "W"]
+    # (column_template, friendly_name, is_std)
+    # {d} = direction placeholder
+    _HS_SPECS: List[tuple] = [
+        ("HCP_{d}", "HCP", False),
+        ("HCP_{d}", "HCP_std", True),
+        ("SL_{d}_C", "SL_C", False),
+        ("SL_{d}_D", "SL_D", False),
+        ("SL_{d}_H", "SL_H", False),
+        ("SL_{d}_S", "SL_S", False),
+        ("Total_Points_{d}", "Total_Pts", False),
+        ("Total_Points_{d}", "TP_std", True),
+    ]
+    hand_rows: List[Dict[str, Any]] = []
+    for direction in _DIRS:
+        hs: Dict[str, Any] = {"Direction": direction}
+        for col_tmpl, friendly, is_std in _HS_SPECS:
+            col = col_tmpl.format(d=direction)
+            if col in deal_df.columns:
+                arr = deal_df[col].to_numpy(zero_copy_only=False)
+                if is_std:
+                    hs[friendly] = round(float(np.std(arr[deal_indices].astype(np.float64), ddof=0)), 1)
+                else:
+                    hs[friendly] = _mean(arr, deal_indices)
+            else:
+                hs[friendly] = None
+        hand_rows.append(hs)
+
+    # -- DD means: 4 rows (declarer) × 5 strain cols --
+    _DECLARERS = ["N", "E", "S", "W"]
+    _STRAINS = ["C", "D", "H", "S", "N"]
+    dd_rows: List[Dict[str, Any]] = []
+    for decl in _DECLARERS:
+        row_dict: Dict[str, Any] = {"Declarer": decl}
+        for strain in _STRAINS:
+            col = f"DD_{decl}_{strain}"
+            if col in deal_df.columns:
+                arr = deal_df[col].to_numpy(zero_copy_only=False)
+                row_dict[strain] = _mean(arr, deal_indices)
+            else:
+                row_dict[strain] = None
+        dd_rows.append(row_dict)
+
+    # Count how many hand-stat columns were found (for diagnostics)
+    _hs_found = sum(1 for d in _DIRS for tmpl, _, _ in _HS_SPECS if tmpl.format(d=d) in deal_df.columns)
+    _dd_found = sum(1 for d in _DECLARERS for s in _STRAINS if f"DD_{d}_{s}" in deal_df.columns)
+    print(f"[actual-auction-stats] {n_deals} deals, "
+          f"{_hs_found}/{len(_HS_SPECS)*4} HS cols, {_dd_found}/20 DD cols, "
+          f"DD_S_H={dd_rows[2].get('H')}, DD_N_H={dd_rows[0].get('H')}")
+    return {
+        "hand_stats": hand_rows,
+        "dd_means": dd_rows,
+        "deal_count": n_deals,
+    }
+
+
 def handle_sample_deals_by_auction_pattern(
     state: Dict[str, Any],
     pattern: str,
     sample_size: int,
     seed: Optional[int],
+    include_stats: bool = False,
 ) -> Dict[str, Any]:
     """Return a small sample of deals whose *actual auction* matches regex `pattern`.
 
     This intentionally does NOT run any BT / Rules logic. It is used by Streamlit's Auction Builder
     to power "Show Matching Deals" quickly without the heavy /bidding-arena path.
+
+    When ``include_stats`` is True, also computes aggregate hand-stat means and
+    DD trick means from ALL filtered deals (not just the sample) and returns
+    them in the ``"actual_auction_stats"`` key.
     """
     t0 = time.perf_counter()
 
@@ -2969,7 +3060,8 @@ def handle_sample_deals_by_auction_pattern(
         # Polars str.contains() with regex should respect ^ and $ anchors
         # For exact matches (^...$), str.contains() will match the full string
         # For prefix matches (^...), str.contains() will match from the start
-        filtered = df.filter(pl.col(auction_col).cast(pl.Utf8).str.contains(regex))
+        mask = pl.col(auction_col).cast(pl.Utf8).str.contains(regex)
+        filtered = df.filter(mask)
     except Exception as e:
         raise ValueError(f"Invalid pattern: {e}")
 
@@ -3008,9 +3100,23 @@ def handle_sample_deals_by_auction_pattern(
         if "Auction_Actual" not in r and auction_col in r:
             r["Auction_Actual"] = r.get(auction_col)
 
+    result: Dict[str, Any] = {
+        "pattern": pattern,
+        "deals": out_rows,
+        "total_count": total_count,
+    }
+
+    # Compute aggregate stats from ALL filtered deals (not just sample)
+    if include_stats:
+        # Build a boolean mask over the ORIGINAL deal_df (not the filtered subset)
+        full_mask = df[auction_col].cast(pl.Utf8).str.contains(regex)
+        result["actual_auction_stats"] = _compute_actual_auction_stats(df, full_mask)
+
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"[sample-deals-by-auction-pattern] {format_elapsed(elapsed_ms)} ({len(out_rows)}/{total_count} deals)")
-    return {"pattern": pattern, "deals": out_rows, "total_count": total_count, "elapsed_ms": round(elapsed_ms, 1)}
+    result["elapsed_ms"] = round(elapsed_ms, 1)
+    print(f"[sample-deals-by-auction-pattern] {format_elapsed(elapsed_ms)} ({len(out_rows)}/{total_count} deals"
+          f"{', +stats' if include_stats else ''})")
+    return result
 
 
 def handle_auction_pattern_counts(
@@ -3533,6 +3639,155 @@ def handle_bt_seat_stats(
         "seat": seat,
         "seats": seat_results,
         "wrong_bid_stats": wrong_bid_stats,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Handler: /bt-seat-stats-pivot  (precomputed v2 stats, batch)
+# ---------------------------------------------------------------------------
+
+
+def handle_bt_seat_stats_pivot(
+    state: Dict[str, Any],
+    bt_indices: List[int],
+    dealer: str | None = None,
+) -> Dict[str, Any]:
+    """Return pivoted precomputed seat stats for a batch of bt_indices.
+
+    Two stat layers per bt_index:
+      1. **Computed hand stats** — from precomputed GPU EV v2 (seat-relative, correct)
+      2. **Computed DD means**  — from precomputed GPU EV v2 (diluted, kept as-is)
+
+    Actual-auction stats (reality-check baseline) are now served by
+    ``/sample-deals-by-auction-pattern?include_stats=true`` instead.
+    """
+    from bbo_hand_eval_lib import pivot_bt_seat_stats
+
+    t0 = time.perf_counter()
+    bt_stats_df = state.get("bt_stats_df")
+    if bt_stats_df is None:
+        return {"stats": {}, "error": "bt_stats_df not loaded"}
+
+    # Computed stats from precomputed data (hand stats correct, DD diluted)
+    stats = pivot_bt_seat_stats(bt_stats_df, bt_indices, dealer=dealer)
+
+    # Convert int keys to str for JSON serialisation
+    stats_str = {str(k): v for k, v in stats.items()}
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "stats": stats_str,
+        "requested": len(bt_indices),
+        "found": len(stats_str),
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Handler: /sample-deals-for-bt-indices
+# ---------------------------------------------------------------------------
+
+
+def handle_sample_deals_for_bt_indices(
+    state: Dict[str, Any],
+    bt_indices: List[int],
+    sample_size: int = 100,
+    seed: int | None = None,
+) -> Dict[str, Any]:
+    """Return per-deal hand stats and DD tricks for deals matching given bt_indices.
+
+    Uses the precomputed deal_to_bt_index_df (GPU-verified) to find deals,
+    then extracts hand-stat and DD columns from deal_df.
+
+    Returns ``deals_by_bt`` keyed by bt_index (str), each containing:
+      - ``deals``: list of dicts with per-deal columns
+      - ``total_count``: total matching deals (before sampling)
+    """
+    t0 = time.perf_counter()
+
+    deal_df = state.get("deal_df")
+    deal_to_bt_df = state.get("deal_to_bt_index_df")
+
+    if not isinstance(deal_df, pl.DataFrame) or deal_df.is_empty():
+        raise ValueError("deal_df not loaded")
+    if not isinstance(deal_to_bt_df, pl.DataFrame) or deal_to_bt_df.is_empty():
+        raise ValueError("deal_to_bt_index_df not loaded")
+
+    # Columns to return per deal
+    base_cols = ["index", "Dealer", "Vul"]
+    hand_str_cols = [f"Hand_{d}" for d in "NESW"]
+    hs_cols: List[str] = []
+    for d in "NESW":
+        hs_cols.extend([f"HCP_{d}", f"Total_Points_{d}"])
+        for suit in "SHDC":
+            hs_cols.append(f"SL_{suit}_{d}")
+    dd_cols: List[str] = []
+    for decl in "NESW":
+        for strain in ["C", "D", "H", "S", "N"]:
+            dd_cols.append(f"DD_{decl}_{strain}")
+
+    all_cols = base_cols + hand_str_cols + hs_cols + dd_cols
+    all_cols = [c for c in all_cols if c in deal_df.columns]
+
+    effective_seed = _effective_seed(seed)
+    rng = np.random.RandomState(effective_seed)
+
+    n_deals = deal_df.height
+    results: Dict[str, Any] = {}
+
+    for bt_idx in bt_indices:
+        # Find deal_idx values where bt_idx is in Matched_BT_Indices
+        mask = deal_to_bt_df["Matched_BT_Indices"].list.contains(bt_idx)
+        matching_deal_idxs = deal_to_bt_df.filter(mask)["deal_idx"].to_numpy()
+
+        total_count = len(matching_deal_idxs)
+        if total_count == 0:
+            results[str(bt_idx)] = {"deals": [], "total_count": 0}
+            continue
+
+        # Clamp to valid range
+        valid_idxs = matching_deal_idxs[matching_deal_idxs < n_deals]
+        if len(valid_idxs) == 0:
+            results[str(bt_idx)] = {"deals": [], "total_count": total_count}
+            continue
+
+        # Sample
+        if len(valid_idxs) > sample_size:
+            sampled_idxs = rng.choice(valid_idxs, size=sample_size, replace=False)
+        else:
+            sampled_idxs = valid_idxs
+
+        # Sort for sequential disk access (Polars gather is OK for small N)
+        sampled_sorted = sorted(int(x) for x in sampled_idxs)
+        deal_rows_df = deal_df.select(all_cols).gather(sampled_sorted)
+
+        # Compute suit lengths from Hand_ strings for any missing SL columns
+        for d in "NESW":
+            hand_col = f"Hand_{d}"
+            if hand_col not in deal_rows_df.columns:
+                continue
+            for suit_idx, suit in enumerate("SHDC"):
+                sl_col = f"SL_{suit}_{d}"
+                if sl_col not in deal_rows_df.columns:
+                    deal_rows_df = deal_rows_df.with_columns(
+                        pl.col(hand_col)
+                        .str.split(".")
+                        .list.get(suit_idx)
+                        .str.len_chars()
+                        .alias(sl_col)
+                    )
+
+        results[str(bt_idx)] = {
+            "deals": deal_rows_df.to_dicts(),
+            "total_count": total_count,
+        }
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[sample-deals-for-bt-indices] {format_elapsed(elapsed_ms)} "
+          f"({len(bt_indices)} bt_indices, {sum(len(v['deals']) for v in results.values())} deals)")
+    return {
+        "deals_by_bt": results,
+        "elapsed_ms": round(elapsed_ms, 1),
     }
 
 
@@ -11048,6 +11303,15 @@ def handle_ai_model_advanced_path(
     max_deals: int = 500,
     w_desc: float = 150.0,
     w_threat: float = 120.0,
+    w_guard: float = 1.0,
+    w_guard_overbid: float = 80.0,
+    w_guard_tp: float = 15.0,
+    w_guard_neg: float = 0.5,
+    w_guard_underbid: float = 40.0,
+    w_guard_tp_surplus: float = 8.0,
+    w_guard_strain: float = 60.0,
+    w_guard_sacrifice: float = 0.7,
+    w_guard_tricks: float = 30.0,
     permissive_pass: bool = True,
 ) -> Dict[str, Any]:
     """Compute the 'AI Model (Advanced top-1 greedy)' completed auction in-process.
@@ -11315,10 +11579,10 @@ def handle_ai_model_advanced_path(
         passed_sorted = sorted(passed_opts, key=_seed_key, reverse=True)[: max(1, int(top_n))]
         auction_full = "-".join(tokens)
 
-        def _score_one(opt: Dict[str, Any]) -> Tuple[float, str, float, float, bool]:
+        def _score_one(opt: Dict[str, Any]) -> Tuple[float, str, float, float, bool, Dict[str, Any]]:
             bid1 = str(opt.get("bid", "") or "").strip().upper()
             if not bid1:
-                return float("-inf"), "", 0.0, 0.0, False
+                return float("-inf"), "", 0.0, 0.0, False, {}
             
             # Handle Pass (not BT-backed)
             if bid1 in ("P", "PASS"):
@@ -11360,7 +11624,7 @@ def handle_ai_model_advanced_path(
                 
                 # 3. Apply perspective flip
                 final_score = float(acting_sign) * float(score_val)
-                return final_score, bid1, 0.0, 0.0, False
+                return final_score, bid1, 0.0, 0.0, False, {"pass_score": float(score_val), "acting_sign": float(acting_sign)}
 
             details = handle_bid_details(
                 state=state,
@@ -11393,7 +11657,7 @@ def handle_ai_model_advanced_path(
             except Exception:
                 p2_ms = 0.0
             if details.get("error") or details.get("message"):
-                return float("-inf"), bid1, d_ms, p2_ms, hit
+                return float("-inf"), bid1, d_ms, p2_ms, hit, {"error": details.get("error") or details.get("message")}
 
             par_score = details.get("par_score") or {}
             mean_par = par_score.get("mean")
@@ -11438,6 +11702,78 @@ def handle_ai_model_advanced_path(
             except Exception:
                 desc_score = None
 
+            # -- Trick estimation for guardrail --
+            _est_tricks_api: float | None = None
+            try:
+                import re as _re_strain3
+                _strain_m3 = _re_strain3.match(r"^[1-7]\s*(NT|N|[CDHS])", bid1)
+                _bid_strain3: str | None = None
+                if _strain_m3:
+                    _bs3 = _strain_m3.group(1).upper()
+                    _bid_strain3 = "NT" if _bs3 in ("N", "NT") else _bs3
+                _self_hand_api: str | None = None
+                if deal_row and acting_dir:
+                    _self_hand_api = str(deal_row.get(f"Hand_{acting_dir}", "") or "").strip() or None
+                if _bid_strain3 and _self_hand_api:
+                    _p2a_api = details.get("phase2a") or {}
+                    _phcp_api = ((_p2a_api.get("roles") or {}).get("partner") or {}).get("hcp_hist")
+                    _psl_api = ((_p2a_api.get("roles") or {}).get("partner") or {}).get("sl_hist")
+                    _fit_api = (_p2a_api.get("fit") or {}).get("us")
+                    _tr_api = estimate_partnership_tricks(
+                        self_hand=_self_hand_api,
+                        partner_hcp_hist=_phcp_api,
+                        partner_sl_hists=_psl_api,
+                        fit_us_hists=_fit_api,
+                        strain=_bid_strain3,
+                    )
+                    _est_tricks_api = _tr_api.get("est_tricks")
+            except Exception:
+                _est_tricks_api = None
+
+            # Guardrail penalty
+            guard_penalty = 0.0
+            try:
+                if float(w_guard) > 0:
+                    self_tp_val = None
+                    try:
+                        rp2 = details.get("range_percentiles")
+                        if isinstance(rp2, dict):
+                            self_tp_val = (rp2.get("total_points") or {}).get("value")
+                            if self_tp_val is not None:
+                                self_tp_val = float(self_tp_val)
+                    except Exception:
+                        self_tp_val = None
+
+                    partner_tp_hist_val = None
+                    try:
+                        p2a = details.get("phase2a") or {}
+                        partner_tp_hist_val = ((p2a.get("roles") or {}).get("partner") or {}).get("total_points_hist")
+                    except Exception:
+                        partner_tp_hist_val = None
+
+                    par_topk = (details.get("par_contracts") or {}).get("topk") or []
+
+                    gp, _ = compute_guardrail_penalty(
+                        bid=bid1,
+                        par_contracts_topk=par_topk,
+                        self_total_points=self_tp_val,
+                        partner_tp_hist=partner_tp_hist_val,
+                        par_score_mean=mean_par,
+                        acting_sign=float(acting_sign),
+                        w_overbid_level=float(w_guard_overbid),
+                        w_tp_shortfall=float(w_guard_tp),
+                        w_neg_par_high=float(w_guard_neg),
+                        w_underbid_level=float(w_guard_underbid),
+                        w_tp_surplus=float(w_guard_tp_surplus),
+                        w_strain_ineff=float(w_guard_strain),
+                        sacrifice_discount=float(w_guard_sacrifice),
+                        est_tricks=_est_tricks_api,
+                        w_tricks_shortfall=float(w_guard_tricks),
+                    )
+                    guard_penalty = float(gp) * float(w_guard)
+            except Exception:
+                guard_penalty = 0.0
+
             try:
                 # Reconstruct utility from perspective of acting side.
                 # "utility" from eeo is NS-relative (Mean_NS - Penalties).
@@ -11452,11 +11788,27 @@ def handle_ai_model_advanced_path(
                 
                 desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                 threat_term = float(opp_threat) if opp_threat is not None else 0.0
-                # Use shrunk base
-                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term
-                return float(score_val), bid1, d_ms, p2_ms, hit
+                # Use shrunk base, subtract guardrail penalty
+                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term - guard_penalty
+                breakdown = {
+                    "base": round(base, 2),
+                    "base_shrunk": round(base_shrunk, 2),
+                    "matched_n": int(matched_n),
+                    "mean_par": round(float(mean_par), 2) if mean_par is not None else None,
+                    "desc_score": round(float(desc_score), 4) if desc_score is not None else None,
+                    "desc_term": round(desc_term, 4),
+                    "w_desc_contrib": round(float(w_desc) * desc_term, 2),
+                    "opp_threat": round(float(opp_threat), 4) if opp_threat is not None else None,
+                    "w_threat_contrib": round(float(w_threat) * threat_term, 2),
+                    "guard_penalty": round(guard_penalty, 2),
+                    "est_tricks": round(float(_est_tricks_api), 2) if _est_tricks_api is not None else None,
+                    "utility": round(float(utility), 2) if utility is not None else None,
+                    "acting_sign": float(acting_sign),
+                    "final_score": round(float(score_val), 2),
+                }
+                return float(score_val), bid1, d_ms, p2_ms, hit, breakdown
             except Exception:
-                return float("-inf"), bid1, d_ms, p2_ms, hit
+                return float("-inf"), bid1, d_ms, p2_ms, hit, {}
 
         best_bid = ""
         best_score = float("-inf")
@@ -11465,31 +11817,36 @@ def handle_ai_model_advanced_path(
         bd_ms_sum = 0.0
         bd_p2_ms_sum = 0.0
         bd_hits = 0
+        bid_scores: List[Dict[str, Any]] = []
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futs = [ex.submit(_score_one, opt) for opt in passed_sorted]
                 for fut in concurrent.futures.as_completed(futs):
                     try:
-                        sc, b, d_ms, p2_ms, hit = fut.result()
+                        sc, b, d_ms, p2_ms, hit, bkdn = fut.result()
                     except Exception:
                         continue
                     bd_calls += 1
                     bd_ms_sum += float(d_ms or 0.0)
                     bd_p2_ms_sum += float(p2_ms or 0.0)
                     bd_hits += 1 if hit else 0
+                    bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, **bkdn})
                     if b and sc > best_score:
                         best_score = sc
                         best_bid = b
         except Exception:
             for opt in passed_sorted:
-                sc, b, d_ms, p2_ms, hit = _score_one(opt)
+                sc, b, d_ms, p2_ms, hit, bkdn = _score_one(opt)
                 bd_calls += 1
                 bd_ms_sum += float(d_ms or 0.0)
                 bd_p2_ms_sum += float(p2_ms or 0.0)
                 bd_hits += 1 if hit else 0
+                bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, **bkdn})
                 if b and sc > best_score:
                     best_score = sc
                     best_bid = b
+        # Sort bid_scores by score descending for readability
+        bid_scores.sort(key=lambda x: float(x.get("score") or float("-inf")), reverse=True)
 
         if not best_bid:
             best_bid = str(passed_sorted[0].get("bid", "") or "").strip().upper()
@@ -11505,6 +11862,7 @@ def handle_ai_model_advanced_path(
         step_rec["bid_details_cache_hits"] = int(bd_hits)
         step_rec["bid_details_elapsed_ms_sum"] = round(float(bd_ms_sum), 1)
         step_rec["bid_details_phase2a_ms_sum"] = round(float(bd_p2_ms_sum), 1)
+        step_rec["bid_scores"] = bid_scores
         step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
         steps_detail.append(step_rec)
 

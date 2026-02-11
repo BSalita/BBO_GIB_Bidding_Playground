@@ -501,7 +501,8 @@ bt_seat1_file = dataPath.joinpath("bbo_bt_compiled.parquet")  # Pre-compiled BT 
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 bt_categories_file = dataPath.joinpath("bbo_bt_categories.parquet")  # 103 bid-category boolean flags (Phase 4)
-bt_ev_stats_file = dataPath.joinpath("bt_ev_par_stats_gpu.parquet")  # Per-BT EV/Par stats (GPU pipeline output)
+# bt_ev_stats: no longer loaded separately; reused from bt_stats_df (bbo_bt_criteria_seat1_df.parquet)
+# which contains all v2 EV/Par columns from the consolidated bbo_bt_ev_gpu.py pipeline.
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 # New rules file: detailed rule discovery metrics (detailed view)
 new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
@@ -1192,6 +1193,7 @@ class SampleDealsByAuctionPatternRequest(BaseModel):
     pattern: str
     sample_size: int = 25
     seed: Optional[int] = 42
+    include_stats: bool = False  # when True, return aggregate hand/DD stats from ALL matching deals
 
 
 class AuctionPatternCountsRequest(BaseModel):
@@ -1268,6 +1270,19 @@ class BTSeatStatsRequest(BaseModel):
     seat: int = 0
     # Optional cap on number of deals to aggregate (0 = all); currently unused.
     max_deals: Optional[int] = 0
+
+
+class BTSeatStatsPivotRequest(BaseModel):
+    """Request for precomputed v2 seat stats (hand stats + DD means) for a batch of bt_indices."""
+    bt_indices: List[int]
+    dealer: Optional[str] = None  # compass direction (N/E/S/W) for seat-to-direction mapping
+
+
+class SampleDealsForBTIndicesRequest(BaseModel):
+    """Request for per-deal hand stats + DD tricks sampled from deals matching given bt_indices."""
+    bt_indices: List[int]
+    sample_size: int = 100
+    seed: Optional[int] = None
 
 
 class NewRulesLookupRequest(BaseModel):
@@ -1461,6 +1476,15 @@ class AiModelAdvancedPathStartRequest(BaseModel):
     max_deals: int = 500
     w_desc: float = 150.0
     w_threat: float = 120.0
+    w_guard: float = 1.0
+    w_guard_overbid: float = 80.0
+    w_guard_tp: float = 15.0
+    w_guard_neg: float = 0.5
+    w_guard_underbid: float = 40.0
+    w_guard_tp_surplus: float = 8.0
+    w_guard_strain: float = 60.0
+    w_guard_sacrifice: float = 0.7
+    w_guard_tricks: float = 30.0
     permissive_pass: bool = True
 
 
@@ -1648,7 +1672,15 @@ def _build_additional_deal_columns() -> List[str]:
         'PBN', 'Vul', 'Declarer', 'bid', 'Contract', 'Result', 'Tricks', 'Score',
         'ParScore', 'DD_Score_Declarer', 'EV_Score_Declarer', 'ParContracts'
     ]
-    
+
+    # Add hand-stat columns per direction (for actual-auction aggregate stats)
+    # Format: HCP_{dir}, SL_{dir}_{suit}, Total_Points_{dir}
+    for direction in DIRECTIONS_LIST:
+        additional_cols.append(f"HCP_{direction}")
+        additional_cols.append(f"Total_Points_{direction}")
+        for suit in ["C", "D", "H", "S"]:
+            additional_cols.append(f"SL_{direction}_{suit}")
+
     # Add raw DD trick columns (4 directions × 5 strains = 20 columns)
     # Format: DD_{direction}_{strain} e.g. DD_N_C, DD_E_S
     for direction in DIRECTIONS_LIST:
@@ -2517,24 +2549,14 @@ def _heavy_init() -> None:
                 print(f"[init] WARNING: Failed to load new rules from {new_rules_file}: {e}")
         _log_memory("after load new_rules")
 
-        # Load precomputed BT EV/Par stats (optional, GPU pipeline output)
-        # This provides Avg_EV_S{seat} and Avg_Par_S{seat} for each bt_index
-        bt_ev_stats_df: Optional[pl.DataFrame] = None
-        if bt_ev_stats_file.exists():
-            try:
-                print(f"[init] Loading BT EV/Par stats from {bt_ev_stats_file}...")
-                t0_ev = time.perf_counter()
-                bt_ev_stats_df = pl.read_parquet(bt_ev_stats_file)
-                elapsed_ev = time.perf_counter() - t0_ev
-                ev_info = _format_file_info(df=bt_ev_stats_df, file_path=bt_ev_stats_file, elapsed_secs=elapsed_ev)
-                _update_loading_status(5, "Loading BT EV stats...", "bt_ev_stats", ev_info)
-                print(f"[init] bt_ev_stats_df: {ev_info} (pre-computed Avg_EV/Avg_Par per seat)")
-            except Exception as e:
-                print(f"[init] WARNING: Failed to load BT EV stats from {bt_ev_stats_file}: {e}")
-                bt_ev_stats_df = None
+        # EV/Par stats: reuse bt_stats_df (bbo_bt_criteria_seat1_df.parquet) which
+        # already contains all v2 EV/Par columns (Avg_EV_S{n}_NV/V, Avg_Par_S{n}_NV/V, etc.)
+        # from the consolidated bbo_bt_ev_gpu.py pipeline.  No separate file load needed.
+        bt_ev_stats_df: Optional[pl.DataFrame] = bt_stats_df if bt_stats_df is not None else None
+        if bt_ev_stats_df is not None:
+            print(f"[init] bt_ev_stats_df: reusing bt_stats_df ({bt_ev_stats_df.height:,} rows × {bt_ev_stats_df.width} cols)")
         else:
-            print("[init] No BT EV stats found (run bbo_bt_ev_gpu.py)")
-        _log_memory("after load bt_ev_stats")
+            print("[init] WARNING: bt_ev_stats_df unavailable (bt_stats_df not loaded)")
         
         # Load precomputed deal-to-BT verified index (optional, from GPU pipeline)
         # This enables O(1) lookup of which BT rows match each deal
@@ -3352,6 +3374,7 @@ def sample_deals_by_auction_pattern(req: SampleDealsByAuctionPatternRequest) -> 
             pattern=req.pattern,
             sample_size=int(req.sample_size),
             seed=req.seed,
+            include_stats=req.include_stats,
         )
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
@@ -3693,6 +3716,53 @@ def bt_seat_stats(req: BTSeatStatsRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         _log_and_raise("bt-seat-stats", e)
+
+
+# ---------------------------------------------------------------------------
+# API: BT Seat Stats Pivot (precomputed v2 stats, batch)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/bt-seat-stats-pivot")
+def bt_seat_stats_pivot(req: BTSeatStatsPivotRequest) -> Dict[str, Any]:
+    """Return pivoted precomputed v2 seat stats (hand stats + DD means) for a batch of bt_indices."""
+    _ensure_ready()
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_bt_seat_stats_pivot(
+            state=state,
+            bt_indices=req.bt_indices,
+            dealer=req.dealer,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log_and_raise("bt-seat-stats-pivot", e)
+
+
+# ---------------------------------------------------------------------------
+# API: Sample Deals for BT Indices (per-deal hand stats + DD tricks)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/sample-deals-for-bt-indices")
+def sample_deals_for_bt_indices(req: SampleDealsForBTIndicesRequest) -> Dict[str, Any]:
+    """Return per-deal hand stats and DD tricks for deals matching given bt_indices."""
+    _ensure_ready()
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_sample_deals_for_bt_indices(
+            state=state,
+            bt_indices=req.bt_indices,
+            sample_size=req.sample_size,
+            seed=req.seed,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log_and_raise("sample-deals-for-bt-indices", e)
 
 
 # ---------------------------------------------------------------------------
@@ -4113,6 +4183,15 @@ def ai_model_advanced_path_start(req: AiModelAdvancedPathStartRequest) -> Dict[s
             max_deals=int(req.max_deals),
             w_desc=float(req.w_desc),
             w_threat=float(req.w_threat),
+            w_guard=float(req.w_guard),
+            w_guard_overbid=float(req.w_guard_overbid),
+            w_guard_tp=float(req.w_guard_tp),
+            w_guard_neg=float(req.w_guard_neg),
+            w_guard_underbid=float(req.w_guard_underbid),
+            w_guard_tp_surplus=float(req.w_guard_tp_surplus),
+            w_guard_strain=float(req.w_guard_strain),
+            w_guard_sacrifice=float(req.w_guard_sacrifice),
+            w_guard_tricks=float(req.w_guard_tricks),
             permissive_pass=bool(req.permissive_pass),
         )
 
