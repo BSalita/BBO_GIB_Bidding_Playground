@@ -20,6 +20,8 @@ os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
 
 import csv
 import gc
+import hashlib
+import json
 import logging
 import operator
 import re
@@ -514,6 +516,12 @@ deal_to_bt_par_verified_file = dataPath.joinpath("bbo_deal_to_bt_par_verified.pa
 bt_trick_dist_file = dataPath.joinpath("bt_trick_dist_gpu_v1.parquet")
 bt_hand_profile_file = dataPath.joinpath("bt_hand_profile_gpu_v1.parquet")
 bt_trick_quality_file = dataPath.joinpath("bt_trick_quality_gpu_v1.parquet")
+bid_feature_cache_file = dataPath.joinpath("bbo_bid_feature_cache.parquet")
+bid_feature_cache_manifest_file = dataPath.joinpath("bbo_bid_feature_cache_manifest.json")
+augmented_csr_edge_cache_file = dataPath.joinpath("bbo_augmented_csr_edge_cache.parquet")
+augmented_csr_edge_cache_manifest_file = dataPath.joinpath("bbo_augmented_csr_edge_cache_manifest.json")
+cheater_terminal_cache_file = dataPath.joinpath("bbo_cheater_terminal_cache.parquet")
+cheater_terminal_cache_manifest_file = dataPath.joinpath("bbo_cheater_terminal_cache_manifest.json")
 
 # ---------------------------------------------------------------------------
 # Constants for hand criteria
@@ -1085,6 +1093,75 @@ def _format_file_info(
         parts.append(f"{elapsed_secs:.1f}s")
     
     return " | ".join(parts) if parts else "loaded"
+
+
+def _sha256_file(path: pathlib.Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
+    """Compute SHA-256 for a file path."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(chunk_bytes)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _file_sig(path: pathlib.Path) -> Dict[str, Any]:
+    """Return stable file signature used by cache manifests."""
+    if not path.exists():
+        raise FileNotFoundError(f"Required source file not found: {path}")
+    st = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": int(st.st_size),
+        "mtime": float(st.st_mtime),
+        "sha256": _sha256_file(path),
+    }
+
+
+def _load_manifest(path: pathlib.Path) -> Dict[str, Any]:
+    """Load and validate artifact manifest JSON."""
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest missing: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse manifest {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Invalid manifest format (expected object): {path}")
+    return data
+
+
+def _validate_manifest_sources(manifest: Dict[str, Any]) -> None:
+    """Fail-fast source validation for offline artifacts."""
+    sources = manifest.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise RuntimeError("Manifest missing required non-empty 'sources' list")
+    for src in sources:
+        if not isinstance(src, dict):
+            raise RuntimeError("Manifest source entry must be an object")
+        p = src.get("path")
+        if not p:
+            raise RuntimeError("Manifest source entry missing 'path'")
+        live = _file_sig(pathlib.Path(str(p)))
+        expected_sha = str(src.get("sha256") or "").strip().lower()
+        if expected_sha and expected_sha != str(live["sha256"]).lower():
+            raise RuntimeError(
+                f"Artifact source hash mismatch for {p}: "
+                f"expected={expected_sha}, actual={live['sha256']}"
+            )
+
+
+def _build_sorted_index_by_bt(df: pl.DataFrame, bt_col: str = "bt_index") -> Dict[str, Any]:
+    """Build sorted integer index arrays for bt-index keyed lookup."""
+    if bt_col not in df.columns:
+        raise RuntimeError(f"Required column missing for cache index: {bt_col}")
+    arr = df.get_column(bt_col).cast(pl.UInt32, strict=False).to_numpy()
+    if arr.size == 0:
+        return {"bt_sorted": np.array([], dtype=np.uint32), "row_pos": np.array([], dtype=np.uint32)}
+    order = np.argsort(arr, kind="mergesort")
+    return {"bt_sorted": arr[order], "row_pos": order.astype(np.uint32, copy=False)}
 
 
 class InitResponse(BaseModel):
@@ -2622,6 +2699,78 @@ def _heavy_init() -> None:
             bt_trick_dist_df = None
             bt_hand_profile_df = None
             bt_trick_quality_df = None
+
+        # -------------------------------------------------------------------
+        # Offline model caches (Parquet + strict manifest validation)
+        # -------------------------------------------------------------------
+        bid_feature_cache_df: Optional[pl.DataFrame] = None
+        bid_feature_cache_index: Optional[Dict[str, Any]] = None
+        bid_feature_cache_manifest: Optional[Dict[str, Any]] = None
+        try:
+            if bid_feature_cache_file.exists():
+                t0_bfc = time.perf_counter()
+                bid_feature_cache_manifest = _load_manifest(bid_feature_cache_manifest_file)
+                _validate_manifest_sources(bid_feature_cache_manifest)
+                bid_feature_cache_df = pl.read_parquet(bid_feature_cache_file)
+                bid_feature_cache_index = _build_sorted_index_by_bt(bid_feature_cache_df, "bt_index")
+                elapsed_bfc = time.perf_counter() - t0_bfc
+                info_bfc = _format_file_info(
+                    df=bid_feature_cache_df,
+                    file_path=bid_feature_cache_file,
+                    elapsed_secs=elapsed_bfc,
+                )
+                print(f"[init] bid_feature_cache: {info_bfc}")
+                _update_loading_status(5, "Loading bid feature cache...", "bid_feature_cache", info_bfc)
+            else:
+                print(f"[init] bid feature cache not found (optional): {bid_feature_cache_file.name}")
+        except Exception as e:
+            raise RuntimeError(f"Failed loading bid feature cache: {e}") from e
+
+        augmented_csr_edge_cache_df: Optional[pl.DataFrame] = None
+        augmented_csr_edge_cache_index: Optional[Dict[str, Any]] = None
+        augmented_csr_edge_cache_manifest: Optional[Dict[str, Any]] = None
+        try:
+            if augmented_csr_edge_cache_file.exists():
+                t0_aec = time.perf_counter()
+                augmented_csr_edge_cache_manifest = _load_manifest(augmented_csr_edge_cache_manifest_file)
+                _validate_manifest_sources(augmented_csr_edge_cache_manifest)
+                augmented_csr_edge_cache_df = pl.read_parquet(augmented_csr_edge_cache_file)
+                augmented_csr_edge_cache_index = _build_sorted_index_by_bt(augmented_csr_edge_cache_df, "parent_bt_index")
+                elapsed_aec = time.perf_counter() - t0_aec
+                info_aec = _format_file_info(
+                    df=augmented_csr_edge_cache_df,
+                    file_path=augmented_csr_edge_cache_file,
+                    elapsed_secs=elapsed_aec,
+                )
+                print(f"[init] augmented_csr_edge_cache: {info_aec}")
+                _update_loading_status(5, "Loading augmented CSR edge cache...", "augmented_csr_edge_cache", info_aec)
+            else:
+                print(f"[init] augmented CSR edge cache not found (optional): {augmented_csr_edge_cache_file.name}")
+        except Exception as e:
+            raise RuntimeError(f"Failed loading augmented CSR edge cache: {e}") from e
+
+        cheater_terminal_cache_df: Optional[pl.DataFrame] = None
+        cheater_terminal_cache_index: Optional[Dict[str, Any]] = None
+        cheater_terminal_cache_manifest: Optional[Dict[str, Any]] = None
+        try:
+            if cheater_terminal_cache_file.exists():
+                t0_ctc = time.perf_counter()
+                cheater_terminal_cache_manifest = _load_manifest(cheater_terminal_cache_manifest_file)
+                _validate_manifest_sources(cheater_terminal_cache_manifest)
+                cheater_terminal_cache_df = pl.read_parquet(cheater_terminal_cache_file)
+                cheater_terminal_cache_index = _build_sorted_index_by_bt(cheater_terminal_cache_df, "bt_index")
+                elapsed_ctc = time.perf_counter() - t0_ctc
+                info_ctc = _format_file_info(
+                    df=cheater_terminal_cache_df,
+                    file_path=cheater_terminal_cache_file,
+                    elapsed_secs=elapsed_ctc,
+                )
+                print(f"[init] cheater_terminal_cache: {info_ctc}")
+                _update_loading_status(5, "Loading cheater terminal cache...", "cheater_terminal_cache", info_ctc)
+            else:
+                print(f"[init] cheater terminal cache not found (optional): {cheater_terminal_cache_file.name}")
+        except Exception as e:
+            raise RuntimeError(f"Failed loading cheater terminal cache: {e}") from e
         
         # Load precomputed deal-to-BT verified index (optional, from GPU pipeline)
         # This enables O(1) lookup of which BT rows match each deal
@@ -2754,6 +2903,15 @@ def _heavy_init() -> None:
             STATE["bt_trick_dist_df"] = bt_trick_dist_df
             STATE["bt_hand_profile_df"] = bt_hand_profile_df
             STATE["bt_trick_quality_df"] = bt_trick_quality_df
+            STATE["bid_feature_cache_df"] = bid_feature_cache_df
+            STATE["bid_feature_cache_index"] = bid_feature_cache_index
+            STATE["bid_feature_cache_manifest"] = bid_feature_cache_manifest
+            STATE["augmented_csr_edge_cache_df"] = augmented_csr_edge_cache_df
+            STATE["augmented_csr_edge_cache_index"] = augmented_csr_edge_cache_index
+            STATE["augmented_csr_edge_cache_manifest"] = augmented_csr_edge_cache_manifest
+            STATE["cheater_terminal_cache_df"] = cheater_terminal_cache_df
+            STATE["cheater_terminal_cache_index"] = cheater_terminal_cache_index
+            STATE["cheater_terminal_cache_manifest"] = cheater_terminal_cache_manifest
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None

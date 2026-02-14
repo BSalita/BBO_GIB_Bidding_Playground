@@ -48,6 +48,16 @@ def default_state() -> dict[str, Any]:
         # Fast bt_index -> row position mapping for lightweight BT
         "bt_index_arr": None,  # numpy array of UInt32
         "bt_index_monotonic": False,
+        # Offline caches (Parquet-backed, indexed in-memory at API startup)
+        "bid_feature_cache_df": None,
+        "bid_feature_cache_index": None,
+        "bid_feature_cache_manifest": None,
+        "augmented_csr_edge_cache_df": None,
+        "augmented_csr_edge_cache_index": None,
+        "augmented_csr_edge_cache_manifest": None,
+        "cheater_terminal_cache_df": None,
+        "cheater_terminal_cache_index": None,
+        "cheater_terminal_cache_manifest": None,
         "duckdb_conn": None,
         # Hot-reloadable overlay rules loaded from bbo_custom_auction_criteria.csv.
         "custom_criteria_overlay": [],

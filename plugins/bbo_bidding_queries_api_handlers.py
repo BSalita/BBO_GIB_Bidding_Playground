@@ -69,6 +69,7 @@ from bbo_bid_details_lib import (
 from bbo_explanation_lib import (
     compute_eeo_from_bid_details,
     compute_guardrail_penalty,
+    hand_controls,
     render_counterfactual_why_not,
     render_recommendation_explanation,
 )
@@ -229,6 +230,9 @@ _EXPLAIN_BID_CACHE_LOCK = threading.Lock()
 _CACHE_MAX_NEXT_BT_ROWS = 10_000
 _NEXT_BT_ROWS_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
 _NEXT_BT_ROWS_CACHE_LOCK = threading.Lock()
+_CACHE_MAX_GREEDY_EVAL = 100_000
+_GREEDY_EVAL_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
+_GREEDY_EVAL_CACHE_LOCK = threading.Lock()
 
 
 def _lru_get(cache: "OrderedDict[tuple[Any, ...], dict[str, Any]]", key: tuple[Any, ...], lock: threading.Lock) -> dict[str, Any] | None:
@@ -264,6 +268,30 @@ def _lru_put(
     except Exception:
         # Fail-fast: caching is an optimization, never a correctness requirement.
         return
+
+
+def _lookup_bid_feature_cache_row(state: Dict[str, Any], bt_index: Any) -> dict[str, Any] | None:
+    """Lookup a bid-feature cache row by bt_index using startup-built sorted index arrays."""
+    idx_obj = state.get("bid_feature_cache_index")
+    df = state.get("bid_feature_cache_df")
+    if idx_obj is None or df is None:
+        return None
+    try:
+        bt_i = int(bt_index)
+    except Exception:
+        return None
+    try:
+        bt_sorted = idx_obj.get("bt_sorted")
+        row_pos = idx_obj.get("row_pos")
+        if bt_sorted is None or row_pos is None or len(bt_sorted) == 0:
+            return None
+        j = int(np.searchsorted(bt_sorted, bt_i))
+        if j >= len(bt_sorted) or int(bt_sorted[j]) != bt_i:
+            return None
+        row_i = int(row_pos[j])
+        return cast(dict[str, Any], df.row(row_i, named=True))
+    except Exception:
+        return None
 
 
 def _get_next_bt_rows_for_parent(state: Dict[str, Any], parent_bt_index: int) -> dict[str, dict[str, Any]]:
@@ -2977,7 +3005,7 @@ def _compute_actual_auction_stats(
         ("SL_{d}_H", "SL_H", False),
         ("SL_{d}_S", "SL_S", False),
         ("Total_Points_{d}", "Total_Points", False),
-        ("Total_Points_{d}", "TP_std", True),
+        ("Total_Points_{d}", "Total_Points_std", True),
     ]
     hand_rows: List[Dict[str, Any]] = []
     for direction in _DIRS:
@@ -11392,25 +11420,42 @@ def handle_greedy_model_path(
                     bidder_idx = len(path_bids)
                     bidder_dir = DIRECTIONS_LIST[(DIRECTIONS_LIST.index(dealer_actual) + bidder_idx) % 4]
                     bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
-                    
-                    # DD Score (side-relative)
-                    declarer = get_declarer_for_auction(next_auc, dealer_actual)
-                    if declarer:
-                        raw_dd = get_dd_score_for_auction(next_auc, dealer_actual, deal_row)
-                        if raw_dd is not None:
-                            declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
-                            side_sign = 1.0 if bidder_side == declarer_side else -1.0
-                            dd_score = float(side_sign * float(raw_dd))
-                    
-                    # EV Score (side-relative)
-                    raw_ev = get_ev_for_auction(next_auc, dealer_actual, deal_row)
-                    if raw_ev is not None:
+
+                    memo_key = (
+                        int(deal_row_idx) if deal_row_idx is not None else -1,
+                        str(dealer_actual).upper(),
+                        str(next_auc).upper(),
+                    )
+                    memo_hit = _lru_get(_GREEDY_EVAL_CACHE, memo_key, _GREEDY_EVAL_CACHE_LOCK)
+                    if memo_hit is not None:
+                        dd_score = float(memo_hit.get("dd_score", float("-inf")))
+                        ev_score = float(memo_hit.get("ev_score", 0.0))
+                    else:
+                        # DD Score (side-relative)
+                        declarer = get_declarer_for_auction(next_auc, dealer_actual)
                         if declarer:
-                            declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
-                            side_sign = 1.0 if bidder_side == declarer_side else -1.0
-                            ev_score = float(side_sign * float(raw_ev))
-                        else:
-                            ev_score = float(raw_ev)
+                            raw_dd = get_dd_score_for_auction(next_auc, dealer_actual, deal_row)
+                            if raw_dd is not None:
+                                declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
+                                side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                                dd_score = float(side_sign * float(raw_dd))
+
+                        # EV Score (side-relative)
+                        raw_ev = get_ev_for_auction(next_auc, dealer_actual, deal_row)
+                        if raw_ev is not None:
+                            if declarer:
+                                declarer_side = "NS" if str(declarer).upper() in ("N", "S") else "EW"
+                                side_sign = 1.0 if bidder_side == declarer_side else -1.0
+                                ev_score = float(side_sign * float(raw_ev))
+                            else:
+                                ev_score = float(raw_ev)
+                        _lru_put(
+                            _GREEDY_EVAL_CACHE,
+                            memo_key,
+                            {"dd_score": float(dd_score), "ev_score": float(ev_score)},
+                            _CACHE_MAX_GREEDY_EVAL,
+                            _GREEDY_EVAL_CACHE_LOCK,
+                        )
                 except: pass
 
             # UI parity: if the auction so far is only passes (opening/lead-pass sequences),
@@ -11781,6 +11826,7 @@ def handle_ai_model_advanced_path(
         
         # PERSPECTIVE: determine acting side sign (+1 for NS, -1 for EW acting)
         acting_sign = 1.0
+        acting_dir = "N"
         try:
             # Use deal_row dealer
             dealer_actual = str(deal_row.get("Dealer", "N")).upper()
@@ -11791,6 +11837,7 @@ def handle_ai_model_advanced_path(
             acting_sign = 1.0 if acting_dir in ("N", "S") else -1.0
         except Exception:
             acting_sign = 1.0
+            acting_dir = "N"
 
         # Score top-N passing bids via bid-details (already seed-ranked above).
         passed_sorted = passed_opts[: max(1, int(top_n))]
@@ -11802,44 +11849,105 @@ def handle_ai_model_advanced_path(
                 return float("-inf"), "", 0.0, 0.0, False, {}
             
             # Handle Pass (not BT-backed)
+            # IMPORTANT: Use BT-aggregate avg_ev, NOT deal-specific EV.
+            # Non-Pass bids are scored using BT-aggregate mean_par from /bid-details.
+            # Using deal-specific EV for Pass creates an apples-vs-oranges comparison
+            # that systematically favours stopping (Pass) when the current contract
+            # happens to play well on this specific deal, even if continuing to game
+            # would be much better on average.  Both Pass and non-Pass must use the
+            # same BT-aggregate scale for fair comparison.
             if bid1 in ("P", "PASS"):
                 score_val: float | None = None
-                
-                # 1. Try exact EV from pinned deal
                 try:
-                    # Construct potential full auction with Pass
-                    # We are at `auction_full` + `bid1`
-                    current_toks = tokens + [bid1]
-                    
-                    # Logic to complete auction with passes
-                    # (Mirror _append_passes_to_complete)
-                    trailing = 0
-                    for t in reversed(current_toks):
-                        if t == "P": trailing += 1
-                        else: break
-                    has_non_pass = any(t != "P" for t in current_toks)
-                    needed = max(0, 4 - len(current_toks)) if not has_non_pass else max(0, 3 - trailing)
-                    completed_auc = "-".join(current_toks + ["P"] * needed)
-                    
-                    # Use precomputed EV if available
-                    ev_raw = get_ev_for_auction_pre(completed_auc, dealer_actual, deal_row)
-                    if ev_raw is not None:
-                        score_val = float(ev_raw)
+                    avg_ev = opt.get("avg_ev")
+                    if avg_ev is not None:
+                        score_val = float(avg_ev)
                 except Exception:
                     pass
-                
-                # 2. Fallback to avg_ev proxy
                 if score_val is None:
                     try:
-                        avg_ev = opt.get("avg_ev")
-                        val = float(avg_ev) if avg_ev is not None else float("-inf")
-                        score_val = 0.0 if val == float("-inf") else val
+                        avg_par = opt.get("avg_par")
+                        if avg_par is not None:
+                            score_val = float(avg_par)
                     except Exception:
-                        score_val = 0.0
-                
-                # 3. Apply perspective flip
+                        pass
+                if score_val is None:
+                    score_val = 0.0
+
+                # Apply perspective flip (same as non-Pass base)
                 final_score = float(acting_sign) * float(score_val)
                 return final_score, bid1, 0.0, 0.0, False, {"pass_score": float(score_val), "acting_sign": float(acting_sign)}
+
+            # Try bid-feature cache for fast scoring (only useful when cache row
+            # has actual stats — i.e. terminal/completed auctions that joined with
+            # the stats table).  Non-terminal rows have NULL stats from the LEFT JOIN
+            # and would score 0.0, so we must fall through to the full bid-details path.
+            cache_row = _lookup_bid_feature_cache_row(state, opt.get("bt_index"))
+            if cache_row is not None:
+                def _is_vul_for_acting(vul_val: Any, dir_to_act: str) -> bool:
+                    s = str(vul_val or "").strip().upper()
+                    if s in ("BOTH", "ALL", "V", "VUL"):
+                        return True
+                    if s in ("NONE", "NV", "NONVUL", "NON-VUL", ""):
+                        return False
+                    if s in ("NS",):
+                        return dir_to_act in ("N", "S")
+                    if s in ("EW",):
+                        return dir_to_act in ("E", "W")
+                    try:
+                        i = int(s)
+                        if i == 3:
+                            return True
+                        if i == 1:
+                            return dir_to_act in ("N", "S")
+                        if i == 2:
+                            return dir_to_act in ("E", "W")
+                        return False
+                    except Exception:
+                        return False
+
+                def _pick_num(row: Dict[str, Any], keys: List[str]) -> float | None:
+                    for k in keys:
+                        v = row.get(k)
+                        if v is None:
+                            continue
+                        try:
+                            return float(v)
+                        except Exception:
+                            continue
+                    return None
+
+                use_v = _is_vul_for_acting(board_vul, acting_dir)
+                suf = "V" if use_v else "NV"
+                seat_i = int(seat_display)
+                mean_par = _pick_num(
+                    cache_row,
+                    [f"mean_par_{suf.lower()}", f"Avg_Par_S{seat_i}_{suf}", "mean_par"],
+                )
+                matched_n = _pick_num(
+                    cache_row,
+                    [f"count_{suf.lower()}", f"Count_S{seat_i}_{suf}", "matching_deal_count", "matched_n"],
+                )
+                # Only use cache fast-path when we have real stats (non-NULL mean_par
+                # AND count > 0).  Most BT rows are non-terminal and have NULL stats
+                # from the LEFT JOIN — scoring them as 0.0 causes Pass to always win.
+                if mean_par is not None and matched_n is not None and float(matched_n) > 0:
+                    mean_par_val = float(mean_par)
+                    n_val = float(matched_n)
+                    shrinkage_k = 5.0
+                    base = float(acting_sign) * mean_par_val
+                    base_shrunk = (base * n_val) / (n_val + shrinkage_k)
+                    breakdown = {
+                        "cache_mode": "bid_feature_cache",
+                        "base": round(base, 2),
+                        "base_shrunk": round(base_shrunk, 2),
+                        "matched_n": int(n_val),
+                        "mean_par": round(mean_par_val, 2),
+                        "acting_sign": float(acting_sign),
+                        "final_score": round(float(base_shrunk), 2),
+                    }
+                    return float(base_shrunk), bid1, 0.0, 0.0, False, breakdown
+                # else: cache row lacks stats → fall through to full bid-details scoring
 
             details = handle_bid_details(
                 state=state,
@@ -11917,10 +12025,43 @@ def handle_ai_model_advanced_path(
             except Exception:
                 desc_score = None
 
-            # Standalone/manual parity: keep AI-model advanced path independent
-            # of optional hand-string availability; do not apply trick-shortfall
-            # guardrail in this path.
+            # Acting player's hand string (used by trick estimation + control check)
+            _self_hand_str: str | None = None
+            try:
+                _self_hand_str = str(deal_row.get(f"Hand_{acting_dir}", "") or "").strip() or None
+            except Exception:
+                _self_hand_str = None
+
+            # Hand controls for INSUFFICIENT_FIRST_ROUND_CONTROLS guardrail
+            _self_aces: int | None = None
+            _self_helpful_voids: int | None = None
+            if _self_hand_str:
+                _self_aces, _self_helpful_voids = hand_controls(_self_hand_str)
+
+            # Trick estimation for guardrail (TRICKS_SHORTFALL component).
+            # Uses the acting player's hand string + Phase2a partner posteriors.
             _est_tricks_api: float | None = None
+            try:
+                import re as _re_strain
+                _strain_m = _re_strain.match(r"^[1-7]\s*(NT|N|[CDHS])", bid1)
+                if _strain_m:
+                    _bs = _strain_m.group(1).upper()
+                    _bid_strain = "NT" if _bs in ("N", "NT") else _bs
+                    if _self_hand_str:
+                        _p2a_tricks = details.get("phase2a") or {}
+                        _partner_hcp_h = ((_p2a_tricks.get("roles") or {}).get("partner") or {}).get("hcp_hist")
+                        _partner_sl_h = ((_p2a_tricks.get("roles") or {}).get("partner") or {}).get("sl_hist")
+                        _fit_us_h = (_p2a_tricks.get("fit") or {}).get("us")
+                        _trick_res = estimate_partnership_tricks(
+                            self_hand=_self_hand_str,
+                            partner_hcp_hist=_partner_hcp_h,
+                            partner_sl_hists=_partner_sl_h,
+                            fit_us_hists=_fit_us_h,
+                            strain=_bid_strain,
+                        )
+                        _est_tricks_api = _trick_res.get("est_tricks")
+            except Exception:
+                _est_tricks_api = None
 
             # Guardrail penalty
             guard_penalty = 0.0
@@ -11961,6 +12102,8 @@ def handle_ai_model_advanced_path(
                         sacrifice_discount=float(w_guard_sacrifice),
                         est_tricks=_est_tricks_api,
                         w_tricks_shortfall=float(w_guard_tricks),
+                        self_aces=_self_aces,
+                        self_helpful_voids=_self_helpful_voids,
                         debug_equivalence_bypass=True,
                     )
                     guard_penalty = float(gp) * float(w_guard)

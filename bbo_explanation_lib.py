@@ -14,10 +14,15 @@ from typing import Any, Optional
 # Guardrail reason tags (exhaustive list):
 #   OVERBID_VS_PAR      - Bid level exceeds most likely par contract level
 #   TP_SHORTFALL         - Partnership TP below standard minimum for bid level
+#   WEAK_HAND_OVERBID    - Acting player's own TP far too low for bid level
 #   NEG_PAR_HIGH_LEVEL   - Expected acting-par is negative at level 4+
-#   STRAIN_INEFFICIENCY  - Minor game (5m = 11 tricks) when 3NT (9 tricks)
-#                          is the par contract
+#   STRAIN_INEFFICIENCY  - Minor 4m/5m when 3NT is par (extra tricks for
+#                          comparable or worse score, scaled by extra tricks)
 #   TRICKS_SHORTFALL     - Estimated tricks below required for contract level
+#   INSUFFICIENT_FIRST_ROUND_CONTROLS - Bid level exceeds 3 + estimated
+#                          partnership first-round controls (aces + helpful
+#                          voids in suit contracts).  Opponents can cash
+#                          enough aces to set the contract.
 #   UNDERBID_VS_PAR      - Bid level is below par contract owned by our side
 #   TP_SURPLUS_UNDERBID  - Partnership TP exceeds threshold for a higher level
 #                          that matches par
@@ -36,6 +41,19 @@ _TP_THRESHOLDS: dict[int, float] = {
     5: 29.0,
     6: 33.0,
     7: 37.0,
+}
+
+# Minimum *individual* (self) Total_Points to justify voluntarily bidding at
+# a level.  These are very conservative floors — even a raise of partner's
+# suit generally requires at least this much.  Catches cases where a very
+# weak hand (e.g. 5 HCP / 6 TP) makes a high-level bid purely because the
+# BT node happens to exist and has inflated aggregate statistics.
+_SELF_TP_FLOORS: dict[int, float] = {
+    3: 6.0,
+    4: 10.0,
+    5: 12.0,
+    6: 14.0,
+    7: 16.0,
 }
 
 # Tricks required per level (level + 6).
@@ -85,6 +103,40 @@ def expected_from_hist(hist: dict[str, Any] | None) -> float | None:
         return None
 
 
+_SUITS_ORDER = ["S", "H", "D", "C"]  # dot-notation order
+
+
+def hand_controls(hand_str: str) -> tuple[int, int]:
+    """Count aces and helpful voids from a dot-notation hand string.
+
+    Parameters
+    ----------
+    hand_str : str
+        Dot-notation hand string, e.g. "AT97.A98.AKQJ.T8" (S.H.D.C).
+
+    Returns
+    -------
+    (aces, helpful_voids) : tuple[int, int]
+        *aces* – number of aces in the hand.
+        *helpful_voids* – voids in suits where the player does NOT hold the
+        ace.  A helpful void prevents opponents from cashing an ace in that
+        suit (declarer ruffs the first round).
+    """
+    parts = str(hand_str or "").strip().split(".")
+    if len(parts) != 4:
+        return (0, 0)
+    aces = 0
+    helpful_voids = 0
+    for p in parts:
+        has_ace = "A" in p
+        is_void = len(p) == 0
+        if has_ace:
+            aces += 1
+        if is_void and not has_ace:
+            helpful_voids += 1
+    return (aces, helpful_voids)
+
+
 def compute_guardrail_penalty(
     bid: str,
     par_contracts_topk: list[dict[str, Any]] | None,
@@ -102,11 +154,15 @@ def compute_guardrail_penalty(
     sacrifice_discount: float = 0.7,
     est_tricks: float | None = None,
     w_tricks_shortfall: float = 30.0,
+    self_aces: int | None = None,
+    self_helpful_voids: int | None = None,
+    w_first_round_control: float = 75.0,
+    w_weak_hand: float = 40.0,
     debug_equivalence_bypass: bool = False,
 ) -> tuple[float, list[str]]:
     """Compute a non-negative guardrail penalty to subtract from the bid score.
 
-    Seven checks plus a sacrifice exemption (each contributes additively):
+    Ten checks plus a sacrifice exemption (each contributes additively):
 
     **Overbid checks** (bid level is too high for the hand):
 
@@ -114,24 +170,36 @@ def compute_guardrail_penalty(
        level.  Catches bids like 5C when par says 3NT.
     2. **TP_SHORTFALL** – combined SELF + E[PARTNER] total points fall below
        the standard minimum for the bid level.
-    3. **NEG_PAR_HIGH_LEVEL** – at the 4-level or above, the acting-side par
+    3. **WEAK_HAND_OVERBID** – the acting player's own TP is below a
+       minimum floor for the bid level.  Catches weak hands (e.g. 6 TP)
+       making high-level bids that only exist in the BT because of
+       strong distributional hands in the population.
+    4. **NEG_PAR_HIGH_LEVEL** – at the 4-level or above, the acting-side par
        mean is negative (contract is expected to go down on average).
-    4. **STRAIN_INEFFICIENCY** – bidding 5C/5D (11 tricks) when the par
-       contract is 3NT (9 tricks for comparable score).
-    5. **TRICKS_SHORTFALL** – estimated partnership tricks fall below the
+    5. **STRAIN_INEFFICIENCY** – bidding 4m/5m when the par contract is 3NT.
+       3NT is almost always preferred.  4m is strictly worse (partscore vs
+       game + extra trick): 1.5× base.  5m needs 2 extra tricks: 1.0× base.
+    6. **TRICKS_SHORTFALL** – estimated partnership tricks fall below the
        number required for the contract level (level + 6).
+    7. **INSUFFICIENT_FIRST_ROUND_CONTROLS** – bid level exceeds
+       3 + estimated partnership first-round controls.  A first-round
+       control is an ace or (in suit contracts) a void in a suit where
+       the player doesn't hold the ace.  Without enough controls,
+       opponents can cash aces to set the contract.  Rule:
+       max safe level = 3 + first_round_controls.  Applies at level 4+.
+       Sacrifice-discounted when par belongs to opponents.
 
     **Underbid checks** (bid level is too low for the hand):
 
-    6. **UNDERBID_VS_PAR** – bid level is *below* the most likely par contract
+    8. **UNDERBID_VS_PAR** – bid level is *below* the most likely par contract
        that *our side* owns.  Catches stopping at 2H when par says 4H.
-    7. **TP_SURPLUS_UNDERBID** – partnership TP exceeds the threshold for a
+    9. **TP_SURPLUS_UNDERBID** – partnership TP exceeds the threshold for a
        higher level consistent with par (game bonus being left on the table).
 
     **Sacrifice exemption**:
 
     When the most likely par contract belongs to the *opponents*, overbid
-    checks (1-3) are discounted by ``sacrifice_discount`` (default 70%),
+    checks (1-4, 6-7) are discounted by ``sacrifice_discount`` (default 70%),
     because the bid may be a deliberate sacrifice — going down for less than
     opponents would score.  The sacrifice discount does NOT apply to underbid
     checks or to strain-inefficiency.
@@ -165,7 +233,8 @@ def compute_guardrail_penalty(
         Penalty per total-point surplus above threshold for the next achievable
         level (default 8).
     w_strain_ineff : float
-        Flat penalty for bidding 5m when par says 3NT (default 60).
+        Base penalty for minor suit when par is 3NT (default 60).
+        4m (partscore vs game) = ×1.5; 5m (2 extra tricks) = ×1.0.
     sacrifice_discount : float
         Fraction by which overbid penalties are reduced when the par contract
         belongs to opponents (default 0.7 = 70% discount).
@@ -175,6 +244,20 @@ def compute_guardrail_penalty(
     w_tricks_shortfall : float
         Penalty per estimated trick below the required tricks for the
         contract level (default 30).
+    self_aces : int, optional
+        Number of aces in the acting player's hand.  Enables the
+        INSUFFICIENT_FIRST_ROUND_CONTROLS check.
+    self_helpful_voids : int, optional
+        Number of voids in suits where the player does NOT hold the ace.
+        In suit contracts (non-NT), each helpful void is a first-round
+        control (ruff prevents opponents from cashing that ace).
+    w_first_round_control : float
+        Penalty per level the bid exceeds the max safe level (3 + controls).
+        Default 75.
+    w_weak_hand : float
+        Penalty per self-TP below the floor for the bid level (default 40).
+        Catches very weak hands making high-level bids.  Sacrifice-
+        discounted.
     debug_equivalence_bypass : bool
         If True, append a debug-only reason when 3NT <-> 4M equivalence
         suppresses OVERBID/UNDERBID penalties.
@@ -315,7 +398,29 @@ def compute_guardrail_penalty(
             )
 
     # ------------------------------------------------------------------
-    # 3. NEG_PAR_HIGH_LEVEL – negative acting-par at level 4+
+    # 3. WEAK_HAND_OVERBID – acting player's own TP far too low for
+    #    the bid level.  Even a raise of partner's suit requires some
+    #    minimum contribution.  Catches weak hands (e.g. 5-6 TP) bidding
+    #    at the 4+ level because a BT node with inflated statistics
+    #    happened to match their hand pattern.
+    # ------------------------------------------------------------------
+    if self_total_points is not None and bid_level is not None:
+        _self_tp_floor = _SELF_TP_FLOORS.get(bid_level)
+        if _self_tp_floor is not None:
+            _self_tp_gap = _self_tp_floor - float(self_total_points)
+            if _self_tp_gap > 0:
+                raw_p = _self_tp_gap * float(w_weak_hand)
+                p = raw_p * sac_factor
+                penalty += p
+                sac_note = f" [sacrifice discount applied]" if sac_factor < 1.0 else ""
+                reasons.append(
+                    f"WEAK_HAND_OVERBID: self TP {self_total_points:.0f} is below "
+                    f"floor {_self_tp_floor:.0f} for level {bid_level}; "
+                    f"deficit {_self_tp_gap:.0f} (-{p:.0f}){sac_note}"
+                )
+
+    # ------------------------------------------------------------------
+    # 4. NEG_PAR_HIGH_LEVEL – negative acting-par at level 4+
     # ------------------------------------------------------------------
     if bid_level >= 4 and par_score_mean is not None:
         acting_par = float(acting_sign) * float(par_score_mean)
@@ -334,27 +439,40 @@ def compute_guardrail_penalty(
             )
 
     # ------------------------------------------------------------------
-    # 4. STRAIN_INEFFICIENCY – 5m when par is 3NT (same score, 2 extra
-    #    tricks required)
+    # 5. STRAIN_INEFFICIENCY – 4m/5m when par is 3NT
+    #
+    #    Bridge reality: 3NT is almost always preferred over minor suits.
+    #    - 4m is strictly worse: partscore (130 NV) vs game (400 NV),
+    #      AND needs 1 more trick.  Greatly penalised (1.5× base).
+    #    - 5m is usually worse: same game score but needs 2 extra tricks.
+    #      Only correct when a suit is unstoppable AND hand has 2 aces
+    #      (or a void covering the missing ace).  1.0× base.
+    #    Future: reduce penalty when Phase2a shows no stopper.
     # ------------------------------------------------------------------
     if (
-        bid_level == 5
+        bid_level is not None
+        and bid_level >= 4
         and bid_strain in ("C", "D")
         and top_level is not None
         and top_strain == "NT"
         and top_level == 3
         and not par_is_opponents
     ):
-        p = float(w_strain_ineff)
-        penalty += p
-        reasons.append(
-            f"STRAIN_INEFFICIENCY: {bid} needs {_TRICKS_REQUIRED[5]} tricks; "
-            f"par {top_contract} needs only {_TRICKS_REQUIRED[3]} tricks "
-            f"for comparable score (-{p:.0f})"
-        )
+        # Level 4: partscore vs game — strictly dominated by 3NT → 1.5×
+        # Level 5: both game but 2 extra tricks needed         → 1.0×
+        _strain_scale = 1.5 if bid_level == 4 else 1.0
+        p = float(w_strain_ineff) * _strain_scale
+        if p > 0:
+            _req_tricks = _TRICKS_REQUIRED.get(bid_level, bid_level + 6)
+            penalty += p
+            reasons.append(
+                f"STRAIN_INEFFICIENCY: {bid} needs {_req_tricks} tricks; "
+                f"par {top_contract} needs only {_TRICKS_REQUIRED[3]} tricks "
+                f"for comparable score (-{p:.0f})"
+            )
 
     # ------------------------------------------------------------------
-    # 5. TRICKS_SHORTFALL – estimated tricks below required for contract
+    # 6. TRICKS_SHORTFALL – estimated tricks below required for contract
     # ------------------------------------------------------------------
     if est_tricks is not None and bid_level is not None:
         required = _TRICKS_REQUIRED.get(bid_level, bid_level + 6)
@@ -370,13 +488,96 @@ def compute_guardrail_penalty(
                 f"shortfall {shortfall:.1f} (-{p:.0f}){sac_note}"
             )
 
+    # ------------------------------------------------------------------
+    # 7. INSUFFICIENT_FIRST_ROUND_CONTROLS
+    #
+    #    Universal bridge principle: max safe level = 3 + first-round
+    #    controls.  Without enough controls opponents can cash aces to
+    #    set the contract before declarer gains the lead.
+    #
+    #    First-round controls per suit:
+    #      - An ace (either partner)
+    #      - A void in a suit contract (ruff), provided it doesn't
+    #        double-count with partner's ace in the same suit.
+    #    In NT, only aces count (can't ruff).
+    #
+    #    Self controls are known.  Partner aces are estimated from the
+    #    TP histogram (E[partner_aces] ≈ E[partner_HCP] / 10).
+    #    Partner's aces live in suits where self has no ace, so we
+    #    only count them toward UNCONTROLLED suits.
+    #
+    #    Examples:
+    #      0 controls → max level 3  (opponents cash 4 aces)
+    #      1 control  → max level 4  (opponents cash 3 aces)
+    #      2 controls → max level 5  (opponents cash 2 aces)
+    #      3 controls → max level 6  (opponents cash 1 ace)
+    #      4 controls → max level 7  (no aces to cash)
+    #
+    #    Sacrifice-discounted: if par belongs to opponents, this is
+    #    expected to go down and the penalty is reduced.
+    # ------------------------------------------------------------------
+    if (
+        bid_level is not None
+        and bid_level >= 4
+        and self_aces is not None
+    ):
+        _hv = int(self_helpful_voids or 0)
+        _is_suit = bid_strain in ("C", "D", "H", "S")
+
+        # Self first-round controls: aces + helpful voids (suit only)
+        _self_controls = int(self_aces) + (_hv if _is_suit else 0)
+
+        # Estimate partner aces from TP histogram.
+        # Heuristic: 4 aces = 16 HCP of 40 → ~1 ace per 10 HCP.
+        # TP includes ~1 distribution point on average, so subtract 1.
+        _est_partner_aces = 1.0  # default if no histogram
+        if partner_tp_hist is not None:
+            _e_tp = expected_from_hist(partner_tp_hist)
+            if _e_tp is not None:
+                _est_partner_hcp = max(0.0, float(_e_tp) - 1.0)
+                _est_partner_aces = _est_partner_hcp / 10.0
+
+        # Partner's aces are in suits where self doesn't have the ace.
+        # Of (4 - self_aces) such suits, self may already control some
+        # via voids (suit contracts).  Partner aces in void-controlled
+        # suits are redundant.  Distribute partner's aces uniformly
+        # among the (4 - self_aces) suits and count only those in the
+        # uncontrolled remainder.
+        _suits_without_self_ace = max(1, 4 - int(self_aces))
+        _uncontrolled = max(0, _suits_without_self_ace - (_hv if _is_suit else 0))
+        _partner_new = _est_partner_aces * (_uncontrolled / _suits_without_self_ace)
+
+        _total_controls = min(4.0, float(_self_controls) + _partner_new)
+        _max_safe = 3.0 + _total_controls
+        _excess = float(bid_level) - _max_safe
+
+        if _excess > 0:
+            raw_p = _excess * float(w_first_round_control)
+            p = raw_p * sac_factor
+            sac_note = f" [sacrifice-discounted from {raw_p:.0f}]" if sac_factor < 1.0 else ""
+            _ctrl_parts: list[str] = []
+            _ctrl_parts.append(f"self {self_aces} ace(s)")
+            if _is_suit and _hv > 0:
+                _ctrl_parts.append(f"{_hv} helpful void(s)")
+            _ctrl_parts.append(f"est. partner ~{_est_partner_aces:.1f} aces")
+            _ctrl_parts.append(f"total ~{_total_controls:.1f} controls")
+            _ctrl_parts.append(f"max safe level {_max_safe:.1f}")
+            penalty += p
+            reasons.append(
+                f"INSUFFICIENT_FIRST_ROUND_CONTROLS: level {bid_level} "
+                f"exceeds max safe level {_max_safe:.1f} "
+                f"(= 3 + {_total_controls:.1f} controls); "
+                f"{', '.join(_ctrl_parts)}; "
+                f"excess {_excess:.1f} level(s) (-{p:.0f}){sac_note}"
+            )
+
     # ==================================================================
     # UNDERBID CHECKS (only when par belongs to our side)
     # ==================================================================
 
     if not par_is_opponents and top_level is not None:
         # ------------------------------------------------------------------
-        # 6. UNDERBID_VS_PAR – bid level below par that our side owns
+        # 8. UNDERBID_VS_PAR – bid level below par that our side owns
         # ------------------------------------------------------------------
         if bid_level < top_level and not nt_major_game_equiv:
             underbid_levels = top_level - bid_level
@@ -391,7 +592,7 @@ def compute_guardrail_penalty(
             )
 
         # ------------------------------------------------------------------
-        # 7. TP_SURPLUS_UNDERBID – partnership TP exceeds threshold for par
+        # 9. TP_SURPLUS_UNDERBID – partnership TP exceeds threshold for par
         #    level but we're bidding below it
         # ------------------------------------------------------------------
         if combined_tp is not None and bid_level < top_level and not nt_major_game_equiv:
