@@ -86,6 +86,7 @@ from bbo_bidding_queries_lib import (
     format_elapsed,
     is_regex_pattern,
     get_cached_regex,
+    normalize_auction_input,
     pattern_matches,
 )
 
@@ -510,6 +511,9 @@ new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
 deal_to_bt_verified_file = dataPath.joinpath("bbo_deal_to_bt_verified.parquet")
 # Optional: precomputed deal_idx -> Par_Indexes (subset of verified deal→BT matches)
 deal_to_bt_par_verified_file = dataPath.joinpath("bbo_deal_to_bt_par_verified.parquet")
+bt_trick_dist_file = dataPath.joinpath("bt_trick_dist_gpu_v1.parquet")
+bt_hand_profile_file = dataPath.joinpath("bt_hand_profile_gpu_v1.parquet")
+bt_trick_quality_file = dataPath.joinpath("bt_trick_quality_gpu_v1.parquet")
 
 # ---------------------------------------------------------------------------
 # Constants for hand criteria
@@ -1283,6 +1287,27 @@ class SampleDealsForBTIndicesRequest(BaseModel):
     bt_indices: List[int]
     sample_size: int = 100
     seed: Optional[int] = None
+
+
+class CriteriaStatsByBTIndicesRequest(BaseModel):
+    """Request for criteria-only aggregate hand stats + DD means by bt_index."""
+    bt_indices: List[int]
+    dealer: Optional[str] = None
+
+
+class BTTrickQualityRequest(BaseModel):
+    """Request for precomputed trick-quality rows by bt_index."""
+    bt_indices: List[int]
+    seat: Optional[int] = None
+    strain: Optional[int] = None
+    level: Optional[int] = None
+    vul: Optional[int] = None  # 0=NV, 1=V
+
+
+class BTHandProfileRequest(BaseModel):
+    """Request for precomputed hand-profile rows by bt_index."""
+    bt_indices: List[int]
+    seat: Optional[int] = None
 
 
 class NewRulesLookupRequest(BaseModel):
@@ -2557,6 +2582,46 @@ def _heavy_init() -> None:
             print(f"[init] bt_ev_stats_df: reusing bt_stats_df ({bt_ev_stats_df.height:,} rows × {bt_ev_stats_df.width} cols)")
         else:
             print("[init] WARNING: bt_ev_stats_df unavailable (bt_stats_df not loaded)")
+
+        # Trick-quality artifacts (optional in Phase 0, required in Phase 1)
+        bt_trick_dist_df: Optional[pl.DataFrame] = None
+        bt_hand_profile_df: Optional[pl.DataFrame] = None
+        bt_trick_quality_df: Optional[pl.DataFrame] = None
+        try:
+            if bt_trick_dist_file.exists():
+                t0_tqd = time.perf_counter()
+                bt_trick_dist_df = pl.read_parquet(bt_trick_dist_file)
+                print(
+                    f"[init] bt_trick_dist_df: {bt_trick_dist_df.height:,} rows × {bt_trick_dist_df.width} cols "
+                    f"in {(time.perf_counter() - t0_tqd):.1f}s"
+                )
+            else:
+                print(f"[init] bt_trick_dist_df not found (optional): {bt_trick_dist_file.name}")
+
+            if bt_hand_profile_file.exists():
+                t0_thp = time.perf_counter()
+                bt_hand_profile_df = pl.read_parquet(bt_hand_profile_file)
+                print(
+                    f"[init] bt_hand_profile_df: {bt_hand_profile_df.height:,} rows × {bt_hand_profile_df.width} cols "
+                    f"in {(time.perf_counter() - t0_thp):.1f}s"
+                )
+            else:
+                print(f"[init] bt_hand_profile_df not found (optional): {bt_hand_profile_file.name}")
+
+            if bt_trick_quality_file.exists():
+                t0_tqq = time.perf_counter()
+                bt_trick_quality_df = pl.read_parquet(bt_trick_quality_file)
+                print(
+                    f"[init] bt_trick_quality_df: {bt_trick_quality_df.height:,} rows × {bt_trick_quality_df.width} cols "
+                    f"in {(time.perf_counter() - t0_tqq):.1f}s"
+                )
+            else:
+                print(f"[init] bt_trick_quality_df not found (optional): {bt_trick_quality_file.name}")
+        except Exception as e:
+            print(f"[init] WARNING: Failed to load trick-quality artifacts: {e}")
+            bt_trick_dist_df = None
+            bt_hand_profile_df = None
+            bt_trick_quality_df = None
         
         # Load precomputed deal-to-BT verified index (optional, from GPU pipeline)
         # This enables O(1) lookup of which BT rows match each deal
@@ -2686,6 +2751,9 @@ def _heavy_init() -> None:
             STATE["deal_to_bt_index_df"] = deal_to_bt_index_df  # Precomputed deal→[bt_indices] DataFrame (or None)
             STATE["deal_to_bt_par_index_df"] = deal_to_bt_par_index_df  # Precomputed deal→Par_Indexes (or None)
             STATE["bt_ev_stats_df"] = bt_ev_stats_df  # Precomputed Avg_EV/Avg_Par per bt_index per seat (or None)
+            STATE["bt_trick_dist_df"] = bt_trick_dist_df
+            STATE["bt_hand_profile_df"] = bt_hand_profile_df
+            STATE["bt_trick_quality_df"] = bt_trick_quality_df
             STATE["initialized"] = True  # Required for _ensure_ready() in pre-warming
             STATE["warming"] = bool(_cli_prewarm)  # Only true if we will actually pre-warm
             STATE["error"] = None
@@ -3763,6 +3831,63 @@ def sample_deals_for_bt_indices(req: SampleDealsForBTIndicesRequest) -> Dict[str
         raise
     except Exception as e:
         _log_and_raise("sample-deals-for-bt-indices", e)
+
+
+@app.post("/criteria-stats-by-bt-indices")
+def criteria_stats_by_bt_indices(req: CriteriaStatsByBTIndicesRequest) -> Dict[str, Any]:
+    """Return criteria-only aggregate hand stats + DD means for bt_indices."""
+    _ensure_ready()
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_criteria_stats_by_bt_indices(
+            state=state,
+            bt_indices=req.bt_indices,
+            dealer=req.dealer,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log_and_raise("criteria-stats-by-bt-indices", e)
+
+
+@app.post("/bt-trick-quality")
+def bt_trick_quality(req: BTTrickQualityRequest) -> Dict[str, Any]:
+    """Return precomputed trick-quality rows keyed by bt_index."""
+    _ensure_ready()
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_bt_trick_quality(
+            state=state,
+            bt_indices=req.bt_indices,
+            seat=req.seat,
+            strain=req.strain,
+            level=req.level,
+            vul=req.vul,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log_and_raise("bt-trick-quality", e)
+
+
+@app.post("/bt-hand-profile")
+def bt_hand_profile(req: BTHandProfileRequest) -> Dict[str, Any]:
+    """Return precomputed hand-profile rows keyed by bt_index."""
+    _ensure_ready()
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_bt_hand_profile(
+            state=state,
+            bt_indices=req.bt_indices,
+            seat=req.seat,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log_and_raise("bt-hand-profile", e)
 
 
 # ---------------------------------------------------------------------------

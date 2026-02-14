@@ -5,7 +5,10 @@ Installation: (has been problematic)
   pip uninstall torch torchvision
   pip install -U torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
-Estimated runtime: ~12-16 hours on RTX 5080 with 16GB VRAM. ~100-115GB peak RAM.
+Estimated runtime (historical target): ~12-16 hours on RTX 5080 with 16GB VRAM.
+Observed latest full-run baseline (2026-02-11 to 2026-02-13): 43.8h total
+(Step 3 merged GPU pass: 39.1h, Step 4 combine: 4.6h, write: 4.2m).
+~100-115GB peak RAM.
 
 Single-pass architecture (2026-02-10, optimized from v2 two-pass):
   8 vul-split cubes, 47 ops/batch — EV + hand stats + DD means in one traversal.
@@ -36,7 +39,8 @@ Features:
 - Restartable via checkpoints
 - Memory-efficient chunked processing
 
-Expected runtime: ~12-16 hours (single merged pass on 8 vul-split cubes)
+Expected runtime (historical target): ~12-16 hours
+Observed latest full run: 43.8h (single merged pass on 8 vul-split cubes)
 
 Output Schema (~205 columns):
 - bt_index: BT row identifier
@@ -52,7 +56,7 @@ Output Files:
 - bt_ev_par_stats_gpu_v3.parquet: Per-BT stats with NV/V splits + hand stats + seat-relative DD means
 
 Usage:
-    python bbo_bt_ev_gpu.py                           # Full pipeline (~12-16 hours)
+    python bbo_bt_ev_gpu.py                           # Full pipeline (latest full run: 43.8h)
     python bbo_bt_ev_gpu.py --resume                  # Resume from checkpoint
     python bbo_bt_ev_gpu.py --max-bt-rows 1000000     # Test run
     python bbo_bt_ev_gpu.py --build-index             # DEPRECATED/disabled (ignored)
@@ -1130,8 +1134,10 @@ def run_pipeline(
     """
     
     pipeline_start = time.time()
+    stage_elapsed: Dict[str, float] = {}
     log("=" * 70)
     log("BT EV/Par Stats - GPU Accelerated Pipeline")
+    log("Latest full-run baseline: 43.8h total (Step3 39.1h, Step4 4.6h, write 4.2m)")
     if build_index:
         log("  WARNING: --build-index is DEPRECATED and will be removed.")
         log("  Use bbo_deal_to_bt_verified.parquet for deal→BT lookups instead.")
@@ -1244,6 +1250,7 @@ def run_pipeline(
     del bt_core  # Free immediately
     
     elapsed = time.time() - step_start
+    stage_elapsed["step1_load_bt_core"] = elapsed
     log(f"  Loaded {n_bt:,} BT indices in {fmt_time(elapsed)}")
     
     # ---------------------------------------------------------------------------
@@ -1276,6 +1283,7 @@ def run_pipeline(
                 ckpt.save_state(state)
     
     elapsed = time.time() - step_start
+    stage_elapsed["step2_build_cubes"] = elapsed
     log(f"  Cubes built in {fmt_time(elapsed)} (8 vul-split cubes)")
     
     # ---------------------------------------------------------------------------
@@ -1427,6 +1435,7 @@ def run_pipeline(
     torch.cuda.empty_cache()
 
     gpu_elapsed = time.time() - step_start
+    stage_elapsed["step3_merged_gpu_pass"] = gpu_elapsed
     log(f"  Merged GPU pass completed in {fmt_time(gpu_elapsed)}")
     
     # ---------------------------------------------------------------------------
@@ -1594,6 +1603,7 @@ def run_pipeline(
     
     n_total_cols = len(result_cols)
     elapsed = time.time() - step_start
+    stage_elapsed["step4_combine_results"] = elapsed
     log(f"  Combined {n:,} rows in {fmt_time(elapsed)} ({n_total_cols} columns: "
         f"24 EV/Par + {4 * (n_dims * 4 + 1)} hand stats + {4 * n_dd} DD means)")
     
@@ -1608,6 +1618,7 @@ def run_pipeline(
     
     file_size = output_file.stat().st_size / 1e6
     elapsed = time.time() - step_start
+    stage_elapsed["step5_write_output"] = elapsed
     log(f"  Written {output_file} ({file_size:.1f} MB) in {fmt_time(elapsed)}")
     
     # ---------------------------------------------------------------------------
@@ -1623,6 +1634,19 @@ def run_pipeline(
     log(f"Stats:   {output_file}")
     log(f"Columns: {n_total_cols}")
     log(f"Rows:    {n:,}")
+    log("Stage elapsed:")
+    for key, label in (
+        ("step1_load_bt_core", "  [1/5] Load BT core"),
+        ("step2_build_cubes", "  [2/5] Build cubes"),
+        ("step3_merged_gpu_pass", "  [3/5] Merged GPU pass"),
+        ("step4_combine_results", "  [4/5] Combine results"),
+        ("step5_write_output", "  [5/5] Write output"),
+    ):
+        sec = stage_elapsed.get(key)
+        if sec is None:
+            continue
+        pct = (sec / total_elapsed * 100.0) if total_elapsed > 0 else 0.0
+        log(f"{label}: {fmt_time(sec)} ({pct:.1f}%)")
     log("=" * 70)
     
     # Sample output

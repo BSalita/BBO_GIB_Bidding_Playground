@@ -438,7 +438,7 @@ def parse_distribution_pattern(pattern: str) -> dict | None:
     if len(parts) != 4:
         return None  # Invalid format
     
-    for i, (part, suit) in enumerate(zip(parts, suits)):
+    for i, (part, suit) in enumerate(list(zip(parts, suits))):
         part = part.strip()
         
         # Wildcard: x, X, .*, .+, or empty
@@ -600,7 +600,7 @@ def build_distribution_sql(
                 for perm in unique_perms:
                     # perm is (S_len, H_len, D_len, C_len)
                     perm_parts = []
-                    for i, (suit, expected_len) in enumerate(zip(suits, perm)):
+                    for i, (suit, expected_len) in enumerate(list(zip(suits, perm))):
                         min_col = f"SL_{suit}_min_S{seat}"
                         max_col = f"SL_{suit}_max_S{seat}"
                         if min_col in available_columns and max_col in available_columns:
@@ -9070,6 +9070,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     sacrifice_discount=float(w_guard_sacrifice) / 100.0,
                                     est_tricks=est_tricks_val,
                                     w_tricks_shortfall=float(w_guard_tricks),
+                                    debug_equivalence_bypass=True,
                                 )
                                 guard_penalty = float(gp) * float(w_guard)
                                 guard_reasons = gr
@@ -10481,7 +10482,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     _hs_row[f"SL_{_sk}"] = _sl_by_suit.get(_sk)
 
                                 _tp = pinned_deal.get(f"Total_Points_{_dir}")
-                                _hs_row["Total_Pts"] = round(float(_tp), 1) if _tp is not None else None
+                                _hs_row["Total_Points"] = round(float(_tp), 1) if _tp is not None else None
                                 _hs_row["TP_std"] = None  # single deal
                                 _actual_hand_rows.append(_hs_row)
 
@@ -10512,27 +10513,44 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         st.caption(f"⚠️ Actual deal stats error: {_e_actual}")
 
                     # -- Per-deal Stats per bid (from sampled deals matching bt_index) --
-                    try:
-                        _bt_indices_for_stats = [
-                            int(r["BT Index"])
-                            for r in valid_rows
-                            if r.get("BT Index") is not None
-                        ]
+                    _load_per_bid_stats = st.toggle(
+                        "Load sampled per-bid deal stats (slower)",
+                        value=False,
+                        key=f"ab_load_per_bid_stats_{current_seat}_{deal_cache_id}",
+                        help="Fetches sampled deals for all valid BT rows. Can add significant latency.",
+                    )
+                    if _load_per_bid_stats:
+                        try:
+                            _bt_indices_for_stats = [
+                                int(r["BT Index"])
+                                for r in valid_rows
+                                if r.get("BT Index") is not None
+                            ]
 
-                        _deals_by_bt: dict = {}
-                        if _bt_indices_for_stats:
-                            _deals_resp = api_post(
-                                "/sample-deals-for-bt-indices",
-                                {
-                                    "bt_indices": _bt_indices_for_stats,
-                                    "sample_size": 100,
-                                    "seed": int(seed) if seed is not None else None,
-                                },
-                                timeout=30,
-                            )
-                            _deals_by_bt = _deals_resp.get("deals_by_bt", {})
+                            _deals_by_bt: dict = {}
+                            if _bt_indices_for_stats:
+                                _sample_batch_cache = st.session_state.setdefault(
+                                    "_auction_builder_sample_deals_batch_cache", {}
+                                )
+                                _batch_key = (
+                                    tuple(sorted(_bt_indices_for_stats)),
+                                    int(seed) if seed is not None else None,
+                                    100,
+                                )
+                                _deals_by_bt = _sample_batch_cache.get(_batch_key)
+                                if _deals_by_bt is None:
+                                    _deals_resp = api_post(
+                                        "/sample-deals-for-bt-indices",
+                                        {
+                                            "bt_indices": _bt_indices_for_stats,
+                                            "sample_size": 100,
+                                            "seed": int(seed) if seed is not None else None,
+                                        },
+                                        timeout=120,
+                                    )
+                                    _deals_by_bt = _deals_resp.get("deals_by_bt", {})
+                                    _sample_batch_cache[_batch_key] = _deals_by_bt
 
-                        if _deals_by_bt:
                             _bt_to_bid = {
                                 str(int(r["BT Index"])): str(r.get("Bid", "?"))
                                 for r in valid_rows
@@ -10605,6 +10623,38 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                         _hs_shape_df = _hs_df[_shape_mask].reset_index(drop=True)
                                         _dd_shape_df = _dd_df[_shape_mask].reset_index(drop=True)
 
+                                def _agg_hand_stats(df: pd.DataFrame) -> pd.DataFrame:
+                                    """Aggregate hand stats: 4 rows (direction) × mean/std cols."""
+                                    rows = []
+                                    for _d in ["N", "E", "S", "W"]:
+                                        r: dict[str, Any] = {"Direction": _d}
+                                        for stat in ["HCP", "Total_Points"]:
+                                            col = f"{stat}_{_d}" if stat == "HCP" else f"TP_{_d}"
+                                            if col in df.columns:
+                                                vals = pd.to_numeric(df[col], errors="coerce").dropna()
+                                                r[stat] = round(float(vals.mean()), 1) if len(vals) else None
+                                                r[f"{stat}_std"] = round(float(vals.std()), 1) if len(vals) >= 2 else None
+                                        for _suit in ["S", "H", "D", "C"]:
+                                            c = f"SL_{_suit}_{_d}"
+                                            if c in df.columns:
+                                                vals = pd.to_numeric(df[c], errors="coerce").dropna()
+                                                r[f"SL_{_suit}"] = round(float(vals.mean()), 1) if len(vals) else None
+                                        rows.append(r)
+                                    return pd.DataFrame(rows).set_index("Direction")
+
+                                def _agg_dd_tricks(df: pd.DataFrame) -> pd.DataFrame:
+                                    """Aggregate DD tricks: 4 rows (declarer) × 5 strain cols (mean)."""
+                                    rows = []
+                                    for _decl in ["N", "E", "S", "W"]:
+                                        r: dict[str, Any] = {"Declarer": _decl}
+                                        for _s in _DD_STRAINS:
+                                            c = f"DD_{_decl}_{_s}"
+                                            if c in df.columns:
+                                                vals = pd.to_numeric(df[c], errors="coerce").dropna()
+                                                r[_s] = round(float(vals.mean()), 1) if len(vals) else None
+                                        rows.append(r)
+                                    return pd.DataFrame(rows).set_index("Declarer")
+
                                 with st.expander(
                                     f"Deal Stats: {_bid_label} (bt_index={_bt_key}, "
                                     f"{len(_deal_list)}/{_total_ct:,} deals)",
@@ -10612,8 +10662,13 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 ):
                                     st.markdown(f"**Hand Stats ({len(_hs_df)} deals)**")
                                     st.dataframe(_hs_df, width="stretch", height=min(400, 35 + len(_hs_df) * 28))
+                                    st.markdown("**Hand Stats (aggregated)**")
+                                    st.dataframe(_agg_hand_stats(_hs_df), width="stretch")
+
                                     st.markdown(f"**DD Tricks ({len(_dd_df)} deals)**")
                                     st.dataframe(_dd_df, width="stretch", height=min(400, 35 + len(_dd_df) * 28))
+                                    st.markdown("**DD Tricks (aggregated)**")
+                                    st.dataframe(_agg_dd_tricks(_dd_df), width="stretch")
 
                                     if _hs_shape_df is not None and len(_hs_shape_df) > 0:
                                         st.markdown(
@@ -10621,16 +10676,22 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                             f"({len(_hs_shape_df)} deals)**"
                                         )
                                         st.dataframe(_hs_shape_df, width="stretch", height=min(400, 35 + len(_hs_shape_df) * 28))
+                                        st.markdown(f"**Hand Stats — shape {_shape_label} (aggregated)**")
+                                        st.dataframe(_agg_hand_stats(_hs_shape_df), width="stretch")
                                     if _dd_shape_df is not None and len(_dd_shape_df) > 0:
                                         st.markdown(
                                             f"**DD Tricks — {_active_dir} shape {_shape_label} "
                                             f"({len(_dd_shape_df)} deals)**"
                                         )
                                         st.dataframe(_dd_shape_df, width="stretch", height=min(400, 35 + len(_dd_shape_df) * 28))
+                                        st.markdown(f"**DD Tricks — shape {_shape_label} (aggregated)**")
+                                        st.dataframe(_agg_dd_tricks(_dd_shape_df), width="stretch")
                                     elif _active_dir and _active_shape:
                                         st.caption(f"No deals with {_active_dir} shape {_shape_label}")
-                    except Exception as _e_computed:
-                        st.caption(f"⚠️ Deal stats error: {_e_computed}")
+                        except Exception as _e_computed:
+                            st.caption(f"⚠️ Deal stats error: {_e_computed}")
+                    else:
+                        st.caption("Sampled per-bid deal stats not loaded (toggle on to fetch).")
 
                 # Rejected bids grid (dead ends, 0 deals, empty criteria)
                 if rejected_rows:
@@ -11945,13 +12006,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             criteria_list = opt.get("agg_expr", []) or []
                             is_dead_end = bool(opt.get("is_dead_end", False))
                             has_empty_criteria = not criteria_list
+                            has_underspecified = _is_underspecified_criteria(criteria_list)
                             can_complete = opt.get("can_complete")
                             can_complete_b = bool(can_complete) if can_complete is not None else True
 
                             # Cheap pre-filter only here; pinned-criteria pass/fail is evaluated in ONE batch below.
                             # IMPORTANT: do NOT reject on can_complete yet. In the UI, "cannot complete"
                             # only rejects bids that OTHERWISE match the pinned deal.
-                            is_rejected = is_dead_end or has_empty_criteria
+                            is_rejected = is_dead_end or has_empty_criteria or has_underspecified
                             if is_rejected and bid_str not in ("P", "PASS"):
                                 continue
                             candidates.append(opt)
@@ -12230,33 +12292,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             except Exception:
                                 desc_score = None
 
-                            # -- Trick / Loser estimation for AI Model path --
+                            # Standalone/manual parity: AI-model path does not
+                            # apply trick-shortfall guardrail.
                             _est_tricks_path: float | None = None
-                            try:
-                                import re as _re_strain2
-                                _strain_m2 = _re_strain2.match(r"^[1-7]\s*(NT|N|[CDHS])", bid0)
-                                _bid_strain2: str | None = None
-                                if _strain_m2:
-                                    _bs2 = _strain_m2.group(1).upper()
-                                    _bid_strain2 = "NT" if _bs2 in ("N", "NT") else _bs2
-                                _self_hand_p: str | None = None
-                                if pinned_deal and acting_dir:
-                                    _self_hand_p = str(pinned_deal.get(f"Hand_{acting_dir}", "") or "").strip() or None
-                                if _bid_strain2 and _self_hand_p:
-                                    _p2a_p = details.get("phase2a") or {}
-                                    _phcp_h = ((_p2a_p.get("roles") or {}).get("partner") or {}).get("hcp_hist")
-                                    _psl_h = ((_p2a_p.get("roles") or {}).get("partner") or {}).get("sl_hist")
-                                    _fit_h = (_p2a_p.get("fit") or {}).get("us")
-                                    _tr = estimate_partnership_tricks(
-                                        self_hand=_self_hand_p,
-                                        partner_hcp_hist=_phcp_h,
-                                        partner_sl_hists=_psl_h,
-                                        fit_us_hists=_fit_h,
-                                        strain=_bid_strain2,
-                                    )
-                                    _est_tricks_path = _tr.get("est_tricks")
-                            except Exception:
-                                _est_tricks_path = None
 
                             # Guardrail penalty (Streamlit-side AI Model path)
                             guard_penalty_s = 0.0
@@ -12303,6 +12341,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                         sacrifice_discount=_wgsd,
                                         est_tricks=_est_tricks_path,
                                         w_tricks_shortfall=_wgtk,
+                                        debug_equivalence_bypass=True,
                                     )
                                     guard_penalty_s = float(_gp) * _wg
                             except Exception:
@@ -12800,6 +12839,212 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 for rr in completion_rows:
                     rr["Bucket"] = "Valid" if (rr.get("BT Index") is not None) else "Invalid"
 
+                # Combined aggregate comparison table: Hand Stats + DD Tricks with Source labels.
+                try:
+                    _AB_DIRS = ["N", "E", "S", "W"]
+                    _AB_STRAINS = ["C", "D", "H", "S", "N"]
+                    _ab_stats_cache = st.session_state.setdefault("_auction_builder_source_stats_cache", {})
+                    _ab_criteria_stats_cache = st.session_state.setdefault("_auction_builder_criteria_stats_cache", {})
+
+                    def _ab_norm_source_label(src_raw: str) -> str:
+                        s = str(src_raw or "").strip().upper()
+                        if s == "ACTUAL":
+                            return "Actual Auction"
+                        if s == "AI MODEL":
+                            return "AI Model"
+                        return str(src_raw or "").strip() or "Selected"
+
+                    def _ab_deal_rows(deal_obj: dict[str, Any]) -> list[dict[str, Any]]:
+                        rows: list[dict[str, Any]] = []
+                        for _d in _AB_DIRS:
+                            r: dict[str, Any] = {"Source": "Deal", "Direction": _d, "Deals": 1}
+                            _hcp = deal_obj.get(f"HCP_{_d}")
+                            r["HCP"] = round(float(_hcp), 1) if _hcp is not None else None
+                            r["HCP_std"] = None
+                            _tp = deal_obj.get(f"Total_Points_{_d}")
+                            r["Total_Points"] = round(float(_tp), 1) if _tp is not None else None
+                            r["Total_Points_std"] = None
+
+                            # Prefer parsing Hand_ strings (S.H.D.C), fallback to SL columns.
+                            _sl_by_suit: dict[str, int | None] = {}
+                            _hand = str(deal_obj.get(f"Hand_{_d}", "") or "")
+                            _parts = _hand.split(".") if _hand else []
+                            if len(_parts) == 4:
+                                _sl_by_suit = {
+                                    "S": len(_parts[0]),
+                                    "H": len(_parts[1]),
+                                    "D": len(_parts[2]),
+                                    "C": len(_parts[3]),
+                                }
+                            else:
+                                for _s in ["S", "H", "D", "C"]:
+                                    _v = deal_obj.get(f"SL_{_s}_{_d}")
+                                    _sl_by_suit[_s] = int(_v) if _v is not None else None
+                            r["SL_C"] = _sl_by_suit.get("C")
+                            r["SL_D"] = _sl_by_suit.get("D")
+                            r["SL_H"] = _sl_by_suit.get("H")
+                            r["SL_S"] = _sl_by_suit.get("S")
+
+                            for _s in _AB_STRAINS:
+                                _v = deal_obj.get(f"DD_{_d}_{_s}")
+                                _col = "DD_NT" if _s == "N" else f"DD_{_s}"
+                                r[_col] = int(float(_v)) if _v is not None else None
+                            rows.append(r)
+                        return rows
+
+                    def _ab_rows_from_agg_stats(src_label: str, agg_stats: dict[str, Any]) -> list[dict[str, Any]]:
+                        _deal_count = agg_stats.get("deal_count")
+                        hand_rows = agg_stats.get("hand_stats") or []
+                        dd_rows = agg_stats.get("dd_means") or []
+                        hs_map = {
+                            str(r.get("Direction") or "").upper(): r
+                            for r in hand_rows
+                            if isinstance(r, dict)
+                        }
+                        dd_map = {
+                            str(r.get("Declarer") or "").upper(): r
+                            for r in dd_rows
+                            if isinstance(r, dict)
+                        }
+                        rows: list[dict[str, Any]] = []
+                        for _d in _AB_DIRS:
+                            hs = hs_map.get(_d, {})
+                            dd = dd_map.get(_d, {})
+                            rows.append(
+                                {
+                                    "Source": src_label,
+                                    "Direction": _d,
+                                    "Deals": _deal_count,
+                                    "HCP": hs.get("HCP"),
+                                    "HCP_std": hs.get("HCP_std"),
+                                    "SL_C": hs.get("SL_C"),
+                                    "SL_D": hs.get("SL_D"),
+                                    "SL_H": hs.get("SL_H"),
+                                    "SL_S": hs.get("SL_S"),
+                                    "Total_Points": hs.get("Total_Points"),
+                                    "Total_Points_std": hs.get("Total_Points_std"),
+                                    "DD_C": dd.get("C"),
+                                    "DD_D": dd.get("D"),
+                                    "DD_H": dd.get("H"),
+                                    "DD_S": dd.get("S"),
+                                    "DD_NT": dd.get("N"),
+                                }
+                            )
+                        return rows
+
+                    def _ab_fetch_agg_stats(auction_text_raw: str) -> dict[str, Any] | None:
+                        _auc = str(auction_text_raw or "").strip().upper()
+                        if not _auc or _auc in ("(UNAVAILABLE)", "(COMPUTING...)"):
+                            return None
+                        _k = f"{_auc}|{int(max_matching_deals)}|{int(seed)}"
+                        if _k in _ab_stats_cache:
+                            return _ab_stats_cache.get(_k)
+                        _resp = api_post(
+                            "/sample-deals-by-auction-pattern",
+                            {
+                                "pattern": f"^{_auc}$",
+                                "sample_size": int(max_matching_deals),
+                                "seed": int(seed),
+                                "include_stats": True,
+                            },
+                            timeout=30,
+                        )
+                        _stats = _resp.get("actual_auction_stats")
+                        _ab_stats_cache[_k] = _stats
+                        return _stats
+
+                    def _ab_fetch_criteria_stats_map(bt_indices_raw: list[Any]) -> dict[str, Any]:
+                        _bt_keys: list[str] = []
+                        for _v in bt_indices_raw:
+                            try:
+                                _bt_i = int(_v)
+                            except Exception:
+                                continue
+                            _bt_keys.append(str(_bt_i))
+                        if not _bt_keys:
+                            return {}
+
+                        _missing: list[int] = []
+                        for _k in _bt_keys:
+                            if _k not in _ab_criteria_stats_cache:
+                                try:
+                                    _missing.append(int(_k))
+                                except Exception:
+                                    continue
+                        if _missing:
+                            _dealer_payload = None
+                            if pinned_deal is not None:
+                                _dealer_payload = str(pinned_deal.get("Dealer") or "").upper() or None
+                            if _dealer_payload is None:
+                                return {k: _ab_criteria_stats_cache.get(k) for k in _bt_keys}
+                            _resp = api_post(
+                                "/criteria-stats-by-bt-indices",
+                                {"bt_indices": _missing, "dealer": _dealer_payload},
+                                timeout=30,
+                            )
+                            _stats_map = _resp.get("stats_by_bt") or {}
+                            for _k_i in _missing:
+                                _k_s = str(int(_k_i))
+                                _ab_criteria_stats_cache[_k_s] = _stats_map.get(_k_s)
+
+                        return {k: _ab_criteria_stats_cache.get(k) for k in _bt_keys}
+
+                    _combined_source_rows: list[dict[str, Any]] = []
+                    if pinned_deal:
+                        _combined_source_rows.extend(_ab_deal_rows(pinned_deal))
+                    for rr in completion_rows:
+                        _src_label = _ab_norm_source_label(rr.get("Source"))
+                        _stats = _ab_fetch_agg_stats(str(rr.get("Auction") or ""))
+                        if _stats:
+                            _combined_source_rows.extend(_ab_rows_from_agg_stats(_src_label, _stats))
+
+                    # Criteria-only stats from agg_expr matches by BT index (independent of actual/predicted auction text).
+                    _bt_to_source: dict[str, str] = {}
+                    for rr in completion_rows:
+                        _bt_val = rr.get("BT Index")
+                        if _bt_val is None:
+                            continue
+                        try:
+                            _bt_key = str(int(_bt_val))
+                        except Exception:
+                            continue
+                        _bt_to_source[_bt_key] = _ab_norm_source_label(rr.get("Source"))
+
+                    if _bt_to_source:
+                        _criteria_stats_map = _ab_fetch_criteria_stats_map(list(_bt_to_source.keys()))
+                        for _bt_key, _src_label in _bt_to_source.items():
+                            _c_stats = _criteria_stats_map.get(_bt_key)
+                            if _c_stats:
+                                _combined_source_rows.extend(
+                                    _ab_rows_from_agg_stats(f"Criteria ({_src_label})", _c_stats)
+                                )
+
+                    if _combined_source_rows:
+                        _combined_df = pd.DataFrame(_combined_source_rows)
+                        _col_order = [
+                            "Source",
+                            "Direction",
+                            "Deals",
+                            "HCP",
+                            "HCP_std",
+                            "SL_C",
+                            "SL_D",
+                            "SL_H",
+                            "SL_S",
+                            "Total_Points",
+                            "Total_Points_std",
+                            "DD_C",
+                            "DD_D",
+                            "DD_H",
+                            "DD_S",
+                            "DD_NT",
+                        ]
+                        _keep_cols = [c for c in _col_order if c in _combined_df.columns]
+                        with st.expander("Aggregate Hand Stats + DD Tricks (all sources)", expanded=False):
+                            st.dataframe(_combined_df[_keep_cols], width="stretch")
+                except Exception as _e_source_agg:
+                    st.caption(f"⚠️ Aggregate comparison stats error: {_e_source_agg}")
+
                 completion_df = order_columns(
                     pl.DataFrame(completion_rows),
                     priority_cols=[
@@ -13009,6 +13254,609 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     st.caption(f"Deals where the deal's actual auction starts with: **{display_auction}**")
                 else:
                     st.caption(f"Deals where the deal's actual auction starts with the {src_label} prefix: **{display_auction}**")
+
+            # Criteria-based range snapshot for the selected partial step.
+            # Shows hard bounds from agg_expr (if present) and observed ranges from criteria-matched deals.
+            try:
+                _range_bid_num: int | None = None
+                if selected_step_row is not None:
+                    try:
+                        _bn_raw = selected_step_row.get("Bid Num")
+                        _range_bid_num = int(_bn_raw) if _bn_raw is not None else None
+                    except Exception:
+                        _range_bid_num = None
+                if _range_bid_num is None:
+                    _tok_ct = len([t for t in str(display_auction or "").split("-") if str(t).strip()])
+                    if 1 <= _tok_ct <= len(current_path):
+                        _range_bid_num = int(_tok_ct)
+
+                _range_step: dict[str, Any] | None = None
+                if _range_bid_num is not None and 1 <= _range_bid_num <= len(current_path):
+                    _range_step = current_path[_range_bid_num - 1]
+
+                _range_bt_idx: int | None = None
+                if selected_step_row is not None:
+                    try:
+                        _bt_raw = selected_step_row.get("BT Index")
+                        _range_bt_idx = int(_bt_raw) if _bt_raw not in (None, "") else None
+                    except Exception:
+                        _range_bt_idx = None
+                if _range_bt_idx is None and _range_step is not None:
+                    try:
+                        _bt_raw = _range_step.get("bt_index")
+                        _range_bt_idx = int(_bt_raw) if _bt_raw is not None else None
+                    except Exception:
+                        _range_bt_idx = None
+
+                _range_criteria: list[str] = []
+                if _range_step is not None:
+                    _range_criteria = [str(x) for x in (_range_step.get("agg_expr") or []) if str(x).strip()]
+
+                # Active bidder direction for this selected step (requires pinned deal's dealer).
+                _range_active_dir: str | None = None
+                if pinned_deal and _range_bid_num is not None:
+                    try:
+                        _dirs = ["N", "E", "S", "W"]
+                        _dealer = str(pinned_deal.get("Dealer", "N")).upper()
+                        _d_idx = _dirs.index(_dealer) if _dealer in _dirs else 0
+                        _seat_1_to_4 = ((_range_bid_num - 1) % 4) + 1
+                        _range_active_dir = _dirs[(_d_idx + _seat_1_to_4 - 1) % 4]
+                    except Exception:
+                        _range_active_dir = None
+
+                # Parse simple numeric criterion bounds for active bidder stats.
+                def _criteria_bounds_map(criteria_list: list[str]) -> dict[str, dict[str, float | None]]:
+                    out: dict[str, dict[str, float | None]] = {}
+                    for metric in ["HCP", "Total_Points", "SL_C", "SL_D", "SL_H", "SL_S"]:
+                        out[metric] = {"lb": None, "ub": None}
+
+                    patt = re.compile(r"^\s*(HCP|Total_Points|SL_[SHDC])\s*(<=|>=|==|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")
+                    for c_raw in criteria_list:
+                        c = str(c_raw or "").strip().replace("≥", ">=").replace("≤", "<=")
+                        m = patt.match(c)
+                        if not m:
+                            continue
+                        metric_raw, op, val_s = m.group(1), m.group(2), m.group(3)
+                        metric = metric_raw
+                        if metric.startswith("SL_") and len(metric) == 4:
+                            metric = f"SL_{metric[-1]}"
+                        if metric not in out:
+                            continue
+                        try:
+                            val = float(val_s)
+                        except Exception:
+                            continue
+                        is_int_like = metric in {"HCP", "Total_Points", "SL_C", "SL_D", "SL_H", "SL_S"}
+                        if op == ">":
+                            lb = val + 1.0 if is_int_like else val
+                            cur = out[metric]["lb"]
+                            out[metric]["lb"] = lb if cur is None else max(float(cur), lb)
+                        elif op == ">=":
+                            cur = out[metric]["lb"]
+                            out[metric]["lb"] = val if cur is None else max(float(cur), val)
+                        elif op == "<":
+                            ub = val - 1.0 if is_int_like else val
+                            cur = out[metric]["ub"]
+                            out[metric]["ub"] = ub if cur is None else min(float(cur), ub)
+                        elif op == "<=":
+                            cur = out[metric]["ub"]
+                            out[metric]["ub"] = val if cur is None else min(float(cur), val)
+                        elif op == "==":
+                            out[metric]["lb"] = val
+                            out[metric]["ub"] = val
+                    return out
+
+                def _fmt_num_range(v: float | None) -> str:
+                    if v is None:
+                        return "—"
+                    if abs(float(v) - round(float(v))) < 1e-9:
+                        return str(int(round(float(v))))
+                    return f"{float(v):.1f}"
+
+                def _fmt_range(lb: float | None, ub: float | None) -> str:
+                    if lb is None and ub is None:
+                        return "—"
+                    if lb is not None and ub is not None:
+                        return f"{_fmt_num_range(lb)}-{_fmt_num_range(ub)}"
+                    if lb is not None:
+                        return f"{_fmt_num_range(lb)}+"
+                    return f"<= {_fmt_num_range(ub)}"
+
+                if _range_bt_idx is not None:
+                    _criteria_stats_cache = st.session_state.setdefault("_auction_builder_criteria_stats_cache", {})
+                    _k = str(int(_range_bt_idx))
+                    if _k not in _criteria_stats_cache:
+                        _dealer_payload = None
+                        if pinned_deal is not None:
+                            _dealer_payload = str(pinned_deal.get("Dealer") or "").upper() or None
+                        if _dealer_payload is not None:
+                            _resp = api_post(
+                                "/criteria-stats-by-bt-indices",
+                                {"bt_indices": [int(_range_bt_idx)], "dealer": _dealer_payload},
+                                timeout=30,
+                            )
+                            _criteria_stats_cache[_k] = (_resp.get("stats_by_bt") or {}).get(_k)
+                        else:
+                            _criteria_stats_cache[_k] = {}
+
+                    _c_stats = _criteria_stats_cache.get(_k) or {}
+                    _dealer_for_map = str((pinned_deal or {}).get("Dealer") or "").upper() if pinned_deal else ""
+                    _row_by_dir: dict[str, dict[str, Any]] = {}
+                    if _dealer_for_map in {"N", "E", "S", "W"}:
+                        _hp_cache = st.session_state.setdefault("_auction_builder_bt_hand_profile_cache", {})
+                        _hp_key = f"{int(_range_bt_idx)}|{_dealer_for_map}"
+                        _hp_rows = _hp_cache.get(_hp_key)
+                        if _hp_rows is None:
+                            _resp_hp = api_post(
+                                "/bt-hand-profile",
+                                {"bt_indices": [int(_range_bt_idx)]},
+                                timeout=30,
+                            )
+                            _hp_rows = _resp_hp.get("rows") or []
+                            _hp_cache[_hp_key] = _hp_rows
+
+                        _dirs = ["N", "E", "S", "W"]
+                        _d0 = _dirs.index(_dealer_for_map)
+                        _seat_to_dir = {
+                            1: _dirs[_d0],
+                            2: _dirs[(_d0 + 1) % 4],
+                            3: _dirs[(_d0 + 2) % 4],
+                            4: _dirs[(_d0 + 3) % 4],
+                        }
+                        for _r in _hp_rows:
+                            if not isinstance(_r, dict):
+                                continue
+                            try:
+                                _seat_i = int(_r.get("seat"))
+                            except Exception:
+                                continue
+                            _dir_i = _seat_to_dir.get(_seat_i)
+                            if _dir_i:
+                                _row_by_dir[_dir_i] = {
+                                    "Direction": _dir_i,
+                                    "Deals": _r.get("n"),
+                                    "HCP_min": _r.get("HCP_min"),
+                                    "HCP_max": _r.get("HCP_max"),
+                                    "HCP_p10": _r.get("HCP_p10"),
+                                    "HCP_p90": _r.get("HCP_p90"),
+                                    "Total_Points_min": _r.get("Total_Points_min"),
+                                    "Total_Points_max": _r.get("Total_Points_max"),
+                                    "Total_Points_p10": _r.get("Total_Points_p10"),
+                                    "Total_Points_p90": _r.get("Total_Points_p90"),
+                                    "SL_C_min": _r.get("SL_C_min"),
+                                    "SL_C_max": _r.get("SL_C_max"),
+                                    "SL_C_p10": _r.get("SL_C_p10"),
+                                    "SL_C_p90": _r.get("SL_C_p90"),
+                                    "SL_D_min": _r.get("SL_D_min"),
+                                    "SL_D_max": _r.get("SL_D_max"),
+                                    "SL_D_p10": _r.get("SL_D_p10"),
+                                    "SL_D_p90": _r.get("SL_D_p90"),
+                                    "SL_H_min": _r.get("SL_H_min"),
+                                    "SL_H_max": _r.get("SL_H_max"),
+                                    "SL_H_p10": _r.get("SL_H_p10"),
+                                    "SL_H_p90": _r.get("SL_H_p90"),
+                                    "SL_S_min": _r.get("SL_S_min"),
+                                    "SL_S_max": _r.get("SL_S_max"),
+                                    "SL_S_p10": _r.get("SL_S_p10"),
+                                    "SL_S_p90": _r.get("SL_S_p90"),
+                                }
+                    _obs_row = _row_by_dir.get(str(_range_active_dir or "").upper()) if _range_active_dir else None
+                    if _obs_row:
+                        _bounds = _criteria_bounds_map(_range_criteria)
+                        _deals_n = _obs_row.get("Deals")
+                        with st.expander(
+                            f"📏 Criteria Range Snapshot ({display_auction}) — bidder {_range_active_dir} "
+                            f"({_deals_n:,} criteria-matched deals)" if isinstance(_deals_n, int) else
+                            f"📏 Criteria Range Snapshot ({display_auction}) — bidder {_range_active_dir}",
+                            expanded=False,
+                        ):
+                            _show_all_dirs = st.checkbox(
+                                "All 4 directions",
+                                value=False,
+                                key=f"ab_range_all_dirs_{display_auction}_{_k}",
+                                help="Show ranges for N/E/S/W instead of only the active bidder direction.",
+                            )
+
+                            _dirs_to_show = ["N", "E", "S", "W"] if _show_all_dirs else [str(_range_active_dir)]
+                            _metric_rows: list[dict[str, Any]] = []
+                            for _dir_show in _dirs_to_show:
+                                _r = _row_by_dir.get(str(_dir_show).upper())
+                                if not _r:
+                                    continue
+                                for _metric in ["HCP", "Total_Points", "SL_C", "SL_D", "SL_H", "SL_S"]:
+                                    _b = _bounds.get(_metric, {"lb": None, "ub": None})
+                                    _obs_min = _r.get(f"{_metric}_min")
+                                    _obs_max = _r.get(f"{_metric}_max")
+                                    _p10 = _r.get(f"{_metric}_p10")
+                                    _p90 = _r.get(f"{_metric}_p90")
+                                    _metric_rows.append(
+                                        {
+                                            "Direction": str(_dir_show).upper(),
+                                            "Metric": _metric,
+                                            "Criteria": _fmt_range(_b.get("lb"), _b.get("ub")),
+                                            "Observed Min-Max": _fmt_range(
+                                                float(_obs_min) if _obs_min is not None else None,
+                                                float(_obs_max) if _obs_max is not None else None,
+                                            ),
+                                            "Observed P10-P90": _fmt_range(
+                                                float(_p10) if _p10 is not None else None,
+                                                float(_p90) if _p90 is not None else None,
+                                            ),
+                                        }
+                                    )
+                            _range_df = pd.DataFrame(_metric_rows)
+                            st.dataframe(_range_df, width="stretch")
+
+                            # Trick Quality: compare multiple trick estimators in one place.
+                            try:
+                                _calls = [c.strip().upper() for c in str(display_auction or "").split("-") if str(c).strip()]
+                                _last_contract: str | None = None
+                                for _c in _calls:
+                                    if re.match(r"^[1-7][CDHSN]$", _c):
+                                        _last_contract = _c
+                                if _last_contract:
+                                    _level = int(_last_contract[0])
+                                    _strain = _last_contract[1]
+                                    _book = _level + 6
+
+                                    _declarer_dir: str | None = None
+                                    if pinned_deal:
+                                        try:
+                                            _declarer_dir = _declarer_direction_from_calls(_calls, str(pinned_deal.get("Dealer", "N")))
+                                        except Exception:
+                                            _declarer_dir = None
+                                    if not _declarer_dir:
+                                        _declarer_dir = str(_range_active_dir or "").upper() or None
+
+                                    def _conf_label(n: int | None) -> str:
+                                        if n is None:
+                                            return "Low"
+                                        if n >= 1000:
+                                            return "High"
+                                        if n >= 250:
+                                            return "Med"
+                                        return "Low"
+
+                                    def _fmt_delta(v: float | None) -> str:
+                                        if v is None:
+                                            return "—"
+                                        return f"{float(v):+.1f}"
+
+                                    _tq_rows: list[dict[str, Any]] = []
+                                    _deal_count_all = _c_stats.get("deal_count")
+                                    _deal_count_i = int(_deal_count_all) if isinstance(_deal_count_all, (int, float)) else None
+
+                                    # 1) Precomputed trick quality (Phase 1 endpoint)
+                                    _dealer_for_tq = str((pinned_deal or {}).get("Dealer") or "").upper() if pinned_deal else ""
+                                    if (
+                                        _dealer_for_tq in {"N", "E", "S", "W"}
+                                        and _declarer_dir in {"N", "E", "S", "W"}
+                                    ):
+                                        _dirs = ["N", "E", "S", "W"]
+                                        _d0 = _dirs.index(_dealer_for_tq)
+                                        _dir_to_seat = {
+                                            _dirs[_d0]: 1,
+                                            _dirs[(_d0 + 1) % 4]: 2,
+                                            _dirs[(_d0 + 2) % 4]: 3,
+                                            _dirs[(_d0 + 3) % 4]: 4,
+                                        }
+                                        _seat_i = _dir_to_seat.get(str(_declarer_dir))
+                                        _strain_to_i = {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}
+                                        _strain_i = _strain_to_i.get(str(_strain))
+                                        _vul_i = None
+                                        if pinned_deal:
+                                            _vul_raw = str(
+                                                pinned_deal.get("Vul", pinned_deal.get("Vulnerability", ""))
+                                            ).upper()
+                                            _ns_vul = _vul_raw in ("N_S", "NS", "BOTH", "ALL")
+                                            _ew_vul = _vul_raw in ("E_W", "EW", "BOTH", "ALL")
+                                            _is_ns_decl = str(_declarer_dir) in ("N", "S")
+                                            _vul_i = 1 if ((_is_ns_decl and _ns_vul) or ((not _is_ns_decl) and _ew_vul)) else 0
+                                        if _seat_i is not None and _strain_i is not None:
+                                            _resp_tq = api_post(
+                                                "/bt-trick-quality",
+                                                {
+                                                    "bt_indices": [int(_range_bt_idx)],
+                                                    "seat": int(_seat_i),
+                                                    "strain": int(_strain_i),
+                                                    "level": int(_level),
+                                                    "vul": int(_vul_i) if _vul_i is not None else None,
+                                                },
+                                                timeout=30,
+                                            )
+                                            _tq_pre_rows = _resp_tq.get("rows") or []
+                                            if _tq_pre_rows:
+                                                _pre = _tq_pre_rows[0]
+                                                try:
+                                                    _pre_exp = float(_pre.get("exp_extra")) if _pre.get("exp_extra") is not None else None
+                                                except Exception:
+                                                    _pre_exp = None
+                                                try:
+                                                    _pre_mt = float(_pre.get("mean_tricks")) if _pre.get("mean_tricks") is not None else None
+                                                except Exception:
+                                                    _pre_mt = None
+                                                try:
+                                                    _pre_pm = float(_pre.get("p_make")) if _pre.get("p_make") is not None else None
+                                                except Exception:
+                                                    _pre_pm = None
+                                                try:
+                                                    _pre_pp1 = float(_pre.get("p_plus1")) if _pre.get("p_plus1") is not None else None
+                                                except Exception:
+                                                    _pre_pp1 = None
+                                                _pre_n = _pre.get("n")
+                                                _pre_n_i = int(_pre_n) if isinstance(_pre_n, (int, float)) else None
+                                                _vul_label = "V" if _vul_i == 1 else ("NV" if _vul_i == 0 else "?")
+                                                _tq_rows.append(
+                                                    {
+                                                        "Metric": "Precomputed Trick Quality",
+                                                        "Tricks +/-": _fmt_delta(_pre_exp),
+                                                        "ExpTricks": round(_pre_mt, 1) if _pre_mt is not None else None,
+                                                        "Baseline": _book,
+                                                        "SampleN": _pre_n_i,
+                                                        "Confidence": _conf_label(_pre_n_i),
+                                                        "Notes": (
+                                                            f"p_make={(_pre_pm * 100.0):.1f}%"
+                                                            if _pre_pm is not None
+                                                            else ""
+                                                        )
+                                                        + (
+                                                            f", p_plus1={(_pre_pp1 * 100.0):.1f}%"
+                                                            if _pre_pp1 is not None
+                                                            else ""
+                                                        )
+                                                        + f", vul={_vul_label}",
+                                                    }
+                                                )
+
+                                    # 2) Criteria DD mean (full matched set stats)
+                                    _dd_rows = _c_stats.get("dd_means") or []
+                                    _dd_map = {
+                                        str(r.get("Declarer") or "").upper(): r
+                                        for r in _dd_rows
+                                        if isinstance(r, dict)
+                                    }
+                                    _dd_decl_row = _dd_map.get(str(_declarer_dir or "").upper(), {})
+                                    _dd_mean = _dd_decl_row.get(_strain) if isinstance(_dd_decl_row, dict) else None
+                                    try:
+                                        _dd_mean_f = float(_dd_mean) if _dd_mean is not None else None
+                                    except Exception:
+                                        _dd_mean_f = None
+                                    if _dd_mean_f is not None:
+                                        _tq_rows.append(
+                                            {
+                                                "Metric": "Criteria DD Mean",
+                                                "Tricks +/-": _fmt_delta(_dd_mean_f - float(_book)),
+                                                "ExpTricks": round(_dd_mean_f, 1),
+                                                "Baseline": _book,
+                                                "SampleN": _deal_count_i,
+                                                "Confidence": _conf_label(_deal_count_i),
+                                                "Notes": f"Declarer {_declarer_dir}, strain {_strain}",
+                                            }
+                                        )
+
+                                    # Sample deals for percentile/median and bucket estimators (optional; can be slow).
+                                    _sample_deals: list[dict[str, Any]] = []
+                                    _load_sample_estimators = st.toggle(
+                                        "Load sampled estimators (median + historical bucket)",
+                                        value=False,
+                                        key=f"ab_tq_sample_estimators_{display_auction}_{_k}",
+                                        help="Calls /sample-deals-for-bt-indices and may add several seconds.",
+                                    )
+                                    if _load_sample_estimators:
+                                        _bt_sample_cache = st.session_state.setdefault("_auction_builder_bt_sample_cache", {})
+                                        _sample_key = f"{int(_range_bt_idx)}|{int(seed)}|{min(int(max_matching_deals), 500)}"
+                                        _sample_deals = _bt_sample_cache.get(_sample_key)
+                                        if _sample_deals is None:
+                                            _resp_sd = api_post(
+                                                "/sample-deals-for-bt-indices",
+                                                {
+                                                    "bt_indices": [int(_range_bt_idx)],
+                                                    "sample_size": min(int(max_matching_deals), 500),
+                                                    "seed": int(seed),
+                                                },
+                                                timeout=45,
+                                            )
+                                            _sample_deals = (
+                                                ((_resp_sd.get("deals_by_bt") or {}).get(str(int(_range_bt_idx))) or {})
+                                                .get("deals", [])
+                                                or []
+                                            )
+                                            _bt_sample_cache[_sample_key] = _sample_deals
+
+                                    _dd_col = f"DD_{str(_declarer_dir or '').upper()}_{_strain}"
+                                    _dd_vals: list[float] = []
+                                    for _d in _sample_deals:
+                                        try:
+                                            _v = _d.get(_dd_col)
+                                            if _v is not None:
+                                                _dd_vals.append(float(_v))
+                                        except Exception:
+                                            pass
+
+                                    # 3) Criteria DD median (sampled)
+                                    if _dd_vals:
+                                        _p50 = float(pd.Series(_dd_vals).median())
+                                        _tq_rows.append(
+                                            {
+                                                "Metric": "Criteria DD Median (sample)",
+                                                "Tricks +/-": _fmt_delta(_p50 - float(_book)),
+                                                "ExpTricks": round(_p50, 1),
+                                                "Baseline": _book,
+                                                "SampleN": len(_dd_vals),
+                                                "Confidence": _conf_label(len(_dd_vals)),
+                                                "Notes": f"P50 from sampled criteria-matched deals ({_dd_col})",
+                                            }
+                                        )
+                                    elif not _load_sample_estimators:
+                                        _tq_rows.append(
+                                            {
+                                                "Metric": "Criteria DD Median (sample)",
+                                                "Tricks +/-": "—",
+                                                "ExpTricks": None,
+                                                "Baseline": _book,
+                                                "SampleN": None,
+                                                "Confidence": "Low",
+                                                "Notes": "Enable 'Load sampled estimators' to compute",
+                                            }
+                                        )
+
+                                    # 4) Historical bucket (Total_Points + trump length + secondary length)
+                                    if pinned_deal and _range_active_dir and _sample_deals:
+                                        _ad = str(_range_active_dir).upper()
+                                        _tp_cur = pinned_deal.get(f"Total_Points_{_ad}")
+                                        try:
+                                            _tp_cur_f = float(_tp_cur) if _tp_cur is not None else None
+                                        except Exception:
+                                            _tp_cur_f = None
+
+                                        def _tp_bin(tp: float | None) -> str | None:
+                                            if tp is None:
+                                                return None
+                                            if tp <= 7:
+                                                return "0-7"
+                                            if tp <= 10:
+                                                return "8-10"
+                                            if tp <= 13:
+                                                return "11-13"
+                                            if tp <= 16:
+                                                return "14-16"
+                                            if tp <= 19:
+                                                return "17-19"
+                                            return "20+"
+
+                                        def _slen_bin(x: float | int | None) -> str | None:
+                                            if x is None:
+                                                return None
+                                            try:
+                                                xi = int(x)
+                                            except Exception:
+                                                return None
+                                            if xi <= 4:
+                                                return "<=4"
+                                            if xi == 5:
+                                                return "5"
+                                            if xi == 6:
+                                                return "6"
+                                            return "7+"
+
+                                        def _sec_bin(x: float | int | None) -> str | None:
+                                            if x is None:
+                                                return None
+                                            try:
+                                                xi = int(x)
+                                            except Exception:
+                                                return None
+                                            if xi <= 3:
+                                                return "<=3"
+                                            if xi == 4:
+                                                return "4"
+                                            return "5+"
+
+                                        _suit_for_len = _strain if _strain in {"C", "D", "H", "S"} else None
+                                        _cur_sl_by_suit: dict[str, int | None] = {}
+                                        for _s in ["S", "H", "D", "C"]:
+                                            _v = pinned_deal.get(f"SL_{_s}_{_ad}")
+                                            try:
+                                                _cur_sl_by_suit[_s] = int(_v) if _v is not None else None
+                                            except Exception:
+                                                _cur_sl_by_suit[_s] = None
+                                        _cur_trump_len = _cur_sl_by_suit.get(_suit_for_len) if _suit_for_len else max(
+                                            [_v for _v in _cur_sl_by_suit.values() if isinstance(_v, int)],
+                                            default=None,
+                                        )
+                                        _cur_secondary = None
+                                        _vals_sorted = sorted(
+                                            [int(_v) for _v in _cur_sl_by_suit.values() if isinstance(_v, int)],
+                                            reverse=True,
+                                        )
+                                        if len(_vals_sorted) >= 2:
+                                            _cur_secondary = _vals_sorted[1]
+
+                                        _target_bucket = (_tp_bin(_tp_cur_f), _slen_bin(_cur_trump_len), _sec_bin(_cur_secondary))
+
+                                        _bucket_vals: list[float] = []
+                                        for _d in _sample_deals:
+                                            _tp = _d.get(f"Total_Points_{_ad}")
+                                            try:
+                                                _tp_f = float(_tp) if _tp is not None else None
+                                            except Exception:
+                                                _tp_f = None
+                                            _sl_map = {}
+                                            for _s in ["S", "H", "D", "C"]:
+                                                _sv = _d.get(f"SL_{_s}_{_ad}")
+                                                try:
+                                                    _sl_map[_s] = int(_sv) if _sv is not None else None
+                                                except Exception:
+                                                    _sl_map[_s] = None
+                                            _trump = _sl_map.get(_suit_for_len) if _suit_for_len else max(
+                                                [_v for _v in _sl_map.values() if isinstance(_v, int)],
+                                                default=None,
+                                            )
+                                            _sec = None
+                                            _ss = sorted(
+                                                [int(_v) for _v in _sl_map.values() if isinstance(_v, int)],
+                                                reverse=True,
+                                            )
+                                            if len(_ss) >= 2:
+                                                _sec = _ss[1]
+                                            _bucket = (_tp_bin(_tp_f), _slen_bin(_trump), _sec_bin(_sec))
+                                            if _bucket != _target_bucket:
+                                                continue
+                                            try:
+                                                _v = _d.get(_dd_col)
+                                                if _v is not None:
+                                                    _bucket_vals.append(float(_v))
+                                            except Exception:
+                                                pass
+
+                                        if _bucket_vals:
+                                            _bucket_mean = float(pd.Series(_bucket_vals).mean())
+                                            _tq_rows.append(
+                                                {
+                                                    "Metric": "Historical Bucket",
+                                                    "Tricks +/-": _fmt_delta(_bucket_mean - float(_book)),
+                                                    "ExpTricks": round(_bucket_mean, 1),
+                                                    "Baseline": _book,
+                                                    "SampleN": len(_bucket_vals),
+                                                    "Confidence": _conf_label(len(_bucket_vals)),
+                                                    "Notes": (
+                                                        f"TP={_target_bucket[0]}, TrumpLen={_target_bucket[1]}, "
+                                                        f"Secondary={_target_bucket[2]}"
+                                                    ),
+                                                }
+                                            )
+
+                                    # 5) Actual pinned deal DD for this contract/declarer (if available)
+                                    if pinned_deal:
+                                        _dd_actual = pinned_deal.get(_dd_col)
+                                        try:
+                                            _dd_actual_i = int(float(_dd_actual)) if _dd_actual is not None else None
+                                        except Exception:
+                                            _dd_actual_i = None
+                                        if _dd_actual_i is not None:
+                                            _tq_rows.append(
+                                                {
+                                                    "Metric": "Pinned Deal Actual",
+                                                    "Tricks +/-": _fmt_delta(float(_dd_actual_i) - float(_book)),
+                                                    "ExpTricks": _dd_actual_i,
+                                                    "Baseline": _book,
+                                                    "SampleN": 1,
+                                                    "Confidence": "N/A",
+                                                    "Notes": f"Observed DD for pinned deal ({_dd_col})",
+                                                }
+                                            )
+
+                                    if _tq_rows:
+                                        _tq_df = pd.DataFrame(_tq_rows)
+                                        st.markdown("**Trick Quality**")
+                                        st.dataframe(_tq_df, width="stretch")
+                            except Exception as _e_tq:
+                                st.caption(f"⚠️ Trick quality error: {_e_tq}")
+                                pass
+                    elif _range_criteria:
+                        st.caption("Range snapshot: pin a deal to resolve bidder direction for this partial step.")
+            except Exception as _e_range_snapshot:
+                st.caption(f"⚠️ Criteria range snapshot error: {_e_range_snapshot}")
             
             # Use display_auction for cache key (changes when row is selected)
             display_deals_cache_key = f"auction_builder_deals_{display_auction}_{max_matching_deals}_{seed}"
@@ -13052,20 +13900,52 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             f"Actual Auction Stats ({_aa_n:,} deals)",
                             expanded=False,
                         ):
-                            _aa_hs = _aa_stats.get("hand_stats")
-                            if _aa_hs:
-                                st.markdown("**Hand Stats Means**")
-                                st.dataframe(
-                                    pd.DataFrame(_aa_hs).set_index("Direction"),
-                                    width="stretch",
+                            _src_raw = str(detail_source or "Selected").strip()
+                            _src_up = _src_raw.upper()
+                            if _src_up == "ACTUAL":
+                                _src_label = "Actual Auction"
+                            elif _src_up == "AI MODEL":
+                                _src_label = "AI Model"
+                            else:
+                                _src_label = _src_raw or "Selected"
+                            _aa_hs = _aa_stats.get("hand_stats") or []
+                            _aa_dd = _aa_stats.get("dd_means") or []
+                            _aa_hs_map = {
+                                str(r.get("Direction") or "").upper(): r
+                                for r in _aa_hs
+                                if isinstance(r, dict)
+                            }
+                            _aa_dd_map = {
+                                str(r.get("Declarer") or "").upper(): r
+                                for r in _aa_dd
+                                if isinstance(r, dict)
+                            }
+                            _aa_rows: list[dict[str, Any]] = []
+                            for _dir in ["N", "E", "S", "W"]:
+                                _hs_r = _aa_hs_map.get(_dir, {})
+                                _dd_r = _aa_dd_map.get(_dir, {})
+                                _aa_rows.append(
+                                    {
+                                        "Source": _src_label,
+                                        "Direction": _dir,
+                                        "Deals": _aa_n,
+                                        "HCP": _hs_r.get("HCP"),
+                                        "HCP_std": _hs_r.get("HCP_std"),
+                                        "SL_C": _hs_r.get("SL_C"),
+                                        "SL_D": _hs_r.get("SL_D"),
+                                        "SL_H": _hs_r.get("SL_H"),
+                                        "SL_S": _hs_r.get("SL_S"),
+                                        "Total_Points": _hs_r.get("Total_Points"),
+                                        "Total_Points_std": _hs_r.get("Total_Points_std"),
+                                        "DD_C": _dd_r.get("C"),
+                                        "DD_D": _dd_r.get("D"),
+                                        "DD_H": _dd_r.get("H"),
+                                        "DD_S": _dd_r.get("S"),
+                                        "DD_NT": _dd_r.get("N"),
+                                    }
                                 )
-                            _aa_dd = _aa_stats.get("dd_means")
-                            if _aa_dd:
-                                st.markdown("**DD Trick Means**")
-                                st.dataframe(
-                                    pd.DataFrame(_aa_dd).set_index("Declarer"),
-                                    width="stretch",
-                                )
+                            _aa_df = pd.DataFrame(_aa_rows)
+                            st.dataframe(_aa_df, width="stretch")
                 else:
                     st.info("No deals found matching this auction pattern.")
             elif display_deals_cache_key in st.session_state:

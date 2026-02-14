@@ -44,6 +44,7 @@ from bbo_bidding_queries_lib import (
     get_declarer_for_auction,
     get_dd_score_for_auction,
     get_ev_for_auction,
+    get_ev_for_auction_pre,
     compute_hand_features,
     compute_par_score,
     parse_pbn_deal,
@@ -71,7 +72,7 @@ from bbo_explanation_lib import (
     render_counterfactual_why_not,
     render_recommendation_explanation,
 )
-from bbo_hand_eval_lib import estimate_partnership_tricks
+from bbo_hand_eval_lib import estimate_partnership_tricks, pivot_bt_seat_stats
 
 from mlBridge.mlBridgeBiddingLib import DIRECTIONS
 import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
@@ -2975,7 +2976,7 @@ def _compute_actual_auction_stats(
         ("SL_{d}_D", "SL_D", False),
         ("SL_{d}_H", "SL_H", False),
         ("SL_{d}_S", "SL_S", False),
-        ("Total_Points_{d}", "Total_Pts", False),
+        ("Total_Points_{d}", "Total_Points", False),
         ("Total_Points_{d}", "TP_std", True),
     ]
     hand_rows: List[Dict[str, Any]] = []
@@ -3019,6 +3020,63 @@ def _compute_actual_auction_stats(
         "dd_means": dd_rows,
         "deal_count": n_deals,
     }
+
+
+def _compute_hand_range_stats(
+    deal_df: "pl.DataFrame",
+    row_mask: "pl.Series",
+) -> List[Dict[str, Any]]:
+    """Compute observed hand-stat ranges (min/max + p10/p90) by direction."""
+    import numpy as np
+
+    n_deals = int(row_mask.sum())
+    if n_deals == 0:
+        return []
+
+    deal_indices = np.where(row_mask.to_numpy())[0]
+
+    def _series_vals(col: str) -> np.ndarray:
+        if col not in deal_df.columns:
+            return np.array([], dtype=np.float64)
+        arr = deal_df[col].to_numpy(zero_copy_only=False)[deal_indices]
+        vals = np.asarray(arr, dtype=np.float64)
+        vals = vals[~np.isnan(vals)]
+        return vals
+
+    def _q(vals: np.ndarray, pct: float) -> float | None:
+        if len(vals) == 0:
+            return None
+        return round(float(np.percentile(vals, pct)), 1)
+
+    def _mn(vals: np.ndarray) -> float | None:
+        if len(vals) == 0:
+            return None
+        return round(float(np.min(vals)), 1)
+
+    def _mx(vals: np.ndarray) -> float | None:
+        if len(vals) == 0:
+            return None
+        return round(float(np.max(vals)), 1)
+
+    rows: List[Dict[str, Any]] = []
+    for d in ["N", "E", "S", "W"]:
+        r: Dict[str, Any] = {"Direction": d, "Deals": n_deals}
+        specs: List[tuple[str, str]] = [
+            ("HCP", f"HCP_{d}"),
+            ("Total_Points", f"Total_Points_{d}"),
+            ("SL_C", f"SL_{d}_C"),
+            ("SL_D", f"SL_{d}_D"),
+            ("SL_H", f"SL_{d}_H"),
+            ("SL_S", f"SL_{d}_S"),
+        ]
+        for metric, col in specs:
+            vals = _series_vals(col)
+            r[f"{metric}_min"] = _mn(vals)
+            r[f"{metric}_max"] = _mx(vals)
+            r[f"{metric}_p10"] = _q(vals, 10.0)
+            r[f"{metric}_p90"] = _q(vals, 90.0)
+        rows.append(r)
+    return rows
 
 
 def handle_sample_deals_by_auction_pattern(
@@ -3757,9 +3815,9 @@ def handle_sample_deals_for_bt_indices(
         else:
             sampled_idxs = valid_idxs
 
-        # Sort for sequential disk access (Polars gather is OK for small N)
+        # Sort for sequential access; use NumPy-style row indexing (OK for small N)
         sampled_sorted = sorted(int(x) for x in sampled_idxs)
-        deal_rows_df = deal_df.select(all_cols).gather(sampled_sorted)
+        deal_rows_df = deal_df.select(all_cols)[sampled_sorted]
 
         # Compute suit lengths from Hand_ strings for any missing SL columns
         for d in "NESW":
@@ -3787,6 +3845,161 @@ def handle_sample_deals_for_bt_indices(
           f"({len(bt_indices)} bt_indices, {sum(len(v['deals']) for v in results.values())} deals)")
     return {
         "deals_by_bt": results,
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Handler: /criteria-stats-by-bt-indices
+# ---------------------------------------------------------------------------
+
+
+def handle_criteria_stats_by_bt_indices(
+    state: Dict[str, Any],
+    bt_indices: List[int],
+    dealer: str | None = None,
+) -> Dict[str, Any]:
+    """Return aggregate hand/DD stats for deals matched by BT criteria.
+
+    This is a criteria-only aggregation path. For each ``bt_index`` we use
+    ``deal_to_bt_index_df.Matched_BT_Indices`` to find matching deals, then
+    compute the same aggregate output shape as ``actual_auction_stats``.
+    """
+    t0 = time.perf_counter()
+
+    deal_df = state.get("deal_df")
+    deal_to_bt_df = state.get("deal_to_bt_index_df")
+    bt_stats_df = state.get("bt_stats_df")
+
+    if not isinstance(deal_df, pl.DataFrame) or deal_df.is_empty():
+        raise ValueError("deal_df not loaded")
+    if not isinstance(deal_to_bt_df, pl.DataFrame) or deal_to_bt_df.is_empty():
+        raise ValueError("deal_to_bt_index_df not loaded")
+
+    if "Matched_BT_Indices" not in deal_to_bt_df.columns:
+        raise ValueError("Required column 'Matched_BT_Indices' missing from deal_to_bt_index_df")
+
+    # Phase 0 prerequisite: dealer is required for seat->compass mapping when
+    # serving precomputed seat-relative stats.
+    dealer_n = normalize_dealer_strict(dealer) if dealer is not None else None
+    if dealer_n is None:
+        raise ValueError("dealer is required for /criteria-stats-by-bt-indices precomputed mapping")
+
+    # Fast path: use precomputed bt_stats_df (seat-relative) with explicit
+    # seat-to-compass translation via pivot_bt_seat_stats.
+    stats_by_bt: Dict[str, Any] = {}
+    if isinstance(bt_stats_df, pl.DataFrame) and not bt_stats_df.is_empty():
+        precomputed = pivot_bt_seat_stats(
+            bt_stats_df=bt_stats_df,
+            bt_indices=[int(x) for x in bt_indices],
+            dealer=dealer_n,
+        )
+        for bt_idx in bt_indices:
+            bt_i = int(bt_idx)
+            row = precomputed.get(bt_i)
+            if row is None:
+                stats_by_bt[str(bt_i)] = {}
+                continue
+            # Keep response shape stable; hand_ranges now comes from /bt-hand-profile.
+            stats_by_bt[str(bt_i)] = {
+                "hand_stats": row.get("hand_stats") or [],
+                "dd_means": row.get("dd_means") or [],
+                "hand_ranges": [],
+                "deal_count": None,
+            }
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(
+            f"[criteria-stats-by-bt-indices] {format_elapsed(elapsed_ms)} "
+            f"({len(bt_indices)} bt_indices, precomputed={sum(1 for v in stats_by_bt.values() if v)})"
+        )
+        return {
+            "stats_by_bt": stats_by_bt,
+            "requested": len(bt_indices),
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+
+    # Hard fail rather than silently regressing to heavy full-scan path.
+    raise ValueError("bt_stats_df not loaded; cannot serve precomputed criteria stats")
+
+
+def handle_bt_trick_quality(
+    state: Dict[str, Any],
+    bt_indices: List[int],
+    seat: int | None = None,
+    strain: int | None = None,
+    level: int | None = None,
+    vul: int | None = None,
+) -> Dict[str, Any]:
+    """Return precomputed trick quality rows for requested bt_indices."""
+    t0 = time.perf_counter()
+    df = state.get("bt_trick_quality_df")
+    if not isinstance(df, pl.DataFrame) or df.is_empty():
+        raise ValueError("bt_trick_quality_df not loaded")
+
+    idxs = [int(x) for x in bt_indices]
+    if len(idxs) == 0:
+        return {"rows": [], "requested": 0, "elapsed_ms": 0.0}
+    if len(idxs) > 100:
+        raise ValueError("bt_indices batch limit exceeded (max 100)")
+
+    q = df.filter(pl.col("bt_index").is_in(pl.Series("bt_index", idxs, dtype=pl.UInt32)))
+    if seat is not None:
+        if int(seat) not in (1, 2, 3, 4):
+            raise ValueError("seat must be in 1..4")
+        q = q.filter(pl.col("seat") == int(seat))
+    if strain is not None:
+        if int(strain) not in (0, 1, 2, 3, 4):
+            raise ValueError("strain must be in 0..4")
+        q = q.filter(pl.col("strain") == int(strain))
+    if level is not None:
+        if int(level) not in (1, 2, 3, 4, 5, 6, 7):
+            raise ValueError("level must be in 1..7")
+        q = q.filter(pl.col("level") == int(level))
+    if vul is not None:
+        if int(vul) not in (0, 1):
+            raise ValueError("vul must be 0 (NV) or 1 (V)")
+        q = q.filter(pl.col("vul") == int(vul))
+
+    rows = q.sort(["bt_index", "seat", "strain", "level"]).to_dicts()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "rows": rows,
+        "requested": len(idxs),
+        "returned": len(rows),
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def handle_bt_hand_profile(
+    state: Dict[str, Any],
+    bt_indices: List[int],
+    seat: int | None = None,
+) -> Dict[str, Any]:
+    """Return precomputed hand profile rows for requested bt_indices."""
+    t0 = time.perf_counter()
+    df = state.get("bt_hand_profile_df")
+    if not isinstance(df, pl.DataFrame) or df.is_empty():
+        raise ValueError("bt_hand_profile_df not loaded")
+
+    idxs = [int(x) for x in bt_indices]
+    if len(idxs) == 0:
+        return {"rows": [], "requested": 0, "elapsed_ms": 0.0}
+    if len(idxs) > 100:
+        raise ValueError("bt_indices batch limit exceeded (max 100)")
+
+    q = df.filter(pl.col("bt_index").is_in(pl.Series("bt_index", idxs, dtype=pl.UInt32)))
+    if seat is not None:
+        if int(seat) not in (1, 2, 3, 4):
+            raise ValueError("seat must be in 1..4")
+        q = q.filter(pl.col("seat") == int(seat))
+
+    rows = q.sort(["bt_index", "seat"]).to_dicts()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "rows": rows,
+        "requested": len(idxs),
+        "returned": len(rows),
         "elapsed_ms": round(elapsed_ms, 1),
     }
 
@@ -11488,11 +11701,25 @@ def handle_ai_model_advanced_path(
             steps_detail.append(step_rec)
             continue
 
+        # Seed ranking parity with standalone/Streamlit path: prefer higher Avg_EV,
+        # then matching_deal_count.
+        def _seed_key(o: Dict[str, Any]) -> Tuple[float, float, float]:
+            def _f(x: Any) -> float:
+                try:
+                    if x is None or x == "":
+                        return float("-inf")
+                    return float(x)
+                except Exception:
+                    return float("-inf")
+            return (_f(o.get("avg_ev")), _f(o.get("matching_deal_count")), _f(o.get("matching_deal_count")))
+
+        candidates_sorted = sorted(candidates, key=_seed_key, reverse=True)
+
         # Criteria pass batch for these candidates.
         # Pass always passes criteria check.
         checks = [
             {"seat": int(seat_bt), "criteria": list((o.get("agg_expr") or []))}
-            for o in candidates
+            for o in candidates_sorted
             if str(o.get("bid", "")).strip().upper() not in ("P", "PASS")
         ]
         
@@ -11503,7 +11730,7 @@ def handle_ai_model_advanced_path(
             
             # Re-merge results with candidates (Pass automatically passes)
             check_idx = 0
-            for opt in candidates:
+            for opt in candidates_sorted:
                 bid0 = str(opt.get("bid", "")).strip().upper()
                 if bid0 in ("P", "PASS"):
                     passed_opts.append(opt)
@@ -11519,9 +11746,9 @@ def handle_ai_model_advanced_path(
                         if can_complete_b:
                             passed_opts.append(opt)
         except Exception:
-            # Fallback: if batch fail, assume all pass? Or fail safe?
-            # Let's keep Pass at minimum.
-            passed_opts = [o for o in candidates if str(o.get("bid", "")).strip().upper() in ("P", "PASS")]
+            # Standalone parity: if criteria batch fails, optimistically keep all
+            # candidates in seed-ranked order.
+            passed_opts = list(candidates_sorted)
 
         step_rec["pass"] = int(len(passed_opts))
 
@@ -11565,18 +11792,8 @@ def handle_ai_model_advanced_path(
         except Exception:
             acting_sign = 1.0
 
-        # Score top-N passing bids via bid-details.
-        def _seed_key(o: Dict[str, Any]) -> Tuple[float, float, float]:
-            def _f(x: Any) -> float:
-                try:
-                    if x is None or x == "":
-                        return float("-inf")
-                    return float(x)
-                except Exception:
-                    return float("-inf")
-            return (_f(o.get("avg_ev")), _f(o.get("matching_deal_count")), _f(o.get("matching_deal_count")))
-
-        passed_sorted = sorted(passed_opts, key=_seed_key, reverse=True)[: max(1, int(top_n))]
+        # Score top-N passing bids via bid-details (already seed-ranked above).
+        passed_sorted = passed_opts[: max(1, int(top_n))]
         auction_full = "-".join(tokens)
 
         def _score_one(opt: Dict[str, Any]) -> Tuple[float, str, float, float, bool, Dict[str, Any]]:
@@ -11614,12 +11831,10 @@ def handle_ai_model_advanced_path(
                 # 2. Fallback to avg_ev proxy
                 if score_val is None:
                     try:
-                        val = float(opt.get("avg_ev")) if opt.get("avg_ev") is not None else float("-inf")
-                        if val == float("-inf"):
-                            score_val = 0.0
-                        else:
-                            score_val = val
-                    except:
+                        avg_ev = opt.get("avg_ev")
+                        val = float(avg_ev) if avg_ev is not None else float("-inf")
+                        score_val = 0.0 if val == float("-inf") else val
+                    except Exception:
                         score_val = 0.0
                 
                 # 3. Apply perspective flip
@@ -11702,33 +11917,10 @@ def handle_ai_model_advanced_path(
             except Exception:
                 desc_score = None
 
-            # -- Trick estimation for guardrail --
+            # Standalone/manual parity: keep AI-model advanced path independent
+            # of optional hand-string availability; do not apply trick-shortfall
+            # guardrail in this path.
             _est_tricks_api: float | None = None
-            try:
-                import re as _re_strain3
-                _strain_m3 = _re_strain3.match(r"^[1-7]\s*(NT|N|[CDHS])", bid1)
-                _bid_strain3: str | None = None
-                if _strain_m3:
-                    _bs3 = _strain_m3.group(1).upper()
-                    _bid_strain3 = "NT" if _bs3 in ("N", "NT") else _bs3
-                _self_hand_api: str | None = None
-                if deal_row and acting_dir:
-                    _self_hand_api = str(deal_row.get(f"Hand_{acting_dir}", "") or "").strip() or None
-                if _bid_strain3 and _self_hand_api:
-                    _p2a_api = details.get("phase2a") or {}
-                    _phcp_api = ((_p2a_api.get("roles") or {}).get("partner") or {}).get("hcp_hist")
-                    _psl_api = ((_p2a_api.get("roles") or {}).get("partner") or {}).get("sl_hist")
-                    _fit_api = (_p2a_api.get("fit") or {}).get("us")
-                    _tr_api = estimate_partnership_tricks(
-                        self_hand=_self_hand_api,
-                        partner_hcp_hist=_phcp_api,
-                        partner_sl_hists=_psl_api,
-                        fit_us_hists=_fit_api,
-                        strain=_bid_strain3,
-                    )
-                    _est_tricks_api = _tr_api.get("est_tricks")
-            except Exception:
-                _est_tricks_api = None
 
             # Guardrail penalty
             guard_penalty = 0.0
@@ -11769,6 +11961,7 @@ def handle_ai_model_advanced_path(
                         sacrifice_discount=float(w_guard_sacrifice),
                         est_tricks=_est_tricks_api,
                         w_tricks_shortfall=float(w_guard_tricks),
+                        debug_equivalence_bypass=True,
                     )
                     guard_penalty = float(gp) * float(w_guard)
             except Exception:
@@ -11779,7 +11972,8 @@ def handle_ai_model_advanced_path(
                 # "utility" from eeo is NS-relative (Mean_NS - Penalties).
                 # We want Acting-relative score.
                 # Base: Acting_Sign * Mean_Par (NS).
-                base = float(acting_sign) * float(mean_par)
+                mean_par_val = float(mean_par) if mean_par is not None else 0.0
+                base = float(acting_sign) * mean_par_val
                 
                 # Bayesian Shrinkage for low-N bids
                 matched_n = float(details.get("matched_deals_total_excluding_pinned") or details.get("matched_deals_total") or 0.0)

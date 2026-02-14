@@ -102,6 +102,7 @@ def compute_guardrail_penalty(
     sacrifice_discount: float = 0.7,
     est_tricks: float | None = None,
     w_tricks_shortfall: float = 30.0,
+    debug_equivalence_bypass: bool = False,
 ) -> tuple[float, list[str]]:
     """Compute a non-negative guardrail penalty to subtract from the bid score.
 
@@ -174,6 +175,9 @@ def compute_guardrail_penalty(
     w_tricks_shortfall : float
         Penalty per estimated trick below the required tricks for the
         contract level (default 30).
+    debug_equivalence_bypass : bool
+        If True, append a debug-only reason when 3NT <-> 4M equivalence
+        suppresses OVERBID/UNDERBID penalties.
 
     Returns
     -------
@@ -194,6 +198,26 @@ def compute_guardrail_penalty(
     # ------------------------------------------------------------------
     # Determine the reference par contract and whether sacrifice context
     # ------------------------------------------------------------------
+    def _contract_rank_from_level_strain(level: int | None, strain: str | None) -> int | None:
+        if level is None or strain is None:
+            return None
+        order = {"C": 0, "D": 1, "H": 2, "S": 3, "NT": 4}
+        o = order.get(strain)
+        if o is None:
+            return None
+        return (int(level) - 1) * 5 + int(o)
+
+    def _is_nt_major_game_equivalent(
+        level_a: int | None, strain_a: str | None, level_b: int | None, strain_b: str | None
+    ) -> bool:
+        # 3NT and 4M are close game targets; avoid penalizing this tradeoff as a
+        # generic level error in OVERBID/UNDERBID checks.
+        a_is_3nt = level_a == 3 and strain_a == "NT"
+        b_is_3nt = level_b == 3 and strain_b == "NT"
+        a_is_4m = level_a == 4 and strain_a in ("H", "S")
+        b_is_4m = level_b == 4 and strain_b in ("H", "S")
+        return (a_is_3nt and b_is_4m) or (b_is_3nt and a_is_4m)
+
     top_contract: str | None = None
     top_level: int | None = None
     top_strain: str | None = None
@@ -213,6 +237,15 @@ def compute_guardrail_penalty(
             top_prob = None
         par_is_opponents = bool(top_pair and top_pair != acting_pair)
 
+    bid_rank = _contract_rank_from_level_strain(bid_level, bid_strain)
+    top_rank = _contract_rank_from_level_strain(top_level, top_strain)
+    nt_major_game_equiv = _is_nt_major_game_equivalent(bid_level, bid_strain, top_level, top_strain)
+    if debug_equivalence_bypass and nt_major_game_equiv and not par_is_opponents:
+        reasons.append(
+            "EQUIV_BYPASS_3NT_4M: treating 3NT and 4M as equivalent game targets; "
+            "skipping generic OVERBID/UNDERBID level penalties (0)"
+        )
+
     # Sacrifice discount factor: 1.0 = full penalty, 0.0 = no penalty.
     # When opponents own the par, overbid penalties are reduced.
     sac_factor = 1.0
@@ -231,8 +264,14 @@ def compute_guardrail_penalty(
     # ------------------------------------------------------------------
     # 1. OVERBID_VS_PAR – bid level exceeds par contract level
     # ------------------------------------------------------------------
-    if top_level is not None and bid_level > top_level:
-        overbid_levels = bid_level - top_level
+    if top_rank is not None and bid_rank is not None and bid_rank > top_rank and not (
+        nt_major_game_equiv and not par_is_opponents
+    ):
+        top_level_i = int(top_level) if top_level is not None else None
+        if top_level_i is None:
+            overbid_levels = 0
+        else:
+            overbid_levels = int(bid_level) - top_level_i
         raw_p = float(overbid_levels) * float(w_overbid_level)
         p = raw_p * sac_factor
         penalty += p
@@ -244,11 +283,12 @@ def compute_guardrail_penalty(
                 f"penalty reduced {sacrifice_discount*100:.0f}%]"
             )
         prob_s = f"{top_prob*100:.0f}%" if top_prob is not None else "?"
+        par_tricks = _TRICKS_REQUIRED.get(top_level_i) if top_level_i is not None else None
         reasons.append(
             f"{tag}: bid {bid} is {overbid_levels} level(s) above par "
             f"{top_contract} ({prob_s} likely); "
             f"{_TRICKS_REQUIRED.get(bid_level, '?')} tricks needed vs "
-            f"{_TRICKS_REQUIRED.get(top_level, '?')} for par "
+            f"{par_tricks if par_tricks is not None else '?'} for par "
             f"(-{p:.0f}){sac_note}"
         )
 
@@ -338,7 +378,7 @@ def compute_guardrail_penalty(
         # ------------------------------------------------------------------
         # 6. UNDERBID_VS_PAR – bid level below par that our side owns
         # ------------------------------------------------------------------
-        if bid_level < top_level:
+        if bid_level < top_level and not nt_major_game_equiv:
             underbid_levels = top_level - bid_level
             p = float(underbid_levels) * float(w_underbid_level)
             penalty += p
@@ -354,7 +394,7 @@ def compute_guardrail_penalty(
         # 7. TP_SURPLUS_UNDERBID – partnership TP exceeds threshold for par
         #    level but we're bidding below it
         # ------------------------------------------------------------------
-        if combined_tp is not None and bid_level < top_level:
+        if combined_tp is not None and bid_level < top_level and not nt_major_game_equiv:
             par_required_tp = _TP_THRESHOLDS.get(top_level, 20.0)
             surplus = combined_tp - par_required_tp
             if surplus > 0:
@@ -394,7 +434,11 @@ def compute_eeo_from_bid_details(bid_details: dict[str, Any]) -> dict[str, Any]:
     mu = 0.25
     utility = None
     try:
-        utility = float(mean) - lam * float(tail_risk or 0.0) - mu * float(entropy_full or 0.0)
+        mean_f = float(mean) if isinstance(mean, (int, float)) else None
+        tail_f = float(tail_risk) if isinstance(tail_risk, (int, float)) else 0.0
+        entropy_f = float(entropy_full) if isinstance(entropy_full, (int, float)) else 0.0
+        if mean_f is not None:
+            utility = mean_f - lam * tail_f - mu * entropy_f
     except Exception:
         utility = None
 
