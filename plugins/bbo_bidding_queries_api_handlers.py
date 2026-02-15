@@ -11858,6 +11858,7 @@ def handle_ai_model_advanced_path(
             # same BT-aggregate scale for fair comparison.
             if bid1 in ("P", "PASS"):
                 score_val: float | None = None
+                _pass_source = "opt"
                 try:
                     avg_ev = opt.get("avg_ev")
                     if avg_ev is not None:
@@ -11871,12 +11872,64 @@ def handle_ai_model_advanced_path(
                             score_val = float(avg_par)
                     except Exception:
                         pass
+
+                # ---- CONTRACT-ON-TABLE FALLBACK ----
+                # When the intermediate Pass node has no BT stats (avg_ev/avg_par
+                # are both None), but a contract is already established in the
+                # auction, look up the *terminal* auction's mean_par so Pass is
+                # valued at the expected outcome of accepting the current contract.
+                # Without this, Pass defaults to 0.0, making almost any bid look
+                # better than stopping in a making game.
+                if score_val is None and tokens:
+                    try:
+                        # Check if a contract bid exists in the current auction
+                        has_contract = any(
+                            len(t) >= 2 and t[0].isdigit() and t[1] in "CDHSN"
+                            for t in (tk.upper() for tk in tokens)
+                        )
+                        if has_contract:
+                            # Build the "passed-out" auction
+                            completed_tok = list(tokens) + ["P"]
+                            while not _is_auction_complete_list(completed_tok):
+                                completed_tok.append("P")
+                            bt_tok_c, _lp_c = _strip_leading_passes_tokens(completed_tok)
+                            bt_prefix_c = "-".join(bt_tok_c) if bt_tok_c else ""
+                            terminal_bt_idx = _resolve_bt_index_by_traversal(state, bt_prefix_c)
+                            if terminal_bt_idx is not None:
+                                bt_ev_stats_df = state.get("bt_ev_stats_df")
+                                if bt_ev_stats_df is not None:
+                                    ev_map = preload_precomputed_ev_par_stats(
+                                        bt_ev_stats_df, bt_indices=[int(terminal_bt_idx)]
+                                    )
+                                    ev_data = ev_map.get(int(terminal_bt_idx))
+                                    if ev_data is not None:
+                                        _, _, _par_nv, _par_v = get_avg_ev_par_precomputed_nv_v(
+                                            ev_data, seat=int(seat_bt)
+                                        )
+                                        # Determine if acting player is vulnerable
+                                        _vul_s = str(board_vul or "").strip().upper()
+                                        _ns_vul = _vul_s in ("N_S", "NS", "BOTH", "ALL")
+                                        _ew_vul = _vul_s in ("E_W", "EW", "BOTH", "ALL")
+                                        _act_vul = (acting_dir in ("N", "S") and _ns_vul) or (
+                                            acting_dir in ("E", "W") and _ew_vul
+                                        )
+                                        _par_val = _par_v if _act_vul else _par_nv
+                                        if _par_val is not None:
+                                            score_val = float(_par_val)
+                                            _pass_source = "terminal_contract"
+                    except Exception:
+                        pass  # Best-effort; fall through to 0.0
+
                 if score_val is None:
                     score_val = 0.0
 
                 # Apply perspective flip (same as non-Pass base)
                 final_score = float(acting_sign) * float(score_val)
-                return final_score, bid1, 0.0, 0.0, False, {"pass_score": float(score_val), "acting_sign": float(acting_sign)}
+                return final_score, bid1, 0.0, 0.0, False, {
+                    "pass_score": float(score_val),
+                    "pass_source": _pass_source,
+                    "acting_sign": float(acting_sign),
+                }
 
             # Try bid-feature cache for fast scoring (only useful when cache row
             # has actual stats — i.e. terminal/completed auctions that joined with
