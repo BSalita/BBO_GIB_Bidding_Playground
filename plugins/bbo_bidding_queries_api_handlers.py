@@ -11875,18 +11875,37 @@ def handle_ai_model_advanced_path(
 
                 # ---- CONTRACT-ON-TABLE FALLBACK ----
                 # When the intermediate Pass node has no BT stats (avg_ev/avg_par
-                # are both None), but a contract is already established in the
-                # auction, look up the *terminal* auction's mean_par so Pass is
-                # valued at the expected outcome of accepting the current contract.
+                # are both None), but a GAME-LEVEL+ contract is already established
+                # in the auction, look up the *terminal* auction's mean_par so Pass
+                # is valued at the expected outcome of accepting the current contract.
                 # Without this, Pass defaults to 0.0, making almost any bid look
                 # better than stopping in a making game.
+                #
+                # IMPORTANT: Only activate for game-level+ contracts (3NT, 4M, 5m,
+                # slams).  For partscores (e.g. 1S-P), the terminal mean_par is
+                # heavily biased by the opener's hand strength in the BT population
+                # and produces inflated values (e.g. 489 for 1S) that make Pass
+                # always win over constructive bidding.  At partscore, the non-Pass
+                # bids are scored via /bid-details with criteria conditioning, and
+                # the Pass should compete on the same scale (avg_ev/avg_par or 0.0).
+                _GAME_LEVEL_THRESHOLDS = {
+                    "C": 5, "D": 5, "H": 4, "S": 4, "N": 3, "NT": 3,
+                }
                 if score_val is None and tokens:
                     try:
-                        # Check if a contract bid exists in the current auction
-                        has_contract = any(
-                            len(t) >= 2 and t[0].isdigit() and t[1] in "CDHSN"
-                            for t in (tk.upper() for tk in tokens)
-                        )
+                        # Find the highest contract bid in the current auction
+                        _highest_level = 0
+                        _highest_strain = ""
+                        for t in (tk.upper() for tk in tokens):
+                            if len(t) >= 2 and t[0].isdigit() and t[1] in "CDHSN":
+                                _lvl = int(t[0])
+                                _st = t[1:].replace("T", "")  # NT -> N
+                                if _lvl > _highest_level or (_lvl == _highest_level and _st > _highest_strain):
+                                    _highest_level = _lvl
+                                    _highest_strain = _st
+                        # Only use terminal fallback for game-level+ contracts
+                        _game_min = _GAME_LEVEL_THRESHOLDS.get(_highest_strain, 4)
+                        has_contract = _highest_level >= _game_min
                         if has_contract:
                             # Build the "passed-out" auction
                             completed_tok = list(tokens) + ["P"]

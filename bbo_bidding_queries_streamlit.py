@@ -4348,6 +4348,8 @@ def render_ai_model_batch_arena():
     _BATCH_DEAL_COLS: list[str] = [
         "index", "Dealer", "Vul",
         "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+        "HCP_N", "HCP_E", "HCP_S", "HCP_W",
+        "Total_Points_N", "Total_Points_E", "Total_Points_S", "Total_Points_W",
         "ParContracts", "ParScore", "bid",
     ]
     # DD score columns: DD_Score_{level}{strain}_{direction} (140 cols)
@@ -4466,6 +4468,9 @@ def render_ai_model_batch_arena():
         status_text = st.empty()
         results_placeholder = st.empty()
 
+        # Accumulate per-deal debug entries for data/batch_arena_debug.json
+        _batch_debug_entries: list[dict] = []
+
         indices = list(range(int(start_index), int(start_index) + int(deal_count)))
 
         # Pre-fetch all deal rows in one batch call
@@ -4544,6 +4549,7 @@ def render_ai_model_batch_arena():
 
             # ---- Poll until done ----
             ai_auction = ""
+            ai_steps_detail: list[dict] = []
             poll_ok = False
             for _poll in range(300):  # up to ~150 seconds
                 time.sleep(0.5)
@@ -4555,6 +4561,7 @@ def render_ai_model_batch_arena():
                 if status_val == "completed":
                     res = job.get("result") or {}
                     ai_auction = str(res.get("auction") or "").strip()
+                    ai_steps_detail = res.get("steps_detail") or []
                     poll_ok = True
                     break
                 elif status_val == "failed":
@@ -4629,6 +4636,87 @@ def render_ai_model_batch_arena():
             })
             st.session_state["_arena_batch_results"] = list(results)
 
+            # ---- Accumulate debug entry for this deal ----
+            try:
+                _dbg_deal_info: dict[str, Any] = {}
+                for _dk in [
+                    "_row_idx", "index", "Dealer", "Vul",
+                    "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                    "ParContracts", "ParScore", "bid",
+                ]:
+                    _dv = deal_row.get(_dk)
+                    if _dv is not None:
+                        _dbg_deal_info[_dk] = _dv
+                # Add HCP/TP per direction (computed from hands if not in row)
+                for _dir in ("N", "E", "S", "W"):
+                    for _stat in ("HCP", "Total_Points"):
+                        _sk = f"{_stat}_{_dir}"
+                        _sv = deal_row.get(_sk)
+                        if _sv is not None:
+                            _dbg_deal_info[_sk] = _sv
+
+                # ---- Compute divergence point ----
+                # Find the first step where the AI bid differs from the actual
+                # auction.  This is the most useful diagnostic: which bid went
+                # wrong, what were the alternatives, and why?
+                _actual_toks = [
+                    t.strip().upper()
+                    for t in (actual_auction or "").split("-")
+                    if t.strip()
+                ]
+                _ai_toks = [
+                    t.strip().upper()
+                    for t in (ai_auction or "").split("-")
+                    if t.strip()
+                ]
+                _divergence: dict[str, Any] | None = None
+                for _si in range(max(len(_actual_toks), len(_ai_toks))):
+                    _a_bid = _actual_toks[_si] if _si < len(_actual_toks) else None
+                    _ai_bid = _ai_toks[_si] if _si < len(_ai_toks) else None
+                    if _a_bid != _ai_bid:
+                        # Find the matching step in ai_steps_detail
+                        _step_data: dict[str, Any] | None = None
+                        for _sd in ai_steps_detail:
+                            if isinstance(_sd, dict) and _sd.get("step") == _si + 1:
+                                _step_data = _sd
+                                break
+                        _divergence = {
+                            "step": _si + 1,
+                            "actual_bid": _a_bid,
+                            "ai_bid": _ai_bid,
+                            "auction_so_far": "-".join(_ai_toks[:_si]) if _si > 0 else "(opening)",
+                        }
+                        # Include compact scoring summary at divergence point
+                        if _step_data:
+                            _divergence["seat"] = _step_data.get("seat")
+                            _divergence["seat_bt"] = _step_data.get("seat_bt")
+                            _divergence["scored_n"] = _step_data.get("scored_n")
+                            _divergence["bid_scores"] = _step_data.get("bid_scores")
+                        break
+
+                _batch_debug_entries.append({
+                    "deal_index": deal_idx,
+                    "deal": _dbg_deal_info,
+                    "dealer": dealer,
+                    "vul": vul,
+                    "actual_auction": actual_auction,
+                    "ai_auction": ai_auction,
+                    "actual_contract": actual_contract,
+                    "ai_contract": ai_contract,
+                    "dd_score_actual_ns": actual_score_ns,
+                    "dd_score_ai_ns": ai_score_ns,
+                    "ev_actual_ns": actual_ev,
+                    "ev_ai_ns": ai_ev,
+                    "par": par_score,
+                    "par_contracts": par_contracts,
+                    "imp_diff": imp,
+                    "par_imp": par_imp,
+                    "divergence": _divergence,
+                    "ai_model_steps": ai_steps_detail,
+                })
+            except Exception:
+                pass  # Debug accumulation is best-effort
+
             # ---- Live update ----
             elapsed_s = time.perf_counter() - t_batch_start
             avg_s = elapsed_s / (i + 1)
@@ -4648,6 +4736,88 @@ def render_ai_model_batch_arena():
         # Final render
         st.session_state["_arena_batch_results"] = list(results)
         _render_batch_results_df(results, results_placeholder)
+
+        # ── Write batch debug log for agent/diagnostic access ──
+        try:
+            import json as _ba_json
+            from datetime import datetime as _ba_dt, timezone as _ba_tz
+            _ba_debug_path = pathlib.Path("data/batch_arena_debug.json")
+            _ba_debug_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # ---- Build worst-deals summary (top 10 by most negative IMP_Diff) ----
+            # This goes at the top of the file so an agent can immediately see the
+            # worst outcomes without scanning the full deals list.
+            _worst_n = 10
+            def _imp_sort_key(d: dict) -> float:
+                v = d.get("imp_diff")
+                return float(v) if v is not None else 0.0
+            _sorted_entries = sorted(_batch_debug_entries, key=_imp_sort_key)
+            _worst_deals_summary: list[dict[str, Any]] = []
+            for _we in _sorted_entries[:_worst_n]:
+                _imp = _we.get("imp_diff")
+                if _imp is None or _imp >= 0:
+                    continue  # only include negative IMP deals
+                _div = _we.get("divergence") or {}
+                _ws: dict[str, Any] = {
+                    "deal_index": _we.get("deal_index"),
+                    "imp_diff": _imp,
+                    "par_imp": _we.get("par_imp"),
+                    "actual_auction": _we.get("actual_auction"),
+                    "ai_auction": _we.get("ai_auction"),
+                    "actual_contract": _we.get("actual_contract"),
+                    "ai_contract": _we.get("ai_contract"),
+                    "dd_score_actual_ns": _we.get("dd_score_actual_ns"),
+                    "dd_score_ai_ns": _we.get("dd_score_ai_ns"),
+                    "par": _we.get("par"),
+                    "par_contracts": _we.get("par_contracts"),
+                }
+                # Compact divergence synopsis
+                if _div:
+                    _ws["divergence_step"] = _div.get("step")
+                    _ws["divergence_auction_so_far"] = _div.get("auction_so_far")
+                    _ws["actual_bid_at_divergence"] = _div.get("actual_bid")
+                    _ws["ai_bid_at_divergence"] = _div.get("ai_bid")
+                    # Include what the AI chose vs top alternative scores
+                    _bs = _div.get("bid_scores") or []
+                    if _bs:
+                        _ws["bid_scores_at_divergence"] = [
+                            {
+                                "bid": b.get("bid"),
+                                "score": b.get("score"),
+                                "guard_penalty": b.get("guard_penalty"),
+                                "pass_source": b.get("pass_source"),
+                            }
+                            for b in _bs[:5]  # top 5 candidates
+                        ]
+                # Include hands for quick reference
+                _deal = _we.get("deal") or {}
+                _ws["hands"] = {
+                    d: _deal.get(f"Hand_{d}") for d in ("N", "E", "S", "W")
+                }
+                _ws["hcp"] = {
+                    d: _deal.get(f"HCP_{d}") for d in ("N", "E", "S", "W")
+                }
+                _ws["dealer"] = _we.get("dealer")
+                _ws["vul"] = _we.get("vul")
+                _worst_deals_summary.append(_ws)
+
+            _ba_payload = {
+                "timestamp": _ba_dt.now(_ba_tz.utc).isoformat(),
+                "start_index": int(start_index),
+                "deal_count": int(deal_count),
+                "seed": int(seed),
+                "deals_processed": len(results),
+                "imp_running_total": imp_running,
+                "par_imp_running_total": par_imp_running,
+                "worst_deals": _worst_deals_summary,
+                "deals": _batch_debug_entries,
+            }
+            _ba_debug_path.write_text(
+                _ba_json.dumps(_ba_payload, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass  # Debug dump is best-effort; never break the UI
 
     # ---- Display previous results (persisted in session_state) ----
     prev_results = st.session_state.get("_arena_batch_results")
