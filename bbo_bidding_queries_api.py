@@ -1108,12 +1108,15 @@ def _sha256_file(path: pathlib.Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
 
 
 def _file_sig(path: pathlib.Path) -> Dict[str, Any]:
-    """Return stable file signature used by cache manifests."""
+    """Return stable file signature used by cache manifests.
+
+    Stores only the filename (no directory) so manifests are portable across machines.
+    """
     if not path.exists():
         raise FileNotFoundError(f"Required source file not found: {path}")
     st = path.stat()
     return {
-        "path": str(path.resolve()),
+        "path": path.name,  # filename only – portable across machines
         "size": int(st.st_size),
         "mtime": float(st.st_mtime),
         "sha256": _sha256_file(path),
@@ -1133,8 +1136,15 @@ def _load_manifest(path: pathlib.Path) -> Dict[str, Any]:
     return data
 
 
-def _validate_manifest_sources(manifest: Dict[str, Any]) -> None:
-    """Fail-fast source validation for offline artifacts."""
+def _validate_manifest_sources(manifest: Dict[str, Any], data_dir: pathlib.Path | None = None) -> None:
+    """Fail-fast source validation for offline artifacts.
+
+    Source paths in the manifest may be absolute (from the build machine) or just
+    filenames. We resolve them relative to *data_dir* (defaults to ``dataPath``)
+    so the API server never reaches for paths on the build machine's E: drive.
+    """
+    if data_dir is None:
+        data_dir = dataPath
     sources = manifest.get("sources")
     if not isinstance(sources, list) or not sources:
         raise RuntimeError("Manifest missing required non-empty 'sources' list")
@@ -1144,11 +1154,13 @@ def _validate_manifest_sources(manifest: Dict[str, Any]) -> None:
         p = src.get("path")
         if not p:
             raise RuntimeError("Manifest source entry missing 'path'")
-        live = _file_sig(pathlib.Path(str(p)))
+        # Resolve: use just the filename, look in data_dir
+        source_path = data_dir / pathlib.Path(str(p)).name
+        live = _file_sig(source_path)
         expected_sha = str(src.get("sha256") or "").strip().lower()
         if expected_sha and expected_sha != str(live["sha256"]).lower():
             raise RuntimeError(
-                f"Artifact source hash mismatch for {p}: "
+                f"Artifact source hash mismatch for {source_path.name}: "
                 f"expected={expected_sha}, actual={live['sha256']}"
             )
 

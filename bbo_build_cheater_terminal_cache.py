@@ -46,7 +46,7 @@ def _file_sig(path: Path) -> Dict[str, Any]:
         raise FileNotFoundError(f"Missing required file: {path}")
     st = path.stat()
     return {
-        "path": str(path.resolve()),
+        "path": path.name,  # filename only – portable across machines
         "size": int(st.st_size),
         "mtime": float(st.st_mtime),
         "sha256": _sha256_file(path),
@@ -101,7 +101,7 @@ def build_cheater_terminal_cache(*, bt_file: Path, out_file: Path, manifest_file
     print(f"[done] rows={df.height:,} cols={df.width} elapsed={elapsed_s:.1f}s")
 
     manifest = {
-        "artifact": str(out_file.resolve()),
+        "artifact": out_file.name,
         "artifact_type": "bbo_cheater_terminal_cache",
         "builder": "bbo_build_cheater_terminal_cache.py",
         "version": 1,
@@ -117,9 +117,9 @@ def build_cheater_terminal_cache(*, bt_file: Path, out_file: Path, manifest_file
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Build optional terminal-auction cheater cache parquet.")
-    p.add_argument("--bt-file", type=Path, default=Path("E:/bridge/data/bbo/bidding/bbo_bt_compiled.parquet"))
-    p.add_argument("--out-file", type=Path, default=Path("E:/bridge/data/bbo/bidding/bbo_cheater_terminal_cache.parquet"))
-    p.add_argument("--manifest-file", type=Path, default=Path("E:/bridge/data/bbo/bidding/bbo_cheater_terminal_cache_manifest.json"))
+    p.add_argument("--bt-file", type=Path, default=Path("data/bbo_bt_compiled.parquet"))
+    p.add_argument("--out-file", type=Path, default=Path("data/bbo_cheater_terminal_cache.parquet"))
+    p.add_argument("--manifest-file", type=Path, default=Path("data/bbo_cheater_terminal_cache_manifest.json"))
     args = p.parse_args()
     build_cheater_terminal_cache(
         bt_file=args.bt_file,
