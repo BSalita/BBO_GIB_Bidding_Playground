@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Optional
 
@@ -135,6 +136,379 @@ def hand_controls(hand_str: str) -> tuple[int, int]:
         if is_void and not has_ace:
             helpful_voids += 1
     return (aces, helpful_voids)
+
+
+def compute_non_rebiddable_suit_rebid_penalty(
+    *,
+    bid_text: str,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+    bt_acting_criteria: list[str] | None,
+) -> tuple[float, str | None]:
+    """Penalty for suit rebids lacking rebiddable criteria support."""
+    s = str(bid_text or "").strip().upper()
+    m = re.match(r"^([1-7])\s*(NT|N|[CDHS])", s)
+    if not m:
+        return 0.0, None
+    bid_level = int(m.group(1))
+    bid_strain = "N" if m.group(2).upper() in ("N", "NT") else m.group(2).upper()
+    if bid_strain not in ("S", "H", "D", "C"):
+        return 0.0, None
+    if not acting_direction:
+        return 0.0, None
+
+    # Determine which direction bid each prior token from dealer + token index.
+    directions = ["N", "E", "S", "W"]
+    d = str(dealer_actual or "N").upper()
+    dealer_idx = directions.index(d) if d in directions else 0
+
+    def _token_bidder_dir(token_idx: int) -> str:
+        return directions[(dealer_idx + int(token_idx)) % 4]
+
+    # Has this same player already bid this same strain?
+    prev_levels: list[int] = []
+    for i, tk in enumerate(auction_tokens):
+        if _token_bidder_dir(i) != acting_direction:
+            continue
+        p = re.match(r"^([1-7])\s*(NT|N|[CDHS])", str(tk or "").strip().upper())
+        if not p:
+            continue
+        pl = int(p.group(1))
+        ps = "N" if p.group(2).upper() in ("N", "NT") else p.group(2).upper()
+        if ps == bid_strain:
+            prev_levels.append(pl)
+    if not prev_levels:
+        return 0.0, None
+
+    crit_norm = {str(c or "").strip().upper().strip("()") for c in (bt_acting_criteria or []) if str(c or "").strip()}
+    has_reb = f"REBIDDABLE_{bid_strain}" in crit_norm
+    has_twice = f"TWICE_REBIDDABLE_{bid_strain}" in crit_norm
+
+    # 3-level+ rebids should generally be twice-rebiddable; lower rebids need rebiddable.
+    needed = "TWICE_REBIDDABLE" if bid_level >= 3 else "REBIDDABLE"
+    acceptable = has_twice if bid_level >= 3 else (has_reb or has_twice)
+    if acceptable:
+        return 0.0, None
+
+    penalty = 170.0 if bid_level >= 3 else 120.0
+    reason = (
+        f"NON_REBIDDABLE_SUIT_REBID: rebid {s} in {bid_strain} "
+        f"without required {needed}_{bid_strain} criteria support "
+        f"(-{penalty:.0f})"
+    )
+    return float(penalty), reason
+
+
+def compute_rebiddable_major_game_bonus(
+    *,
+    bid_text: str,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+    bt_acting_criteria: list[str] | None,
+) -> tuple[float, str | None]:
+    """Bonus for committing to game in a strongly rebiddable major.
+
+    Purpose: when a player has shown a long/strong major and now has a chance to
+    bid game in that same major, prefer direct game over side-suit wandering.
+    """
+    s = str(bid_text or "").strip().upper()
+    m = re.match(r"^([1-7])\s*(NT|N|[CDHS])", s)
+    if not m:
+        return 0.0, None
+    bid_level = int(m.group(1))
+    bid_strain = "N" if m.group(2).upper() in ("N", "NT") else m.group(2).upper()
+    if bid_strain not in ("H", "S"):
+        return 0.0, None
+    if bid_level < 4:
+        return 0.0, None
+    if not acting_direction:
+        return 0.0, None
+
+    directions = ["N", "E", "S", "W"]
+    d = str(dealer_actual or "N").upper()
+    dealer_idx = directions.index(d) if d in directions else 0
+
+    def _token_bidder_dir(token_idx: int) -> str:
+        return directions[(dealer_idx + int(token_idx)) % 4]
+
+    # Must be a rebid (same player has bid this major earlier).
+    showed_major = False
+    for i, tk in enumerate(auction_tokens):
+        if _token_bidder_dir(i) != acting_direction:
+            continue
+        p = re.match(r"^([1-7])\s*(NT|N|[CDHS])", str(tk or "").strip().upper())
+        if not p:
+            continue
+        ps = "N" if p.group(2).upper() in ("N", "NT") else p.group(2).upper()
+        if ps == bid_strain:
+            showed_major = True
+            break
+    if not showed_major:
+        return 0.0, None
+
+    crit_norm = {str(c or "").strip().upper().strip("()") for c in (bt_acting_criteria or []) if str(c or "").strip()}
+    has_reb = f"REBIDDABLE_{bid_strain}" in crit_norm
+    has_twice = f"TWICE_REBIDDABLE_{bid_strain}" in crit_norm
+    if not (has_reb or has_twice):
+        return 0.0, None
+
+    # Prefer "doubly rebiddable" as stronger evidence than plain rebiddable.
+    bonus = 120.0 if has_twice else 70.0
+    reason = (
+        f"REBIDDABLE_MAJOR_GAME: committing to {bid_text} with "
+        f"{'TWICE_REBIDDABLE' if has_twice else 'REBIDDABLE'}_{bid_strain} "
+        f"criteria support (+{bonus:.0f})"
+    )
+    return float(bonus), reason
+
+
+def compute_partner_major_game_commit_adjustment(
+    *,
+    bid_text: str,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+    bt_acting_criteria: list[str] | None = None,
+) -> tuple[float, float, str | None]:
+    """Context adjustment for partner-major game commitment decisions.
+
+    Returns (bonus, penalty, reason).
+    - Bonus: when raising partner's repeatedly shown major directly to game.
+    - Penalty: when detouring into side-suit (esp. 4m) instead of that game call.
+    """
+    s = str(bid_text or "").strip().upper()
+    m = re.match(r"^([1-7])\s*(NT|N|[CDHS])", s)
+    if not m:
+        return 0.0, 0.0, None
+    bid_level = int(m.group(1))
+    bid_strain = "N" if m.group(2).upper() in ("N", "NT") else m.group(2).upper()
+    if not acting_direction:
+        return 0.0, 0.0, None
+
+    directions = ["N", "E", "S", "W"]
+    d = str(dealer_actual or "N").upper()
+    dealer_idx = directions.index(d) if d in directions else 0
+
+    def _token_bidder_dir(token_idx: int) -> str:
+        return directions[(dealer_idx + int(token_idx)) % 4]
+
+    partner = {"N": "S", "S": "N", "E": "W", "W": "E"}.get(str(acting_direction), "")
+    if not partner:
+        return 0.0, 0.0, None
+
+    # Partner suit-showing history.
+    partner_major_counts = {"H": 0, "S": 0}
+    partner_last_major: str | None = None
+    for i, tk in enumerate(auction_tokens):
+        if _token_bidder_dir(i) != partner:
+            continue
+        p = re.match(r"^([1-7])\s*(NT|N|[CDHS])", str(tk or "").strip().upper())
+        if not p:
+            continue
+        ps = "N" if p.group(2).upper() in ("N", "NT") else p.group(2).upper()
+        if ps in ("H", "S"):
+            partner_major_counts[ps] += 1
+            partner_last_major = ps
+
+    if not partner_last_major:
+        return 0.0, 0.0, None
+
+    # "Doubly rebiddable by history": partner bid the same major at least twice.
+    partner_major_rebid_count = int(partner_major_counts.get(partner_last_major, 0))
+    if partner_major_rebid_count < 2:
+        return 0.0, 0.0, None
+
+    crit_norm = {str(c or "").strip().upper().strip("()") for c in (bt_acting_criteria or []) if str(c or "").strip()}
+    fit_context = (
+        "SUPPORTSHOWING" in crit_norm
+        or "FITESTABLISHED" in crit_norm
+        or "RAISE" in crit_norm
+    )
+
+    # Prefer direct game in partner's repeated major.
+    if bid_strain == partner_last_major and bid_level >= 4:
+        bonus = 110.0 + (20.0 if fit_context else 0.0)
+        reason = (
+            f"PARTNER_MAJOR_GAME_COMMIT: partner has repeatedly shown {partner_last_major} "
+            f"({partner_major_rebid_count} calls); prefer direct {bid_text} game commitment "
+            f"(+{bonus:.0f})"
+        )
+        return float(bonus), 0.0, reason
+
+    # Penalize side-suit detours when partner's major game is available.
+    if bid_level >= 4 and bid_strain in ("C", "D", "H", "S", "N") and bid_strain != partner_last_major:
+        # Stronger penalty for 4m detour.
+        detour_pen = 120.0 if bid_strain in ("C", "D") else 90.0
+        detour_pen += 20.0 if fit_context else 0.0
+        reason = (
+            f"PARTNER_MAJOR_GAME_DETOUR: partner repeatedly showed {partner_last_major}; "
+            f"side-suit/non-fit game detour {bid_text} without committing that major (-{detour_pen:.0f})"
+        )
+        return 0.0, float(detour_pen), reason
+
+    return 0.0, 0.0, None
+
+
+def compute_pass_signoff_bonus(
+    *,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+) -> tuple[float, str | None]:
+    """Bonus for Pass when partner already committed to game."""
+    if not acting_direction:
+        return 0.0, None
+    directions = ["N", "E", "S", "W"]
+    d = str(dealer_actual or "N").upper()
+    dealer_idx = directions.index(d) if d in directions else 0
+
+    def _token_bidder_dir(token_idx: int) -> str:
+        return directions[(dealer_idx + int(token_idx)) % 4]
+
+    partner = {"N": "S", "S": "N", "E": "W", "W": "E"}.get(str(acting_direction), "")
+    if not partner:
+        return 0.0, None
+
+    last_non_pass_idx = None
+    for i in range(len(auction_tokens) - 1, -1, -1):
+        tk = str(auction_tokens[i] or "").strip().upper()
+        if tk and tk not in ("P", "PASS", "X", "XX"):
+            last_non_pass_idx = i
+            break
+    if last_non_pass_idx is None:
+        return 0.0, None
+
+    last_bid = str(auction_tokens[last_non_pass_idx] or "").strip().upper()
+    m = re.match(r"^([1-7])\s*(NT|N|[CDHS])", last_bid)
+    if not m:
+        return 0.0, None
+    lvl = int(m.group(1))
+    st = "N" if m.group(2).upper() in ("N", "NT") else m.group(2).upper()
+    game_min = 3 if st == "N" else (4 if st in ("H", "S") else 5)
+    last_bidder = _token_bidder_dir(int(last_non_pass_idx))
+    if last_bidder != partner:
+        return 0.0, None
+    if lvl < game_min:
+        return 0.0, None
+
+    bonus = 80.0
+    reason = f"PASS_SIGNOFF_BONUS: partner last bid {last_bid} (game+); reward closing action (+{bonus:.0f})"
+    return bonus, reason
+
+
+def compute_post_game_slam_gate_adjustment(
+    *,
+    bid_text: str,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+    self_total_points: float | None,
+    partner_tp_hist: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Penalty for slam-explore continuation without sufficient evidence."""
+    out: dict[str, Any] = {
+        "penalty": 0.0,
+        "reason": None,
+        "game_contract_on_table": False,
+        "p_slam_tp_ge_33": None,
+        "combined_tp_mean": None,
+    }
+    if not acting_direction:
+        return out
+
+    b = str(bid_text or "").strip().upper()
+    m_bid = re.match(r"^([1-7])\s*(NT|N|[CDHS])", b)
+    if not m_bid:
+        return out
+    b_lvl = int(m_bid.group(1))
+    b_st = "N" if m_bid.group(2).upper() in ("N", "NT") else m_bid.group(2).upper()
+    is_slam_explore = b in ("4N", "4NT", "5N", "5NT") or b_lvl >= 5
+    if not is_slam_explore:
+        return out
+
+    directions = ["N", "E", "S", "W"]
+    d = str(dealer_actual or "N").upper()
+    dealer_idx = directions.index(d) if d in directions else 0
+
+    def _token_bidder_dir(token_idx: int) -> str:
+        return directions[(dealer_idx + int(token_idx)) % 4]
+
+    def _strain_rank(st: str) -> int:
+        return {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}.get(str(st or "").upper(), -1)
+
+    # Highest contract on table + bidder side
+    best: dict[str, Any] | None = None
+    for i, tk in enumerate(auction_tokens):
+        s = str(tk or "").strip().upper()
+        m = re.match(r"^([1-7])\s*(NT|N|[CDHS])", s)
+        if not m:
+            continue
+        lvl = int(m.group(1))
+        st = "N" if m.group(2).upper() in ("N", "NT") else m.group(2).upper()
+        if best is None or lvl > int(best["level"]) or (lvl == int(best["level"]) and _strain_rank(st) > _strain_rank(str(best["strain"]))):
+            best = {"level": lvl, "strain": st, "token_idx": i}
+    if best is None:
+        return out
+
+    bidder_dir = _token_bidder_dir(int(best["token_idx"]))
+    bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
+    acting_side = "NS" if acting_direction in ("N", "S") else "EW"
+    if bidder_side != acting_side:
+        return out
+
+    top_level = int(best["level"])
+    top_strain = str(best["strain"])
+    game_min = 3 if top_strain == "N" else (4 if top_strain in ("H", "S") else 5)
+    game_contract_on_table = top_level >= game_min
+    out["game_contract_on_table"] = bool(game_contract_on_table)
+    if not game_contract_on_table:
+        return out
+
+    partner_mean_tp = expected_from_hist(partner_tp_hist) if partner_tp_hist is not None else None
+    combined_tp_mean = None
+    if self_total_points is not None and partner_mean_tp is not None:
+        combined_tp_mean = float(self_total_points) + float(partner_mean_tp)
+    out["combined_tp_mean"] = combined_tp_mean
+
+    p_slam_tp_ge_33 = None
+    if self_total_points is not None and isinstance(partner_tp_hist, dict):
+        needed_partner_tp = max(0, int(math.ceil(33.0 - float(self_total_points))))
+        tot = 0.0
+        ok = 0.0
+        for k, v in partner_tp_hist.items():
+            try:
+                tp = int(k)
+                cnt = float(v)
+            except Exception:
+                continue
+            if cnt <= 0:
+                continue
+            tot += cnt
+            if tp >= needed_partner_tp:
+                ok += cnt
+        if tot > 0:
+            p_slam_tp_ge_33 = ok / tot
+    out["p_slam_tp_ge_33"] = p_slam_tp_ge_33
+
+    p_min = 0.45
+    penalty = 0.0
+    if p_slam_tp_ge_33 is None:
+        penalty += 140.0
+    elif float(p_slam_tp_ge_33) < p_min:
+        penalty += (p_min - float(p_slam_tp_ge_33)) * 500.0
+    if combined_tp_mean is not None and float(combined_tp_mean) < 32.0:
+        penalty += (32.0 - float(combined_tp_mean)) * 25.0
+    out["penalty"] = float(penalty)
+    if penalty > 0:
+        p_txt = f"{p_slam_tp_ge_33:.2f}" if p_slam_tp_ge_33 is not None else "NA"
+        c_txt = f"{combined_tp_mean:.1f}" if combined_tp_mean is not None else "NA"
+        out["reason"] = (
+            f"POST_GAME_SLAM_GATE: slam explore {b} without enough evidence "
+            f"(p33={p_txt}, combinedTP={c_txt}) (-{penalty:.0f})"
+        )
+    return out
 
 
 def compute_guardrail_penalty(

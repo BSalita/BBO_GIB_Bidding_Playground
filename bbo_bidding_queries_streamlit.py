@@ -66,6 +66,11 @@ from plugins.bbo_handlers_common import (
 )
 
 from bbo_explanation_lib import (
+    compute_partner_major_game_commit_adjustment,
+    compute_pass_signoff_bonus,
+    compute_post_game_slam_gate_adjustment,
+    compute_rebiddable_major_game_bonus,
+    compute_non_rebiddable_suit_rebid_penalty,
     compute_eeo_from_bid_details,
     compute_guardrail_penalty,
     expected_from_hist,
@@ -9269,7 +9274,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
 
                     return (_f(r.get("Avg_EV")), _f(r.get("Deals")), _f(r.get("Matches")))
 
-                AB_ADV_CACHE_VERSION = 2  # bump to invalidate Streamlit-side cached bid-details
+                AB_ADV_CACHE_VERSION = 3  # bump to invalidate Streamlit-side cached bid-details
 
                 # 1) Prefer bids that match the pinned deal ("Valid" bucket).
                 candidate_rows = list(valid_rows or [])
@@ -9603,6 +9608,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         # Compute guardrail penalty
                         guard_penalty = 0.0
                         guard_reasons: list[str] = []
+                        non_rebiddable_rebid_penalty = 0.0
+                        rebiddable_major_game_bonus = 0.0
+                        partner_major_game_bonus = 0.0
+                        partner_major_detour_penalty = 0.0
+                        post_game_slam_gate_penalty = 0.0
                         try:
                             if float(w_guard) > 0:
                                 gp, gr = compute_guardrail_penalty(
@@ -9631,6 +9641,76 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             guard_penalty = 0.0
                             guard_reasons = []
 
+                        # Additional bridge-texture guardrail for suit rebids.
+                        try:
+                            if float(w_guard) > 0:
+                                _nr_p, _nr_reason = compute_non_rebiddable_suit_rebid_penalty(
+                                    bid_text=bid0,
+                                    auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                                    acting_direction=acting_dir_adv,
+                                    dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                                    bt_acting_criteria=crit if isinstance(crit, list) else [],
+                                )
+                                non_rebiddable_rebid_penalty = float(_nr_p) * float(w_guard)
+                                if _nr_reason:
+                                    guard_reasons = list(guard_reasons or [])
+                                    guard_reasons.append(_nr_reason)
+                        except Exception:
+                            non_rebiddable_rebid_penalty = 0.0
+
+                        # Bonus for directly committing to game in a strongly
+                        # rebiddable major already shown by acting player.
+                        try:
+                            _rb_bonus, _rb_reason = compute_rebiddable_major_game_bonus(
+                                bid_text=bid0,
+                                auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                                acting_direction=acting_dir_adv,
+                                dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                                bt_acting_criteria=crit if isinstance(crit, list) else [],
+                            )
+                            rebiddable_major_game_bonus = float(_rb_bonus)
+                            if _rb_reason:
+                                guard_reasons = list(guard_reasons or [])
+                                guard_reasons.append(_rb_reason)
+                        except Exception:
+                            rebiddable_major_game_bonus = 0.0
+
+                        # Partner-major context adjustment (shared with API scorer).
+                        try:
+                            _pm_bonus, _pm_pen, _pm_reason = compute_partner_major_game_commit_adjustment(
+                                bid_text=bid0,
+                                auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                                acting_direction=acting_dir_adv,
+                                dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                                bt_acting_criteria=crit if isinstance(crit, list) else [],
+                            )
+                            partner_major_game_bonus = float(_pm_bonus)
+                            partner_major_detour_penalty = float(_pm_pen)
+                            if _pm_reason:
+                                guard_reasons = list(guard_reasons or [])
+                                guard_reasons.append(_pm_reason)
+                        except Exception:
+                            partner_major_game_bonus = 0.0
+                            partner_major_detour_penalty = 0.0
+
+                        # Shared post-game slam gate (align with API scorer).
+                        try:
+                            _slam_adj = compute_post_game_slam_gate_adjustment(
+                                bid_text=bid0,
+                                auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                                acting_direction=acting_dir_adv,
+                                dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                                self_total_points=self_tp_val,
+                                partner_tp_hist=partner_tp_hist_val,
+                            )
+                            post_game_slam_gate_penalty = float(_slam_adj.get("penalty") or 0.0)
+                            _slam_reason = _slam_adj.get("reason")
+                            if _slam_reason:
+                                guard_reasons = list(guard_reasons or [])
+                                guard_reasons.append(str(_slam_reason))
+                        except Exception:
+                            post_game_slam_gate_penalty = 0.0
+
                         # Composite Score (transparent & adjustable)
                         # MUST match AI Model server-side _score_one to be "one source of truth".
                         score = None
@@ -9654,6 +9734,11 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             score = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term
                             # Subtract guardrail penalty
                             score -= guard_penalty
+                            score -= non_rebiddable_rebid_penalty
+                            score += rebiddable_major_game_bonus
+                            score += partner_major_game_bonus
+                            score -= partner_major_detour_penalty
+                            score -= post_game_slam_gate_penalty
                         except Exception:
                             score = None
 
@@ -9745,6 +9830,20 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     pass_score, pass_note = _pick_pass_score_and_note(
                         pr, acting_sign_adv
                     )
+                    pass_bonus = 0.0
+                    pass_bonus_reason = None
+                    try:
+                        pass_bonus, pass_bonus_reason = compute_pass_signoff_bonus(
+                            auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                            acting_direction=acting_dir_adv,
+                            dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                        )
+                    except Exception:
+                        pass_bonus = 0.0
+                        pass_bonus_reason = None
+                    pass_score = float(pass_score) + float(pass_bonus)
+                    if pass_bonus_reason:
+                        pass_note = f"{pass_note}; {pass_bonus_reason}"
                     pass_row_dict = {
                         "Bid": "P",
                         "Error": f"Synthetic row: Pass is not BT-backed (no /bid-details evidence); {pass_note}.",
@@ -9805,33 +9904,12 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 if not adv_df.is_empty():
                     # Rank column for readability
                     try:
-                        # Priority categories: bids with [raise, FitEstablished, SupportShowing] come first
-                        priority_categories = ["raise", "FitEstablished", "SupportShowing"]
-                        
-                        # Create a priority column: 0 for priority bids, 1 for others
-                        def has_priority_category(cats_str: str | None) -> int:
-                            if not cats_str:
-                                return 1
-                            cats_upper = str(cats_str).upper()
-                            for cat in priority_categories:
-                                if cat.upper() in cats_upper:
-                                    return 0
-                            return 1
-                        
-                        # Add priority column
-                        adv_df = adv_df.with_columns(
-                            pl.col("Categories").map_elements(has_priority_category, return_dtype=pl.Int8).alias("_priority")
-                        )
-                        
-                        # Sort: priority first (0), then by Score descending
-                        adv_df = adv_df.sort(["_priority", "Score"], descending=[False, True], nulls_last=True)
-                        
-                        # Remove temporary priority column
-                        adv_df = adv_df.drop("_priority")
-                        
+                        # IMPORTANT: keep ordering consistent with automated AI Model.
+                        # The top row must be the highest Score candidate.
+                        adv_df = adv_df.sort("Score", descending=True, nulls_last=True)
                         adv_df = adv_df.with_row_index("Rank", offset=1)
                     except Exception:
-                        # Fallback to simple Score sort if priority logic fails
+                        # Fallback to simple Score sort
                         try:
                             adv_df = adv_df.sort("Score", descending=True, nulls_last=True)
                             adv_df = adv_df.with_row_index("Rank", offset=1)
@@ -12388,635 +12466,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     except Exception:
                         return True
 
-                def _is_complete_auc(auc_text: str) -> bool:
-                    toks = [t.strip().upper() for t in str(auc_text or "").split("-") if t.strip()]
-                    if not toks:
-                        return False
-                    if len(toks) >= 4 and all(t == "P" for t in toks):
-                        return True
-                    trailing = 0
-                    for t in reversed(toks):
-                        if t == "P":
-                            trailing += 1
-                        else:
-                            break
-                    if trailing >= 3 and any(t != "P" for t in toks):
-                        return True
-                    return False
-
-                def _ai_model_auction_from_advanced_greedy(
-                    *,
-                    max_steps: int = 40,
-                    top_n: int = 12,
-                    max_deals: int = 500,
-                    w_desc: float = 150.0,
-                    w_threat: float = 120.0,
-                ) -> tuple[str | None, list[dict[str, Any]]]:
-                    """Build a completed auction by repeatedly taking the first row of 'Best Next Bids (Advanced)'."""
-                    if not pinned_deal:
-                        return None, []
-
-                    # Cache per pinned deal + params (can be expensive).
-                    deal_key = None
-                    try:
-                        rk = pinned_deal.get("_row_idx")
-                        ik = pinned_deal.get("index")
-                        deal_key = f"row_{int(rk)}" if rk is not None else (f"idx_{int(ik)}" if ik is not None else None)
-                    except Exception:
-                        deal_key = None
-                    cache_key = (
-                        "_ab_ai_model_advanced_auc",
-                        str(deal_key or ""),
-                        int(seed) if isinstance(seed, (int, float)) else 0,
-                        int(max_steps),
-                        int(top_n),
-                        int(max_deals),
-                        float(w_desc),
-                        float(w_threat),
-                    )
-                    try:
-                        cached = st.session_state.get(cache_key)
-                        if isinstance(cached, dict):
-                            auc_cached = cached.get("auction")
-                            times_cached = cached.get("times")
-                            if isinstance(auc_cached, str) and auc_cached.strip():
-                                return auc_cached.strip(), (times_cached if isinstance(times_cached, list) else [])
-                        if isinstance(cached, str) and cached.strip():
-                            # Back-compat with earlier cache format (string only).
-                            return cached.strip(), []
-                    except Exception:
-                        pass
-
-                    pinned_deal_index_val: int | None = None
-                    try:
-                        if pinned_deal.get("index") is not None:
-                            pinned_deal_index_val = int(pinned_deal.get("index"))
-                    except Exception:
-                        pinned_deal_index_val = None
-
-                    vul_filter_val: str | None = None
-                    try:
-                        v = str(pinned_deal.get("Vul", pinned_deal.get("Vulnerability", "")) or "").strip()
-                        vul_filter_val = v if v else None
-                    except Exception:
-                        vul_filter_val = None
-
-                    auc = ""
-                    elapsed_steps: list[dict[str, Any]] = []
-                    for _ in range(int(max_steps)):
-                        if _is_complete_auc(auc):
-                            break
-
-                        t_step0 = time.perf_counter()
-                        seat_1_to_4 = _next_display_seat_from_auction(auc)
-                        
-                        # PERSPECTIVE: determine acting side sign (+1 for NS, -1 for EW acting)
-                        acting_sign = 1.0
-                        try:
-                            # Use pinned deal dealer or default to North
-                            dealer_actual = str(pinned_deal.get("Dealer", "N") if pinned_deal else "N").upper()
-                            directions = ["N", "E", "S", "W"]
-                            dealer_idx = directions.index(dealer_actual) if dealer_actual in directions else 0
-                            # Seat 1 is dealer, Seat 2 is LHO, etc.
-                            acting_dir = directions[(dealer_idx + int(seat_1_to_4) - 1) % 4]
-                            acting_sign = 1.0 if acting_dir in ("N", "S") else -1.0
-                        except Exception:
-                            acting_sign = 1.0
-
-                        # We allow leading opening passes in the display auction. For BT lookups we strip
-                        # those passes (seat-1 canonical), then rotate the dealer + map the seat for any
-                        # pinned-deal criteria evaluation. This matches the main Auction Builder logic.
-                        options: list[dict[str, Any]] = []
-                        try:
-                            dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
-                            bt_prefix, leading_passes = _strip_leading_passes(auc)
-                            dealer_rot = _rotate_dealer_by(dealer_actual, int(leading_passes))
-                            vul_payload = pinned_deal.get("Vul", pinned_deal.get("Vulnerability"))
-                            nb_cache = st.session_state.setdefault("_ai_model_next_bids_cache", {})
-                            nb_key = ("nb", str(bt_prefix or "__opening__"), int(seed), str(dealer_rot), str(vul_payload))
-                            if nb_key in nb_cache:
-                                options = list(nb_cache[nb_key] or [])
-                            else:
-                                data_nb = api_post(
-                                    "/list-next-bids",
-                                    {"auction": bt_prefix or "", "dealer": dealer_rot, "vulnerable": vul_payload},
-                                    timeout=DEFAULT_API_TIMEOUT,
-                                )
-                                next_bids = data_nb.get("next_bids", []) or []
-                                options = []
-                                for item in next_bids:
-                                    options.append(
-                                        {
-                                            "bid": item.get("bid", ""),
-                                            "bt_index": item.get("bt_index"),
-                                            "expr": item.get("expr", []) or [],
-                                            "agg_expr": item.get("agg_expr", []) or [],
-                                            "can_complete": item.get("can_complete"),
-                                            "is_complete": item.get("is_completed_auction", False),
-                                            "is_dead_end": item.get("is_dead_end", False),
-                                            "matching_deal_count": item.get("matching_deal_count"),
-                                            "avg_ev_nv": item.get("avg_ev_nv"),
-                                            "avg_ev_v": item.get("avg_ev_v"),
-                                            "avg_par_nv": item.get("avg_par_nv"),
-                                            "avg_par_v": item.get("avg_par_v"),
-                                            "avg_ev": item.get("avg_ev"),
-                                            "avg_par": item.get("avg_par"),
-                                        }
-                                    )
-                                nb_cache[nb_key] = options
-                        except Exception:
-                            # Fallback to shared helper (may be slower; expects stripped prefix)
-                            bt_prefix_fallback, _lp = _strip_leading_passes(auc)
-                            options = list(get_next_bid_options(bt_prefix_fallback) or [])
-                        debug_step: dict[str, Any] = {
-                            "step": int(len(elapsed_steps) + 1),
-                            "seat": int(seat_1_to_4),
-                            "bt_prefix": str(bt_prefix or ""),
-                            "leading_passes": int(leading_passes),
-                            "dealer_rot": str(dealer_rot),
-                            "options": int(len(options)),
-                        }
-
-                        # Ensure Pass is offered when permissive-pass is enabled (matches UI semantics).
-                        if st.session_state.get("always_valid_pass", True):
-                            has_p = any(str(o.get("bid") or "").strip().upper() in ("P", "PASS") for o in options)
-                            if not has_p:
-                                options.append(
-                                    {
-                                        "bid": "P",
-                                        "bt_index": None,
-                                        "expr": [],
-                                        "agg_expr": [],
-                                        "can_complete": True,
-                                        "is_complete": _is_auction_complete_after_next_bid(auc, "P"),
-                                        "is_dead_end": False,
-                                        "matching_deal_count": 0,
-                                        "avg_ev_nv": None,
-                                        "avg_ev_v": None,
-                                        "avg_par_nv": None,
-                                        "avg_par_v": None,
-                                        "avg_ev": None,
-                                        "avg_par": None,
-                                    }
-                                )
-
-                        candidates: list[dict[str, Any]] = []
-                        pass_opt: dict[str, Any] | None = None
-                        for opt in options:
-                            bid_str = str(opt.get("bid", "") or "").strip().upper()
-                            if not bid_str:
-                                continue
-                            
-                            # WORKAROUND: Separately track Pass so it can be handled as a fallback 
-                            # if BT-backed candidates fail criteria.
-                            if bid_str in ("P", "PASS"):
-                                pass_opt = opt
-                                # Fall through to add to candidates so it competes in scoring
-                            
-                            if opt.get("bt_index") is None and bid_str not in ("P", "PASS"):
-                                continue
-
-                            criteria_list = opt.get("agg_expr", []) or []
-                            is_dead_end = bool(opt.get("is_dead_end", False))
-                            has_empty_criteria = not criteria_list
-                            has_underspecified = _is_underspecified_criteria(criteria_list)
-                            can_complete = opt.get("can_complete")
-                            can_complete_b = bool(can_complete) if can_complete is not None else True
-
-                            # Cheap pre-filter only here; pinned-criteria pass/fail is evaluated in ONE batch below.
-                            # IMPORTANT: do NOT reject on can_complete yet. In the UI, "cannot complete"
-                            # only rejects bids that OTHERWISE match the pinned deal.
-                            is_rejected = is_dead_end or has_empty_criteria or has_underspecified
-                            if is_rejected and bid_str not in ("P", "PASS"):
-                                continue
-                            candidates.append(opt)
-
-                        # If no BT-backed candidates, mirror Advanced UI behavior: choose Pass if it's the only move.
-                        if not candidates:
-                            if pass_opt is None:
-                                break
-                            auc = f"{auc}-P" if auc else "P"
-                            auc = normalize_auction_input(auc).upper() if auc else ""
-                            elapsed_ms = (time.perf_counter() - t_step0) * 1000
-                            debug_step.update({"candidates": 0, "passed": 0, "choice": "P"})
-                            elapsed_steps.append({"bid": "P", "elapsed_ms": round(elapsed_ms, 1), **debug_step})
-                            continue
-
-                        # ----------------------------------------------------------
-                        # Speedups:
-                        # 1) Prefilter by cheap stats (avoid evaluating tons of bids)
-                        # 2) Batch criteria-eval in ONE API call for this step
-                        # 3) Parallelize /bid-details scoring for the survivors
-                        # ----------------------------------------------------------
-                        # For correctness, do NOT exclude bids before scoring; the BT branching factor
-                        # here is small (~40). We still cap scoring to top_n after seeding.
-                        PREFILTER_K = max(int(len(candidates)), int(top_n))
-
-                        def _safe_float(x: Any) -> float:
-                            try:
-                                if x is None or x == "":
-                                    return float("-inf")
-                                return float(x)
-                            except Exception:
-                                return float("-inf")
-
-                        # Seed ranking parity with Advanced table: prefer higher Avg_EV, then deal counts.
-                        # (Avg_EV is already seat/vul-adjusted by /list-next-bids when pinned_deal context is provided.)
-                        candidates_sorted = sorted(
-                            candidates,
-                            key=lambda o: (
-                                _safe_float(o.get("avg_ev")),
-                                _safe_float(o.get("matching_deal_count")),
-                                _safe_float(o.get("matching_deal_count")),
-                            ),
-                            reverse=True,
-                        )[: int(PREFILTER_K)]
-
-                        # Batch pinned-criteria evaluation for these candidates.
-                        passed_opts: list[dict[str, Any]] = []
-                        if pinned_deal and pinned_deal.get("_row_idx") is not None:
-                            try:
-                                dealer_actual = str(pinned_deal.get("Dealer", "N")).upper()
-                                # Map dealer/seat to BT-canonical frame when there are leading passes.
-                                dealer_rot = _rotate_dealer_by(dealer_actual, int(leading_passes))
-                                seat_bt = _bt_seat_from_display_seat(int(seat_1_to_4), int(leading_passes))
-                                checks: list[dict[str, Any]] = []
-                                opt_by_i: list[dict[str, Any]] = []
-                                for opt in candidates_sorted:
-                                    bid_s = str(opt.get("bid", "") or "").strip().upper()
-                                    if bid_s in ("P", "PASS"):
-                                        # Pass always passes criteria check
-                                        passed_opts.append(opt)
-                                        continue
-
-                                    criteria_list = opt.get("agg_expr", []) or []
-                                    if not criteria_list:
-                                        # Non-pass with empty criteria is rejected in main UI, 
-                                        # but here we follow pool_opts logic.
-                                        continue
-                                    checks.append({"seat": int(seat_bt), "criteria": list(criteria_list)})
-                                    opt_by_i.append(opt)
-                                if checks:
-                                    data = api_post(
-                                        "/deal-criteria-pass-batch",
-                                        {
-                                            "deal_row_idx": int(pinned_deal.get("_row_idx")),
-                                            "dealer": dealer_rot,
-                                            "checks": checks,
-                                        },
-                                        timeout=10,
-                                    )
-                                    results = data.get("results", []) or []
-                                    for i_res, r0 in enumerate(results[: len(opt_by_i)]):
-                                        if not bool((r0 or {}).get("passes", False)):
-                                            continue
-                                        # UI parity: reject "cannot complete" only if bid matches pinned.
-                                        opt = opt_by_i[i_res]
-                                        can_complete = opt.get("can_complete")
-                                        can_complete_b = bool(can_complete) if can_complete is not None else True
-                                        if not can_complete_b:
-                                            continue
-                                        passed_opts.append(opt)
-                            except Exception:
-                                # If batch eval fails, fall back to optimistic (do not block UI).
-                                passed_opts = list(candidates_sorted)
-                        else:
-                            # No bitmap-eval possible (PBN/LIN pin): keep optimistic semantics.
-                            passed_opts = list(candidates_sorted)
-
-                        # IMPORTANT: Match Advanced table behavior.
-                        # - If ANY bids match the pinned deal (Valid bucket), only consider those.
-                        # - Otherwise, fall back to non-rejected BT-backed bids even if they don't match.
-                        pool_opts = passed_opts if passed_opts else list(candidates_sorted)
-
-                        debug_step.update(
-                            {
-                                "candidates": int(len(candidates_sorted)),
-                                "passed": int(len(passed_opts)),
-                                "pool": int(len(pool_opts)),
-                                "prefilter_k": int(PREFILTER_K),
-                                "top_n": int(top_n),
-                            }
-                        )
-                        # IMPORTANT: For AI Model, only advance using bids that actually match the pinned deal.
-                        # If no bids match (Valid bucket is empty), choose Pass (if available) rather than
-                        # falling back to non-matching bids (which produces bizarre auctions and is slow).
-                        if not passed_opts:
-                            if pass_opt is None:
-                                break
-                            auc = f"{auc}-P" if auc else "P"
-                            auc = normalize_auction_input(auc).upper() if auc else ""
-                            elapsed_ms = (time.perf_counter() - t_step0) * 1000
-                            debug_step.update({"choice": "P"})
-                            elapsed_steps.append({"bid": "P", "elapsed_ms": round(elapsed_ms, 1), **debug_step})
-                            continue
-
-                        # Bid-details scoring for top_n survivors (parallel).
-                        import concurrent.futures
-
-                        step_top = passed_opts[: int(top_n)]
-
-                        # If there's only one valid bid, don't waste time scoring.
-                        if len(step_top) == 1:
-                            next_bid = str(step_top[0].get("bid", "") or "").strip().upper()
-                            if next_bid:
-                                best_is_complete = bool(step_top[0].get("is_complete", False)) or _is_auction_complete_after_next_bid(auc, next_bid)
-                                auc = f"{auc}-{next_bid}" if auc else next_bid
-                                auc = normalize_auction_input(auc).upper() if auc else ""
-                                elapsed_ms = (time.perf_counter() - t_step0) * 1000
-                                debug_step.update({"choice": next_bid})
-                                elapsed_steps.append({"bid": next_bid, "elapsed_ms": round(elapsed_ms, 1), **debug_step})
-                                if best_is_complete:
-                                    break
-                                continue
-
-                        # Small per-run cache to avoid duplicate calls inside the greedy loop.
-                        bd_cache: dict[tuple[str, str, int, int, str | None, int | None, bool], dict[str, Any]] = st.session_state.setdefault(
-                            "_ai_model_bid_details_cache",
-                            {},
-                        )
-
-                        def _fetch_details_cached(bid0: str) -> dict[str, Any] | None:
-                            key = (
-                                str(auc or ""),
-                                str(bid0),
-                                int(max_deals),
-                                int(seed) if isinstance(seed, (int, float)) else 0,
-                                vul_filter_val,
-                                pinned_deal_index_val,
-                                bool(pinned_deal_index_val is not None),
-                            )
-                            if key in bd_cache:
-                                return bd_cache[key]
-                            try:
-                                details = api_post(
-                                    "/bid-details",
-                                    {
-                                        "auction": auc,
-                                        "bid": bid0,
-                                        "max_deals": int(max_deals),
-                                        "seed": int(seed) if isinstance(seed, (int, float)) else 0,
-                                        "vul_filter": vul_filter_val,
-                                        "deal_index": pinned_deal_index_val,
-                                        "include_phase2a": bool(pinned_deal_index_val is not None),
-                                        # We don't use top-K par contracts in AI Model scoring; keep minimal.
-                                        "topk": 1,
-                                    },
-                                    timeout=30,
-                                )
-                                if isinstance(details, dict):
-                                    bd_cache[key] = details
-                                return details if isinstance(details, dict) else None
-                            except Exception:
-                                return None
-
-                        def _score_opt(opt: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
-                            bid0 = str(opt.get("bid", "") or "").strip().upper()
-                            if not bid0:
-                                return None, opt
-                            
-                            # Handle Pass (not BT-backed)
-                            # Use BT-aggregate avg_ev (NOT deal-specific EV) to stay on the
-                            # same scale as non-Pass bids which use BT-aggregate mean_par.
-                            if bid0 in ("P", "PASS"):
-                                score_val: float | None = None
-                                val = _safe_float(opt.get("avg_ev"))
-                                if val != float("-inf"):
-                                    score_val = val
-                                if score_val is None:
-                                    val2 = _safe_float(opt.get("avg_par"))
-                                    if val2 != float("-inf"):
-                                        score_val = val2
-                                if score_val is None:
-                                    score_val = 0.0
-
-                                # Apply perspective flip (NS-positive -> Acting-side positive)
-                                final_score = float(acting_sign) * float(score_val)
-                                try:
-                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | RawScore: {score_val} | ActingSign: {acting_sign} | Final: {final_score}")
-                                except: pass
-                                return final_score, opt
-
-                            details = _fetch_details_cached(bid0)
-                            if not details or (details.get("error") or details.get("message")):
-                                return None, opt
-
-                            par_score = details.get("par_score") or {}
-                            mean_par = par_score.get("mean")
-
-                            eeo = {}
-                            try:
-                                eeo = compute_eeo_from_bid_details(details)
-                            except Exception:
-                                eeo = {}
-                            utility = eeo.get("utility")
-
-                            opp_threat = None
-                            try:
-                                threat = (details.get("phase2a") or {}).get("threat") or {}
-                                vals = []
-                                for su in ["S", "H", "D", "C"]:
-                                    t_su = threat.get(su) or {}
-                                    v = t_su.get("p_them_6plus")
-                                    if isinstance(v, (int, float)):
-                                        vals.append(float(v))
-                                if vals:
-                                    opp_threat = max(vals)
-                            except Exception:
-                                opp_threat = None
-
-                            desc_score = None
-                            try:
-                                rp = details.get("range_percentiles")
-                                if isinstance(rp, dict) and rp.get("role") == "self":
-                                    pcts = []
-                                    h = (rp.get("hcp") or {}).get("percentile")
-                                    if isinstance(h, (int, float)):
-                                        pcts.append(float(h))
-                                    sl = rp.get("suit_lengths") or {}
-                                    for su in ["S", "H", "D", "C"]:
-                                        p = ((sl.get(su) or {}).get("percentile"))
-                                        if isinstance(p, (int, float)):
-                                            pcts.append(float(p))
-                                    if pcts:
-                                        dev = sum(abs(p - 50.0) for p in pcts) / len(pcts)
-                                        desc_score = max(0.0, min(1.0, 1.0 - (dev / 50.0)))
-                            except Exception:
-                                desc_score = None
-
-                            # Standalone/manual parity: AI-model path does not
-                            # apply trick-shortfall guardrail.
-                            _est_tricks_path: float | None = None
-
-                            # Guardrail penalty (Streamlit-side AI Model path)
-                            guard_penalty_s = 0.0
-                            try:
-                                _wg = float(locals().get("w_guard", 1.0) or 1.0)
-                                if _wg > 0:
-                                    _self_tp = None
-                                    try:
-                                        _rp2 = details.get("range_percentiles")
-                                        if isinstance(_rp2, dict):
-                                            _self_tp = (_rp2.get("total_points") or {}).get("value")
-                                            if _self_tp is not None:
-                                                _self_tp = float(_self_tp)
-                                    except Exception:
-                                        _self_tp = None
-                                    _ptnr_hist = None
-                                    try:
-                                        _p2a = details.get("phase2a") or {}
-                                        _ptnr_hist = ((_p2a.get("roles") or {}).get("partner") or {}).get("total_points_hist")
-                                    except Exception:
-                                        _ptnr_hist = None
-                                    _ptopk = (details.get("par_contracts") or {}).get("topk") or []
-                                    _wgo = float(locals().get("w_guard_overbid", 80) or 80)
-                                    _wgt = float(locals().get("w_guard_tp", 15) or 15)
-                                    _wgn = float(locals().get("w_guard_neg", 0.5) or 0.5)
-                                    _wgu = float(locals().get("w_guard_underbid", 40) or 40)
-                                    _wgts = float(locals().get("w_guard_tp_surplus", 8) or 8)
-                                    _wgsi = float(locals().get("w_guard_strain", 60) or 60)
-                                    _wgsd = float(locals().get("w_guard_sacrifice", 70) or 70) / 100.0
-                                    _wgtk = float(locals().get("w_guard_tricks", 30) or 30)
-                                    # Hand controls for INSUFFICIENT_FIRST_ROUND_CONTROLS
-                                    _sa_path: int | None = None
-                                    _shv_path: int | None = None
-                                    try:
-                                        _hstr = str(pinned_deal.get(f"Hand_{acting_dir}", "") or "").strip() if pinned_deal else ""
-                                        if _hstr:
-                                            _sa_path, _shv_path = hand_controls(_hstr)
-                                    except Exception:
-                                        pass
-                                    _gp, _ = compute_guardrail_penalty(
-                                        bid=bid0,
-                                        par_contracts_topk=_ptopk,
-                                        self_total_points=_self_tp,
-                                        partner_tp_hist=_ptnr_hist,
-                                        par_score_mean=mean_par,
-                                        acting_sign=float(acting_sign),
-                                        w_overbid_level=_wgo,
-                                        w_tp_shortfall=_wgt,
-                                        w_neg_par_high=_wgn,
-                                        w_underbid_level=_wgu,
-                                        w_tp_surplus=_wgts,
-                                        w_strain_ineff=_wgsi,
-                                        sacrifice_discount=_wgsd,
-                                        est_tricks=_est_tricks_path,
-                                        w_tricks_shortfall=_wgtk,
-                                        self_aces=_sa_path,
-                                        self_helpful_voids=_shv_path,
-                                        debug_equivalence_bypass=True,
-                                    )
-                                    guard_penalty_s = float(_gp) * _wg
-                            except Exception:
-                                guard_penalty_s = 0.0
-
-                            try:
-                                # Reconstruct utility from perspective of acting side.
-                                # "utility" from eeo is NS-relative (Mean_NS - Penalties).
-                                # We want Acting-relative score.
-                                # Base: Acting_Sign * Mean_Par (NS).
-                                base = float(acting_sign) * float(mean_par)
-                                
-                                # Bayesian Shrinkage for low-N bids
-                                # N < 5 is penalized by shrinking score towards 0.
-                                # Effective_Score = (Total_Score + K*Prior) / (N + K)
-                                # Assuming Prior=0.
-                                matched_n = float(details.get("matched_deals_total_excluding_pinned") or details.get("matched_deals_total") or 0.0)
-                                shrinkage_k = 5.0
-                                base_shrunk = (base * matched_n) / (matched_n + shrinkage_k)
-                                
-                                desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
-                                threat_term = float(opp_threat) if opp_threat is not None else 0.0
-                                # Use shrunk base, subtract guardrail penalty
-                                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term - guard_penalty_s
-                                try:
-                                    # Debug print to console for tracking
-                                    guard_s = f" | Guard: -{guard_penalty_s:.0f}" if guard_penalty_s > 0 else ""
-                                    print(f"[AI_Model_Debug] Step: {auc} | Bid: {bid0} | N: {matched_n} | RawMean: {mean_par} | ActingSign: {acting_sign} | Base: {base} | ShrunkBase: {base_shrunk} | Final: {score_val}{guard_s}")
-                                except: pass
-                                return float(score_val), opt
-                            except Exception:
-                                return None, opt
-
-                        scored: list[tuple[float | None, dict[str, Any]]] = []
-                        # Raise parallelism a bit; this is localhost and can handle more.
-                        max_workers = min(10, max(1, len(step_top)))
-                        try:
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                                futs = [ex.submit(_score_opt, opt) for opt in step_top]
-                                for fut in concurrent.futures.as_completed(futs):
-                                    try:
-                                        scored.append(fut.result())
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            # If threadpool fails for any reason, fall back to sequential.
-                            scored = [_score_opt(opt) for opt in step_top]
-
-                        best_opt: dict[str, Any] | None = None
-                        best_score: float = float("-inf")
-                        for sc, opt in scored:
-                            if sc is None:
-                                continue
-                            if float(sc) > best_score:
-                                best_score = float(sc)
-                                best_opt = opt
-                        if best_opt is None:
-                            best_opt = passed_opts[0]
-                            best_score = 0.0
-
-                        next_bid = str(best_opt.get("bid", "") or "").strip().upper()
-                        if not next_bid:
-                            break
-                        best_is_complete = bool(best_opt.get("is_complete", False)) or _is_auction_complete_after_next_bid(auc, next_bid)
-                        auc = f"{auc}-{next_bid}" if auc else next_bid
-                        auc = normalize_auction_input(auc).upper() if auc else ""
-                        elapsed_ms = (time.perf_counter() - t_step0) * 1000
-                        debug_step.update({"choice": next_bid, "score": best_score, "acting_sign": acting_sign})
-                        elapsed_steps.append({"bid": next_bid, "elapsed_ms": round(elapsed_ms, 1), **debug_step})
-                        if best_is_complete:
-                            break
-
-                    auc = auc.strip("-")
-                    if not auc:
-                        return None, elapsed_steps
-                    try:
-                        st.session_state[cache_key] = {"auction": auc, "times": elapsed_steps}
-                    except Exception:
-                        pass
-                    # Also store under stable keys so we can display near the top placeholder.
-                    try:
-                        st.session_state[ai_model_auc_ss_key] = auc
-                        st.session_state[ai_model_times_ss_key] = elapsed_steps
-                    except Exception:
-                        pass
-                    # Update placeholders (they were created earlier near the Cheater Model placeholder).
-                    try:
-                        ai_model_auction_placeholder.empty()
-                    except Exception:
-                        pass
-                    try:
-                        if elapsed_steps:
-                            lines = ["AI Model Step Details:"]
-                            for j, t in enumerate(elapsed_steps[:60], start=1):
-                                if not isinstance(t, dict):
-                                    continue
-                                b = str(t.get("bid", "") or "").strip().upper()
-                                ms = t.get("elapsed_ms")
-                                score = t.get("score")
-                                sign = t.get("acting_sign")
-                                try:
-                                    ms_f = float(ms) if ms is not None else None
-                                except Exception:
-                                    ms_f = None
-                                if b and ms_f is not None:
-                                    score_s = f"{score:.1f}" if score is not None else "?"
-                                    sign_s = f"{sign:+.0f}" if sign is not None else "?"
-                                    lines.append(f"- {j}. `{b}`: {ms_f:.0f} ms | Score: {score_s} (Sign: {sign_s})")
-                            ai_model_times_placeholder.markdown("\n".join(lines))
-                    except Exception:
-                        pass
-                    return auc, elapsed_steps
                 actual_row = {
                     "BT Index": actual_bt_index,
                     "Source": "Actual",

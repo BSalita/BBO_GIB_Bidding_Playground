@@ -67,8 +67,14 @@ from bbo_bid_details_lib import (
     compute_phase2a_auction_conditioned_posteriors,
 )
 from bbo_explanation_lib import (
+    compute_partner_major_game_commit_adjustment,
+    compute_pass_signoff_bonus,
+    compute_post_game_slam_gate_adjustment,
+    compute_rebiddable_major_game_bonus,
+    compute_non_rebiddable_suit_rebid_penalty,
     compute_eeo_from_bid_details,
     compute_guardrail_penalty,
+    expected_from_hist,
     hand_controls,
     render_counterfactual_why_not,
     render_recommendation_explanation,
@@ -11843,6 +11849,40 @@ def handle_ai_model_advanced_path(
         passed_sorted = passed_opts[: max(1, int(top_n))]
         auction_full = "-".join(tokens)
 
+        def _parse_contract_bid_text(bid_text: str) -> tuple[int, str] | None:
+            s = str(bid_text or "").strip().upper()
+            if len(s) < 2 or not s[0].isdigit():
+                return None
+            try:
+                lvl = int(s[0])
+            except Exception:
+                return None
+            st = s[1:]
+            if st == "NT":
+                st = "N"
+            if lvl < 1 or lvl > 7 or st not in ("C", "D", "H", "S", "N"):
+                return None
+            return (lvl, st)
+
+        def _game_level_for_strain(st: str) -> int:
+            if st == "N":
+                return 3
+            if st in ("H", "S"):
+                return 4
+            return 5
+
+        def _strain_rank(st: str) -> int:
+            return {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}.get(str(st or "").upper(), -1)
+
+        def _token_bidder_dir(token_idx: int) -> str:
+            try:
+                directions = ["N", "E", "S", "W"]
+                d = str(dealer_actual or "N").upper()
+                i = directions.index(d) if d in directions else 0
+                return directions[(i + int(token_idx)) % 4]
+            except Exception:
+                return "N"
+
         def _score_one(opt: Dict[str, Any]) -> Tuple[float, str, float, float, bool, Dict[str, Any]]:
             bid1 = str(opt.get("bid", "") or "").strip().upper()
             if not bid1:
@@ -11873,80 +11913,28 @@ def handle_ai_model_advanced_path(
                     except Exception:
                         pass
 
-                # ---- CONTRACT-ON-TABLE FALLBACK ----
-                # When the intermediate Pass node has no BT stats (avg_ev/avg_par
-                # are both None), but a GAME-LEVEL+ contract is already established
-                # in the auction, look up the *terminal* auction's mean_par so Pass
-                # is valued at the expected outcome of accepting the current contract.
-                # Without this, Pass defaults to 0.0, making almost any bid look
-                # better than stopping in a making game.
-                #
-                # IMPORTANT: Only activate for game-level+ contracts (3NT, 4M, 5m,
-                # slams).  For partscores (e.g. 1S-P), the terminal mean_par is
-                # heavily biased by the opener's hand strength in the BT population
-                # and produces inflated values (e.g. 489 for 1S) that make Pass
-                # always win over constructive bidding.  At partscore, the non-Pass
-                # bids are scored via /bid-details with criteria conditioning, and
-                # the Pass should compete on the same scale (avg_ev/avg_par or 0.0).
-                _GAME_LEVEL_THRESHOLDS = {
-                    "C": 5, "D": 5, "H": 4, "S": 4, "N": 3, "NT": 3,
-                }
-                if score_val is None and tokens:
-                    try:
-                        # Find the highest contract bid in the current auction
-                        _highest_level = 0
-                        _highest_strain = ""
-                        for t in (tk.upper() for tk in tokens):
-                            if len(t) >= 2 and t[0].isdigit() and t[1] in "CDHSN":
-                                _lvl = int(t[0])
-                                _st = t[1:].replace("T", "")  # NT -> N
-                                if _lvl > _highest_level or (_lvl == _highest_level and _st > _highest_strain):
-                                    _highest_level = _lvl
-                                    _highest_strain = _st
-                        # Only use terminal fallback for game-level+ contracts
-                        _game_min = _GAME_LEVEL_THRESHOLDS.get(_highest_strain, 4)
-                        has_contract = _highest_level >= _game_min
-                        if has_contract:
-                            # Build the "passed-out" auction
-                            completed_tok = list(tokens) + ["P"]
-                            while not _is_auction_complete_list(completed_tok):
-                                completed_tok.append("P")
-                            bt_tok_c, _lp_c = _strip_leading_passes_tokens(completed_tok)
-                            bt_prefix_c = "-".join(bt_tok_c) if bt_tok_c else ""
-                            terminal_bt_idx = _resolve_bt_index_by_traversal(state, bt_prefix_c)
-                            if terminal_bt_idx is not None:
-                                bt_ev_stats_df = state.get("bt_ev_stats_df")
-                                if bt_ev_stats_df is not None:
-                                    ev_map = preload_precomputed_ev_par_stats(
-                                        bt_ev_stats_df, bt_indices=[int(terminal_bt_idx)]
-                                    )
-                                    ev_data = ev_map.get(int(terminal_bt_idx))
-                                    if ev_data is not None:
-                                        _, _, _par_nv, _par_v = get_avg_ev_par_precomputed_nv_v(
-                                            ev_data, seat=int(seat_bt)
-                                        )
-                                        # Determine if acting player is vulnerable
-                                        _vul_s = str(board_vul or "").strip().upper()
-                                        _ns_vul = _vul_s in ("N_S", "NS", "BOTH", "ALL")
-                                        _ew_vul = _vul_s in ("E_W", "EW", "BOTH", "ALL")
-                                        _act_vul = (acting_dir in ("N", "S") and _ns_vul) or (
-                                            acting_dir in ("E", "W") and _ew_vul
-                                        )
-                                        _par_val = _par_v if _act_vul else _par_nv
-                                        if _par_val is not None:
-                                            score_val = float(_par_val)
-                                            _pass_source = "terminal_contract"
-                    except Exception:
-                        pass  # Best-effort; fall through to 0.0
-
                 if score_val is None:
                     score_val = 0.0
 
+                pass_bonus = 0.0
+                pass_bonus_reason: str | None = None
+                try:
+                    pass_bonus, pass_bonus_reason = compute_pass_signoff_bonus(
+                        auction_tokens=tokens,
+                        acting_direction=acting_dir,
+                        dealer_actual=dealer_actual,
+                    )
+                except Exception:
+                    pass_bonus = 0.0
+                    pass_bonus_reason = None
+
                 # Apply perspective flip (same as non-Pass base)
-                final_score = float(acting_sign) * float(score_val)
+                final_score = float(acting_sign) * float(score_val) + float(pass_bonus)
                 return final_score, bid1, 0.0, 0.0, False, {
                     "pass_score": float(score_val),
                     "pass_source": _pass_source,
+                    "pass_bonus": float(pass_bonus),
+                    "pass_bonus_reason": pass_bonus_reason,
                     "acting_sign": float(acting_sign),
                 }
 
@@ -11954,7 +11942,7 @@ def handle_ai_model_advanced_path(
             # has actual stats — i.e. terminal/completed auctions that joined with
             # the stats table).  Non-terminal rows have NULL stats from the LEFT JOIN
             # and would score 0.0, so we must fall through to the full bid-details path.
-            cache_row = _lookup_bid_feature_cache_row(state, opt.get("bt_index"))
+            cache_row = None  # Disabled for strict parity with Streamlit Advanced scorer.
             if cache_row is not None:
                 def _is_vul_for_acting(vul_val: Any, dir_to_act: str) -> bool:
                     s = str(vul_val or "").strip().upper()
@@ -12029,15 +12017,8 @@ def handle_ai_model_advanced_path(
                 seed=int(seed or 0),
                 vul_filter=str(board_vul or "") if board_vul is not None else None,
                 deal_index=deal_index_i,
-                topk=1,
+                topk=10,
                 include_phase2a=True,
-                # Performance-critical: AI Model scoring currently consumes only:
-                # - phase2a.threat (fit-based)
-                # - phase2a.range_percentiles
-                # It does NOT use keycards/onside, which require parsing Hand_* strings.
-                # Disable them to preserve bid choice while drastically reducing CPU.
-                phase2a_include_keycards=False,
-                phase2a_include_onside=False,
                 include_timing=True,
             )
             d_ms = 0.0
@@ -12056,6 +12037,13 @@ def handle_ai_model_advanced_path(
 
             par_score = details.get("par_score") or {}
             mean_par = par_score.get("mean")
+            bt_acting_criteria: list[str] = []
+            try:
+                _crit = details.get("bt_acting_criteria") or []
+                if isinstance(_crit, list):
+                    bt_acting_criteria = [str(x) for x in _crit if str(x or "").strip()]
+            except Exception:
+                bt_acting_criteria = []
 
             eeo = {}
             try:
@@ -12137,9 +12125,17 @@ def handle_ai_model_advanced_path(
 
             # Guardrail penalty
             guard_penalty = 0.0
+            self_tp_val = None
+            partner_tp_hist_val = None
+            non_rebiddable_rebid_penalty = 0.0
+            non_rebiddable_rebid_reason: str | None = None
+            rebiddable_major_game_bonus = 0.0
+            rebiddable_major_game_reason: str | None = None
+            partner_major_game_bonus = 0.0
+            partner_major_detour_penalty = 0.0
+            partner_major_reason: str | None = None
             try:
                 if float(w_guard) > 0:
-                    self_tp_val = None
                     try:
                         rp2 = details.get("range_percentiles")
                         if isinstance(rp2, dict):
@@ -12149,7 +12145,6 @@ def handle_ai_model_advanced_path(
                     except Exception:
                         self_tp_val = None
 
-                    partner_tp_hist_val = None
                     try:
                         p2a = details.get("phase2a") or {}
                         partner_tp_hist_val = ((p2a.get("roles") or {}).get("partner") or {}).get("total_points_hist")
@@ -12182,6 +12177,83 @@ def handle_ai_model_advanced_path(
             except Exception:
                 guard_penalty = 0.0
 
+            # Additional bridge-texture guardrail:
+            # Penalize same-player suit rebids that are not rebiddable by hand.
+            try:
+                if float(w_guard) > 0:
+                    _nr_p, _nr_reason = compute_non_rebiddable_suit_rebid_penalty(
+                        bid_text=bid1,
+                        auction_tokens=tokens,
+                        acting_direction=acting_dir,
+                        dealer_actual=dealer_actual,
+                        bt_acting_criteria=bt_acting_criteria,
+                    )
+                    non_rebiddable_rebid_penalty = float(_nr_p) * float(w_guard)
+                    non_rebiddable_rebid_reason = _nr_reason
+            except Exception:
+                non_rebiddable_rebid_penalty = 0.0
+                non_rebiddable_rebid_reason = None
+
+            # Bonus for directly committing to game in a strongly rebiddable
+            # major already shown by acting player.
+            try:
+                _rb_bonus, _rb_reason = compute_rebiddable_major_game_bonus(
+                    bid_text=bid1,
+                    auction_tokens=tokens,
+                    acting_direction=acting_dir,
+                    dealer_actual=dealer_actual,
+                    bt_acting_criteria=bt_acting_criteria,
+                )
+                rebiddable_major_game_bonus = float(_rb_bonus)
+                rebiddable_major_game_reason = _rb_reason
+            except Exception:
+                rebiddable_major_game_bonus = 0.0
+                rebiddable_major_game_reason = None
+
+            # Partner-major context: if partner has repeatedly shown a major,
+            # prefer direct game in that major over side-suit detours.
+            try:
+                _pm_bonus, _pm_pen, _pm_reason = compute_partner_major_game_commit_adjustment(
+                    bid_text=bid1,
+                    auction_tokens=tokens,
+                    acting_direction=acting_dir,
+                    dealer_actual=dealer_actual,
+                    bt_acting_criteria=bt_acting_criteria,
+                )
+                partner_major_game_bonus = float(_pm_bonus)
+                partner_major_detour_penalty = float(_pm_pen)
+                partner_major_reason = _pm_reason
+            except Exception:
+                partner_major_game_bonus = 0.0
+                partner_major_detour_penalty = 0.0
+                partner_major_reason = None
+
+            post_game_slam_gate_penalty = 0.0
+            p_slam_tp_ge_33 = None
+            combined_tp_mean = None
+            game_contract_on_table = False
+            post_game_slam_gate_reason: str | None = None
+            try:
+                _slam_adj = compute_post_game_slam_gate_adjustment(
+                    bid_text=bid1,
+                    auction_tokens=tokens,
+                    acting_direction=acting_dir,
+                    dealer_actual=dealer_actual,
+                    self_total_points=self_tp_val,
+                    partner_tp_hist=partner_tp_hist_val,
+                )
+                post_game_slam_gate_penalty = float(_slam_adj.get("penalty") or 0.0)
+                p_slam_tp_ge_33 = _slam_adj.get("p_slam_tp_ge_33")
+                combined_tp_mean = _slam_adj.get("combined_tp_mean")
+                game_contract_on_table = bool(_slam_adj.get("game_contract_on_table"))
+                post_game_slam_gate_reason = _slam_adj.get("reason")
+            except Exception:
+                post_game_slam_gate_penalty = 0.0
+                p_slam_tp_ge_33 = None
+                combined_tp_mean = None
+                game_contract_on_table = False
+                post_game_slam_gate_reason = None
+
             try:
                 # Reconstruct utility from perspective of acting side.
                 # "utility" from eeo is NS-relative (Mean_NS - Penalties).
@@ -12198,7 +12270,17 @@ def handle_ai_model_advanced_path(
                 desc_term = float(desc_score - 0.5) if desc_score is not None else 0.0
                 threat_term = float(opp_threat) if opp_threat is not None else 0.0
                 # Use shrunk base, subtract guardrail penalty
-                score_val = base_shrunk + float(w_desc) * desc_term - float(w_threat) * threat_term - guard_penalty
+                score_val = (
+                    base_shrunk
+                    + float(w_desc) * desc_term
+                    - float(w_threat) * threat_term
+                    - guard_penalty
+                    - float(non_rebiddable_rebid_penalty)
+                    - float(post_game_slam_gate_penalty)
+                    + float(rebiddable_major_game_bonus)
+                    + float(partner_major_game_bonus)
+                    - float(partner_major_detour_penalty)
+                )
                 breakdown = {
                     "base": round(base, 2),
                     "base_shrunk": round(base_shrunk, 2),
@@ -12210,6 +12292,18 @@ def handle_ai_model_advanced_path(
                     "opp_threat": round(float(opp_threat), 4) if opp_threat is not None else None,
                     "w_threat_contrib": round(float(w_threat) * threat_term, 2),
                     "guard_penalty": round(guard_penalty, 2),
+                    "non_rebiddable_rebid_penalty": round(float(non_rebiddable_rebid_penalty), 2),
+                    "non_rebiddable_rebid_reason": non_rebiddable_rebid_reason,
+                    "post_game_slam_gate_penalty": round(float(post_game_slam_gate_penalty), 2),
+                    "post_game_slam_gate_reason": post_game_slam_gate_reason,
+                    "rebiddable_major_game_bonus": round(float(rebiddable_major_game_bonus), 2),
+                    "rebiddable_major_game_reason": rebiddable_major_game_reason,
+                    "partner_major_game_bonus": round(float(partner_major_game_bonus), 2),
+                    "partner_major_detour_penalty": round(float(partner_major_detour_penalty), 2),
+                    "partner_major_reason": partner_major_reason,
+                    "game_contract_on_table": bool(game_contract_on_table),
+                    "p_slam_tp_ge_33": round(float(p_slam_tp_ge_33), 4) if p_slam_tp_ge_33 is not None else None,
+                    "combined_tp_mean": round(float(combined_tp_mean), 2) if combined_tp_mean is not None else None,
                     "est_tricks": round(float(_est_tricks_api), 2) if _est_tricks_api is not None else None,
                     "utility": round(float(utility), 2) if utility is not None else None,
                     "acting_sign": float(acting_sign),
@@ -12227,6 +12321,7 @@ def handle_ai_model_advanced_path(
         bd_p2_ms_sum = 0.0
         bd_hits = 0
         bid_scores: List[Dict[str, Any]] = []
+        scored_rows: List[Tuple[float, str, Dict[str, Any]]] = []
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futs = [ex.submit(_score_one, opt) for opt in passed_sorted]
@@ -12240,9 +12335,8 @@ def handle_ai_model_advanced_path(
                     bd_p2_ms_sum += float(p2_ms or 0.0)
                     bd_hits += 1 if hit else 0
                     bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, **bkdn})
-                    if b and sc > best_score:
-                        best_score = sc
-                        best_bid = b
+                    if b:
+                        scored_rows.append((float(sc), str(b), bkdn))
         except Exception:
             for opt in passed_sorted:
                 sc, b, d_ms, p2_ms, hit, bkdn = _score_one(opt)
@@ -12251,9 +12345,13 @@ def handle_ai_model_advanced_path(
                 bd_p2_ms_sum += float(p2_ms or 0.0)
                 bd_hits += 1 if hit else 0
                 bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, **bkdn})
-                if b and sc > best_score:
-                    best_score = sc
-                    best_bid = b
+                if b:
+                    scored_rows.append((float(sc), str(b), bkdn))
+        if scored_rows:
+            # Deterministic tie-break: score desc, then lexical bid asc.
+            scored_rows.sort(key=lambda t: (-float(t[0]), str(t[1])))
+            best_score = float(scored_rows[0][0])
+            best_bid = str(scored_rows[0][1])
         # Sort bid_scores by score descending for readability
         bid_scores.sort(key=lambda x: float(x.get("score") or float("-inf")), reverse=True)
 
