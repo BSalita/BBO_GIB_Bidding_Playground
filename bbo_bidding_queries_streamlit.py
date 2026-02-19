@@ -4868,11 +4868,15 @@ def _render_batch_input_from_deals_df() -> dict[str, Any]:
 
 def _render_batch_input_from_pbn() -> dict[str, Any]:
     """Render local/URL PBN input controls and return normalized config."""
-    url_col, dl_col = st.columns([5, 1])
+    url_col, dl_col = st.columns([5, 1], vertical_alignment="bottom")
     with url_col:
-        pbn_url = st.text_input("PBN URL", key="_batch_pbn_url", placeholder="https://.../file.pbn")
+        pbn_url = st.text_input(
+            "PBN URL",
+            key="_batch_pbn_url",
+            value="https://raw.githubusercontent.com/BSalita/Calculate_PBN_Results/refs/heads/master/DDS_Camrose24_1-%20BENCAM22%20v%20WBridge5.pbn",
+        )
     with dl_col:
-        download_clicked = st.button("Download", key="_batch_pbn_download")
+        download_clicked = st.button("Download", key="_batch_pbn_download", use_container_width=True)
 
     pbn_file = st.file_uploader("Upload PBN File", type=["pbn"], key="_batch_pbn_upload")
 
@@ -4881,6 +4885,7 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
             pbn_content = pbn_file.read().decode("utf-8", errors="replace")
             parsed_boards = parse_pbn_file_to_boards(pbn_content)
             st.session_state["_arena_pbn_boards"] = parsed_boards
+            st.session_state["_batch_count_pbn"] = len(parsed_boards)
             st.success(f"Loaded **{len(parsed_boards)}** board(s) from `{pbn_file.name}`.")
         except Exception as e:
             st.error(f"Failed to parse PBN file: {e}")
@@ -4890,6 +4895,7 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
             pbn_content = _download_text_from_url(pbn_url, "PBN")
             parsed_boards = parse_pbn_file_to_boards(pbn_content)
             st.session_state["_arena_pbn_boards"] = parsed_boards
+            st.session_state["_batch_count_pbn"] = len(parsed_boards)
             st.success(f"Downloaded and parsed **{len(parsed_boards)}** board(s) from URL.")
         except Exception as e:
             st.error(f"Failed to download/parse PBN URL: {e}")
@@ -4916,11 +4922,11 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
 
 def _render_batch_input_from_csv() -> dict[str, Any]:
     """Render local/URL CSV input controls and return normalized config."""
-    url_col, dl_col = st.columns([5, 1])
+    url_col, dl_col = st.columns([5, 1], vertical_alignment="bottom")
     with url_col:
         csv_url = st.text_input("CSV URL", key="_batch_csv_url", placeholder="https://.../file.csv")
     with dl_col:
-        download_clicked = st.button("Download", key="_batch_csv_download")
+        download_clicked = st.button("Download", key="_batch_csv_download", use_container_width=True)
 
     csv_file = st.file_uploader("Upload CSV File", type=["csv"], key="_batch_csv_upload")
     st.caption("CSV header row must include: Deals, Dealer, Vul. It may include additional columns.")
@@ -4930,6 +4936,7 @@ def _render_batch_input_from_csv() -> dict[str, Any]:
             csv_content = csv_file.read().decode("utf-8", errors="replace")
             parsed_boards = parse_csv_to_boards(csv_content)
             st.session_state["_arena_csv_boards"] = parsed_boards
+            st.session_state["_batch_count_csv"] = len(parsed_boards)
             st.success(f"Loaded **{len(parsed_boards)}** row(s) from `{csv_file.name}`.")
         except Exception as e:
             st.error(f"Failed to parse CSV file: {e}")
@@ -4939,6 +4946,7 @@ def _render_batch_input_from_csv() -> dict[str, Any]:
             csv_content = _download_text_from_url(csv_url, "CSV")
             parsed_boards = parse_csv_to_boards(csv_content)
             st.session_state["_arena_csv_boards"] = parsed_boards
+            st.session_state["_batch_count_csv"] = len(parsed_boards)
             st.success(f"Downloaded and parsed **{len(parsed_boards)}** row(s) from URL.")
         except Exception as e:
             st.error(f"Failed to download/parse CSV URL: {e}")
