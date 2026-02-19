@@ -16,6 +16,7 @@ from __future__ import annotations
 
 
 import streamlit as st
+import streamlit.components.v1 as st_components
 from st_aggrid import AgGrid, GridOptionsBuilder, ColumnsAutoSizeMode, JsCode
 from st_aggrid.shared import DataReturnMode
 import polars as pl
@@ -4471,7 +4472,6 @@ def render_ai_model_batch_arena():
 
         progress_bar = st.progress(0, text="Starting batch...")
         status_text = st.empty()
-        results_placeholder = st.empty()
 
         # Accumulate per-deal debug entries for data/batch_arena_debug.json
         _batch_debug_entries: list[dict] = []
@@ -4479,7 +4479,7 @@ def render_ai_model_batch_arena():
         indices = list(range(int(start_index), int(start_index) + int(deal_count)))
 
         # Pre-fetch all deal rows in one batch call
-        status_text.text(f"Fetching {len(indices)} deal rows...")
+        status_text.text("")
         try:
             deals_resp = api_post(
                 "/deals-by-index",
@@ -4518,7 +4518,7 @@ def render_ai_model_batch_arena():
             if deal_row is None:
                 results.append({"Deal": deal_idx, "Error": "not_found"})
                 st.session_state["_arena_batch_results"] = list(results)
-                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — not found")
+                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — not found — IMP: {imp_running:+d}")
                 continue
 
             dealer = str(deal_row.get("Dealer", "N")).upper()
@@ -4529,11 +4529,11 @@ def render_ai_model_batch_arena():
             if row_idx is None:
                 results.append({"Deal": deal_idx, "Error": "no_row_idx"})
                 st.session_state["_arena_batch_results"] = list(results)
-                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — no _row_idx")
+                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — no _row_idx — IMP: {imp_running:+d}")
                 continue
 
             # ---- Start AI Model async job ----
-            progress_bar.progress(i / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — running AI Model...")
+            progress_bar.progress(i / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — IMP: {imp_running:+d} — running AI Model...")
             try:
                 start_resp = api_post(
                     "/ai-model-advanced-path/start",
@@ -4544,7 +4544,7 @@ def render_ai_model_batch_arena():
             except Exception as e:
                 results.append({"Deal": deal_idx, "Error": f"start_failed: {e}"})
                 st.session_state["_arena_batch_results"] = list(results)
-                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — start failed")
+                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — start failed — IMP: {imp_running:+d}")
                 continue
 
             if not job_id:
@@ -4577,7 +4577,7 @@ def render_ai_model_batch_arena():
 
             if not poll_ok:
                 st.session_state["_arena_batch_results"] = list(results)
-                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — failed/timeout")
+                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — failed/timeout — IMP: {imp_running:+d}")
                 continue
 
             # ---- Compute scores ----
@@ -4730,17 +4730,19 @@ def render_ai_model_batch_arena():
                 (i + 1) / len(indices),
                 text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — IMP running: {imp_running:+d} — ETA {eta_s:.0f}s",
             )
-            # Render partial results
-            _render_batch_results_df(results, results_placeholder)
+            # Live table intentionally omitted — AgGrid renders after st.rerun().
 
         else:
             # Loop completed without cancel
             elapsed_total = time.perf_counter() - t_batch_start
             status_text.text(f"Batch complete: {len(results)} deals in {elapsed_total:.1f}s. IMP running total: {imp_running:+d}")
 
-        # Final render
+        # Store results and rerun — the interactive table is rendered outside
+        # this block (always, on every rerun) so there is never a duplicate.
         st.session_state["_arena_batch_results"] = list(results)
-        _render_batch_results_df(results, results_placeholder)
+        st.session_state["_arena_deal_row_map"] = deal_row_map
+        st.session_state["_batch_selected_result"] = None  # clear any stale selection
+        st.rerun()
 
         # ── Write batch debug log for agent/diagnostic access ──
         try:
@@ -4824,15 +4826,15 @@ def render_ai_model_batch_arena():
         except Exception:
             pass  # Debug dump is best-effort; never break the UI
 
-    # ---- Display previous results (persisted in session_state) ----
-    prev_results = st.session_state.get("_arena_batch_results")
-    if prev_results and not run_clicked:
-        st.subheader("Previous Batch Results")
-        _render_batch_results_df(prev_results, st.empty())
-
-    # ---- Export button ----
-    all_results = st.session_state.get("_arena_batch_results")
+    # ---- Results table (always rendered; single source of truth) ----
+    # This block runs on every Streamlit execution that is not mid-batch.
+    # It shows the interactive AgGrid table, the export button, and — when a
+    # row has been clicked — the deal diagram followed by the selected-row detail.
+    all_results: list[dict] = st.session_state.get("_arena_batch_results") or []
     if all_results:
+        _render_batch_results_df(all_results, st, interactive=True, aggrid_key="_batch_results_main")
+
+        # Export button
         results_df = pd.DataFrame(all_results)
         csv_bytes = results_df.to_csv(index=False).encode("utf-8")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -4844,34 +4846,131 @@ def render_ai_model_batch_arena():
             key="_batch_export",
         )
 
+        # ---- Row-click: deal diagram then single-row detail ----
+        _sel_result: dict | None = st.session_state.get("_batch_selected_result")
+        _deal_row_map: dict[int, dict] = st.session_state.get("_arena_deal_row_map") or {}
+        if _sel_result:
+            _sel_deal_idx = _sel_result.get("Deal")
+            st.divider()
 
-def _render_batch_results_df(results: list[dict], container) -> None:
-    """Render the batch results DataFrame with color-coded IMP_Diff rows."""
+            # 1. Deal diagram
+            _deal_row = _deal_row_map.get(int(_sel_deal_idx)) if _sel_deal_idx is not None else None
+            if _deal_row:
+                _diag_deal = dict(_deal_row)
+                _diag_deal.setdefault("ParScore", _sel_result.get("Par"))
+                _diag_deal.setdefault("Score", _sel_result.get("DD_Score_AI"))
+                render_deal_diagram(
+                    _diag_deal,
+                    title=f"📋 Deal {_sel_deal_idx}",
+                    show_header=True,
+                    width_ratio=(3, 7),
+                )
+            else:
+                st.info("Deal diagram unavailable — re-run the batch to load hand data.")
+
+            # 2. Single-row detail — same colour as the clicked row
+            _display_result = {k: v for k, v in _sel_result.items() if not k.startswith("_")}
+            _imp_val = _display_result.get("IMP_Diff")
+            if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):
+                _imp_int = int(_imp_val)
+                _imp_color = "Valid" if _imp_int > 0 else ("Invalid" if _imp_int < 0 else "Neutral")
+            else:
+                _imp_color = "Neutral"  # no class → white
+            _display_result["_IMP_Color"] = _imp_color
+            render_aggrid(
+                [_display_result],
+                key=f"_batch_selected_detail_{_sel_deal_idx}",
+                table_name=None,
+                show_sql_expander=False,
+                row_bucket_col="_IMP_Color",
+                hide_cols=["_IMP_Color"],
+                height=calc_grid_height(1),
+            )
+
+            # Scroll to bottom after all content is rendered.
+            st_components.html(
+                "<script>window.parent.document.querySelector('.main').scrollTo("
+                "{top: window.parent.document.querySelector('.main').scrollHeight, behavior: 'smooth'});"
+                "</script>",
+                height=0,
+            )
+
+
+def _render_batch_results_df(
+    results: list[dict],
+    container,
+    *,
+    interactive: bool = False,
+    aggrid_key: str = "_batch_results_grid",
+    height: int | None = None,
+) -> None:
+    """Render the batch results DataFrame with color-coded IMP_Diff rows.
+
+    Args:
+        results: List of result dicts produced by the batch loop.
+        container: Streamlit container (st, st.empty(), etc.) to render into.
+        interactive: When True uses AgGrid with selectionChanged so clicking a
+            row triggers a Streamlit rerun and exposes the deal diagram.
+            Set False during live in-loop updates to avoid key conflicts.
+        aggrid_key: Unique AgGrid key (must differ between final and previous
+            result renders to avoid widget-state collision).
+    """
     if not results:
         return
-    df = pd.DataFrame(results)
-    if "Error" in df.columns:
-        # Keep error rows visible but don't style them
-        pass
 
-    if "IMP_Diff" in df.columns:
-        def _color_row(row):
-            imp = row.get("IMP_Diff")
-            if imp is None or pd.isna(imp):
+    if not interactive:
+        # Plain styled pandas table — used during the live batch-update loop.
+        df = pd.DataFrame(results)
+        if "IMP_Diff" in df.columns:
+            def _color_row(row):
+                imp = row.get("IMP_Diff")
+                if imp is None or pd.isna(imp):
+                    return [""] * len(row)
+                if imp < 0:
+                    return ["background-color: #ffcccc"] * len(row)
+                elif imp > 0:
+                    return ["background-color: #ccffcc"] * len(row)
                 return [""] * len(row)
-            if imp < 0:
-                return ["background-color: #ffcccc"] * len(row)  # red tint
-            elif imp > 0:
-                return ["background-color: #ccffcc"] * len(row)  # green tint
+            styled = df.style.apply(_color_row, axis=1).format(
+                {col: "{:.1f}" for col in ("EV_Actual", "EV_AI") if col in df.columns}
+            )
+            container.dataframe(styled, width="stretch", hide_index=True)
+        else:
+            container.dataframe(df, width="stretch", hide_index=True)
+        return
+
+    # ---- Interactive AgGrid with row-click support ----
+    # Map IMP_Diff to a bucket column for row colouring:
+    #   Valid (green) = AI did better, Invalid (red) = AI did worse, Rejected (yellow) = tied/unknown
+    enriched: list[dict] = []
+    for r in results:
+        row = dict(r)
+        imp = row.get("IMP_Diff")
+        if imp is not None and not (isinstance(imp, float) and pd.isna(imp)):
+            imp_int = int(imp)
+            if imp_int > 0:
+                row["_IMP_Color"] = "Valid"
+            elif imp_int < 0:
+                row["_IMP_Color"] = "Invalid"
             else:
-                return [""] * len(row)
+                row["_IMP_Color"] = "Neutral"  # no class → white
+        else:
+            row["_IMP_Color"] = "Neutral"  # no class → white
+        enriched.append(row)
 
-        styled = df.style.apply(_color_row, axis=1).format(
-            {col: "{:.1f}" for col in ("EV_Actual", "EV_AI") if col in df.columns}
-        )
-        container.dataframe(styled, width="stretch", hide_index=True)
-    else:
-        container.dataframe(df, width="stretch", hide_index=True)
+    selected_records = render_aggrid(
+        enriched,
+        key=aggrid_key,
+        table_name=None,
+        show_sql_expander=False,
+        row_bucket_col="_IMP_Color",
+        hide_cols=["_IMP_Color"],
+        update_on=["selectionChanged"],
+        height=height if height is not None else calc_grid_height(len(enriched), max_height=600),
+    )
+
+    if selected_records:
+        st.session_state["_batch_selected_result"] = selected_records[0]
 
 
 # ---------------------------------------------------------------------------
@@ -14251,11 +14350,11 @@ st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
 func_choice = st.sidebar.selectbox(
     "Function",
     [
+        "AI Model Batch Arena",          # Batch compare AI Model vs Actual auctions
         "Auction Builder",               # Build auction step-by-step with BT lookups
         "Deals by Auction Pattern",      # Primary: find deals matching auction criteria
         "Analyze Actual Auctions",       # Group deals by bid column, analyze outcomes
         "Bidding Arena",                 # Head-to-head model comparison
-        "AI Model Batch Arena",          # Batch compare AI Model vs Actual auctions
         "Auction Criteria Debugger",     # Debug why an auction is rejected
         "New Rules Metrics",             # View detailed rule discovery metrics
         "Wrong Bid Analysis",            # Wrong bid statistics and leaderboard
