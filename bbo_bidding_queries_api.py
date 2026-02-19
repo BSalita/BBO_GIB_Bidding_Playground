@@ -1583,7 +1583,10 @@ class GreedyModelPathRequest(BaseModel):
 
 class AiModelAdvancedPathStartRequest(BaseModel):
     """Request to start an async AI Model (Advanced) path job (avoid client timeouts)."""
-    deal_row_idx: int
+    # When deal_row_idx is -1 (sentinel), deal_row_dict must be provided (PBN/CSV on-the-fly deals).
+    deal_row_idx: int = -1
+    # Full deal row dict for on-the-fly deals (PBN/CSV) that are not in the BBO database.
+    deal_row_dict: Optional[Dict[str, Any]] = None
     seed: int = 0
     max_steps: int = 40
     top_n: int = 12
@@ -1600,6 +1603,15 @@ class AiModelAdvancedPathStartRequest(BaseModel):
     w_guard_sacrifice: float = 0.7
     w_guard_tricks: float = 30.0
     permissive_pass: bool = True
+
+
+class CustomCriteriaImpactRequest(BaseModel):
+    """Request to estimate the impact of adding new criteria to a BT auction node."""
+    auction: str = ""
+    criteria: List[str]
+    seat: int = 1
+    dealer: str = "N"
+    sample_size: int = 10_000
 
 
 class DealMatchedBTSampleRequest(BaseModel):
@@ -2454,6 +2466,16 @@ def _heavy_init() -> None:
             available_criteria_names = set(deal_criteria_by_direction_dfs[ref_dir].columns)
         except Exception:
             available_criteria_names = None
+
+        # Save criteria expressions for dynamic on-the-fly evaluation (PBN/CSV deals not in DB).
+        # Maps: direction -> { orig_expr (directionless) -> pythonized_polars_expr_str }
+        # This allows handle_deal_criteria_pass_batch to evaluate criteria against an arbitrary
+        # deal_row dict instead of requiring a pre-computed bitmap row index.
+        with _STATE_LOCK:
+            STATE["criteria_pythonized_exprs_by_direction"] = {
+                d: dict(exprs) for d, exprs in pythonized_exprs_by_direction.items()
+            }
+        print(f"[init] Saved criteria_pythonized_exprs_by_direction ({sum(len(v) for v in pythonized_exprs_by_direction.values())} total exprs)")
 
         # We no longer need these large helper objects
         del criteria_deal_dfs_directional, pythonized_exprs_by_direction, directionless_criteria_cols
@@ -4472,6 +4494,7 @@ def ai_model_advanced_path_start(req: AiModelAdvancedPathStartRequest) -> Dict[s
         return handler_module.handle_ai_model_advanced_path(
             state=state,
             deal_row_idx=int(req.deal_row_idx),
+            deal_row_dict=req.deal_row_dict,
             seed=int(req.seed or 0),
             max_steps=int(req.max_steps),
             top_n=int(req.top_n),
@@ -4503,6 +4526,26 @@ def ai_model_advanced_path_status(job_id: str) -> Dict[str, Any]:
     if job is None:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
     return _attach_hot_reload_info(job, reload_info)
+
+
+@app.post("/custom-criteria-impact")
+def custom_criteria_impact(req: CustomCriteriaImpactRequest) -> Dict[str, Any]:
+    """Estimate the impact (blast radius) of adding new criteria to a BT auction node.
+
+    Samples deals from the database and evaluates each proposed criterion against them,
+    reporting pass/fail counts and percentages.  Combined stats show how many deals
+    would be excluded by ANY of the proposed criteria together.
+    """
+    state, reload_info, handler_module = _prepare_handler_call()
+    result = handler_module.handle_custom_criteria_impact(
+        state,
+        auction=str(req.auction),
+        criteria=list(req.criteria),
+        seat=int(req.seat),
+        dealer=str(req.dealer),
+        sample_size=int(req.sample_size),
+    )
+    return _attach_hot_reload_info(result, reload_info)
 
 
 @app.post("/greedy-model-path")

@@ -25,6 +25,7 @@ import pandas as pd
 import time
 import requests
 import base64
+import io
 import numpy as np
 from datetime import datetime, timezone
 import importlib.metadata as importlib_metadata
@@ -96,6 +97,10 @@ MATCH_ALL_DEALERS_HELP = (
 # Auction Builder Notes (CSV-backed, local)
 AUCTION_BUILDER_NOTES_MAX_CHARS = 200
 AUCTION_BUILDER_NOTES_CSV = pathlib.Path(__file__).resolve().parent / "data" / "auction_builder_notes.csv"
+
+# Batch Arena Notes (CSV-backed, local)
+BATCH_ARENA_NOTES_MAX_CHARS = 200
+BATCH_ARENA_NOTES_CSV = pathlib.Path(__file__).resolve().parent / "data" / "batch_arena_notes.csv"
 AUCTION_BUILDER_LAST_PIN_TXT = pathlib.Path(__file__).resolve().parent / "data" / "auction_builder_last_pinned_deal_index.txt"
 CUSTOM_QUESTIONS_CSV = pathlib.Path(__file__).resolve().parent / "data" / "bbo_custom_questions.csv"
 
@@ -189,6 +194,82 @@ def auction_builder_upsert_or_delete_note(*, deal_index: int, note: str) -> None
         )
     df = df.sort("deal_index")
     _auction_builder_atomic_write_csv(df, AUCTION_BUILDER_NOTES_CSV)
+
+
+# ---------------------------------------------------------------------------
+# Batch Arena Notes helpers (CSV-backed, keyed by deal_key string)
+# ---------------------------------------------------------------------------
+
+def _batch_arena_notes_empty_df() -> pl.DataFrame:
+    return pl.DataFrame(
+        {"deal_key": [], "label": [], "note": [], "updated_at": []},
+        schema={"deal_key": pl.Utf8, "label": pl.Utf8, "note": pl.Utf8, "updated_at": pl.Utf8},
+    )
+
+
+def _batch_arena_load_notes_df(path: pathlib.Path) -> pl.DataFrame:
+    """Load batch-arena notes CSV. Missing file => empty DataFrame."""
+    if not path.exists():
+        return _batch_arena_notes_empty_df()
+    df = pl.read_csv(path, infer_schema_length=1000)
+    for col, dtype in [("deal_key", pl.Utf8), ("label", pl.Utf8), ("note", pl.Utf8), ("updated_at", pl.Utf8)]:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit("").cast(dtype).alias(col))
+    return (
+        df.select(["deal_key", "label", "note", "updated_at"])
+        .with_columns(
+            pl.col("deal_key").cast(pl.Utf8),
+            pl.col("label").cast(pl.Utf8),
+            pl.col("note").cast(pl.Utf8),
+            pl.col("updated_at").cast(pl.Utf8),
+        )
+        .filter(pl.col("deal_key").is_not_null() & (pl.col("deal_key") != ""))
+    )
+
+
+def _batch_arena_notes_map(df: pl.DataFrame) -> dict[str, str]:
+    """Return {deal_key: note} from the notes DataFrame."""
+    return {str(r["deal_key"]): str(r.get("note") or "") for r in df.to_dicts()}
+
+
+def batch_arena_upsert_or_delete_note(*, deal_key: str, label: str, note: str) -> None:
+    """Upsert a note for deal_key. Empty note deletes the row."""
+    note_clean = str(note or "").strip()
+    if len(note_clean) > BATCH_ARENA_NOTES_MAX_CHARS:
+        raise ValueError(f"Note must be <= {BATCH_ARENA_NOTES_MAX_CHARS} characters.")
+    df = _batch_arena_load_notes_df(BATCH_ARENA_NOTES_CSV)
+    df = df.filter(pl.col("deal_key") != str(deal_key))
+    if note_clean:
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        df = pl.concat(
+            [df, pl.DataFrame([{"deal_key": str(deal_key), "label": str(label), "note": note_clean, "updated_at": now}])],
+            how="vertical",
+        )
+    df = df.sort("deal_key")
+    _auction_builder_atomic_write_csv(df, BATCH_ARENA_NOTES_CSV)
+
+
+def _batch_arena_deal_key(sel_result: dict, deal_row: dict | None) -> str:
+    """Compute a stable string key for a batch arena deal.
+
+    Priority:
+    1. If the DB row has an ``index`` (BBO database row number), use ``db:{index}``.
+    2. Otherwise, hash the four hand strings (stable for same deal regardless of source).
+    """
+    import hashlib
+    if deal_row:
+        db_idx = deal_row.get("index")
+        if db_idx is not None:
+            try:
+                return f"db:{int(db_idx)}"
+            except Exception:
+                pass
+        # PBN fingerprint from hands
+        hands = "".join(str(deal_row.get(f"Hand_{d}") or "") for d in "NESW")
+        if hands.replace(".", ""):
+            return "pbn:" + hashlib.sha1(hands.encode()).hexdigest()[:12]
+    # Last resort: use the Deal identifier from the result row
+    return f"deal:{sel_result.get('Deal', '?')}"
 
 
 def prepend_all_seats_prefix(pattern: str) -> str:
@@ -4342,6 +4423,547 @@ def render_bidding_arena():
 
 
 # ---------------------------------------------------------------------------
+# PBN file helpers for AI Model Batch Arena
+# ---------------------------------------------------------------------------
+
+def _pbn_deal_tag_to_hands(deal: str, fallback_dealer: str = "N") -> dict[str, str] | None:
+    """Parse a PBN [Deal] tag value like 'N:AKQ.JT9.876.5432 ...' into Hand_N/E/S/W."""
+    deal = deal.strip()
+    if ":" in deal:
+        start_dir, rest = deal.split(":", 1)
+        start_dir = start_dir.strip().upper()[:1]
+    else:
+        start_dir = fallback_dealer.upper()[:1]
+        rest = deal
+    dirs = ["N", "E", "S", "W"]
+    if start_dir not in dirs:
+        start_dir = "N"
+    parts = rest.strip().split()
+    if len(parts) < 4:
+        return None
+    start_idx = dirs.index(start_dir)
+    return {dirs[(start_idx + i) % 4]: parts[i] for i in range(4)}
+
+
+def _pbn_bids_to_dash(tokens: list[str]) -> str:
+    """Convert a list of PBN bid tokens to dash-separated auction string.
+
+    'AP' (All Pass) expands to three passes.  Annotations like '!' or '?'
+    appended to a bid token are stripped.  Skips empty and separator tokens.
+    """
+    bids: list[str] = []
+    for tok in tokens:
+        tok = tok.strip().rstrip("!?").upper()
+        if not tok or tok in ("-", "*", "NT"):
+            continue
+        if tok == "AP":
+            bids.extend(["P", "P", "P"])
+        else:
+            bids.append(tok)
+    return "-".join(bids)
+
+
+def _hand_hcp(hand: str) -> int:
+    """Count HCP in a dot-separated hand string (e.g. 'AKQ.JT9.876.5432')."""
+    hcp_map = {"A": 4, "K": 3, "Q": 2, "J": 1}
+    return sum(hcp_map.get(c, 0) for c in hand.upper() if c in hcp_map)
+
+
+def _hand_total_points(hand: str) -> int:
+    """HCP + distribution points (void=3, singleton=2, doubleton=1)."""
+    hcp = _hand_hcp(hand)
+    suits = hand.split(".")
+    dist = sum(max(0, 3 - len(s)) for s in suits)
+    return hcp + dist
+
+
+# ---------------------------------------------------------------------------
+# On-the-fly DDS augmentation (follows mlBridgeAugmentLib patterns)
+# ---------------------------------------------------------------------------
+
+_dd_scoring_cache: dict | None = None
+
+
+def _get_dd_scoring_table() -> dict:
+    """Return cached (level, strain, tricks, vul_bool) → score dict.
+
+    Uses mlBridgeAugmentLib.precompute_contract_score_tables(); built once per
+    process lifetime.  Cost ~5ms on first call; subsequent calls are O(1).
+    """
+    global _dd_scoring_cache
+    if _dd_scoring_cache is None:
+        from mlBridge.mlBridgeAugmentLib import precompute_contract_score_tables
+        _, scores_d, _ = precompute_contract_score_tables()
+        _dd_scoring_cache = scores_d
+    return _dd_scoring_cache
+
+
+def _compute_board_dds_augmentation(pbn_str: str, dealer: str, vul: str) -> dict:
+    """Compute DD tricks, DD scores, and Par for one board on-the-fly (~1 ms).
+
+    Follows the same patterns as mlBridgeAugmentLib.compute_dd_trick_tables and
+    compute_par_scores_for_missing, but operates on a single board dict rather
+    than a Polars DataFrame.
+
+    Returns a dict containing:
+      - DD_{dir}_{strain}             20 cols  (e.g. DD_N_S, DD_E_H, …)
+      - DD_Score_{lvl}{strain}_{dir}  140 cols (e.g. DD_Score_3N_S, …)
+      - ParScore                      int
+      - ParContracts                  str
+
+    Any column that cannot be computed is omitted silently so callers can use
+    ``dict.get(col)`` with a None fallback.
+    """
+    try:
+        from endplay.types import Deal as _EndplayDeal, Player as _Player, Denom as _Denom, Vul as _EndplayVul
+        from endplay.dds import calc_dd_table as _calc_dd_table, par as _endplay_par
+    except ImportError:
+        return {}
+
+    try:
+        deal = _EndplayDeal(pbn_str)
+    except Exception:
+        return {}
+
+    result: dict = {}
+
+    # ---- DD tricks (20 cols) ------------------------------------------------
+    try:
+        dd_table = _calc_dd_table(deal)
+    except Exception:
+        return result
+
+    _dir_to_player = {
+        "N": _Player.north, "E": _Player.east,
+        "S": _Player.south, "W": _Player.west,
+    }
+    _strain_to_denom = {
+        "S": _Denom.spades, "H": _Denom.hearts,
+        "D": _Denom.diamonds, "C": _Denom.clubs, "N": _Denom.nt,
+    }
+
+    for _d in "NESW":
+        for _s in "SHDCN":
+            try:
+                # DDTable requires tuple indexing: (Player, Denom) or (Denom, Player)
+                result[f"DD_{_d}_{_s}"] = int(dd_table[_dir_to_player[_d], _strain_to_denom[_s]])  # type: ignore[index]
+            except Exception:
+                pass
+
+    # ---- Par score ----------------------------------------------------------
+    _vul_map = {
+        "None": _EndplayVul.none, "NS": _EndplayVul.ns,
+        "EW": _EndplayVul.ew, "Both": _EndplayVul.both,
+        "N_S": _EndplayVul.ns, "E_W": _EndplayVul.ew,
+    }
+    _dealer_map = {
+        "N": _Player.north, "E": _Player.east,
+        "S": _Player.south, "W": _Player.west,
+    }
+    _vul_enum = _vul_map.get(str(vul), _EndplayVul.none)
+    _dealer_enum = _dealer_map.get(str(dealer).upper(), _Player.north)
+    try:
+        _par_result = _endplay_par(dd_table, _vul_enum, _dealer_enum)
+        result["ParScore"] = int(_par_result.score)
+        # ParList is iterable; build a contract list matching the DB schema
+        result["ParContracts"] = [
+            {
+                "Level": str(_c.level),
+                "Strain": "SHDCN"[int(_c.denom)],
+                "Doubled": _c.penalty.abbr,
+                "Pair_Direction": "NS" if _c.declarer.abbr in "NS" else "EW",
+                "Result": _c.result,
+            }
+            for _c in _par_result  # type: ignore[union-attr]
+        ]
+    except Exception:
+        pass
+
+    # ---- DD scores (140 cols) -----------------------------------------------
+    try:
+        _scores_d = _get_dd_scoring_table()
+        _vul_ns = str(vul) in ("NS", "Both", "N_S")
+        _vul_ew = str(vul) in ("EW", "Both", "E_W")
+        for _lvl in range(1, 8):
+            for _s in "CDHSN":
+                for _d in "NESW":
+                    _pair_vul = _vul_ns if _d in "NS" else _vul_ew
+                    _tricks = result.get(f"DD_{_d}_{_s}")
+                    if _tricks is not None:
+                        _score = _scores_d.get((_lvl, _s, _tricks, _pair_vul))
+                        result[f"DD_Score_{_lvl}{_s}_{_d}"] = _score
+    except Exception:
+        pass
+
+    return result
+
+
+def _compute_board_sd_ev_augmentation(pbn_str: str, dealer: str, vul: str, produce: int = 100) -> dict:
+    """Compute single-dummy Probs_* (280 cols) and EV_* (70 cols) for one board.
+
+    Uses mlBridgeAugmentLib.estimate_sd_trick_distributions which runs Monte Carlo
+    single-dummy simulation via endplay.dealer.generate_deals + DDS.
+
+    Runtime: ~0.5-2 s for produce=100 (two sides × produce DDS batches).
+    Reduce `produce` to speed up at the cost of noisier EV estimates.
+
+    Output columns:
+      - Probs_{NS|EW}_{decl}_{strain}_{t}   280 cols — P(take exactly t tricks)
+      - EV_{pair}_{decl}_{strain}_{level}    70 cols  — expected score (vul-adjusted)
+
+    EV columns have no vulnerability suffix; they already reflect the board's vul
+    (NS pair uses vul_ns, EW pair uses vul_ew), matching what get_ev_for_auction_pre()
+    and get_ev_for_auction() read from deal_row.
+    """
+    try:
+        from mlBridge.mlBridgeAugmentLib import estimate_sd_trick_distributions as _est_sd
+    except ImportError:
+        return {}
+
+    try:
+        # pbn_str is always "X:hand_n hand_e hand_s hand_w"; [2:] strips the "X:" prefix.
+        _, (_, ns_ew_rows) = _est_sd(pbn_str, produce)
+    except Exception:
+        return {}
+
+    result: dict = {}
+
+    # ---- Probs_* columns (280 cols) -----------------------------------------
+    # ns_ew_rows: {(pair_dir, decl_dir, strain): [prob_t for t in 0..13]}
+    for (_pair, _decl, _strain), _probs in ns_ew_rows.items():
+        for _t, _p in enumerate(_probs):
+            result[f"Probs_{_pair}_{_decl}_{_strain}_{_t}"] = float(_p)
+
+    # ---- EV_* columns (70 cols, no vul suffix) ------------------------------
+    # EV = sum_t( prob[t] * score(level, strain, t, pair_vul) )
+    # Vulnerability-adjust per pair direction, matching the board's Vul string.
+    try:
+        _scores_d = _get_dd_scoring_table()
+        _vul_ns = str(vul) in ("NS", "Both", "N_S")
+        _vul_ew = str(vul) in ("EW", "Both", "E_W")
+
+        for _pair in ("NS", "EW"):
+            _pair_vul = _vul_ns if _pair == "NS" else _vul_ew
+            for _decl in _pair:  # N,S for "NS"; E,W for "EW"
+                for _strain in "SHDCN":
+                    _probs = ns_ew_rows.get((_pair, _decl, _strain))
+                    if _probs is None:
+                        continue
+                    for _lvl in range(1, 8):
+                        _ev = sum(
+                            _probs[_t] * (_scores_d.get((_lvl, _strain, _t, _pair_vul)) or 0.0)
+                            for _t in range(14)
+                        )
+                        result[f"EV_{_pair}_{_decl}_{_strain}_{_lvl}"] = _ev
+    except Exception:
+        pass
+
+    return result
+
+
+_PBN_VUL_MAP: dict[str, str] = {
+    "None": "None", "Love": "None", "-": "None",
+    "NS": "NS", "N-S": "NS",
+    "EW": "EW", "E-W": "EW",
+    "Both": "Both", "All": "Both", "B": "Both",
+}
+
+
+def parse_pbn_file_to_boards(content: str) -> list[dict]:
+    """Parse a multi-board PBN file into a list of board dicts.
+
+    Each returned dict has:
+        board      int | None  – [Board] number
+        dealer     str         – N/E/S/W
+        vul        str         – None/NS/EW/Both (BBO format)
+        Hand_N/E/S/W  str     – dot-separated hands
+        auction    str         – dash-separated auction (from [Auction] section)
+        pbn        str         – 'N:hand_n hand_e hand_s hand_w' for /pbn-lookup
+    """
+    import re
+    tag_re = re.compile(r'\[(\w+)\s+"([^"]*)"\]')
+
+    boards: list[dict] = []
+    current: dict = {}
+    auction_tokens: list[str] = []
+    in_auction = False
+
+    def _flush():
+        if not current.get("_deal"):
+            return
+        dealer = current.get("dealer", "N")
+        hands = current["_deal"]
+        vul_raw = current.get("vul_raw", "None")
+        board: dict = {
+            "board": current.get("board"),
+            "dealer": dealer,
+            "vul": _PBN_VUL_MAP.get(vul_raw, vul_raw),
+            "Hand_N": hands.get("N", ""),
+            "Hand_E": hands.get("E", ""),
+            "Hand_S": hands.get("S", ""),
+            "Hand_W": hands.get("W", ""),
+            "auction": _pbn_bids_to_dash(auction_tokens),
+            "pbn": f"{dealer}:{hands.get('N','')} {hands.get('E','')} {hands.get('S','')} {hands.get('W','')}",
+        }
+        boards.append(board)
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            in_auction = False
+            continue
+
+        m = tag_re.match(line)
+        if m:
+            in_auction = False
+            tag, val = m.group(1), m.group(2)
+
+            # Detect board boundary: a new [Board] or [Event] tag
+            if tag in ("Board", "Event") and current.get("_deal") and tag == "Board":
+                _flush()
+                current = {}
+                auction_tokens = []
+
+            if tag == "Board":
+                try:
+                    current["board"] = int(val)
+                except ValueError:
+                    current["board"] = None
+            elif tag == "Dealer":
+                current["dealer"] = val.upper()[:1]
+            elif tag == "Vulnerable":
+                current["vul_raw"] = val
+            elif tag == "Deal":
+                dealer = current.get("dealer", "N")
+                hands = _pbn_deal_tag_to_hands(val, dealer)
+                if hands:
+                    current["_deal"] = hands
+            elif tag == "Auction":
+                in_auction = True
+                auction_tokens = []
+        elif in_auction:
+            # Bid tokens: one or more per line, stop at commentary (;)
+            for tok in line.split():
+                if tok.startswith(";"):
+                    break
+                auction_tokens.append(tok)
+
+    _flush()  # last board
+    return boards
+
+
+def _download_text_from_url(url: str, label: str) -> str:
+    """Download text content from URL, converting github blob links to raw when needed."""
+    url = (url or "").strip()
+    if not url:
+        raise ValueError(f"{label} URL is empty.")
+    fetch_url = url
+    if "github.com" in fetch_url and "/blob/" in fetch_url:
+        fetch_url = fetch_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    resp = requests.get(fetch_url, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+def parse_csv_to_boards(content: str) -> list[dict]:
+    """Parse CSV input into normalized board dicts used by batch arena.
+
+    Required header columns:
+      - Deals
+      - Dealer
+      - Vul
+
+    Additional supported columns:
+      - PBN (preferred)
+      - Hand_N, Hand_E, Hand_S, Hand_W
+      - bid or Actual_Auction
+    """
+    df = pd.read_csv(io.StringIO(content))
+    if df.empty:
+        return []
+
+    cols_by_lower = {str(c).strip().lower(): str(c) for c in df.columns}
+    required = {"deals", "dealer", "vul"}
+    missing = [c for c in required if c not in cols_by_lower]
+    if missing:
+        raise ValueError(
+            "CSV header must include Deals, Dealer, Vul in the first row. "
+            f"Missing: {', '.join(sorted(missing))}"
+        )
+
+    has_pbn = "pbn" in cols_by_lower
+    has_hands = all(k in cols_by_lower for k in ("hand_n", "hand_e", "hand_s", "hand_w"))
+    if not has_pbn and not has_hands:
+        raise ValueError(
+            "CSV must include either PBN column or all hand columns: Hand_N, Hand_E, Hand_S, Hand_W."
+        )
+
+    deals_col = cols_by_lower["deals"]
+    dealer_col = cols_by_lower["dealer"]
+    vul_col = cols_by_lower["vul"]
+    pbn_col = cols_by_lower.get("pbn")
+    bid_col = cols_by_lower.get("actual_auction") or cols_by_lower.get("bid")
+
+    boards: list[dict] = []
+    for _, row in df.iterrows():
+        dealer = str(row.get(dealer_col, "N") or "N").upper()[:1]
+        vul_raw = str(row.get(vul_col, "None") or "None")
+        deal_id = row.get(deals_col)
+        auction = str(row.get(bid_col, "") or "") if bid_col else ""
+
+        if pbn_col:
+            pbn_val = str(row.get(pbn_col, "") or "").strip()
+            if ":" in pbn_val:
+                hands = _pbn_deal_tag_to_hands(pbn_val, dealer)
+                pbn = pbn_val
+            else:
+                hands = _pbn_deal_tag_to_hands(f"{dealer}:{pbn_val}", dealer)
+                pbn = f"{dealer}:{pbn_val}"
+            if not hands:
+                continue
+        else:
+            hands = {
+                "N": str(row.get(cols_by_lower["hand_n"], "") or ""),
+                "E": str(row.get(cols_by_lower["hand_e"], "") or ""),
+                "S": str(row.get(cols_by_lower["hand_s"], "") or ""),
+                "W": str(row.get(cols_by_lower["hand_w"], "") or ""),
+            }
+            pbn = f"{dealer}:{hands['N']} {hands['E']} {hands['S']} {hands['W']}"
+
+        deal_id_norm: Any = deal_id
+        try:
+            deal_id_s = str(deal_id).strip()
+            if deal_id_s.isdigit():
+                deal_id_norm = int(deal_id_s)
+        except Exception:
+            deal_id_norm = deal_id
+
+        board = {
+            "board": deal_id_norm,
+            "dealer": dealer,
+            "vul": _PBN_VUL_MAP.get(vul_raw, vul_raw),
+            "Hand_N": hands.get("N", ""),
+            "Hand_E": hands.get("E", ""),
+            "Hand_S": hands.get("S", ""),
+            "Hand_W": hands.get("W", ""),
+            "auction": auction,
+            "pbn": pbn,
+        }
+        boards.append(board)
+    return boards
+
+
+def _render_batch_input_from_deals_df() -> dict[str, Any]:
+    """Render controls for DB-backed source and return normalized config."""
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        start_index = st.number_input("Start Deal Index", min_value=1, value=1, step=1, key="_batch_start_db")
+    with col_b:
+        deal_count = st.number_input("Number of Deals", min_value=1, max_value=500, value=25, step=25, key="_batch_count_db")
+    with col_c:
+        seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
+    return {"start_index": int(start_index), "deal_count": int(deal_count), "seed": int(seed), "boards": []}
+
+
+def _render_batch_input_from_pbn() -> dict[str, Any]:
+    """Render local/URL PBN input controls and return normalized config."""
+    url_col, dl_col = st.columns([5, 1])
+    with url_col:
+        pbn_url = st.text_input("PBN URL", key="_batch_pbn_url", placeholder="https://.../file.pbn")
+    with dl_col:
+        download_clicked = st.button("Download", key="_batch_pbn_download")
+
+    pbn_file = st.file_uploader("Upload PBN File", type=["pbn"], key="_batch_pbn_upload")
+
+    if pbn_file is not None:
+        try:
+            pbn_content = pbn_file.read().decode("utf-8", errors="replace")
+            parsed_boards = parse_pbn_file_to_boards(pbn_content)
+            st.session_state["_arena_pbn_boards"] = parsed_boards
+            st.success(f"Loaded **{len(parsed_boards)}** board(s) from `{pbn_file.name}`.")
+        except Exception as e:
+            st.error(f"Failed to parse PBN file: {e}")
+
+    if download_clicked:
+        try:
+            pbn_content = _download_text_from_url(pbn_url, "PBN")
+            parsed_boards = parse_pbn_file_to_boards(pbn_content)
+            st.session_state["_arena_pbn_boards"] = parsed_boards
+            st.success(f"Downloaded and parsed **{len(parsed_boards)}** board(s) from URL.")
+        except Exception as e:
+            st.error(f"Failed to download/parse PBN URL: {e}")
+
+    boards = st.session_state.get("_arena_pbn_boards") or []
+    n_boards = len(boards)
+    col_b, col_c = st.columns(2)
+    with col_b:
+        deal_count = st.number_input(
+            "Number of Deals",
+            min_value=1,
+            max_value=max(1, n_boards),
+            value=n_boards if n_boards > 0 else 1,
+            step=1,
+            key="_batch_count_pbn",
+            disabled=(n_boards == 0),
+        )
+    with col_c:
+        seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
+    if n_boards == 0:
+        st.info("Provide a local PBN file or URL, then click Download.")
+    return {"start_index": 1, "deal_count": int(deal_count), "seed": int(seed), "boards": boards[: int(deal_count)]}
+
+
+def _render_batch_input_from_csv() -> dict[str, Any]:
+    """Render local/URL CSV input controls and return normalized config."""
+    url_col, dl_col = st.columns([5, 1])
+    with url_col:
+        csv_url = st.text_input("CSV URL", key="_batch_csv_url", placeholder="https://.../file.csv")
+    with dl_col:
+        download_clicked = st.button("Download", key="_batch_csv_download")
+
+    csv_file = st.file_uploader("Upload CSV File", type=["csv"], key="_batch_csv_upload")
+    st.caption("CSV header row must include: Deals, Dealer, Vul. It may include additional columns.")
+
+    if csv_file is not None:
+        try:
+            csv_content = csv_file.read().decode("utf-8", errors="replace")
+            parsed_boards = parse_csv_to_boards(csv_content)
+            st.session_state["_arena_csv_boards"] = parsed_boards
+            st.success(f"Loaded **{len(parsed_boards)}** row(s) from `{csv_file.name}`.")
+        except Exception as e:
+            st.error(f"Failed to parse CSV file: {e}")
+
+    if download_clicked:
+        try:
+            csv_content = _download_text_from_url(csv_url, "CSV")
+            parsed_boards = parse_csv_to_boards(csv_content)
+            st.session_state["_arena_csv_boards"] = parsed_boards
+            st.success(f"Downloaded and parsed **{len(parsed_boards)}** row(s) from URL.")
+        except Exception as e:
+            st.error(f"Failed to download/parse CSV URL: {e}")
+
+    boards = st.session_state.get("_arena_csv_boards") or []
+    n_boards = len(boards)
+    col_b, col_c = st.columns(2)
+    with col_b:
+        deal_count = st.number_input(
+            "Number of Deals",
+            min_value=1,
+            max_value=max(1, n_boards),
+            value=n_boards if n_boards > 0 else 1,
+            step=1,
+            key="_batch_count_csv",
+            disabled=(n_boards == 0),
+        )
+    with col_c:
+        seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
+    if n_boards == 0:
+        st.info("Provide a local CSV file or URL, then click Download.")
+    return {"start_index": 1, "deal_count": int(deal_count), "seed": int(seed), "boards": boards[: int(deal_count)]}
+
+
+# ---------------------------------------------------------------------------
 # AI Model Batch Arena – Batch compare AI Model vs Actual auctions
 # ---------------------------------------------------------------------------
 
@@ -4374,14 +4996,26 @@ def render_ai_model_batch_arena():
                 for _lvl in range(1, 8):
                     _BATCH_DEAL_COLS.append(f"EV_{_pair}_{_decl}_{_s}_{_lvl}")
 
-    # ---- Input controls ----
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        start_index = st.number_input("Start Deal Index", min_value=1, value=1, step=1, key="_batch_start")
-    with col_b:
-        deal_count = st.number_input("Number of Deals", min_value=1, max_value=500, value=25, step=25, key="_batch_count")
-    with col_c:
-        seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
+    # ---- Source mode selector ----
+    batch_mode = st.radio(
+        "Deal Source",
+        ["Deals DF", "PBN Local/URL", "CSV Local/URL"],
+        horizontal=True,
+        key="_batch_mode",
+        help="Choose input source: database deals, PBN, or CSV.",
+    )
+
+    if batch_mode == "Deals DF":
+        input_cfg = _render_batch_input_from_deals_df()
+    elif batch_mode == "PBN Local/URL":
+        input_cfg = _render_batch_input_from_pbn()
+    else:
+        input_cfg = _render_batch_input_from_csv()
+
+    start_index = int(input_cfg["start_index"])
+    deal_count = int(input_cfg["deal_count"])
+    seed = int(input_cfg["seed"])
+    _external_boards_for_run = list(input_cfg.get("boards") or [])
 
     # ---- Run / Cancel buttons ----
     btn_col1, btn_col2, _ = st.columns([1, 1, 4])
@@ -4465,6 +5099,38 @@ def render_ai_model_batch_arena():
             return round(-val, 1)
         return round(val, 1)
 
+    def _json_safe_deal_row(row: dict) -> dict:
+        """Convert a deal_row dict to JSON-serializable form for API transport.
+
+        Handles numpy scalars, Polars scalars, NaN/inf, and other non-JSON types.
+        """
+        import math
+        out: dict = {}
+        for k, v in row.items():
+            if v is None:
+                out[k] = None
+            elif isinstance(v, bool):
+                out[k] = v
+            elif isinstance(v, int):
+                out[k] = v
+            elif isinstance(v, float):
+                out[k] = None if (math.isnan(v) or math.isinf(v)) else v
+            elif isinstance(v, str):
+                out[k] = v
+            elif isinstance(v, list):
+                out[k] = v
+            else:
+                # numpy/polars scalars and other types — convert to native Python
+                try:
+                    f = float(v)
+                    out[k] = None if (math.isnan(f) or math.isinf(f)) else f
+                except (TypeError, ValueError):
+                    try:
+                        out[k] = str(v)
+                    except Exception:
+                        out[k] = None
+        return out
+
     # ---- Batch processing loop ----
     if run_clicked:
         st.session_state["_arena_batch_cancel"] = False
@@ -4476,68 +5142,172 @@ def render_ai_model_batch_arena():
         # Accumulate per-deal debug entries for data/batch_arena_debug.json
         _batch_debug_entries: list[dict] = []
 
-        indices = list(range(int(start_index), int(start_index) + int(deal_count)))
+        _use_external = (batch_mode != "Deals DF")
 
-        # Pre-fetch all deal rows in one batch call
-        status_text.text("")
-        try:
-            deals_resp = api_post(
-                "/deals-by-index",
-                {"indices": indices, "max_rows": len(indices), "columns": _BATCH_DEAL_COLS},
-                timeout=60,
-            )
-            deal_rows_raw = deals_resp.get("rows") or []
-        except Exception as e:
-            st.error(f"Failed to fetch deal rows: {e}")
-            return
-
-        # Build lookup: deal index -> deal row dict (with _row_idx)
-        deal_row_map: dict[int, dict] = {}
-        for dr in deal_rows_raw:
+        # ------------------------------------------------------------------ #
+        # DB mode: pre-fetch all rows in one batch API call                  #
+        # ------------------------------------------------------------------ #
+        if not _use_external:
+            indices = list(range(int(start_index), int(start_index) + int(deal_count)))
+            status_text.text("")
             try:
-                deal_row_map[int(dr["index"])] = dr
-            except Exception:
-                continue
+                deals_resp = api_post(
+                    "/deals-by-index",
+                    {"indices": indices, "max_rows": len(indices), "columns": _BATCH_DEAL_COLS},
+                    timeout=60,
+                )
+                deal_rows_raw = deals_resp.get("rows") or []
+            except Exception as e:
+                st.error(f"Failed to fetch deal rows: {e}")
+                return
 
-        if not deal_row_map:
-            st.warning("No deal rows found for the requested index range.")
-            return
+            deal_row_map: dict[int, dict] = {}
+            for dr in deal_rows_raw:
+                try:
+                    deal_row_map[int(dr["index"])] = dr
+                except Exception:
+                    continue
+
+            if not deal_row_map:
+                st.warning("No deal rows found for the requested index range.")
+                return
+        else:
+            # External mode (PBN/CSV): records already parsed; lookups happen per-row below
+            indices = list(range(len(_external_boards_for_run)))
+            deal_row_map = {}
+            if not _external_boards_for_run:
+                st.warning("No external records loaded. Provide PBN/CSV input first.")
+                return
 
         results: list[dict] = []
         imp_running = 0
         par_imp_running = 0
         t_batch_start = time.perf_counter()
 
-        for i, deal_idx in enumerate(indices):
-            # ---- Cancel check (Streamlit may interrupt via progress bar update) ----
+        for i in range(len(indices)):
+            # ---- Cancel check ----
             if st.session_state.get("_arena_batch_cancel"):
                 status_text.text(f"Cancelled after {i} deal(s).")
                 break
 
-            deal_row = deal_row_map.get(deal_idx)
-            if deal_row is None:
-                results.append({"Deal": deal_idx, "Error": "not_found"})
-                st.session_state["_arena_batch_results"] = list(results)
-                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — not found — IMP: {imp_running:+d}")
-                continue
+            # ---------------------------------------------------------------- #
+            # Resolve deal_row and key fields depending on source mode         #
+            # ---------------------------------------------------------------- #
+            if not _use_external:
+                deal_idx = indices[i]
+                deal_row = deal_row_map.get(deal_idx)
+                if deal_row is None:
+                    results.append({"Deal": deal_idx, "Error": "not_found"})
+                    st.session_state["_arena_batch_results"] = list(results)
+                    progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — not found — IMP: {imp_running:+d}")
+                    continue
+                dealer = str(deal_row.get("Dealer", "N")).upper()
+                vul = deal_row.get("Vul", "")
+                actual_auction = str(deal_row.get("bid", "") or "").strip()
+                row_idx = deal_row.get("_row_idx")
+                if row_idx is None:
+                    results.append({"Deal": deal_idx, "Error": "no_row_idx"})
+                    st.session_state["_arena_batch_results"] = list(results)
+                    progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — no _row_idx — IMP: {imp_running:+d}")
+                    continue
+            else:
+                # External mode (PBN/CSV): look up the board in BBO DB by hand strings
+                src_board = _external_boards_for_run[i]
+                deal_idx = src_board.get("board") or (i + 1)
+                dealer = str(src_board.get("dealer", "N")).upper()
+                # Normalize PBN vul tags to DB format ("All" → "Both", etc.)
+                vul = {"All": "Both", "None": "None", "NS": "NS", "EW": "EW"}.get(
+                    str(src_board.get("vul", "None")), str(src_board.get("vul", "None"))
+                )
+                actual_auction = src_board.get("auction", "")
 
-            dealer = str(deal_row.get("Dealer", "N")).upper()
-            vul = deal_row.get("Vul", "")
-            actual_auction = str(deal_row.get("bid", "") or "").strip()
-            row_idx = deal_row.get("_row_idx")
+                progress_bar.progress(
+                    i / len(indices),
+                    text=f"Board {i+1}/{len(indices)} (#{deal_idx}) — IMP: {imp_running:+d} — looking up in DB...",
+                )
+                try:
+                    lookup_resp = api_post(
+                        "/pbn-lookup",
+                        {"pbn": src_board["pbn"], "max_results": 1},
+                        timeout=30,
+                    )
+                    matches = lookup_resp.get("matches") or []
+                except Exception as _lu_err:
+                    results.append({"Deal": deal_idx, "Error": f"lookup_error: {_lu_err}"})
+                    st.session_state["_arena_batch_results"] = list(results)
+                    progress_bar.progress((i + 1) / len(indices), text=f"Board {i+1}/{len(indices)} — lookup error — IMP: {imp_running:+d}")
+                    continue
 
-            if row_idx is None:
-                results.append({"Deal": deal_idx, "Error": "no_row_idx"})
-                st.session_state["_arena_batch_results"] = list(results)
-                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — no _row_idx — IMP: {imp_running:+d}")
-                continue
+                if not matches:
+                    # Not in BBO DB — compute DD/Par/SD/EV on the fly and run AI
+                    # model using dynamic criterion evaluation (deal_row_dict path).
+                    progress_bar.progress(
+                        i / len(indices),
+                        text=f"Board {i+1}/{len(indices)} (#{deal_idx}) — not in DB, computing DD+EV...",
+                    )
+                    _pbn_for_aug = src_board.get("pbn", "")
+                    _aug = _compute_board_dds_augmentation(_pbn_for_aug, dealer, vul)
+                    _aug_sd = _compute_board_sd_ev_augmentation(_pbn_for_aug, dealer, vul)
+                    deal_row = {
+                        "Dealer": dealer,
+                        "Vul": vul,
+                        **{f"Hand_{_d}": src_board.get(f"Hand_{_d}", "") for _d in "NESW"},
+                        **{f"HCP_{_d}": _hand_hcp(src_board.get(f"Hand_{_d}", "")) for _d in "NESW"},
+                        **{f"Total_Points_{_d}": _hand_total_points(src_board.get(f"Hand_{_d}", "")) for _d in "NESW"},
+                        **_aug,
+                        **_aug_sd,
+                    }
+                    deal_row_map[deal_idx] = deal_row
+                    row_idx = None  # no DB index — will use deal_row_dict path
+                else:
+                    deal_row = dict(matches[0])
+                    # pbn-lookup renames 'bid' to 'Actual_Auction'; restore 'bid' key for helpers
+                    if "Actual_Auction" in deal_row and "bid" not in deal_row:
+                        deal_row["bid"] = deal_row["Actual_Auction"]
+                    # Augment HCP/TP from PBN hands (DB row may already have them; belt+suspenders)
+                    for _dir in ("N", "E", "S", "W"):
+                        _hk = f"HCP_{_dir}"
+                        _tk = f"Total_Points_{_dir}"
+                        _hand = src_board.get(f"Hand_{_dir}", "")
+                        if _hk not in deal_row or deal_row[_hk] is None:
+                            deal_row[_hk] = _hand_hcp(_hand)
+                        if _tk not in deal_row or deal_row[_tk] is None:
+                            deal_row[_tk] = _hand_total_points(_hand)
+                    # Augment any missing DD/Par columns using endplay (~1 ms per board)
+                    if deal_row.get("DD_N_S") is None:
+                        _aug = _compute_board_dds_augmentation(src_board.get("pbn", ""), dealer, vul)
+                        for _col, _val in _aug.items():
+                            if deal_row.get(_col) is None:
+                                deal_row[_col] = _val
+                    # Augment any missing EV/Probs columns via SD simulation (~0.5-2 s per board)
+                    if deal_row.get("EV_NS_N_S_3") is None:
+                        _aug_sd = _compute_board_sd_ev_augmentation(src_board.get("pbn", ""), dealer, vul)
+                        for _col, _val in _aug_sd.items():
+                            if deal_row.get(_col) is None:
+                                deal_row[_col] = _val
+                    # Store matched row in map so the deal diagram appears on row-click
+                    deal_row_map[deal_idx] = deal_row
+                    row_idx = deal_row.get("_row_idx")
 
             # ---- Start AI Model async job ----
             progress_bar.progress(i / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — IMP: {imp_running:+d} — running AI Model...")
+            _ai_start_params: dict[str, Any]
+            if row_idx is not None:
+                # DB deal: use pre-computed bitmap via row index (fast path).
+                _ai_start_params = {"deal_row_idx": int(row_idx), "seed": int(seed)}
+            else:
+                # On-the-fly deal (PBN/CSV not in DB): pass full deal_row for dynamic
+                # criterion evaluation. deal_row_idx=-1 signals the handler to skip
+                # the DB lookup and use deal_row_dict instead.
+                _ai_start_params = {
+                    "deal_row_idx": -1,
+                    "deal_row_dict": _json_safe_deal_row(deal_row),
+                    "seed": int(seed),
+                }
             try:
                 start_resp = api_post(
                     "/ai-model-advanced-path/start",
-                    {"deal_row_idx": int(row_idx), "seed": int(seed)},
+                    _ai_start_params,
                     timeout=15,
                 )
                 job_id = str(start_resp.get("job_id") or "").strip()
@@ -4616,10 +5386,27 @@ def render_ai_model_batch_arena():
             if par_imp is not None:
                 par_imp_running += par_imp
 
+            # ---- Divergence column: "step: AI_bid→actual_bid" or "✓" ----
+            _div_str = ""
+            try:
+                _dtoks_actual = [t.strip().upper() for t in (actual_auction or "").split("-") if t.strip()]
+                _dtoks_ai = [t.strip().upper() for t in (ai_auction or "").split("-") if t.strip()]
+                if _dtoks_actual or _dtoks_ai:
+                    _div_str = "✓"
+                    for _dsi in range(max(len(_dtoks_actual), len(_dtoks_ai))):
+                        _da = _dtoks_actual[_dsi] if _dsi < len(_dtoks_actual) else "—"
+                        _db = _dtoks_ai[_dsi] if _dsi < len(_dtoks_ai) else "—"
+                        if _da != _db:
+                            _div_str = f"{_dsi + 1}: {_db}→{_da}"
+                            break
+            except Exception:
+                _div_str = ""
+
             results.append({
                 "Deal": deal_idx,
                 "Dealer": dealer,
                 "Vul": vul,
+                "Divergence": _div_str,
                 "Actual_Auction": actual_auction,
                 "AI_Auction": ai_auction,
                 "Actual_Contract": actual_contract,
@@ -4697,6 +5484,7 @@ def render_ai_model_batch_arena():
                             _divergence["seat_bt"] = _step_data.get("seat_bt")
                             _divergence["scored_n"] = _step_data.get("scored_n")
                             _divergence["bid_scores"] = _step_data.get("bid_scores")
+                            _divergence["all_bids_filtered"] = _step_data.get("all_bids_filtered")
                         break
 
                 _batch_debug_entries.append({
@@ -4796,6 +5584,28 @@ def render_ai_model_batch_arena():
                             }
                             for b in _bs[:5]  # top 5 candidates
                         ]
+                    # bt_node_at_divergence: full picture of bids scored + bids filtered at the divergence step
+                    _bt_node: dict[str, Any] = {
+                        "auction_so_far": _div.get("auction_so_far"),
+                        "seat": _div.get("seat"),
+                        "seat_bt": _div.get("seat_bt"),
+                        "ai_bid": _div.get("ai_bid"),
+                        "actual_bid": _div.get("actual_bid"),
+                        "bids_scored": [
+                            {
+                                "bid": b.get("bid"),
+                                "score": b.get("score"),
+                                "agg_expr": b.get("agg_expr"),
+                                "desc_score": b.get("desc_score"),
+                                "opp_threat": b.get("opp_threat"),
+                                "guard_penalty": b.get("guard_penalty"),
+                                "final_score": b.get("final_score"),
+                            }
+                            for b in _bs
+                        ],
+                        "bids_filtered": _div.get("all_bids_filtered") or [],
+                    }
+                    _ws["bt_node_at_divergence"] = _bt_node
                 # Include hands for quick reference
                 _deal = _we.get("deal") or {}
                 _ws["hands"] = {
@@ -4868,7 +5678,79 @@ def render_ai_model_batch_arena():
             else:
                 st.info("Deal diagram unavailable — re-run the batch to load hand data.")
 
-            # 2. Single-row detail — same colour as the clicked row
+            # 2. Memo / note box for this deal
+            _note_key_str = _batch_arena_deal_key(_sel_result, _deal_row or {})
+            _note_label_str = (
+                f"Deal {_sel_deal_idx}"
+                + (f"  ({_sel_result.get('Dealer', '')}, {_sel_result.get('Vul', '')})" if _sel_result.get("Dealer") else "")
+            )
+            with st.container(border=True):
+                st.markdown("**📝 Deal memo**")
+                _ba_notes_df = _batch_arena_load_notes_df(BATCH_ARENA_NOTES_CSV)
+                _ba_notes_m = _batch_arena_notes_map(_ba_notes_df)
+                _ba_saved_note = _ba_notes_m.get(_note_key_str, "")
+
+                _ba_note_key = f"_batch_arena_note_{_note_key_str}"
+                _ba_saved_key = f"_batch_arena_note_saved_{_note_key_str}"
+                _ba_status_key = f"_batch_arena_note_status_{_note_key_str}"
+                if _ba_saved_key not in st.session_state:
+                    st.session_state[_ba_saved_key] = _ba_saved_note
+                    st.session_state[_ba_note_key] = _ba_saved_note
+
+                def _ba_note_save_cb(dk: str, lbl: str, nk: str, sk: str, stk: str) -> None:
+                    try:
+                        batch_arena_upsert_or_delete_note(
+                            deal_key=dk,
+                            label=lbl,
+                            note=str(st.session_state.get(nk, "") or ""),
+                        )
+                        refreshed = _batch_arena_notes_map(
+                            _batch_arena_load_notes_df(BATCH_ARENA_NOTES_CSV)
+                        ).get(dk, "")
+                        st.session_state[sk] = refreshed
+                        st.session_state[nk] = refreshed
+                        st.session_state[stk] = {"ok": True, "msg": "Saved."}
+                    except Exception as _e:
+                        st.session_state[stk] = {"ok": False, "msg": f"Could not save memo: {_e}"}
+
+                def _ba_note_cancel_cb(nk: str, sk: str) -> None:
+                    st.session_state[nk] = str(st.session_state.get(sk, "") or "")
+
+                st.text_input(
+                    "Deal memo (max 200 chars)",
+                    key=_ba_note_key,
+                    max_chars=BATCH_ARENA_NOTES_MAX_CHARS,
+                    label_visibility="collapsed",
+                    placeholder="Describe this deal or what went wrong…",
+                    on_change=_ba_note_save_cb,
+                    args=(_note_key_str, _note_label_str, _ba_note_key, _ba_saved_key, _ba_status_key),
+                )
+                _ba_btn_save, _ba_btn_cancel, _ = st.columns([1, 1, 6])
+                with _ba_btn_save:
+                    st.button(
+                        "Save",
+                        key=f"_batch_arena_note_save_{_note_key_str}",
+                        width="stretch",
+                        on_click=_ba_note_save_cb,
+                        args=(_note_key_str, _note_label_str, _ba_note_key, _ba_saved_key, _ba_status_key),
+                    )
+                with _ba_btn_cancel:
+                    st.button(
+                        "Cancel",
+                        key=f"_batch_arena_note_cancel_{_note_key_str}",
+                        width="stretch",
+                        on_click=_ba_note_cancel_cb,
+                        args=(_ba_note_key, _ba_saved_key),
+                    )
+                _ba_status = st.session_state.get(_ba_status_key)
+                if isinstance(_ba_status, dict):
+                    if _ba_status.get("ok"):
+                        st.toast(str(_ba_status.get("msg") or "Saved."))
+                    else:
+                        st.warning(str(_ba_status.get("msg") or "Error saving memo."))
+                    st.session_state[_ba_status_key] = None
+
+            # 3. Single-row detail — same colour as the clicked row
             _display_result = {k: v for k, v in _sel_result.items() if not k.startswith("_")}
             _imp_val = _display_result.get("IMP_Diff")
             if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):

@@ -2348,6 +2348,7 @@ def handle_deal_criteria_pass_batch(
     deal_row_idx: int,
     dealer: str,
     checks: List[Dict[str, Any]],
+    deal_row_dict: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Fast pass/fail only version of /deal-criteria-eval-batch.
 
@@ -2355,18 +2356,32 @@ def handle_deal_criteria_pass_batch(
     - No annotation of failures
     - Short-circuits on first failure/untracked
     - Uses row-dict lookups for bitmap criteria (faster than column indexing)
+
+    When deal_row_dict is provided (on-the-fly PBN/CSV deals not in the BBO database),
+    criteria are evaluated dynamically against a 1-row Polars DataFrame built from
+    deal_row_dict, using the stored pythonized expressions from state. This bypasses
+    both the deal_df row lookup and the pre-computed bitmap index.
     """
     deal_df = state.get("deal_df")
     deal_criteria_by_seat_dfs = state.get("deal_criteria_by_seat_dfs", {})
-    if deal_df is None:
+    if deal_df is None and deal_row_dict is None:
         raise ValueError("deal_df not loaded")
 
-    try:
-        deal_row = deal_df.row(int(deal_row_idx), named=True)
-    except (IndexError, ValueError) as e:
-        raise ValueError(f"Invalid deal_row_idx {deal_row_idx}: {e}")
+    # Resolve deal_row: prefer supplied dict (on-the-fly), else fetch from DB by index.
+    if deal_row_dict is not None:
+        deal_row: Dict[str, Any] = deal_row_dict
+    else:
+        if deal_df is None:
+            raise ValueError("deal_df not loaded")
+        try:
+            deal_row = deal_df.row(int(deal_row_idx), named=True)
+        except (IndexError, ValueError) as e:
+            raise ValueError(f"Invalid deal_row_idx {deal_row_idx}: {e}")
 
     dealer_n = str(dealer or "N").upper()
+
+    # Determine if we can use the pre-computed bitmap (DB deals with valid row index).
+    _use_bitmap = deal_row_dict is None and deal_row_idx >= 0
 
     # Cache per (seat,dealer) row dict for this deal to avoid repeated Polars overhead.
     row_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
@@ -2386,6 +2401,43 @@ def handle_deal_criteria_pass_batch(
         row_cache[key] = r
         return r
 
+    # Dynamic expression evaluator for on-the-fly deals (no bitmap available).
+    # Uses pythonized Polars expressions stored in state during server init.
+    _one_row_df_cache: Dict[str, Any] = {}  # mutable dict used as a namespace for caching
+
+    def _eval_criterion_dynamic(crit_s: str, seat: int) -> bool | None:
+        """Evaluate a criterion expression against deal_row_dict dynamically.
+
+        Returns True/False, or None if the expression is not found in the criteria map.
+        """
+        criteria_exprs = state.get("criteria_pythonized_exprs_by_direction") or {}
+        direction = seat_to_direction(dealer_n, seat)
+        dir_exprs = criteria_exprs.get(direction) or {}
+        pythonized_expr = dir_exprs.get(crit_s)
+        if pythonized_expr is None:
+            return None
+
+        # Build (and cache) a 1-row Polars DataFrame for this deal.
+        if "df" not in _one_row_df_cache:
+            try:
+                import polars as pl_local
+                _one_row_df_cache["df"] = pl_local.DataFrame([deal_row_dict])
+                _one_row_df_cache["pl"] = pl_local
+            except Exception:
+                return None
+        one_row_df = _one_row_df_cache["df"]
+        pl_local = _one_row_df_cache["pl"]
+
+        try:
+            import re as _re
+            eval_env = {col: pl_local.col(col) for col in one_row_df.columns}
+            s = _re.sub(r"\bTrue\b", "pl.lit(True)", pythonized_expr)
+            s = _re.sub(r"\bFalse\b", "pl.lit(False)", s)
+            polars_expr = eval(s, {"pl": pl_local}, eval_env)
+            return bool(one_row_df.select(polars_expr)[0, 0])
+        except Exception:
+            return None
+
     results: List[Dict[str, Any]] = []
     for chk in (checks or []):
         seat = int(chk.get("seat") or 0)
@@ -2394,7 +2446,7 @@ def handle_deal_criteria_pass_batch(
             results.append({"seat": seat, "passes": False})
             continue
 
-        crit_row = _criteria_row_for(seat)
+        crit_row = _criteria_row_for(seat) if _use_bitmap else None
         passes = True
 
         for crit in (criteria_list or []):
@@ -2414,20 +2466,31 @@ def handle_deal_criteria_pass_batch(
                 passes = False
                 break
 
-            # Bitmap lookup via row dict.
-            if crit_row is None:
-                passes = False
-                break
-            if crit_s not in crit_row:
-                passes = False
-                break
-            try:
-                if not bool(crit_row.get(crit_s)):
+            if _use_bitmap:
+                # Pre-computed bitmap path (DB deals): fast row-dict lookup.
+                if crit_row is None:
                     passes = False
                     break
-            except Exception:
-                passes = False
-                break
+                if crit_s not in crit_row:
+                    passes = False
+                    break
+                try:
+                    if not bool(crit_row.get(crit_s)):
+                        passes = False
+                        break
+                except Exception:
+                    passes = False
+                    break
+            else:
+                # Dynamic evaluation path (on-the-fly PBN/CSV deals).
+                dyn_result = _eval_criterion_dynamic(crit_s, seat)
+                if dyn_result is None:
+                    # Expression not found in criteria map — treat as untracked → fail.
+                    passes = False
+                    break
+                if not dyn_result:
+                    passes = False
+                    break
 
         results.append(
             {
@@ -2548,7 +2611,10 @@ def handle_pbn_lookup(
     
     sql_query = f"SELECT * FROM deals WHERE {' AND '.join(sql_parts)} LIMIT {max_results}"
 
-    matching = deal_df.filter(match_criteria)
+    # Add _row_idx BEFORE filtering so each match carries its original row position.
+    # This is required for the AI model batch pipeline which needs deal_row_idx.
+    deal_df_indexed = deal_df.with_row_index("_row_idx")
+    matching = deal_df_indexed.filter(match_criteria)
     
     if matching.height > max_results:
         matching = matching.head(max_results)
@@ -11547,6 +11613,58 @@ def handle_greedy_model_path(
         "debug": debug_info,
     }
 
+def _trace_criteria_failures(
+    criteria_list: List[str],
+    dealer: str,
+    seat: int,
+    deal_row: Dict[str, Any],
+    state: Dict[str, Any],
+    deal_row_dict: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
+    """Evaluate each criterion individually and return pass/fail/value trace.
+
+    Returns a list of dicts with keys: criterion, passed, annotated.
+    Used to identify which specific criterion blocked a bid at a given step.
+    """
+    trace: List[Dict[str, Any]] = []
+    row_source = deal_row_dict if deal_row_dict is not None else deal_row
+    for crit in (criteria_list or []):
+        crit_s = str(crit)
+        passed: bool | None = None
+        annotated = crit_s
+        try:
+            sl_result = evaluate_sl_criterion(crit_s, dealer, seat, row_source, fail_on_missing=False)
+            if sl_result is not None:
+                passed = bool(sl_result)
+                annotated = annotate_criterion_with_value(crit_s, dealer, seat, row_source)
+            else:
+                # Try via criteria_pythonized_exprs_by_direction
+                direction = seat_to_direction(dealer, seat)
+                criteria_exprs = state.get("criteria_pythonized_exprs_by_direction") or {}
+                dir_exprs = (criteria_exprs.get(direction) or {})
+                pythonized_expr = dir_exprs.get(crit_s)
+                if pythonized_expr is not None:
+                    try:
+                        one_row_df = pl.DataFrame([row_source])
+                        eval_env = {col: pl.col(col) for col in one_row_df.columns}
+                        safe_expr_str = re.sub(r"\bTrue\b", "pl.lit(True)", pythonized_expr)
+                        safe_expr_str = re.sub(r"\bFalse\b", "pl.lit(False)", safe_expr_str)
+                        polars_expr = eval(safe_expr_str, {"pl": pl}, eval_env)
+                        passed = bool(one_row_df.select(polars_expr)[0, 0])
+                    except Exception:
+                        passed = None
+                else:
+                    # Evaluate as complex expression (last resort)
+                    sl_result2 = evaluate_sl_criterion(crit_s, dealer, seat, row_source, fail_on_missing=True)
+                    if sl_result2 is not None:
+                        passed = bool(sl_result2)
+                        annotated = annotate_criterion_with_value(crit_s, dealer, seat, row_source)
+        except Exception:
+            passed = None
+        trace.append({"criterion": crit_s, "passed": passed, "annotated": annotated})
+    return trace
+
+
 def _is_auction_complete_list(bids: List[str]) -> bool:
     if len(bids) >= 4 and all(b == "P" for b in bids[:4]):
         return True
@@ -11560,7 +11678,8 @@ def _is_auction_complete_list(bids: List[str]) -> bool:
 def handle_ai_model_advanced_path(
     state: Dict[str, Any],
     *,
-    deal_row_idx: int,
+    deal_row_idx: int = -1,
+    deal_row_dict: Dict[str, Any] | None = None,
     seed: int = 0,
     max_steps: int = 40,
     top_n: int = 12,
@@ -11587,6 +11706,9 @@ def handle_ai_model_advanced_path(
     - If exactly one bid matches, take it without scoring.
     - Else score top-N using bid-details evidence (utility + typicality - threat), pick best.
 
+    When deal_row_dict is provided (on-the-fly PBN/CSV deals), deal_row_idx is ignored for
+    the deal row lookup; criteria are evaluated dynamically via handle_deal_criteria_pass_batch.
+
     Returns:
       - auction: completed (or best-effort) auction string
       - steps_detail: per-step timings + counts
@@ -11595,13 +11717,19 @@ def handle_ai_model_advanced_path(
 
     t0 = time.perf_counter()
     deal_df = state.get("deal_df")
-    if deal_df is None:
+    if deal_df is None and deal_row_dict is None:
         return {"auction": "", "steps": 0, "elapsed_ms": 0, "error": "deal_df not loaded"}
 
-    try:
-        deal_row = deal_df.row(int(deal_row_idx), named=True)
-    except Exception as e:
-        return {"auction": "", "steps": 0, "elapsed_ms": 0, "error": f"invalid_deal_row_idx:{e}"}
+    # Resolve deal_row: prefer supplied dict (on-the-fly), else fetch from DB by index.
+    if deal_row_dict is not None:
+        deal_row: Dict[str, Any] = deal_row_dict
+    else:
+        if deal_df is None:
+            return {"auction": "", "steps": 0, "elapsed_ms": 0, "error": "deal_df not loaded"}
+        try:
+            deal_row = deal_df.row(int(deal_row_idx), named=True)
+        except Exception as e:
+            return {"auction": "", "steps": 0, "elapsed_ms": 0, "error": f"invalid_deal_row_idx:{e}"}
 
     dealer_actual = str(deal_row.get("Dealer", "N")).upper()
     board_vul = deal_row.get("Vul", deal_row.get("Vulnerability"))
@@ -11702,9 +11830,10 @@ def handle_ai_model_advanced_path(
                     }
                 ]
 
-        # Candidate filtering (structural only).
+        # Candidate filtering (structural only). Track why each bid is dropped.
         candidates: List[Dict[str, Any]] = []
         pass_opt: Dict[str, Any] | None = None
+        _bids_struct_filtered: List[Dict[str, Any]] = []
         for opt in next_bids:
             bid0 = str(opt.get("bid", "") or "").strip().upper()
             if not bid0:
@@ -11715,18 +11844,22 @@ def handle_ai_model_advanced_path(
                 candidates.append(opt)
                 continue
             bt_idx = opt.get("bt_index")
-            if bt_idx is None:
-                continue
             crits = opt.get("agg_expr", []) or []
             is_dead_end = bool(opt.get("is_dead_end", False))
             has_empty_criteria = not crits
-            
+            if bt_idx is None:
+                _bids_struct_filtered.append({"bid": bid0, "agg_expr": crits, "filter_reason": "no_bt_index"})
+                continue
             # WORKAROUND: Invalidate bids with underspecified criteria (missing HCP and Total_Points)
             if _is_underspecified_criteria(crits):
+                _bids_struct_filtered.append({"bid": bid0, "agg_expr": crits, "filter_reason": "underspecified", "matching_deal_count": opt.get("matching_deal_count")})
                 continue
-
             # Do NOT reject on can_complete yet; only after pass.
-            if is_dead_end or has_empty_criteria:
+            if is_dead_end:
+                _bids_struct_filtered.append({"bid": bid0, "agg_expr": crits, "filter_reason": "dead_end", "matching_deal_count": opt.get("matching_deal_count")})
+                continue
+            if has_empty_criteria:
+                _bids_struct_filtered.append({"bid": bid0, "agg_expr": crits, "filter_reason": "empty_criteria", "matching_deal_count": opt.get("matching_deal_count")})
                 continue
             candidates.append(opt)
 
@@ -11775,10 +11908,11 @@ def handle_ai_model_advanced_path(
         ]
         
         passed_opts: List[Dict[str, Any]] = []
+        _bids_criteria_filtered: List[Dict[str, Any]] = []
         try:
-            pass_resp = handle_deal_criteria_pass_batch(state, int(deal_row_idx), dealer_rot, checks)
+            pass_resp = handle_deal_criteria_pass_batch(state, int(deal_row_idx), dealer_rot, checks, deal_row_dict=deal_row_dict)
             results = pass_resp.get("results", []) or []
-            
+
             # Re-merge results with candidates (Pass automatically passes)
             check_idx = 0
             for opt in candidates_sorted:
@@ -11786,7 +11920,7 @@ def handle_ai_model_advanced_path(
                 if bid0 in ("P", "PASS"):
                     passed_opts.append(opt)
                     continue
-                
+
                 # Check result for non-pass
                 if check_idx < len(results):
                     r0 = results[check_idx]
@@ -11796,12 +11930,33 @@ def handle_ai_model_advanced_path(
                         can_complete_b = bool(can_complete) if can_complete is not None else True
                         if can_complete_b:
                             passed_opts.append(opt)
+                        else:
+                            _bids_criteria_filtered.append({
+                                "bid": bid0,
+                                "agg_expr": list(opt.get("agg_expr") or []),
+                                "filter_reason": "cannot_complete",
+                                "matching_deal_count": opt.get("matching_deal_count"),
+                            })
+                    else:
+                        crits_list = list(opt.get("agg_expr") or [])
+                        _entry: Dict[str, Any] = {
+                            "bid": bid0,
+                            "agg_expr": crits_list,
+                            "filter_reason": "criteria_fail",
+                            "matching_deal_count": opt.get("matching_deal_count"),
+                        }
+                        _entry["criteria_trace"] = _trace_criteria_failures(
+                            crits_list, dealer_rot, seat_bt, deal_row, state, deal_row_dict
+                        )
+                        _bids_criteria_filtered.append(_entry)
         except Exception:
             # Standalone parity: if criteria batch fails, optimistically keep all
             # candidates in seed-ranked order.
             passed_opts = list(candidates_sorted)
+            _bids_criteria_filtered = []
 
         step_rec["pass"] = int(len(passed_opts))
+        step_rec["all_bids_filtered"] = _bids_struct_filtered + _bids_criteria_filtered
 
         if not passed_opts:
             # Semantics: choose Pass when nothing matches.
@@ -11848,6 +12003,13 @@ def handle_ai_model_advanced_path(
         # Score top-N passing bids via bid-details (already seed-ranked above).
         passed_sorted = passed_opts[: max(1, int(top_n))]
         auction_full = "-".join(tokens)
+
+        # Build agg_expr lookup for bid_scores annotation (item 1)
+        _agg_expr_by_bid: Dict[str, List[str]] = {
+            str(opt.get("bid", "")).strip().upper(): list(opt.get("agg_expr") or [])
+            for opt in passed_sorted
+            if str(opt.get("bid", "")).strip()
+        }
 
         def _parse_contract_bid_text(bid_text: str) -> tuple[int, str] | None:
             s = str(bid_text or "").strip().upper()
@@ -12334,7 +12496,7 @@ def handle_ai_model_advanced_path(
                     bd_ms_sum += float(d_ms or 0.0)
                     bd_p2_ms_sum += float(p2_ms or 0.0)
                     bd_hits += 1 if hit else 0
-                    bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, **bkdn})
+                    bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, "agg_expr": _agg_expr_by_bid.get(str(b or "").strip().upper(), []), **bkdn})
                     if b:
                         scored_rows.append((float(sc), str(b), bkdn))
         except Exception:
@@ -12344,7 +12506,7 @@ def handle_ai_model_advanced_path(
                 bd_ms_sum += float(d_ms or 0.0)
                 bd_p2_ms_sum += float(p2_ms or 0.0)
                 bd_hits += 1 if hit else 0
-                bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, **bkdn})
+                bid_scores.append({"bid": b, "score": round(sc, 2) if sc != float("-inf") else None, "agg_expr": _agg_expr_by_bid.get(str(b or "").strip().upper(), []), **bkdn})
                 if b:
                     scored_rows.append((float(sc), str(b), bkdn))
         if scored_rows:
@@ -12380,4 +12542,159 @@ def handle_ai_model_advanced_path(
         "steps": int(len(tokens)),
         "steps_detail": steps_detail,
         "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def handle_custom_criteria_impact(
+    state: Dict[str, Any],
+    *,
+    auction: str,
+    criteria: List[str],
+    seat: int = 1,
+    dealer: str = "N",
+    sample_size: int = 10_000,
+) -> Dict[str, Any]:
+    """Estimate the impact of proposed new criteria on deals traversing an auction node.
+
+    For each criterion string, reports what fraction of sampled deals would fail
+    (i.e., be excluded) if the criterion were added to the bidding table node
+    at `auction`.  Uses vectorized Polars evaluation where possible, with a
+    per-row Python fallback for complex expressions.
+
+    Returns a dict with:
+      - auction, seat, dealer, sample_size, total_deals_in_db
+      - impact_per_criterion: list of {criterion, pass_count, fail_count, fail_pct, unknown_count}
+      - combined: counts for deals failing ANY proposed criterion
+    """
+    t0 = time.perf_counter()
+    deal_df = state.get("deal_df")
+    if deal_df is None:
+        raise ValueError("deal_df not loaded in server state")
+
+    total_deals = deal_df.height
+    _sample_n = min(int(sample_size), total_deals)
+
+    # Sample deterministically for reproducibility
+    if total_deals > _sample_n:
+        rng = random.Random(42)
+        idxs = sorted(rng.sample(range(total_deals), _sample_n))
+        sample_df = deal_df[idxs]
+    else:
+        sample_df = deal_df
+
+    direction = seat_to_direction(dealer, seat)
+
+    # ---------------------------------------------------------------------------
+    # Vectorized fast-path: map common criterion patterns to Polars expressions
+    # ---------------------------------------------------------------------------
+    def _criterion_to_polars(crit_s: str) -> pl.Expr | None:
+        """Return a Polars boolean expression for simple criterion patterns, or None."""
+        c = crit_s.strip()
+        # Simple: VAR OP NUMBER  (HCP >= 12, Total_Points >= 20, SL_S >= 5)
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|>|<|==|!=)\s*(\d+(?:\.\d+)?)$", c)
+        if not m:
+            return None
+        var_raw, op_s, num_s = m.group(1), m.group(2), m.group(3)
+        try:
+            num = float(num_s) if "." in num_s else int(num_s)
+        except ValueError:
+            return None
+        _op_map = {">=": "__ge__", "<=": "__le__", ">": "__gt__", "<": "__lt__", "==": "__eq__", "!=": "__ne__"}
+        op_fn = _op_map.get(op_s)
+        if op_fn is None:
+            return None
+        var_up = var_raw.upper()
+        SUIT_MAP = {"S": 0, "H": 1, "D": 2, "C": 3}
+        if var_up == "HCP":
+            col = f"HCP_{direction}"
+            if col not in sample_df.columns:
+                return None
+            return getattr(pl.col(col), op_fn)(num)
+        if var_up in ("TOTAL_POINTS", "TOTALPOINTS"):
+            col = f"Total_Points_{direction}"
+            if col not in sample_df.columns:
+                return None
+            return getattr(pl.col(col), op_fn)(num)
+        if var_up.startswith("SL_") and len(var_up) == 4:
+            suit = var_up[-1]
+            suit_idx = SUIT_MAP.get(suit)
+            if suit_idx is None:
+                return None
+            hand_col = f"Hand_{direction}"
+            if hand_col not in sample_df.columns:
+                return None
+            sl_expr = pl.col(hand_col).str.split(".").list.get(suit_idx).str.len_chars()
+            return getattr(sl_expr, op_fn)(num)
+        return None
+
+    impact_per_criterion: List[Dict[str, Any]] = []
+    combined_fail_mask: pl.Series | None = None
+
+    for crit in (criteria or []):
+        crit_s = str(crit).strip()
+        pass_count: int = 0
+        fail_count: int = 0
+        unknown_count: int = 0
+        fail_mask: pl.Series = pl.Series([False] * _sample_n)
+
+        polars_expr = _criterion_to_polars(crit_s)
+        _used_polars = False
+        if polars_expr is not None:
+            try:
+                result_series = sample_df.select(polars_expr.alias("_pass")).get_column("_pass")
+                pass_count = int(result_series.sum())
+                fail_count = _sample_n - pass_count
+                unknown_count = 0
+                fail_mask = ~result_series
+                _used_polars = True
+            except Exception:
+                _used_polars = False
+
+        if not _used_polars:
+            # Per-row Python fallback (handles complex / relative-SL criteria)
+            pass_count = fail_count = unknown_count = 0
+            fail_mask_list: List[bool] = []
+            for row in sample_df.iter_rows(named=True):
+                result = evaluate_sl_criterion(crit_s, dealer, seat, row, fail_on_missing=False)
+                if result is True:
+                    pass_count += 1
+                    fail_mask_list.append(False)
+                elif result is False:
+                    fail_count += 1
+                    fail_mask_list.append(True)
+                else:
+                    unknown_count += 1
+                    fail_mask_list.append(False)
+            fail_mask = pl.Series(fail_mask_list)
+
+        # Accumulate combined mask (ANY criterion fails → excluded)
+        if combined_fail_mask is None:
+            combined_fail_mask = fail_mask
+        else:
+            combined_fail_mask = combined_fail_mask | fail_mask
+
+        impact_per_criterion.append({
+            "criterion": crit_s,
+            "pass_count": int(pass_count),
+            "fail_count": int(fail_count),
+            "unknown_count": int(unknown_count),
+            "fail_pct": round(100.0 * fail_count / max(1, pass_count + fail_count), 1),
+        })
+
+    combined_fail = int(combined_fail_mask.sum()) if combined_fail_mask is not None else 0
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    return {
+        "auction": auction,
+        "seat": seat,
+        "dealer": dealer,
+        "sample_size": _sample_n,
+        "total_deals_in_db": total_deals,
+        "impact_per_criterion": impact_per_criterion,
+        "combined": {
+            "fail_count": combined_fail,
+            "pass_count": _sample_n - combined_fail,
+            "fail_pct": round(100.0 * combined_fail / max(1, _sample_n), 1),
+        },
+        "elapsed_ms": elapsed_ms,
     }
