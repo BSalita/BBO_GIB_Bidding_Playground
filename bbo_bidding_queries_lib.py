@@ -788,15 +788,8 @@ def get_dd_score_for_auction(auction: str, dealer: str, deal_row: dict) -> int |
         is_doubled = False
         is_redoubled = False
 
-    # Undoubled: keep original behavior (precomputed column).
-    if not is_doubled and not is_redoubled:
-        col_name = f"DD_Score_{level}{strain}_{declarer}"
-        return deal_row.get(col_name)
-
-    # Doubled/redoubled: score via endplay using DD tricks + vulnerability.
-    if not HAS_ENDPLAY:
-        return None
-
+    # Score from DD tricks + contract context (level/strain/doubling/vul). This
+    # avoids relying on precomputed DD_Score_* columns that may be inconsistent.
     dd_tricks = get_dd_tricks_for_auction(auction, dealer, deal_row)
     if dd_tricks is None:
         return None
@@ -825,13 +818,25 @@ def get_dd_score_for_auction(auction: str, dealer: str, deal_row: dict) -> int |
     # Denomination and penalty.
     denom_str = "NT" if str(strain).upper() == "N" else str(strain).upper()
     denom = Denom.find(denom_str)  # type: ignore[union-attr]
-    penalty = Penalty.redoubled if is_redoubled else Penalty.doubled if is_doubled else Penalty.undoubled  # type: ignore[union-attr]
+    penalty = Penalty.redoubled if is_redoubled else Penalty.doubled if is_doubled else Penalty.passed  # type: ignore[union-attr]
 
-    try:
-        c = Contract(level=int(level), denom=denom, declarer=declarer_player, penalty=penalty, result=int(result))  # type: ignore[misc]
-        return int(c.score(vul_enum))  # type: ignore[misc]
-    except Exception:
-        return None
+    if HAS_ENDPLAY:
+        try:
+            c = Contract(level=int(level), denom=denom, declarer=declarer_player, penalty=penalty, result=int(result))  # type: ignore[misc]
+            return int(c.score(vul_enum))  # type: ignore[misc]
+        except Exception:
+            return None
+
+    # Last-resort fallback when endplay is unavailable.
+    # Keep compatibility with existing precomputed columns.
+    if not is_doubled and not is_redoubled:
+        col_name = f"DD_Score_{level}{strain}_{declarer}"
+        val = deal_row.get(col_name)
+        try:
+            return int(val) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def get_dd_tricks_for_auction(auction: str, dealer: str, deal_row: dict) -> int | None:
@@ -947,7 +952,7 @@ def get_ev_for_auction(auction: str, dealer: str, deal_row: dict) -> float | Non
 
     denom_str = "NT" if str(strain).upper() == "N" else str(strain).upper()
     denom = Denom.find(denom_str)  # type: ignore[union-attr]
-    penalty = Penalty.redoubled if is_redoubled else Penalty.doubled if is_doubled else Penalty.undoubled  # type: ignore[union-attr]
+    penalty = Penalty.redoubled if is_redoubled else Penalty.doubled if is_doubled else Penalty.passed  # type: ignore[union-attr]
 
     ev = 0.0
     saw_any_prob = False

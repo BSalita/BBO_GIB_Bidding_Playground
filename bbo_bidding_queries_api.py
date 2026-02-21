@@ -1614,6 +1614,38 @@ class CustomCriteriaImpactRequest(BaseModel):
     sample_size: int = 10_000
 
 
+class BeliefSnapshotRequest(BaseModel):
+    """Request seat-wise belief snapshot for an auction step."""
+    auction: str = ""
+    dealer: str = "N"
+    vul: Optional[str] = None
+    step: Optional[int] = None
+    known_hands: Optional[Dict[str, str]] = None
+    deal_row_idx: Optional[int] = None
+    deal_row_dict: Optional[Dict[str, Any]] = None
+    compact: bool = True
+
+
+class BeliefTraceRequest(BaseModel):
+    """Request full-auction belief trace with step deltas."""
+    auction: str = ""
+    dealer: str = "N"
+    vul: Optional[str] = None
+    known_hands: Optional[Dict[str, str]] = None
+    deal_row_idx: Optional[int] = None
+    deal_row_dict: Optional[Dict[str, Any]] = None
+    compact: bool = True
+    max_steps: int = 64
+
+
+class CriticalMistakeAnalysisRequest(BaseModel):
+    """Request for post-auction critical mistake attribution."""
+    ai_model_steps: List[Dict[str, Any]]
+    dealer: str = "N"
+    us_pair: str = "NS"
+    top_k: int = 3
+
+
 class DealMatchedBTSampleRequest(BaseModel):
     """Sample BT rows that match a specific deal using the GPU-verified deal→BT index."""
     # Primary key used by criteria bitmaps and deal_to_bt indices (row position in deals file).
@@ -3691,15 +3723,16 @@ def bidding_table_statistics(req: BiddingTableStatisticsRequest) -> Dict[str, An
 # API: process PBN / LIN
 # ---------------------------------------------------------------------------
 
-def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[str], dict[int, str]]:
+def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[str], dict[int, str], dict[int, dict[str, Any]]]:
     """
     Parse PBN or LIN file content using endplay and extract all deals with vulnerabilities.
-    Returns (list of PBN strings, dict of deal_idx -> vulnerability).
+    Returns (list of PBN strings, dict of deal_idx -> vulnerability, dict of deal_idx -> parsed metadata).
     """
     from endplay.parsers import pbn as pbn_parser, lin as lin_parser
     
     pbn_deals = []
     deal_vuls = {}
+    deal_meta: dict[int, dict[str, Any]] = {}
     
     try:
         # Parse using appropriate endplay parser
@@ -3724,10 +3757,32 @@ def _parse_file_with_endplay(content: str, is_lin: bool = False) -> tuple[list[s
             deal_idx = len(pbn_deals)
             pbn_deals.append(pbn_str)
             deal_vuls[deal_idx] = vul
+            # PBN "Result" is tricks taken total. Convert to internal pair:
+            #   Tricks = total tricks, Result = over/under vs contract target.
+            meta: dict[str, Any] = {}
+            try:
+                c = board.contract
+                if c is not None and int(getattr(c, "level", 0)) > 0:
+                    level_i = int(c.level)
+                    denom_abbr = str(getattr(c.denom, "abbr", "N")).upper()
+                    strain = "N" if denom_abbr in ("NT", "N") else denom_abbr
+                    decl_abbr = str(getattr(c.declarer, "abbr", "")).upper()
+                    result_delta = int(c.result)
+                    tricks_taken = int(level_i + 6 + result_delta)
+                    meta.update({
+                        "Declarer": decl_abbr if decl_abbr in ("N", "E", "S", "W") else None,
+                        "Contract": f"{level_i}{strain}",
+                        "Result": result_delta,
+                        "Tricks": tricks_taken,
+                    })
+            except Exception:
+                # Fail-safe metadata extraction: leave meta empty if parsing is incomplete.
+                meta = {}
+            deal_meta[deal_idx] = meta
     except Exception as e:
         print(f"[parse-file] endplay parsing failed: {e}")
     
-    return pbn_deals, deal_vuls
+    return pbn_deals, deal_vuls, deal_meta
 
 
 
@@ -4544,6 +4599,56 @@ def custom_criteria_impact(req: CustomCriteriaImpactRequest) -> Dict[str, Any]:
         seat=int(req.seat),
         dealer=str(req.dealer),
         sample_size=int(req.sample_size),
+    )
+    return _attach_hot_reload_info(result, reload_info)
+
+
+@app.post("/belief-snapshot")
+def belief_snapshot(req: BeliefSnapshotRequest) -> Dict[str, Any]:
+    """Return seat-wise belief snapshot at one auction step."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    result = handler_module.handle_belief_snapshot(
+        state=state,
+        auction=str(req.auction or ""),
+        dealer=str(req.dealer or "N"),
+        vul=req.vul,
+        step=req.step,
+        known_hands=req.known_hands,
+        deal_row_idx=req.deal_row_idx,
+        deal_row_dict=req.deal_row_dict,
+        compact=bool(req.compact),
+    )
+    return _attach_hot_reload_info(result, reload_info)
+
+
+@app.post("/belief-trace")
+def belief_trace(req: BeliefTraceRequest) -> Dict[str, Any]:
+    """Return step-wise belief snapshots and compact deltas."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    result = handler_module.handle_belief_trace(
+        state=state,
+        auction=str(req.auction or ""),
+        dealer=str(req.dealer or "N"),
+        vul=req.vul,
+        known_hands=req.known_hands,
+        deal_row_idx=req.deal_row_idx,
+        deal_row_dict=req.deal_row_dict,
+        compact=bool(req.compact),
+        max_steps=int(req.max_steps),
+    )
+    return _attach_hot_reload_info(result, reload_info)
+
+
+@app.post("/critical-mistake-analysis")
+def critical_mistake_analysis(req: CriticalMistakeAnalysisRequest) -> Dict[str, Any]:
+    """Analyze per-step scores and identify critical opponent/our mistakes."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    result = handler_module.handle_critical_mistake_analysis(
+        state=state,
+        ai_model_steps=list(req.ai_model_steps or []),
+        dealer=str(req.dealer or "N"),
+        us_pair=str(req.us_pair or "NS"),
+        top_k=int(req.top_k),
     )
     return _attach_hot_reload_info(result, reload_info)
 

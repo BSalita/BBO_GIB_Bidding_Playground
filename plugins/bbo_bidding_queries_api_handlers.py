@@ -4126,6 +4126,7 @@ def handle_process_pbn(
     pbn_input = pbn_input.strip()
     pbn_deals: List[str] = []
     deal_vuls: Dict[int, str] = {}
+    deal_meta_by_idx: Dict[int, Dict[str, Any]] = {}
     input_type = "unknown"
     input_source = ""
     
@@ -4138,7 +4139,7 @@ def handle_process_pbn(
             response.raise_for_status()
             file_content = response.text
             is_lin = url.lower().endswith('.lin') or 'md|' in file_content[:500]
-            pbn_deals, deal_vuls = parse_file_with_endplay_fn(file_content, is_lin=is_lin)
+            pbn_deals, deal_vuls, deal_meta_by_idx = parse_file_with_endplay_fn(file_content, is_lin=is_lin)
             input_type = "LIN URL" if is_lin else "PBN URL"
             input_source = url
         except Exception as e:
@@ -4155,7 +4156,7 @@ def handle_process_pbn(
             with open(file_path, 'r', encoding='utf-8') as f:
                 file_content = f.read()
             is_lin = file_path.lower().endswith('.lin') or 'md|' in file_content[:500]
-            pbn_deals, deal_vuls = parse_file_with_endplay_fn(file_content, is_lin=is_lin)
+            pbn_deals, deal_vuls, deal_meta_by_idx = parse_file_with_endplay_fn(file_content, is_lin=is_lin)
             input_type = "LIN file" if is_lin else "PBN file"
             input_source = file_path
         except ValueError:
@@ -4164,7 +4165,7 @@ def handle_process_pbn(
             raise ValueError(f"Failed to read/parse file: {e}")
     
     elif 'md|' in pbn_input and '|' in pbn_input:
-        pbn_deals, deal_vuls = parse_file_with_endplay_fn(pbn_input, is_lin=True)
+        pbn_deals, deal_vuls, deal_meta_by_idx = parse_file_with_endplay_fn(pbn_input, is_lin=True)
         input_type = "LIN string"
         input_source = f"{len(pbn_input)} chars"
     
@@ -4185,6 +4186,11 @@ def handle_process_pbn(
 
         deal.setdefault("pbn", pbn_str)
         deal.setdefault("Dealer", "N")
+        # For PBN/LIN parsing, the parser-provided semantics are authoritative:
+        # Tricks = total tricks taken; Result = Tricks - (level + 6).
+        parsed_meta = deal_meta_by_idx.get(deal_idx) or {}
+        if parsed_meta:
+            deal.update({k: v for k, v in parsed_meta.items() if v is not None})
         
         for direction in 'NESW':
             hand_col = f'Hand_{direction}'
@@ -4216,6 +4222,9 @@ def handle_process_pbn(
                 game_result_cols = ['bid', 'Declarer', 'Result', 'Tricks', 'Score', 'ParScore', 'DD_Tricks']
                 for col in game_result_cols:
                     if col in first_match:
+                        # Do not overwrite PBN/LIN parser semantics for Result/Tricks.
+                        if col in ("Result", "Tricks") and col in parsed_meta:
+                            continue
                         deal[col] = first_match[col]
                 deal['matching_deals_in_db'] = matching_deals.height
         except Exception as e:
@@ -12697,4 +12706,371 @@ def handle_custom_criteria_impact(
             "fail_pct": round(100.0 * combined_fail / max(1, _sample_n), 1),
         },
         "elapsed_ms": elapsed_ms,
+    }
+
+
+def _merge_numeric_bound(bounds: dict[str, float | None], op: str, value: float) -> None:
+    """Merge a single comparator into min/max bounds."""
+    cur_min = bounds.get("min")
+    cur_max = bounds.get("max")
+    if op == ">=":
+        bounds["min"] = value if cur_min is None else max(float(cur_min), value)
+    elif op == ">":
+        # Keep integer-like strictness in explainable form (+1 for strict integer criteria).
+        strict_min = value + 1.0
+        bounds["min"] = strict_min if cur_min is None else max(float(cur_min), strict_min)
+    elif op == "<=":
+        bounds["max"] = value if cur_max is None else min(float(cur_max), value)
+    elif op == "<":
+        strict_max = value - 1.0
+        bounds["max"] = strict_max if cur_max is None else min(float(cur_max), strict_max)
+    elif op == "==":
+        bounds["min"] = value
+        bounds["max"] = value
+
+
+def _infer_belief_ranges_from_criteria(criteria: list[str]) -> dict[str, dict[str, float | None]]:
+    """Infer coarse numeric ranges from Agg_Expr criteria list."""
+    out: dict[str, dict[str, float | None]] = {
+        "HCP": {"min": None, "max": None},
+        "Total_Points": {"min": None, "max": None},
+        "SL_S": {"min": None, "max": None},
+        "SL_H": {"min": None, "max": None},
+        "SL_D": {"min": None, "max": None},
+        "SL_C": {"min": None, "max": None},
+    }
+    pat = re.compile(r"^\s*(HCP|Total_Points|SL_[SHDC])\s*(>=|<=|>|<|==)\s*(-?\d+(?:\.\d+)?)\s*$", re.IGNORECASE)
+    for crit in criteria:
+        c = str(crit or "").strip()
+        m = pat.match(c)
+        if not m:
+            continue
+        var_raw, op, num_s = m.group(1), m.group(2), m.group(3)
+        var = "Total_Points" if var_raw.upper().startswith("TOTAL") else var_raw.upper()
+        if var not in out:
+            continue
+        try:
+            num_v = float(num_s)
+        except Exception:
+            continue
+        _merge_numeric_bound(out[var], op, num_v)
+    return out
+
+
+def _build_known_seat_features(known_hands: dict[str, str]) -> dict[str, dict[str, Any]]:
+    """Compute per-direction known hand feature dicts for explainability."""
+    out: dict[str, dict[str, Any]] = {}
+    for d in ("N", "E", "S", "W"):
+        hs = str((known_hands or {}).get(d) or "").strip()
+        if not hs:
+            continue
+        feats = compute_hand_features(hs) or {}
+        out[d] = {
+            "hand": hs,
+            "HCP": feats.get("HCP"),
+            "Total_Points": feats.get("Total_Points"),
+            "SL_S": feats.get("SL_S"),
+            "SL_H": feats.get("SL_H"),
+            "SL_D": feats.get("SL_D"),
+            "SL_C": feats.get("SL_C"),
+        }
+    return out
+
+
+def handle_belief_snapshot(
+    state: Dict[str, Any],
+    *,
+    auction: str,
+    dealer: str = "N",
+    vul: str | None = None,
+    step: int | None = None,
+    known_hands: dict[str, str] | None = None,
+    deal_row_idx: int | None = None,
+    deal_row_dict: dict[str, Any] | None = None,
+    compact: bool = True,
+) -> Dict[str, Any]:
+    """Return seat-wise belief snapshot from BT criteria + known hand facts."""
+    t0 = time.perf_counter()
+    auction_in = normalize_auction_input(str(auction or ""))
+    tok_all = [t for t in str(auction_in or "").split("-") if t]
+    step_i = int(step) if step is not None else (len(tok_all) + 1)
+    if step_i < 1:
+        step_i = 1
+    prefix_tokens = tok_all[: max(0, step_i - 1)]
+    auction_prefix = "-".join(prefix_tokens)
+
+    dealer_u = str(dealer or "N").strip().upper() or "N"
+    if dealer_u not in DIRECTIONS_LIST:
+        dealer_u = "N"
+    known_map: dict[str, str] = {str(k).upper(): str(v) for k, v in (known_hands or {}).items() if str(v or "").strip()}
+
+    # Pull known hands from deal row when caller provides db index or inline row.
+    row_dict: dict[str, Any] = {}
+    if isinstance(deal_row_dict, dict):
+        row_dict = dict(deal_row_dict)
+    elif deal_row_idx is not None and int(deal_row_idx) >= 0:
+        try:
+            deal_df = state.get("deal_df")
+            if isinstance(deal_df, pl.DataFrame) and deal_df.height > int(deal_row_idx):
+                one = _take_rows_by_index(deal_df, [int(deal_row_idx)])
+                if one.height > 0:
+                    row_dict = one.to_dicts()[0]
+        except Exception:
+            row_dict = {}
+    if row_dict:
+        dealer_u = str(row_dict.get("Dealer", dealer_u) or dealer_u).upper()
+        if dealer_u not in DIRECTIONS_LIST:
+            dealer_u = "N"
+        for d in ("N", "E", "S", "W"):
+            hv = str(row_dict.get(f"Hand_{d}", "") or "").strip()
+            if hv and d not in known_map:
+                known_map[d] = hv
+
+    bt_index: int | None = None
+    bt_row: dict[str, Any] = {}
+    if auction_prefix:
+        bt_index = _resolve_bt_index_by_traversal(state, auction_prefix)
+        if bt_index is not None:
+            try:
+                bt_file = state.get("bt_seat1_file")
+                if isinstance(bt_file, (str, pathlib.Path)):
+                    bt_map = _load_agg_expr_for_bt_indices([int(bt_index)], bt_file)
+                    bt_row = {"bt_index": int(bt_index)}
+                    bt_row.update(bt_map.get(int(bt_index), {}))
+                    bt_row = _apply_all_rules_to_bt_row(bt_row, state)
+            except Exception:
+                bt_row = {}
+
+    known_features = _build_known_seat_features(known_map)
+    seats_out: dict[str, Any] = {}
+    for seat in (1, 2, 3, 4):
+        dir_map = _seat_direction_map(seat)
+        direction = str(dir_map.get(dealer_u, "N"))
+        crits = list(bt_row.get(agg_expr_col(seat)) or [])
+        ranges = _infer_belief_ranges_from_criteria([str(c) for c in crits])
+        known = known_features.get(direction)
+        seat_payload: dict[str, Any] = {
+            "seat": int(seat),
+            "direction": direction,
+            "criteria_count": int(len(crits)),
+            "ranges": ranges,
+            "is_known": bool(known),
+        }
+        if known:
+            seat_payload["known"] = known
+        if not compact:
+            seat_payload["criteria"] = crits
+        seats_out[direction] = seat_payload
+
+    explanation_facts: list[str] = []
+    for d in ("N", "E", "S", "W"):
+        s = seats_out.get(d) or {}
+        rg = s.get("ranges") or {}
+        hcp_r = rg.get("HCP") or {}
+        tp_r = rg.get("Total_Points") or {}
+        hcp_min = hcp_r.get("min")
+        hcp_max = hcp_r.get("max")
+        tp_min = tp_r.get("min")
+        tp_max = tp_r.get("max")
+        if hcp_min is not None or hcp_max is not None or tp_min is not None or tp_max is not None:
+            explanation_facts.append(
+                f"{d}: HCP[{hcp_min},{hcp_max}] TP[{tp_min},{tp_max}] from criteria"
+            )
+
+    return {
+        "auction_input": auction_in,
+        "auction_prefix_for_step": auction_prefix,
+        "step": int(step_i),
+        "dealer": dealer_u,
+        "vul": vul,
+        "bt_index": bt_index,
+        "belief_version": "criteria-ranges-v1",
+        "seats": seats_out,
+        "known_hands": known_map,
+        "explanation_facts": explanation_facts,
+        "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+    }
+
+
+def handle_belief_trace(
+    state: Dict[str, Any],
+    *,
+    auction: str,
+    dealer: str = "N",
+    vul: str | None = None,
+    known_hands: dict[str, str] | None = None,
+    deal_row_idx: int | None = None,
+    deal_row_dict: dict[str, Any] | None = None,
+    compact: bool = True,
+    max_steps: int = 64,
+) -> Dict[str, Any]:
+    """Return step-wise belief snapshots for full-auction explainability."""
+    t0 = time.perf_counter()
+    auction_in = normalize_auction_input(str(auction or ""))
+    toks = [t for t in auction_in.split("-") if t]
+    n_steps = min(int(len(toks) + 1), max(1, int(max_steps)))
+
+    snapshots: list[dict[str, Any]] = []
+    for s in range(1, n_steps + 1):
+        snap = handle_belief_snapshot(
+            state=state,
+            auction=auction_in,
+            dealer=dealer,
+            vul=vul,
+            step=s,
+            known_hands=known_hands,
+            deal_row_idx=deal_row_idx,
+            deal_row_dict=deal_row_dict,
+            compact=compact,
+        )
+        snapshots.append(snap)
+
+    deltas: list[dict[str, Any]] = []
+    for i in range(1, len(snapshots)):
+        prev = snapshots[i - 1]
+        curr = snapshots[i]
+        delta_rows: list[dict[str, Any]] = []
+        for d in ("N", "E", "S", "W"):
+            p = ((prev.get("seats") or {}).get(d) or {}).get("ranges") or {}
+            c = ((curr.get("seats") or {}).get(d) or {}).get("ranges") or {}
+            p_hcp = p.get("HCP") or {}
+            c_hcp = c.get("HCP") or {}
+            if p_hcp != c_hcp:
+                delta_rows.append({"direction": d, "feature": "HCP", "before": p_hcp, "after": c_hcp})
+        if delta_rows:
+            deltas.append({
+                "step_from": int(i),
+                "step_to": int(i + 1),
+                "changes": delta_rows,
+            })
+
+    return {
+        "auction_input": auction_in,
+        "dealer": str(dealer or "N").upper(),
+        "vul": vul,
+        "steps": snapshots,
+        "deltas": deltas,
+        "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+    }
+
+
+def handle_critical_mistake_analysis(
+    state: Dict[str, Any],
+    *,
+    ai_model_steps: list[dict[str, Any]] | None,
+    dealer: str = "N",
+    us_pair: str = "NS",
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """Identify high-impact opponent mistakes from per-step bid scores.
+
+    This consumes the `ai_model_steps` payload produced by advanced path scoring and
+    finds steps where the acting side selected a bid that scored materially below
+    the best available alternative.
+    """
+    _ = state  # reserved for future richer analysis using stateful lookups
+    t0 = time.perf_counter()
+    dealer_u = str(dealer or "N").strip().upper() or "N"
+    if dealer_u not in DIRECTIONS_LIST:
+        dealer_u = "N"
+    us_pair_u = str(us_pair or "NS").strip().upper()
+    if us_pair_u not in ("NS", "EW"):
+        us_pair_u = "NS"
+    k = max(1, int(top_k or 1))
+
+    rows: list[dict[str, Any]] = []
+    for st in list(ai_model_steps or []):
+        if not isinstance(st, dict):
+            continue
+        scores = st.get("bid_scores") or []
+        if not isinstance(scores, list) or not scores:
+            continue
+
+        # Build best candidate and chosen candidate lookup.
+        best_row: dict[str, Any] | None = None
+        best_score = float("-inf")
+        by_bid: dict[str, dict[str, Any]] = {}
+        for r in scores:
+            if not isinstance(r, dict):
+                continue
+            bid = str(r.get("bid", "")).strip().upper()
+            if bid:
+                by_bid[bid] = r
+            sc = _safe_float(r.get("score"))
+            if sc is None:
+                sc = _safe_float(r.get("final_score"))
+            if sc is None:
+                continue
+            if sc > best_score:
+                best_score = float(sc)
+                best_row = r
+        if best_row is None:
+            continue
+
+        chosen_bid = str(st.get("choice", "")).strip().upper()
+        chosen_row = by_bid.get(chosen_bid)
+        chosen_score = _safe_float(chosen_row.get("score")) if isinstance(chosen_row, dict) else None
+        if chosen_score is None and isinstance(chosen_row, dict):
+            chosen_score = _safe_float(chosen_row.get("final_score"))
+        if chosen_score is None:
+            continue
+
+        seat_i = int(st.get("seat", 0) or 0)
+        seat_map = _seat_direction_map(seat_i if 1 <= seat_i <= 4 else 1)
+        direction = str(seat_map.get(dealer_u, "N"))
+        actor_pair = "NS" if direction in ("N", "S") else "EW"
+        is_opponent_step = actor_pair != us_pair_u
+
+        delta_actor = float(best_score) - float(chosen_score)
+        if not math.isfinite(delta_actor) or delta_actor <= 0.0:
+            continue
+
+        scored_n = int(st.get("scored_n", len(scores)) or len(scores))
+        # Confidence proxy: bigger deltas and larger candidate sets increase trust.
+        conf = max(
+            0.05,
+            min(
+                0.99,
+                0.70 * min(delta_actor / 120.0, 1.0) + 0.30 * min(scored_n / 5.0, 1.0),
+            ),
+        )
+
+        rows.append(
+            {
+                "step": int(st.get("step", 0) or 0),
+                "auction_prefix": st.get("bt_prefix"),
+                "seat": seat_i,
+                "direction": direction,
+                "actor_pair": actor_pair,
+                "is_opponent_step": bool(is_opponent_step),
+                "chosen_bid": chosen_bid,
+                "chosen_score": round(float(chosen_score), 2),
+                "best_alternative_bid": str(best_row.get("bid", "")).strip().upper(),
+                "best_alternative_score": round(float(best_score), 2),
+                "delta_actor": round(delta_actor, 2),
+                "delta_us": round(delta_actor if is_opponent_step else -delta_actor, 2),
+                "scored_n": scored_n,
+                "confidence": round(conf, 3),
+                "chosen_guard_penalty": _safe_float((chosen_row or {}).get("guard_penalty")),
+                "best_guard_penalty": _safe_float((best_row or {}).get("guard_penalty")),
+            }
+        )
+
+    opponent_rows = [r for r in rows if bool(r.get("is_opponent_step"))]
+    opponent_rows.sort(key=lambda r: float(r.get("delta_actor") or 0.0), reverse=True)
+    our_rows = [r for r in rows if not bool(r.get("is_opponent_step"))]
+    our_rows.sort(key=lambda r: float(r.get("delta_actor") or 0.0), reverse=True)
+
+    critical_opp = opponent_rows[0] if opponent_rows else None
+    critical_our = our_rows[0] if our_rows else None
+
+    return {
+        "dealer": dealer_u,
+        "us_pair": us_pair_u,
+        "total_steps_analyzed": len(rows),
+        "critical_opponent_mistake": critical_opp,
+        "critical_our_mistake": critical_our,
+        "top_opponent_mistakes": opponent_rows[:k],
+        "top_our_mistakes": our_rows[:k],
+        "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
     }

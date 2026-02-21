@@ -26,6 +26,7 @@ import time
 import requests
 import base64
 import io
+import json
 import numpy as np
 from datetime import datetime, timezone
 import importlib.metadata as importlib_metadata
@@ -33,7 +34,7 @@ import pathlib
 import os
 import sys
 import re
-from typing import Any, Dict, List, Literal, Set
+from typing import Any, Dict, List, Literal, Optional, Set
 
 import mlBridge.mlBridgeLib as mlBridgeLib
 
@@ -48,6 +49,7 @@ from bbo_bidding_queries_lib import (
     is_regex_pattern,
     normalize_auction_input,
     normalize_auction_user_text,
+    compute_hand_features,
     format_elapsed,
     parse_contract_from_auction,
     get_declarer_for_auction,
@@ -82,7 +84,12 @@ from bbo_hand_eval_lib import (
     estimate_partnership_tricks,
     estimate_quick_losers,
 )
+from chatlib.expert_chat import call_provider, call_providers_all
 
+CHAT_PROVIDERS = ["OpenRouter"]
+DEFAULT_MODELS: dict[str, str] = {
+    "OpenRouter": "openai/gpt-oss-120b",
+}
 
 API_BASE = "http://127.0.0.1:8000"
 
@@ -974,6 +981,526 @@ def api_post(path: str, payload: Dict[str, Any], timeout: int | None = None) -> 
     except Exception:
         pass
     return data
+
+
+def _expert_chat_system_prompt(*, style: str = "Classic", compact: bool = True) -> str:
+    """Return system prompt text for expert chat."""
+    s = str(style or "Classic").strip().lower()
+    spicy = s == "spicy"
+    if compact:
+        if spicy:
+            return (
+                "You are Expert Commentary for contract bridge bidding. "
+                "Use colorful bridge jargon but stay factual. "
+                "Ground every claim in context, compare chosen bid vs best alternative, "
+                "call out opponents vs we with seat direction, and end with 1-3 actionable next moves."
+            )
+        return (
+            "You are Expert Commentary for contract bridge bidding. "
+            "Be concise, technical, and grounded in provided context. "
+            "Explain safety vs upside, fit/LTC/controls, and chosen bid vs best alternative with confidence."
+        )
+    if spicy:
+        return (
+            "You are Expert Commentary, a contract-bridge bidding analyst.\n"
+            "Mission: explain AI bidding choices and mistakes with high-signal bridge insight.\n"
+            "Style: colorful, vivid bridge jargon (whacked, pounced, lying in wait to double) while remaining accurate.\n"
+            "Rules:\n"
+            "- Use only provided data; mark uncertainty explicitly.\n"
+            "- Prioritize critical mistake step, best alternative, and swing.\n"
+            "- Include belief cues (HCP/shape/fit/LTC/controls) and path-to-game/slam trade-offs.\n"
+            "- Keep output concise and actionable."
+        )
+    return (
+        "You are Expert Commentary, a contract-bridge bidding analyst.\n"
+        "Explain decisions clearly using fit, HCP/TP, controls, LTC, safety, and path EV.\n"
+        "Use measured bridge terminology, compare selected bid vs best alternative, "
+        "and provide short actionable recommendations."
+    )
+
+
+def _load_expert_chat_context() -> dict[str, Any]:
+    """Load best-effort debug context for expert chat from local debug file."""
+    dbg_path = pathlib.Path("data/ai_model_debug.json")
+    if not dbg_path.exists():
+        return {"error": "No debug context file found", "path": str(dbg_path)}
+    try:
+        return json.loads(dbg_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"error": f"Could not parse debug context: {e}", "path": str(dbg_path)}
+
+
+def _extract_auction_for_beliefs(ctx: dict[str, Any]) -> tuple[str, str, str]:
+    """Return (auction, dealer, vul) for belief API calls."""
+    ai_auction = str(ctx.get("ai_auction") or "").strip()
+    dealer = str(ctx.get("dealer") or "N").strip().upper() or "N"
+    vul = str(ctx.get("vul") or "").strip()
+    return ai_auction, dealer, vul
+
+
+def _known_hands_from_context(ctx: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    pd = ctx.get("pinned_deal") or {}
+    if isinstance(pd, dict):
+        for d in ("N", "E", "S", "W"):
+            hv = str(pd.get(f"Hand_{d}") or "").strip()
+            if hv:
+                out[d] = hv
+    return out
+
+
+def _parse_contract_text(contract_text: str) -> tuple[int, str, str] | None:
+    """Parse compact contract text like '3DS' -> (3, 'D', 'S')."""
+    s = str(contract_text or "").strip().upper()
+    m = re.match(r"^([1-7])\s*(NT|N|[CDHS])\s*([NESW])$", s)
+    if not m:
+        return None
+    lvl = int(m.group(1))
+    strain = "N" if m.group(2) in ("NT", "N") else m.group(2)
+    decl = m.group(3)
+    return lvl, strain, decl
+
+
+def _build_expert_commentary(
+    ctx: dict[str, Any],
+    cm: dict[str, Any] | None,
+    *,
+    style: str = "Classic",
+) -> list[str]:
+    """Build default bridge-jargon observations for the UI."""
+    spicy = str(style or "Classic").strip().lower() == "spicy"
+    lines: list[str] = []
+    imp = ctx.get("imp_diff")
+    try:
+        imp_i = int(imp) if imp is not None else None
+    except Exception:
+        imp_i = None
+    if imp_i is not None:
+        if imp_i < 0:
+            if spicy:
+                lines.append(f"We got whacked for {abs(imp_i)} IMPs versus Actual on this board.")
+            else:
+                lines.append(f"AI was {abs(imp_i)} IMPs worse than Actual on this board.")
+        elif imp_i > 0:
+            if spicy:
+                lines.append(f"We put in a gem: AI beat Actual by {abs(imp_i)} IMPs.")
+            else:
+                lines.append(f"AI was {abs(imp_i)} IMPs better than Actual on this board.")
+        else:
+            if spicy:
+                lines.append("Flat board: AI and Actual were tied on IMP quality.")
+            else:
+                lines.append("Flat board: AI and Actual were equal by IMP quality.")
+
+    div = ctx.get("divergence")
+    if isinstance(div, dict):
+        step = div.get("step")
+        af = div.get("auction_so_far")
+        ab = div.get("actual_bid")
+        ib = div.get("ai_bid")
+        if step and af and ab and ib and str(ab) != str(ib):
+            if spicy:
+                lines.append(
+                    f"The wheels came off at step {step}: after {af}, we fired {ib} while the field bid {ab}."
+                )
+            else:
+                lines.append(
+                    f"Key divergence at step {step}: after {af}, we chose {ib} while the reference action was {ab}."
+                )
+
+    if isinstance(cm, dict):
+        opp = cm.get("critical_opponent_mistake")
+        if isinstance(opp, dict):
+            if spicy:
+                lines.append(
+                    "Opponent slip spotted: "
+                    f"{opp.get('direction')} ({opp.get('actor_pair')}) chose {opp.get('chosen_bid')} "
+                    f"while {opp.get('best_alternative_bid')} was waiting to pounce."
+                )
+            else:
+                lines.append(
+                    "Opponent mistake identified: "
+                    f"{opp.get('direction')} ({opp.get('actor_pair')}) chose {opp.get('chosen_bid')} "
+                    f"instead of stronger {opp.get('best_alternative_bid')}."
+                )
+
+    ai_contract = str(ctx.get("ai_contract") or "")
+    parsed = _parse_contract_text(ai_contract)
+    pd = ctx.get("pinned_deal") or {}
+    if parsed and isinstance(pd, dict):
+        lvl, strain, decl = parsed
+        partner = {"N": "S", "S": "N", "E": "W", "W": "E"}[decl]
+        try:
+            h_decl = str(pd.get(f"Hand_{decl}") or "")
+            h_part = str(pd.get(f"Hand_{partner}") or "")
+            if h_decl and h_part and strain in ("S", "H", "D", "C"):
+                f_decl = compute_hand_features(h_decl)
+                f_part = compute_hand_features(h_part)
+                fit = int(f_decl.get(f"SL_{strain}", 0) or 0) + int(f_part.get(f"SL_{strain}", 0) or 0)
+                if fit <= 7:
+                    if spicy:
+                        lines.append(
+                            f"{ai_contract} looks like a skinny fit (about {fit} cards) - dummy came down light and we got stretched."
+                        )
+                    else:
+                        lines.append(
+                            f"{ai_contract} appears to be a thin fit (about {fit} cards), so strain safety was shaky."
+                        )
+                elif fit >= 9 and lvl >= 4:
+                    if spicy:
+                        lines.append(f"{ai_contract} has a big fit ({fit} cards) - classic pressure auction territory.")
+                    else:
+                        lines.append(f"{ai_contract} shows a strong fit ({fit} cards), supporting game-level pressure.")
+            if lvl >= 5:
+                aces_decl = sum(1 for c in h_decl if c.upper() == "A")
+                aces_part = sum(1 for c in h_part if c.upper() == "A")
+                if (aces_decl + aces_part) <= 2:
+                    if spicy:
+                        lines.append("At the 5-level or higher with thin controls, key cards can be off-sides and ugly fast.")
+                    else:
+                        lines.append("At 5-level or higher with limited controls, offside key cards are a major risk.")
+        except Exception:
+            pass
+
+    if not lines:
+        if spicy:
+            lines.append("No big fireworks detected yet - ask the chat to drill into a specific step.")
+        else:
+            lines.append("No major signal detected yet - ask chat to drill into a specific step.")
+    return lines
+
+
+def _trim_context_for_chat(context: dict[str, Any], *, top_k: int = 3, max_chars: int = 90000) -> dict[str, Any]:
+    """Return a trimmed copy of the debug context suitable for LLM consumption.
+
+    The raw ai_model_steps payload can exceed 150KB.  We keep only the top-k
+    candidates (by final_score) at each step, which cuts it to ~5-10KB while
+    preserving all the information the LLM needs to reason about bid choices.
+    """
+    out = {k: v for k, v in context.items() if k != "ai_model_steps"}
+    steps = context.get("ai_model_steps")
+    if not isinstance(steps, list) or not steps:
+        return out
+    trimmed: list[dict[str, Any]] = []
+    keep_fields = {
+        "bid", "base", "base_shrunk", "matched_n", "mean_par",
+        "desc_score", "opp_threat", "guard_penalty", "final_score", "cache_mode",
+    }
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        cands = step.get("candidates")
+        if not isinstance(cands, list):
+            trimmed.append(step)
+            continue
+        sorted_cands = sorted(cands, key=lambda c: c.get("final_score", 0), reverse=True)
+        slim_cands = [
+            {k: v for k, v in c.items() if k in keep_fields}
+            for c in sorted_cands[:top_k]
+        ]
+        trimmed.append({**{k: v for k, v in step.items() if k != "candidates"}, "candidates": slim_cands})
+    out["ai_model_steps"] = trimmed
+
+    def _json_chars(obj: Any) -> int:
+        return len(json.dumps(obj, ensure_ascii=True, separators=(",", ":"), default=str))
+
+    # Keep payload bounded so it can be pasted into external chat UIs.
+    if _json_chars(out) <= int(max_chars):
+        return out
+
+    # 1) Reduce number of steps (most recent steps usually matter most).
+    steps_now = out.get("ai_model_steps")
+    if isinstance(steps_now, list):
+        for keep_n in (8, 6, 4, 3, 2, 1):
+            out["ai_model_steps"] = steps_now[-keep_n:]
+            if _json_chars(out) <= int(max_chars):
+                return out
+
+    # 2) Reduce candidates per step.
+    steps_now = out.get("ai_model_steps")
+    if isinstance(steps_now, list):
+        for cand_keep in (2, 1):
+            slim_steps: list[dict[str, Any]] = []
+            for stp in steps_now:
+                if not isinstance(stp, dict):
+                    continue
+                cands = stp.get("candidates")
+                if isinstance(cands, list):
+                    slim_steps.append({**{k: v for k, v in stp.items() if k != "candidates"}, "candidates": cands[:cand_keep]})
+                else:
+                    slim_steps.append(stp)
+            out["ai_model_steps"] = slim_steps
+            if _json_chars(out) <= int(max_chars):
+                return out
+
+    # 3) Drop optional heavy keys if still too large.
+    for k in ("advanced_table_rows", "completion_rows", "critical_mistake_analysis"):
+        if k in out:
+            out.pop(k, None)
+            if _json_chars(out) <= int(max_chars):
+                return out
+
+    # 4) Last resort: remove step detail entirely.
+    out.pop("ai_model_steps", None)
+    return out
+
+
+def render_expert_chat_panel(*, key_prefix: str, title: str = "Expert Chat") -> None:
+    """Render chat-input expert chat panel with message history."""
+    st.markdown(f"#### {title}")
+
+    # --- settings row ---
+    cfg_cols = st.columns([1, 1, 1, 1])
+    commentary_style = cfg_cols[0].selectbox(
+        "Style",
+        options=["Classic", "Spicy"],
+        index=0,
+        key=f"{key_prefix}_commentary_style",
+        help="Classic is measured; Spicy uses colorful bridge table talk.",
+    )
+    compact_prompt = cfg_cols[1].checkbox(
+        "Compact",
+        value=True,
+        key=f"{key_prefix}_compact_prompt",
+        help="Shorter system prompt (fewer tokens).",
+    )
+    provider_opts = CHAT_PROVIDERS + ["All"]
+    provider = cfg_cols[2].selectbox(
+        "Provider",
+        options=provider_opts,
+        index=0,
+        key=f"{key_prefix}_provider",
+    )
+    with cfg_cols[3].popover("Models"):
+        models: dict[str, str] = {}
+        for p in CHAT_PROVIDERS:
+            sk = f"{key_prefix}_model_{p.lower()}"
+            default_val = str(DEFAULT_MODELS.get(p, ""))
+            prev_default_key = f"{sk}__prev_default"
+            if sk not in st.session_state or st.session_state.get(prev_default_key) != default_val:
+                st.session_state[sk] = default_val
+                st.session_state[prev_default_key] = default_val
+            models[p] = st.text_input(f"{p}", key=sk)
+
+    # --- expert commentary (always shown) ---
+    system_prompt = _expert_chat_system_prompt(style=commentary_style, compact=bool(compact_prompt))
+    context = _load_expert_chat_context()
+    ai_auction, dealer, vul = _extract_auction_for_beliefs(context)
+    cm_payload: dict[str, Any] | None = None
+    if ai_auction:
+        try:
+            belief = api_post(
+                "/belief-snapshot",
+                {
+                    "auction": ai_auction,
+                    "dealer": dealer,
+                    "vul": vul,
+                    "known_hands": _known_hands_from_context(context),
+                    "compact": True,
+                },
+                timeout=20,
+            )
+            context["belief_snapshot"] = belief
+        except Exception as e:
+            context["belief_snapshot_error"] = str(e)
+    try:
+        steps = context.get("ai_model_steps") or []
+        if isinstance(steps, list) and steps:
+            cm = api_post(
+                "/critical-mistake-analysis",
+                {
+                    "ai_model_steps": steps,
+                    "dealer": dealer or "N",
+                    "us_pair": "NS",
+                    "top_k": 3,
+                },
+                timeout=20,
+            )
+            context["critical_mistake_analysis"] = cm
+            cm_payload = cm
+    except Exception as e:
+        context["critical_mistake_analysis_error"] = str(e)
+
+    with st.expander("Expert Commentary", expanded=False):
+        for ln in _build_expert_commentary(context, cm_payload, style=commentary_style):
+            st.write(f"- {ln}")
+        if isinstance(cm_payload, dict):
+            top_rows = cm_payload.get("top_opponent_mistakes") or []
+            if isinstance(top_rows, list) and top_rows:
+                st.caption("Top opponent pressure points")
+                st.dataframe(pd.DataFrame(top_rows), width="stretch", hide_index=True)
+
+    # --- chat history ---
+    history_key = f"{key_prefix}_chat_history"
+    if history_key not in st.session_state:
+        st.session_state[history_key] = []
+    chat_history: list[dict[str, str]] = st.session_state[history_key]
+
+    for msg in chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # --- chat input (fires on Enter) ---
+    question = st.chat_input(
+        "Ask about bids, beliefs, mistakes...",
+        key=f"{key_prefix}_chat_input",
+    )
+    if not question:
+        return
+
+    chat_history.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    api_keys = {
+        "OpenAI": str(st.secrets.get("OPENAI_API_KEY", "") or ""),
+        "Anthropic": str(st.secrets.get("ANTHROPIC_API_KEY", "") or ""),
+        "Gemini": str(st.secrets.get("GEMINI_API_KEY", "") or ""),
+        "OpenRouter": str(st.secrets.get("OPENROUTER_API_KEY", "") or ""),
+        "Vercel": str(
+            st.secrets.get("VERCEL_AI_GATEWAY_API_KEY", "")
+            or st.secrets.get("AI_GATEWAY_API_KEY", "")
+            or ""
+        ),
+    }
+    models = {p: str(models.get(p) or DEFAULT_MODELS.get(p) or "") for p in CHAT_PROVIDERS}
+
+    is_all = provider == "All"
+    provider_list = CHAT_PROVIDERS if is_all else [provider]
+    n_steps = 1 + len(provider_list)  # trim + one per provider call
+    t_trim0 = time.perf_counter()
+    trimmed_context = _trim_context_for_chat(context, top_k=3, max_chars=90000)
+    context_trim_s = time.perf_counter() - t_trim0
+
+    # Expose the exact chat request payload for copy/paste to other AI tools.
+    user_message = (
+        "Question:\n"
+        f"{question.strip()}\n\n"
+        "Context JSON:\n"
+        f"{json.dumps(trimmed_context, ensure_ascii=True, separators=(',', ':'), default=str)}"
+    )
+    if is_all:
+        req_header = (
+            "Provider mode: All\n"
+            f"Providers: {', '.join(provider_list)}\n"
+            f"Models: {json.dumps({p: models.get(p, '') for p in provider_list}, ensure_ascii=True)}"
+        )
+    else:
+        req_header = (
+            f"Provider: {provider}\n"
+            f"Model: {models.get(provider, '')}"
+        )
+    request_dump = (
+        f"{req_header}\n\n"
+        "System Prompt:\n"
+        f"{system_prompt}\n\n"
+        "User Message:\n"
+        f"{user_message}"
+    )
+    dump_key = f"{key_prefix}_chat_request_dump"
+    st.session_state[dump_key] = request_dump
+    with st.expander("Chat Request", expanded=False):
+        st.caption(f"Request size: {len(request_dump):,} chars")
+        st.text_area(
+            "Full request sent to chat API",
+            key=dump_key,
+            height=340,
+        )
+
+    with st.chat_message("assistant"):
+        t_total0 = time.perf_counter()
+        timing_rows: list[tuple[str, float]] = [("Context trim", context_trim_s)]
+        progress = st.progress(1 / n_steps, text="Context trimmed.")
+
+        if is_all:
+            parts: list[str] = []
+            for idx, p in enumerate(provider_list, start=1):
+                frac = (idx) / n_steps
+                p_key = api_keys.get(p, "")
+                p_model = str(models.get(p) or "")
+                if not str(p_key).strip():
+                    progress.progress(frac, text=f"{p}: no API key, skipping.")
+                    parts.append(f"**{p}**: API key missing")
+                    timing_rows.append((f"{p} skipped (no key)", 0.0))
+                    continue
+                if not p_model:
+                    progress.progress(frac, text=f"{p}: no model set, skipping.")
+                    parts.append(f"**{p}**: model not set")
+                    timing_rows.append((f"{p} skipped (no model)", 0.0))
+                    continue
+                progress.progress(max(frac - 0.01, 0.0), text=f"Querying {p} ({p_model})...")
+                t_call0 = time.perf_counter()
+                try:
+                    text = call_provider(
+                        provider=p,
+                        api_key=p_key,
+                        model=p_model,
+                        system_prompt=system_prompt,
+                        question=question,
+                        context=trimmed_context,
+                    )
+                    elapsed_call = time.perf_counter() - t_call0
+                    timing_rows.append((f"{p} API call", elapsed_call))
+                    progress.progress(frac, text=f"{p} responded.")
+                    st.markdown(f"**{p}** ({p_model})")
+                    st.write(text)
+                    parts.append(f"**{p}** ({p_model})\n{text}")
+                except Exception as e:
+                    elapsed_call = time.perf_counter() - t_call0
+                    timing_rows.append((f"{p} API call (error)", elapsed_call))
+                    progress.progress(frac, text=f"{p}: error.")
+                    st.error(f"{p}: {e}")
+                    parts.append(f"**{p}**: {e}")
+            progress.progress(1.0, text="All providers done.")
+            total_s = time.perf_counter() - t_total0
+            timing_bits = [f"{name}: {sec:.2f}s" for name, sec in timing_rows]
+            timing_bits.append(f"Total: {total_s:.2f}s")
+            st.caption("Timings - " + " | ".join(timing_bits))
+            chat_history.append({"role": "assistant", "content": "\n\n---\n\n".join(parts)})
+            return
+
+        p_key = api_keys.get(provider, "")
+        p_model = str(models.get(provider) or "")
+        if not str(p_key).strip():
+            progress.progress(1.0, text=f"{provider}: API key missing.")
+            st.error(f"{provider} API key missing in Streamlit secrets.")
+            total_s = time.perf_counter() - t_total0
+            timing_bits = [f"{name}: {sec:.2f}s" for name, sec in timing_rows]
+            timing_bits.append(f"Total: {total_s:.2f}s")
+            st.caption("Timings - " + " | ".join(timing_bits))
+            chat_history.append({"role": "assistant", "content": f"*{provider} API key missing.*"})
+            return
+        progress.progress(1 / n_steps, text=f"Querying {provider} ({p_model})...")
+        t_call0 = time.perf_counter()
+        try:
+            text = call_provider(
+                provider=provider,
+                api_key=p_key,
+                model=p_model,
+                system_prompt=system_prompt,
+                question=question,
+                context=trimmed_context,
+            )
+            elapsed_call = time.perf_counter() - t_call0
+            timing_rows.append((f"{provider} API call", elapsed_call))
+            progress.progress(1.0, text=f"{provider} responded.")
+            st.markdown(f"**{provider}** ({p_model})")
+            st.write(text)
+            total_s = time.perf_counter() - t_total0
+            timing_bits = [f"{name}: {sec:.2f}s" for name, sec in timing_rows]
+            timing_bits.append(f"Total: {total_s:.2f}s")
+            st.caption("Timings - " + " | ".join(timing_bits))
+            chat_history.append({"role": "assistant", "content": f"**{provider}** ({p_model})\n{text}"})
+        except Exception as e:
+            elapsed_call = time.perf_counter() - t_call0
+            timing_rows.append((f"{provider} API call (error)", elapsed_call))
+            progress.progress(1.0, text=f"{provider}: error.")
+            st.error(f"{provider}: {e}")
+            total_s = time.perf_counter() - t_total0
+            timing_bits = [f"{name}: {sec:.2f}s" for name, sec in timing_rows]
+            timing_bits.append(f"Total: {total_s:.2f}s")
+            st.caption("Timings - " + " | ".join(timing_bits))
+            chat_history.append({"role": "assistant", "content": f"*{provider} error: {e}*"})
 
 
 def _fetch_auction_pattern_counts(
@@ -4451,11 +4978,13 @@ def _pbn_bids_to_dash(tokens: list[str]) -> str:
     'AP' (All Pass) expands to three passes.  Annotations like '!' or '?'
     appended to a bid token are stripped.  Skips empty and separator tokens.
     """
+    _BID_NORM = {"PASS": "P", "DOUBLE": "X", "REDOUBLE": "XX", "AP": "AP"}
     bids: list[str] = []
     for tok in tokens:
         tok = tok.strip().rstrip("!?").upper()
         if not tok or tok in ("-", "*", "NT"):
             continue
+        tok = _BID_NORM.get(tok, tok)
         if tok == "AP":
             bids.extend(["P", "P", "P"])
         else:
@@ -4705,6 +5234,22 @@ def parse_pbn_file_to_boards(content: str) -> list[dict]:
             "auction": _pbn_bids_to_dash(auction_tokens),
             "pbn": f"{dealer}:{hands.get('N','')} {hands.get('E','')} {hands.get('S','')} {hands.get('W','')}",
         }
+        # PBN [Result] is always total tricks taken by declarer.
+        # Derive Tricks (absolute) and Result (delta = Tricks - level - 6).
+        if current.get("Declarer"):
+            board["Declarer"] = current["Declarer"]
+        if current.get("Contract"):
+            board["Contract"] = current["Contract"]
+        pbn_result = current.get("Result")
+        pbn_contract = current.get("Contract")
+        if pbn_result is not None:
+            board["Tricks"] = pbn_result  # total tricks taken by declarer
+            if pbn_contract:
+                try:
+                    _lvl = int(pbn_contract[0])
+                    board["Result"] = pbn_result - (_lvl + 6)
+                except (ValueError, IndexError):
+                    pass
         boards.append(board)
 
     for raw_line in content.splitlines():
@@ -4739,6 +5284,17 @@ def parse_pbn_file_to_boards(content: str) -> list[dict]:
                 hands = _pbn_deal_tag_to_hands(val, dealer)
                 if hands:
                     current["_deal"] = hands
+            elif tag == "Result":
+                try:
+                    current["Result"] = int(val)
+                except (ValueError, TypeError):
+                    pass
+            elif tag == "Contract":
+                current["Contract"] = val.strip()
+            elif tag == "Declarer":
+                d = val.strip().upper()[:1]
+                if d in "NESW":
+                    current["Declarer"] = d
             elif tag == "Auction":
                 in_auction = True
                 auction_tokens = []
@@ -4902,13 +5458,24 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
 
     boards = st.session_state.get("_arena_pbn_boards") or []
     n_boards = len(boards)
-    col_b, col_c = st.columns(2)
-    with col_b:
-        deal_count = st.number_input(
-            "Number of Deals",
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        start_board = st.number_input(
+            "Start Board",
             min_value=1,
             max_value=max(1, n_boards),
-            value=n_boards if n_boards > 0 else 1,
+            value=1,
+            step=1,
+            key="_batch_start_pbn",
+            disabled=(n_boards == 0),
+        )
+    with col_b:
+        remaining = max(1, n_boards - int(start_board) + 1)
+        deal_count = st.number_input(
+            "Number of Boards",
+            min_value=1,
+            max_value=remaining,
+            value=remaining,
             step=1,
             key="_batch_count_pbn",
             disabled=(n_boards == 0),
@@ -4917,7 +5484,9 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
         seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
     if n_boards == 0:
         st.info("Provide a local PBN file or URL, then click Download.")
-    return {"start_index": 1, "deal_count": int(deal_count), "seed": int(seed), "boards": boards[: int(deal_count)]}
+    start_0 = int(start_board) - 1
+    selected_boards = boards[start_0 : start_0 + int(deal_count)]
+    return {"start_index": int(start_board), "deal_count": int(deal_count), "seed": int(seed), "boards": selected_boards}
 
 
 def _render_batch_input_from_csv() -> dict[str, Any]:
@@ -5031,6 +5600,7 @@ def render_ai_model_batch_arena():
         run_clicked = st.button("▶ Run Batch", key="_batch_run")
     with btn_col2:
         cancel_clicked = st.button("⏹ Cancel", key="_batch_cancel")
+    live_results_container = st.container()
 
     if cancel_clicked:
         st.session_state["_arena_batch_cancel"] = True
@@ -5080,13 +5650,19 @@ def render_ai_model_batch_arena():
             return -int(raw)
         return int(raw)
 
-    # ---- Helper: signed IMP diff (positive = AI better for NS) ----
-    def _imp_diff(ai_score_ns: int | None, actual_score_ns: int | None) -> int | None:
-        if ai_score_ns is None or actual_score_ns is None:
+    # ---- Helpers: signed IMP vs par ----
+    def _imp_vs_par_signed(score_ns: int | None, par_score_ns: int | None) -> int | None:
+        if score_ns is None or par_score_ns is None:
             return None
-        diff = int(ai_score_ns) - int(actual_score_ns)
+        diff = int(score_ns) - int(par_score_ns)
         sign = 1 if diff >= 0 else -1
         return sign * calculate_imp(abs(diff))
+
+    def _imp_diff(imp_actual: int | None, imp_ai: int | None) -> int | None:
+        if imp_ai is None or imp_actual is None:
+            return None
+        # Positive means AI outscored Actual (vs par). Negative means AI worse.
+        return int(imp_ai) - int(imp_actual)
 
     # ---- Helper: NS-relative EV (precomputed, ignores X/XX) ----
     def _ev_ns(auction: str | None, dealer: str, deal_row: dict) -> float | None:
@@ -5146,6 +5722,9 @@ def render_ai_model_batch_arena():
 
         progress_bar = st.progress(0, text="Starting batch...")
         status_text = st.empty()
+        with live_results_container:
+            st.caption("Batch results (live)")
+            live_results_placeholder = st.empty()
 
         # Accumulate per-deal debug entries for data/batch_arena_debug.json
         _batch_debug_entries: list[dict] = []
@@ -5188,9 +5767,20 @@ def render_ai_model_batch_arena():
                 return
 
         results: list[dict] = []
+        _ai_steps_map: dict[int, list] = {}
         imp_running = 0
-        par_imp_running = 0
         t_batch_start = time.perf_counter()
+
+        def _push_live_results() -> None:
+            st.session_state["_arena_batch_results"] = list(results)
+            if results:
+                _render_batch_results_df(
+                    results,
+                    live_results_placeholder,
+                    interactive=False,
+                    aggrid_key="_batch_results_live",
+                    height=min(520, max(180, 40 + len(results) * 28)),
+                )
 
         for i in range(len(indices)):
             # ---- Cancel check ----
@@ -5206,7 +5796,7 @@ def render_ai_model_batch_arena():
                 deal_row = deal_row_map.get(deal_idx)
                 if deal_row is None:
                     results.append({"Deal": deal_idx, "Error": "not_found"})
-                    st.session_state["_arena_batch_results"] = list(results)
+                    _push_live_results()
                     progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — not found — IMP: {imp_running:+d}")
                     continue
                 dealer = str(deal_row.get("Dealer", "N")).upper()
@@ -5215,7 +5805,7 @@ def render_ai_model_batch_arena():
                 row_idx = deal_row.get("_row_idx")
                 if row_idx is None:
                     results.append({"Deal": deal_idx, "Error": "no_row_idx"})
-                    st.session_state["_arena_batch_results"] = list(results)
+                    _push_live_results()
                     progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — no _row_idx — IMP: {imp_running:+d}")
                     continue
             else:
@@ -5242,7 +5832,7 @@ def render_ai_model_batch_arena():
                     matches = lookup_resp.get("matches") or []
                 except Exception as _lu_err:
                     results.append({"Deal": deal_idx, "Error": f"lookup_error: {_lu_err}"})
-                    st.session_state["_arena_batch_results"] = list(results)
+                    _push_live_results()
                     progress_bar.progress((i + 1) / len(indices), text=f"Board {i+1}/{len(indices)} — lookup error — IMP: {imp_running:+d}")
                     continue
 
@@ -5265,6 +5855,11 @@ def render_ai_model_batch_arena():
                         **_aug,
                         **_aug_sd,
                     }
+                    # Carry over PBN-parsed play results (authoritative).
+                    for _pbn_key in ("Tricks", "Result", "Declarer", "Contract"):
+                        _pbn_val = src_board.get(_pbn_key)
+                        if _pbn_val is not None:
+                            deal_row[_pbn_key] = _pbn_val
                     deal_row_map[deal_idx] = deal_row
                     row_idx = None  # no DB index — will use deal_row_dict path
                 else:
@@ -5293,6 +5888,11 @@ def render_ai_model_batch_arena():
                         for _col, _val in _aug_sd.items():
                             if deal_row.get(_col) is None:
                                 deal_row[_col] = _val
+                    # PBN-parsed play results are authoritative — override DB values.
+                    for _pbn_key in ("Tricks", "Result", "Declarer", "Contract"):
+                        _pbn_val = src_board.get(_pbn_key)
+                        if _pbn_val is not None:
+                            deal_row[_pbn_key] = _pbn_val
                     # Store matched row in map so the deal diagram appears on row-click
                     deal_row_map[deal_idx] = deal_row
                     row_idx = deal_row.get("_row_idx")
@@ -5321,13 +5921,13 @@ def render_ai_model_batch_arena():
                 job_id = str(start_resp.get("job_id") or "").strip()
             except Exception as e:
                 results.append({"Deal": deal_idx, "Error": f"start_failed: {e}"})
-                st.session_state["_arena_batch_results"] = list(results)
+                _push_live_results()
                 progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — start failed — IMP: {imp_running:+d}")
                 continue
 
             if not job_id:
                 results.append({"Deal": deal_idx, "Error": "no_job_id"})
-                st.session_state["_arena_batch_results"] = list(results)
+                _push_live_results()
                 continue
 
             # ---- Poll until done ----
@@ -5345,6 +5945,7 @@ def render_ai_model_batch_arena():
                     res = job.get("result") or {}
                     ai_auction = str(res.get("auction") or "").strip()
                     ai_steps_detail = res.get("steps_detail") or []
+                    _ai_steps_map[deal_idx] = ai_steps_detail
                     poll_ok = True
                     break
                 elif status_val == "failed":
@@ -5354,7 +5955,7 @@ def render_ai_model_batch_arena():
                 results.append({"Deal": deal_idx, "Error": "timeout"})
 
             if not poll_ok:
-                st.session_state["_arena_batch_results"] = list(results)
+                _push_live_results()
                 progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — failed/timeout — IMP: {imp_running:+d}")
                 continue
 
@@ -5362,11 +5963,32 @@ def render_ai_model_batch_arena():
             actual_contract = _contract_str(actual_auction, dealer)
             ai_contract = _contract_str(ai_auction, dealer)
 
-            actual_dd_tricks = _dd_tricks(actual_auction, dealer, deal_row)
-            ai_dd_tricks = _dd_tricks(ai_auction, dealer, deal_row)
+            # Actual tricks/result: use the real play data from deal_row when
+            # available (PBN Tricks / Result columns).  Fall back to DD only
+            # when no actual-play data exists.
+            _actual_tricks_raw = deal_row.get("Tricks")
+            _actual_result_raw = deal_row.get("Result")
+            if _actual_tricks_raw is not None:
+                try:
+                    actual_tricks = int(_actual_tricks_raw)
+                except (ValueError, TypeError):
+                    actual_tricks = None
+            else:
+                actual_tricks = _dd_tricks(actual_auction, dealer, deal_row)
+            if _actual_result_raw is not None:
+                try:
+                    actual_result = int(_actual_result_raw)
+                except (ValueError, TypeError):
+                    actual_result = None
+            else:
+                actual_result = _result(actual_auction, dealer, deal_row)
 
-            actual_result = _result(actual_auction, dealer, deal_row)
+            ai_dd_tricks = _dd_tricks(ai_auction, dealer, deal_row)
             ai_result = _result(ai_auction, dealer, deal_row)
+
+            # Contract-score view (declarer-side) for table display.
+            actual_score_contract = get_dd_score_for_auction(actual_auction, dealer, deal_row) if actual_auction else None
+            ai_score_contract = get_dd_score_for_auction(ai_auction, dealer, deal_row) if ai_auction else None
 
             actual_score_ns = _dd_score_ns(actual_auction, dealer, deal_row)
             ai_score_ns = _dd_score_ns(ai_auction, dealer, deal_row)
@@ -5374,25 +5996,15 @@ def render_ai_model_batch_arena():
             actual_ev = _ev_ns(actual_auction, dealer, deal_row)
             ai_ev = _ev_ns(ai_auction, dealer, deal_row)
 
-            imp = _imp_diff(ai_score_ns, actual_score_ns)
-            if imp is not None:
-                imp_running += imp
-
             par_score = deal_row.get("ParScore")
             par_contracts_raw = deal_row.get("ParContracts")
             par_contracts = _format_par_contracts(par_contracts_raw) or ""
 
-            # Par IMP: difference in IMPs between par score and AI DD score
-            par_imp: int | None = None
-            try:
-                if par_score is not None and ai_score_ns is not None:
-                    par_diff = int(ai_score_ns) - int(par_score)
-                    par_sign = 1 if par_diff >= 0 else -1
-                    par_imp = par_sign * calculate_imp(abs(par_diff))
-            except (ValueError, TypeError):
-                par_imp = None
-            if par_imp is not None:
-                par_imp_running += par_imp
+            imp_actual = _imp_vs_par_signed(actual_score_ns, par_score)
+            imp_ai = _imp_vs_par_signed(ai_score_ns, par_score)
+            imp = _imp_diff(imp_actual, imp_ai)
+            if imp is not None:
+                imp_running += imp
 
             # ---- Divergence column: "step: AI_bid→actual_bid" or "✓" ----
             _div_str = ""
@@ -5419,22 +6031,22 @@ def render_ai_model_batch_arena():
                 "AI_Auction": ai_auction,
                 "Actual_Contract": actual_contract,
                 "AI_Contract": ai_contract,
-                "Actual_Tricks": actual_dd_tricks,
+                "Actual_Tricks": actual_tricks,
                 "AI_Tricks": ai_dd_tricks,
                 "Actual_Result": actual_result,
                 "AI_Result": ai_result,
-                "DD_Score_Actual": actual_score_ns,
-                "DD_Score_AI": ai_score_ns,
+                "DD_Score_Actual": actual_score_contract,
+                "DD_Score_AI": ai_score_contract,
                 "EV_Actual": actual_ev,
                 "EV_AI": ai_ev,
                 "Par": par_score,
                 "ParContracts": par_contracts,
+                "IMP_Actual": imp_actual,
+                "IMP_AI": imp_ai,
                 "IMP_Diff": imp,
                 "IMP_Running": imp_running,
-                "Par_IMP": par_imp,
-                "Par_IMP_Total": par_imp_running,
             })
-            st.session_state["_arena_batch_results"] = list(results)
+            _push_live_results()
 
             # ---- Accumulate debug entry for this deal ----
             try:
@@ -5510,8 +6122,9 @@ def render_ai_model_batch_arena():
                     "ev_ai_ns": ai_ev,
                     "par": par_score,
                     "par_contracts": par_contracts,
+                    "imp_actual": imp_actual,
+                    "imp_ai": imp_ai,
                     "imp_diff": imp,
-                    "par_imp": par_imp,
                     "divergence": _divergence,
                     "ai_model_steps": ai_steps_detail,
                 })
@@ -5526,7 +6139,7 @@ def render_ai_model_batch_arena():
                 (i + 1) / len(indices),
                 text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — IMP running: {imp_running:+d} — ETA {eta_s:.0f}s",
             )
-            # Live table intentionally omitted — AgGrid renders after st.rerun().
+            # Live table is updated via _push_live_results().
 
         else:
             # Loop completed without cancel
@@ -5537,6 +6150,7 @@ def render_ai_model_batch_arena():
         # this block (always, on every rerun) so there is never a duplicate.
         st.session_state["_arena_batch_results"] = list(results)
         st.session_state["_arena_deal_row_map"] = deal_row_map
+        st.session_state["_arena_ai_steps_map"] = _ai_steps_map
         st.session_state["_batch_selected_result"] = None  # clear any stale selection
         st.rerun()
 
@@ -5559,12 +6173,13 @@ def render_ai_model_batch_arena():
             for _we in _sorted_entries[:_worst_n]:
                 _imp = _we.get("imp_diff")
                 if _imp is None or _imp >= 0:
-                    continue  # only include negative IMP deals
+                    continue  # only include negative IMP_Diff (AI worse than Actual)
                 _div = _we.get("divergence") or {}
                 _ws: dict[str, Any] = {
                     "deal_index": _we.get("deal_index"),
+                    "imp_actual": _we.get("imp_actual"),
+                    "imp_ai": _we.get("imp_ai"),
                     "imp_diff": _imp,
-                    "par_imp": _we.get("par_imp"),
                     "actual_auction": _we.get("actual_auction"),
                     "ai_auction": _we.get("ai_auction"),
                     "actual_contract": _we.get("actual_contract"),
@@ -5633,7 +6248,6 @@ def render_ai_model_batch_arena():
                 "seed": int(seed),
                 "deals_processed": len(results),
                 "imp_running_total": imp_running,
-                "par_imp_running_total": par_imp_running,
                 "worst_deals": _worst_deals_summary,
                 "deals": _batch_debug_entries,
             }
@@ -5667,6 +6281,7 @@ def render_ai_model_batch_arena():
         # ---- Row-click: deal diagram then single-row detail ----
         _sel_result: dict | None = st.session_state.get("_batch_selected_result")
         _deal_row_map: dict[int, dict] = st.session_state.get("_arena_deal_row_map") or {}
+        _ai_steps_map_ss: dict[int, list] = st.session_state.get("_arena_ai_steps_map") or {}
         if _sel_result:
             _sel_deal_idx = _sel_result.get("Deal")
             st.divider()
@@ -5685,6 +6300,60 @@ def render_ai_model_batch_arena():
                 )
             else:
                 st.info("Deal diagram unavailable — re-run the batch to load hand data.")
+
+            # ── Debug dump: write ai_model_debug.json so agent has visibility ──
+            try:
+                import json as _ba_dbg_json
+                from datetime import datetime as _ba_dbg_dt, timezone as _ba_dbg_tz
+                _ba_dbg_path = pathlib.Path("data/ai_model_debug.json")
+                _ba_dbg_path.parent.mkdir(parents=True, exist_ok=True)
+                _ba_dbg_deal: dict[str, Any] = {}
+                if _deal_row:
+                    for _dk in [
+                        "_row_idx", "index", "Dealer", "Vul",
+                        "Hand_N", "Hand_E", "Hand_S", "Hand_W",
+                        "HCP_N", "HCP_E", "HCP_S", "HCP_W",
+                        "Total_Points_N", "Total_Points_E", "Total_Points_S", "Total_Points_W",
+                    ]:
+                        _dv = _deal_row.get(_dk)
+                        if _dv is not None:
+                            _ba_dbg_deal[_dk] = _dv
+                _ba_dbg_steps = _ai_steps_map_ss.get(int(_sel_deal_idx)) if _sel_deal_idx is not None else []
+                _ba_dbg_payload = {
+                    "source": "ai_model_batch_arena",
+                    "timestamp": _ba_dbg_dt.now(_ba_dbg_tz.utc).isoformat(),
+                    "deal_index": _sel_deal_idx,
+                    "pinned_deal": _ba_dbg_deal,
+                    "dealer": _sel_result.get("Dealer"),
+                    "vul": _sel_result.get("Vul"),
+                    "actual_auction": _sel_result.get("Actual_Auction"),
+                    "ai_auction": _sel_result.get("AI_Auction"),
+                    "actual_contract": _sel_result.get("Actual_Contract"),
+                    "ai_contract": _sel_result.get("AI_Contract"),
+                    "dd_score_actual_ns": _sel_result.get("DD_Score_Actual"),
+                    "dd_score_ai_ns": _sel_result.get("DD_Score_AI"),
+                    "ev_actual_ns": _sel_result.get("EV_Actual"),
+                    "ev_ai_ns": _sel_result.get("EV_AI"),
+                    "par": _sel_result.get("Par"),
+                    "par_contracts": _sel_result.get("ParContracts"),
+                    "imp_actual": _sel_result.get("IMP_Actual"),
+                    "imp_ai": _sel_result.get("IMP_AI"),
+                    "imp_diff": _sel_result.get("IMP_Diff"),
+                    "divergence": _sel_result.get("Divergence"),
+                    "ai_model_steps": _ba_dbg_steps or [],
+                }
+                _ba_dbg_path.write_text(
+                    _ba_dbg_json.dumps(_ba_dbg_payload, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+            # Expert Chat for selected batch deal (provider-select with All compare).
+            render_expert_chat_panel(
+                key_prefix=f"batch_arena_chat_{_sel_deal_idx}",
+                title="💬 Expert Chat (Batch Arena)",
+            )
 
             # 2. Memo / note box for this deal
             _note_key_str = _batch_arena_deal_key(_sel_result, _deal_row or {})
@@ -5763,7 +6432,7 @@ def render_ai_model_batch_arena():
             _imp_val = _display_result.get("IMP_Diff")
             if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):
                 _imp_int = int(_imp_val)
-                _imp_color = "Valid" if _imp_int > 0 else ("Invalid" if _imp_int < 0 else "Neutral")
+                _imp_color = "Invalid" if _imp_int < 0 else ("Valid" if _imp_int > 0 else "Neutral")
             else:
                 _imp_color = "Neutral"  # no class → white
             _display_result["_IMP_Color"] = _imp_color
@@ -5831,17 +6500,17 @@ def _render_batch_results_df(
 
     # ---- Interactive AgGrid with row-click support ----
     # Map IMP_Diff to a bucket column for row colouring:
-    #   Valid (green) = AI did better, Invalid (red) = AI did worse, Rejected (yellow) = tied/unknown
+    #   Invalid (red) = AI did worse, Valid (green) = AI did better, Neutral = tied/unknown
     enriched: list[dict] = []
     for r in results:
         row = dict(r)
         imp = row.get("IMP_Diff")
         if imp is not None and not (isinstance(imp, float) and pd.isna(imp)):
             imp_int = int(imp)
-            if imp_int > 0:
-                row["_IMP_Color"] = "Valid"
-            elif imp_int < 0:
+            if imp_int < 0:
                 row["_IMP_Color"] = "Invalid"
+            elif imp_int > 0:
+                row["_IMP_Color"] = "Valid"
             else:
                 row["_IMP_Color"] = "Neutral"  # no class → white
         else:
@@ -13907,6 +14576,12 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     )
                 except Exception:
                     pass  # Debug dump is best-effort; never break the UI
+
+                # Expert Chat panel (uses ai_model_debug.json + belief snapshot context).
+                render_expert_chat_panel(
+                    key_prefix="auction_builder_chat",
+                    title="💬 Expert Chat (Auction Builder)",
+                )
 
                 # Combined aggregate comparison table: Hand Stats + DD Tricks with Source labels.
                 try:
