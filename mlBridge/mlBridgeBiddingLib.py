@@ -110,20 +110,26 @@ class CriteriaEvaluator:
         return tokens
 
 
+    # Unary prefix operators: pushed directly without popping (right-associative).
+    _UNARY_PREFIX_OPS = frozenset({'not'})
+
     def infix_to_postfix(self, tokens):
         """Convert infix tokens to postfix notation with proper operator precedence."""
         stack = []
         output = []
         
         for token in tokens:
-            
+
+            # Unary prefix operators: push without popping (like open-paren)
+            if token in self._UNARY_PREFIX_OPS:
+                stack.append(token)
+
             # Operands go directly to output
-            if token.isnumeric() or re.match(r'\b[a-zA-Z_]\w*\b', token):
+            elif token.isnumeric() or re.match(r'\b[a-zA-Z_]\w*\b', token):
                 output.append(token)
                 
-            # Operators get processed according to precedence
+            # Binary operators: pop higher/equal precedence first
             elif token in self.precedence:
-                # Pop operators with higher/equal precedence from stack to output
                 while (stack and 
                     stack[-1] in self.precedence and 
                     self.precedence[stack[-1]] >= self.precedence[token]):
@@ -138,6 +144,10 @@ class CriteriaEvaluator:
                     output.append(stack.pop())
                 if stack:
                     stack.pop()  # Remove '('
+                # If a unary prefix op (e.g. `not`) sits on top of the
+                # stack right after its parenthesized operand, emit it now.
+                if stack and stack[-1] in self._UNARY_PREFIX_OPS:
+                    output.append(stack.pop())
 
         
         # Pop remaining operators from stack to output

@@ -182,8 +182,9 @@ def main():
     parser = argparse.ArgumentParser(description="Build seat-1-only bidding table (Fast)")
     parser.add_argument("--bt-rows", type=int, default=None, help="Limit rows for testing")
     parser.add_argument("--output", type=str, default=None, help="Output path")
-    parser.add_argument("--ev-gpu-stats", type=str, default=None,
-                        help="Path to ev_gpu v2/v3 parquet (replaces bbo_bt_stats/ directory)")
+    parser.add_argument("--ev-gpu-stats", type=str,
+                        default="E:/bridge/data/bbo/bidding/bt_ev_par_stats_gpu_v3.parquet",
+                        help="Path to ev_gpu v3 parquet (replaces bbo_bt_stats/ directory)")
     args = parser.parse_args()
     
     data_dir = pathlib.Path("e:/bridge/data/bbo/bidding")

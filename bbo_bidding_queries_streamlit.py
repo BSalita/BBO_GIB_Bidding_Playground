@@ -326,38 +326,40 @@ def render_deal_diagram(
     hand_e = deal.get("Hand_E", "")
     hand_s = deal.get("Hand_S", "")
     hand_w = deal.get("Hand_W", "")
+    dealer = str(deal.get("Dealer", "")).strip().upper()
+    _d = lambda d: f" (D)" if dealer == d else ""
     
     # Wrap the cross layout in a narrow bordered container
     deal_col, _ = st.columns(list(width_ratio))
     with deal_col:
         with st.container(border=True):
-            if show_header:
-                dealer = deal.get("Dealer", "?")
-                vul = deal.get("Vul", deal.get("Vulnerability", "?"))
-                par = deal.get("ParScore", deal.get("Par_Score", "?"))
-                score = deal.get("Score", deal.get("score", "—"))
-                st.caption(f"Dealer: {dealer} | Vul: {vul} | Par: {par} | Score: {score}")
-            
             # Cross layout: North at top center
             col_left, col_north, col_right = st.columns([1, 2, 1])
             with col_north:
-                st.markdown("**North**")
+                st.markdown(f"**North{_d('N')}**")
                 st.text(_format_hand_suits(hand_n))
             
             # West on left, East on right
             col_west, col_east = st.columns([1, 1])
             with col_west:
-                st.markdown("**West**")
+                st.markdown(f"**West{_d('W')}**")
                 st.text(_format_hand_suits(hand_w))
             with col_east:
-                st.markdown("**East**")
+                st.markdown(f"**East{_d('E')}**")
                 st.text(_format_hand_suits(hand_e))
             
             # South at bottom center
             col_left2, col_south, col_right2 = st.columns([1, 2, 1])
             with col_south:
-                st.markdown("**South**")
+                st.markdown(f"**South{_d('S')}**")
                 st.text(_format_hand_suits(hand_s))
+
+            if show_header:
+                dealer = deal.get("Dealer", "?")
+                vul = deal.get("Vul", deal.get("Vulnerability", "?"))
+                par = deal.get("ParScore", deal.get("Par_Score", "?"))
+                score = deal.get("Score", deal.get("score", "—"))
+                st.caption(f"Dealer: {dealer} Vul: {vul} Par: {par} Score: {score}")
 
 
 def order_columns(df: pl.DataFrame, priority_cols: list[str], drop_cols: list[str] | None = None) -> pl.DataFrame:
@@ -1246,44 +1248,12 @@ def _trim_context_for_chat(context: dict[str, Any], *, top_k: int = 3, max_chars
 
 
 def render_expert_chat_panel(*, key_prefix: str, title: str = "Expert Chat") -> None:
-    """Render chat-input expert chat panel with message history."""
-    st.markdown(f"#### {title}")
+    """Render expert commentary + chat settings/history + prompt."""
+    # Use persisted values so commentary can appear above settings.
+    commentary_style = str(st.session_state.get(f"{key_prefix}_commentary_style", "Classic"))
+    compact_prompt = bool(st.session_state.get(f"{key_prefix}_compact_prompt", True))
 
-    # --- settings row ---
-    cfg_cols = st.columns([1, 1, 1, 1])
-    commentary_style = cfg_cols[0].selectbox(
-        "Style",
-        options=["Classic", "Spicy"],
-        index=0,
-        key=f"{key_prefix}_commentary_style",
-        help="Classic is measured; Spicy uses colorful bridge table talk.",
-    )
-    compact_prompt = cfg_cols[1].checkbox(
-        "Compact",
-        value=True,
-        key=f"{key_prefix}_compact_prompt",
-        help="Shorter system prompt (fewer tokens).",
-    )
-    provider_opts = CHAT_PROVIDERS + ["All"]
-    provider = cfg_cols[2].selectbox(
-        "Provider",
-        options=provider_opts,
-        index=0,
-        key=f"{key_prefix}_provider",
-    )
-    with cfg_cols[3].popover("Models"):
-        models: dict[str, str] = {}
-        for p in CHAT_PROVIDERS:
-            sk = f"{key_prefix}_model_{p.lower()}"
-            default_val = str(DEFAULT_MODELS.get(p, ""))
-            prev_default_key = f"{sk}__prev_default"
-            if sk not in st.session_state or st.session_state.get(prev_default_key) != default_val:
-                st.session_state[sk] = default_val
-                st.session_state[prev_default_key] = default_val
-            models[p] = st.text_input(f"{p}", key=sk)
-
-    # --- expert commentary (always shown) ---
-    system_prompt = _expert_chat_system_prompt(style=commentary_style, compact=bool(compact_prompt))
+    # --- expert commentary (always shown, first) ---
     context = _load_expert_chat_context()
     ai_auction, dealer, vul = _extract_auction_for_beliefs(context)
     cm_payload: dict[str, Any] | None = None
@@ -1330,17 +1300,72 @@ def render_expert_chat_panel(*, key_prefix: str, title: str = "Expert Chat") -> 
                 st.caption("Top opponent pressure points")
                 st.dataframe(pd.DataFrame(top_rows), width="stretch", hide_index=True)
 
-    # --- chat history ---
+    # --- expert chat container ---
+    with st.container(border=True):
+        st.markdown(f"#### {title}")
+        cfg_cols = st.columns([1, 1, 1, 1])
+        commentary_style = cfg_cols[0].selectbox(
+            "Style",
+            options=["Classic", "Spicy"],
+            index=0,
+            key=f"{key_prefix}_commentary_style",
+            help="Classic is measured; Spicy uses colorful bridge table talk.",
+        )
+        compact_prompt = cfg_cols[1].checkbox(
+            "Compact",
+            value=True,
+            key=f"{key_prefix}_compact_prompt",
+            help="Shorter system prompt (fewer tokens).",
+        )
+        provider_opts = CHAT_PROVIDERS + ["All"]
+        provider = cfg_cols[2].selectbox(
+            "Provider",
+            options=provider_opts,
+            index=0,
+            key=f"{key_prefix}_provider",
+        )
+        models: dict[str, str] = {}
+        with cfg_cols[3].popover("Models"):
+            for p in CHAT_PROVIDERS:
+                sk = f"{key_prefix}_model_{p.lower()}"
+                default_val = str(DEFAULT_MODELS.get(p, ""))
+                prev_default_key = f"{sk}__prev_default"
+                if sk not in st.session_state or st.session_state.get(prev_default_key) != default_val:
+                    st.session_state[sk] = default_val
+                    st.session_state[prev_default_key] = default_val
+                models[p] = st.text_input(f"{p}", key=sk)
+
+        history_key = f"{key_prefix}_chat_history"
+        if history_key not in st.session_state:
+            st.session_state[history_key] = []
+        chat_history: list[dict[str, str]] = st.session_state[history_key]
+        for msg in chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        render_expert_chat_prompt(key_prefix=key_prefix)
+
+    st.session_state[f"{key_prefix}_chat_runtime"] = {
+        "provider": provider,
+        "models": {p: str(models.get(p) or DEFAULT_MODELS.get(p) or "") for p in CHAT_PROVIDERS},
+        "system_prompt": _expert_chat_system_prompt(style=commentary_style, compact=bool(compact_prompt)),
+        "context": context,
+    }
+
+
+def render_expert_chat_prompt(*, key_prefix: str) -> None:
+    """Render chat prompt and handle provider calls."""
     history_key = f"{key_prefix}_chat_history"
     if history_key not in st.session_state:
         st.session_state[history_key] = []
     chat_history: list[dict[str, str]] = st.session_state[history_key]
 
-    for msg in chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    runtime = st.session_state.get(f"{key_prefix}_chat_runtime") or {}
+    provider = str(runtime.get("provider") or st.session_state.get(f"{key_prefix}_provider", CHAT_PROVIDERS[0]))
+    models = runtime.get("models") or {p: str(st.session_state.get(f"{key_prefix}_model_{p.lower()}", DEFAULT_MODELS.get(p) or "")) for p in CHAT_PROVIDERS}
+    system_prompt = str(runtime.get("system_prompt") or _expert_chat_system_prompt())
+    context = runtime.get("context") or _load_expert_chat_context()
 
-    # --- chat input (fires on Enter) ---
     question = st.chat_input(
         "Ask about bids, beliefs, mistakes...",
         key=f"{key_prefix}_chat_input",
@@ -1367,12 +1392,11 @@ def render_expert_chat_panel(*, key_prefix: str, title: str = "Expert Chat") -> 
 
     is_all = provider == "All"
     provider_list = CHAT_PROVIDERS if is_all else [provider]
-    n_steps = 1 + len(provider_list)  # trim + one per provider call
+    n_steps = 1 + len(provider_list)
     t_trim0 = time.perf_counter()
     trimmed_context = _trim_context_for_chat(context, top_k=3, max_chars=90000)
     context_trim_s = time.perf_counter() - t_trim0
 
-    # Expose the exact chat request payload for copy/paste to other AI tools.
     user_message = (
         "Question:\n"
         f"{question.strip()}\n\n"
@@ -4086,6 +4110,16 @@ def render_bidding_arena():
         ),
     )
 
+    auction_filter_mode = st.sidebar.radio(
+        "Auction Type",
+        ["All Auctions", "Non-competitive auctions only", "Competitive auctions only"],
+        index=1,
+        help=(
+            "Filter deals by actual auction type. Non-competitive keeps auctions where only the opening side bids "
+            "and every call by the non-opening side is pass."
+        ),
+    )
+
     debug_bt_index_raw = st.sidebar.text_input(
         "Pin BT index (optional).",
         value="",
@@ -4322,6 +4356,62 @@ def render_bidding_arena():
             # 2. "Deal Comparison" - side-by-side comparison where Rules found a match
             if "sample_deals" in data and data["sample_deals"]:
                 sample_df = pl.DataFrame(data["sample_deals"])
+                pre_filter_count = sample_df.height
+
+                def _is_pass_call(call: Any) -> bool:
+                    v = str(call or "").strip().upper()
+                    return v in {"P", "PASS"}
+
+                def _classify_actual_auction_competitive(auction: Any) -> bool | None:
+                    # Returns:
+                    #   True  -> competitive (non-opening side made a non-pass call)
+                    #   False -> non-competitive (opening side only; opponents always pass)
+                    #   None  -> no opening bid found / cannot classify
+                    if auction is None:
+                        return None
+
+                    if isinstance(auction, (list, tuple)):
+                        calls = [str(x).strip() for x in auction if str(x).strip()]
+                    else:
+                        calls = [x.strip() for x in re.split(r"[-\s]+", str(auction)) if x.strip()]
+
+                    if not calls:
+                        return None
+
+                    opener_idx: int | None = None
+                    for i, c in enumerate(calls):
+                        if not _is_pass_call(c):
+                            opener_idx = i
+                            break
+                    if opener_idx is None:
+                        return None
+
+                    opener_parity = opener_idx % 2
+                    for i, c in enumerate(calls):
+                        if i % 2 != opener_parity and not _is_pass_call(c):
+                            return True
+                    return False
+
+                auction_col_for_filter = None
+                for candidate_col in ("Actual_Auction", "Auction_Actual", "bid"):
+                    if candidate_col in sample_df.columns:
+                        auction_col_for_filter = candidate_col
+                        break
+                if auction_filter_mode != "All Auctions":
+                    if auction_col_for_filter is None:
+                        st.warning("Auction type filter requested, but no Actual_Auction column was found in sample deals.")
+                    else:
+                        classes = [_classify_actual_auction_competitive(v) for v in sample_df.get_column(auction_col_for_filter).to_list()]
+                        if auction_filter_mode == "Non-competitive auctions only":
+                            keep_mask = [c is False for c in classes]
+                        else:
+                            keep_mask = [c is True for c in classes]
+                        sample_df = sample_df.filter(pl.Series(keep_mask))
+                        st.caption(
+                            f"Auction type filter: **{auction_filter_mode}** "
+                            f"({sample_df.height}/{pre_filter_count} deals kept)"
+                        )
+
                 # Avoid mixing list-typed "Rules_Matches_Auctions" into Auction_* columns (breaks Polars casting).
                 # Instead, render an optional string column for debugging/visibility.
                 if "Rules_Matches_Auctions_Str" in sample_df.columns:
@@ -5549,6 +5639,63 @@ def render_ai_model_batch_arena():
     st.header("🤖 AI Model Batch Arena")
     st.markdown("Batch compare AI Model auctions against Actual auctions with DD scores, IMP differentials, and running totals.")
 
+    auction_filter_mode = st.sidebar.radio(
+        "Auction Type",
+        ["All Auctions", "Non-competitive auctions only", "Competitive auctions only"],
+        index=1,
+        key="_batch_auction_type_filter",
+        help=(
+            "Filter by actual auction class. Non-competitive means there is an opening bid and "
+            "all calls by the non-opening side are pass."
+        ),
+    )
+    ai_logic_mode_label = st.sidebar.radio(
+        "AI Model Logic",
+        ["All logic", "AI BT only", "Guardrails only", "Use guardrails v2"],
+        index=3,
+        key="_batch_ai_logic_mode",
+        help=(
+            "All logic: current full model. AI BT only: BT-only scoring path. "
+            "Guardrails only: full logic except common-sense adjustments/gates. "
+            "Use guardrails v2: full logic + v2 jump-past-game slam-qualification guardrail."
+        ),
+    )
+    _ai_logic_mode_map = {
+        "All logic": "all_logic",
+        "AI BT only": "ai_bt_only",
+        "Guardrails only": "guardrails_only",
+        "Use guardrails v2": "ai_bt_only",
+    }
+    ai_logic_mode = _ai_logic_mode_map.get(ai_logic_mode_label, "all_logic")
+    use_guardrails_v2 = ai_logic_mode_label == "Use guardrails v2"
+
+    def _is_pass_call(call: Any) -> bool:
+        v = str(call or "").strip().upper()
+        return v in {"P", "PASS"}
+
+    def _classify_actual_auction_competitive(auction: Any) -> bool | None:
+        # Returns:
+        #   True  -> competitive (non-opening side made a non-pass call)
+        #   False -> non-competitive (opening side only; opponents always pass)
+        #   None  -> no opening bid found / cannot classify
+        if auction is None:
+            return None
+        calls = [x.strip() for x in re.split(r"[-\s]+", str(auction)) if x and x.strip()]
+        if not calls:
+            return None
+        opener_idx: int | None = None
+        for i, c in enumerate(calls):
+            if not _is_pass_call(c):
+                opener_idx = i
+                break
+        if opener_idx is None:
+            return None
+        opener_parity = opener_idx % 2
+        for i, c in enumerate(calls):
+            if i % 2 != opener_parity and not _is_pass_call(c):
+                return True
+        return False
+
     # ---- Column list for deal rows (same broad set as Auction Builder) ----
     _BATCH_DEAL_COLS: list[str] = [
         "index", "Dealer", "Vul",
@@ -5650,11 +5797,26 @@ def render_ai_model_batch_arena():
             return -int(raw)
         return int(raw)
 
-    # ---- Helpers: signed IMP vs par ----
-    def _imp_vs_par_signed(score_ns: int | None, par_score_ns: int | None) -> int | None:
-        if score_ns is None or par_score_ns is None:
+    # ---- Helpers: signed IMP vs par (same declarer-side frame) ----
+    def _imp_vs_par_signed(
+        score_contract: int | None,
+        par_score: int | None,
+        auction: str | None,
+        dealer: str,
+    ) -> int | None:
+        """Signed IMP from contract DD score minus par score.
+
+        `score_contract` is from the contract declarer's perspective (make=+, down=-).
+        `ParScore` in deal rows is NS-relative, so convert par into the same declaring-side
+        frame for the auction being evaluated before taking the difference.
+        """
+        if score_contract is None or par_score is None:
             return None
-        diff = int(score_ns) - int(par_score_ns)
+        decl = get_declarer_for_auction(auction or "", dealer)
+        par_for_contract_side = int(par_score)
+        if decl and str(decl).upper() in ("E", "W"):
+            par_for_contract_side = -par_for_contract_side
+        diff = int(score_contract) - int(par_for_contract_side)
         sign = 1 if diff >= 0 else -1
         return sign * calculate_imp(abs(diff))
 
@@ -5748,6 +5910,22 @@ def render_ai_model_batch_arena():
                 st.error(f"Failed to fetch deal rows: {e}")
                 return
 
+            if auction_filter_mode != "All Auctions":
+                filtered_rows: list[dict] = []
+                for dr in deal_rows_raw:
+                    cls = _classify_actual_auction_competitive(dr.get("bid"))
+                    if auction_filter_mode == "Non-competitive auctions only":
+                        if cls is False:
+                            filtered_rows.append(dr)
+                    else:
+                        if cls is True:
+                            filtered_rows.append(dr)
+                st.caption(
+                    f"Auction type filter: **{auction_filter_mode}** "
+                    f"({len(filtered_rows)}/{len(deal_rows_raw)} deals kept)"
+                )
+                deal_rows_raw = filtered_rows
+
             deal_row_map: dict[int, dict] = {}
             for dr in deal_rows_raw:
                 try:
@@ -5758,8 +5936,24 @@ def render_ai_model_batch_arena():
             if not deal_row_map:
                 st.warning("No deal rows found for the requested index range.")
                 return
+            indices = sorted(deal_row_map.keys())
         else:
             # External mode (PBN/CSV): records already parsed; lookups happen per-row below
+            if auction_filter_mode != "All Auctions":
+                filtered_boards: list[dict] = []
+                for b in _external_boards_for_run:
+                    cls = _classify_actual_auction_competitive(b.get("auction"))
+                    if auction_filter_mode == "Non-competitive auctions only":
+                        if cls is False:
+                            filtered_boards.append(b)
+                    else:
+                        if cls is True:
+                            filtered_boards.append(b)
+                st.caption(
+                    f"Auction type filter: **{auction_filter_mode}** "
+                    f"({len(filtered_boards)}/{len(_external_boards_for_run)} deals kept)"
+                )
+                _external_boards_for_run = filtered_boards
             indices = list(range(len(_external_boards_for_run)))
             deal_row_map = {}
             if not _external_boards_for_run:
@@ -5773,6 +5967,10 @@ def render_ai_model_batch_arena():
 
         def _push_live_results() -> None:
             st.session_state["_arena_batch_results"] = list(results)
+            # Keep supporting maps in sync with live results so row-click
+            # detail works even if the batch is cancelled mid-run.
+            st.session_state["_arena_deal_row_map"] = deal_row_map
+            st.session_state["_arena_ai_steps_map"] = _ai_steps_map
             if results:
                 _render_batch_results_df(
                     results,
@@ -5786,6 +5984,9 @@ def render_ai_model_batch_arena():
             # ---- Cancel check ----
             if st.session_state.get("_arena_batch_cancel"):
                 status_text.text(f"Cancelled after {i} deal(s).")
+                st.session_state["_arena_batch_results"] = list(results)
+                st.session_state["_arena_deal_row_map"] = deal_row_map
+                st.session_state["_arena_ai_steps_map"] = _ai_steps_map
                 break
 
             # ---------------------------------------------------------------- #
@@ -5902,7 +6103,12 @@ def render_ai_model_batch_arena():
             _ai_start_params: dict[str, Any]
             if row_idx is not None:
                 # DB deal: use pre-computed bitmap via row index (fast path).
-                _ai_start_params = {"deal_row_idx": int(row_idx), "seed": int(seed)}
+                _ai_start_params = {
+                    "deal_row_idx": int(row_idx),
+                    "seed": int(seed),
+                    "logic_mode": str(ai_logic_mode),
+                    "use_guardrails_v2": bool(use_guardrails_v2),
+                }
             else:
                 # On-the-fly deal (PBN/CSV not in DB): pass full deal_row for dynamic
                 # criterion evaluation. deal_row_idx=-1 signals the handler to skip
@@ -5911,6 +6117,8 @@ def render_ai_model_batch_arena():
                     "deal_row_idx": -1,
                     "deal_row_dict": _json_safe_deal_row(deal_row),
                     "seed": int(seed),
+                    "logic_mode": str(ai_logic_mode),
+                    "use_guardrails_v2": bool(use_guardrails_v2),
                 }
             try:
                 start_resp = api_post(
@@ -5987,8 +6195,16 @@ def render_ai_model_batch_arena():
             ai_result = _result(ai_auction, dealer, deal_row)
 
             # Contract-score view (declarer-side) for table display.
-            actual_score_contract = get_dd_score_for_auction(actual_auction, dealer, deal_row) if actual_auction else None
-            ai_score_contract = get_dd_score_for_auction(ai_auction, dealer, deal_row) if ai_auction else None
+            def _contract_score_or_passout(auction: str | None) -> int | None:
+                if not auction:
+                    return None
+                toks = [t.strip().upper() for t in auction.split("-") if t.strip()]
+                if all(t == "P" for t in toks):
+                    return 0
+                return get_dd_score_for_auction(auction, dealer, deal_row)
+
+            actual_score_contract = _contract_score_or_passout(actual_auction)
+            ai_score_contract = _contract_score_or_passout(ai_auction)
 
             actual_score_ns = _dd_score_ns(actual_auction, dealer, deal_row)
             ai_score_ns = _dd_score_ns(ai_auction, dealer, deal_row)
@@ -6000,8 +6216,8 @@ def render_ai_model_batch_arena():
             par_contracts_raw = deal_row.get("ParContracts")
             par_contracts = _format_par_contracts(par_contracts_raw) or ""
 
-            imp_actual = _imp_vs_par_signed(actual_score_ns, par_score)
-            imp_ai = _imp_vs_par_signed(ai_score_ns, par_score)
+            imp_actual = _imp_vs_par_signed(actual_score_contract, par_score, actual_auction, dealer)
+            imp_ai = _imp_vs_par_signed(ai_score_contract, par_score, ai_auction, dealer)
             imp = _imp_diff(imp_actual, imp_ai)
             if imp is not None:
                 imp_running += imp
@@ -6022,11 +6238,42 @@ def render_ai_model_batch_arena():
             except Exception:
                 _div_str = ""
 
+            _error_flags: list[str] = []
+            try:
+                _ai_toks_err = [t.strip().upper() for t in (ai_auction or "").split("-") if t.strip()]
+                _directions = ["N", "E", "S", "W"]
+                _dealer_idx_err = _directions.index(dealer) if dealer in _directions else 0
+                _suit_bids_by_dir: dict[str, list[str]] = {"N": [], "E": [], "S": [], "W": []}
+                _sl_cache: dict[str, dict[str, int]] = {}
+                for _dir in _directions:
+                    _hpbn = str((deal_row or {}).get(f"Hand_{_dir}", "") or "").strip()
+                    if _hpbn and "." in _hpbn:
+                        _hparts = _hpbn.split(".")
+                        if len(_hparts) == 4:
+                            _sl_cache[_dir] = {"S": len(_hparts[0]), "H": len(_hparts[1]), "D": len(_hparts[2]), "C": len(_hparts[3])}
+                for _ti_err, _tk_err in enumerate(_ai_toks_err):
+                    if len(_tk_err) < 2 or not _tk_err[0].isdigit():
+                        continue
+                    _bidder_dir = _directions[(_dealer_idx_err + _ti_err) % 4]
+                    _strain_err = _tk_err[1:]
+                    if _strain_err not in ("C", "D", "H", "S"):
+                        continue
+                    _prior = _suit_bids_by_dir[_bidder_dir]
+                    if _strain_err in _prior:
+                        _sl_val = (_sl_cache.get(_bidder_dir) or {}).get(_strain_err)
+                        if _sl_val is not None and _sl_val <= 4:
+                            _error_flags.append(f"{_bidder_dir} {_tk_err}: {_strain_err} not rebiddable (SL={_sl_val})")
+                    _prior.append(_strain_err)
+            except Exception:
+                pass
+            _error_str = "; ".join(_error_flags) if _error_flags else ""
+
             results.append({
                 "Deal": deal_idx,
                 "Dealer": dealer,
                 "Vul": vul,
                 "Divergence": _div_str,
+                "BT Error": _error_str,
                 "Actual_Auction": actual_auction,
                 "AI_Auction": ai_auction,
                 "Actual_Contract": actual_contract,
@@ -6349,13 +6596,32 @@ def render_ai_model_batch_arena():
             except Exception:
                 pass
 
-            # Expert Chat for selected batch deal (provider-select with All compare).
+            # 2. Single-row detail — same colour as the clicked row
+            _display_result = {k: v for k, v in _sel_result.items() if not k.startswith("_")}
+            _imp_val = _display_result.get("IMP_Diff")
+            if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):
+                _imp_int = int(_imp_val)
+                _imp_color = "Invalid" if _imp_int < 0 else ("Valid" if _imp_int > 0 else "Neutral")
+            else:
+                _imp_color = "Neutral"  # no class → white
+            _display_result["_IMP_Color"] = _imp_color
+            render_aggrid(
+                [_display_result],
+                key=f"_batch_selected_detail_{_sel_deal_idx}",
+                table_name=None,
+                show_sql_expander=False,
+                row_bucket_col="_IMP_Color",
+                hide_cols=["_IMP_Color"],
+                height=calc_grid_height(1),
+            )
+
+            # 3. Expert Chat for selected batch deal (provider-select with All compare).
             render_expert_chat_panel(
                 key_prefix=f"batch_arena_chat_{_sel_deal_idx}",
                 title="💬 Expert Chat (Batch Arena)",
             )
 
-            # 2. Memo / note box for this deal
+            # 4. Memo / note box for this deal
             _note_key_str = _batch_arena_deal_key(_sel_result, _deal_row or {})
             _note_label_str = (
                 f"Deal {_sel_deal_idx}"
@@ -6426,25 +6692,6 @@ def render_ai_model_batch_arena():
                     else:
                         st.warning(str(_ba_status.get("msg") or "Error saving memo."))
                     st.session_state[_ba_status_key] = None
-
-            # 3. Single-row detail — same colour as the clicked row
-            _display_result = {k: v for k, v in _sel_result.items() if not k.startswith("_")}
-            _imp_val = _display_result.get("IMP_Diff")
-            if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):
-                _imp_int = int(_imp_val)
-                _imp_color = "Invalid" if _imp_int < 0 else ("Valid" if _imp_int > 0 else "Neutral")
-            else:
-                _imp_color = "Neutral"  # no class → white
-            _display_result["_IMP_Color"] = _imp_color
-            render_aggrid(
-                [_display_result],
-                key=f"_batch_selected_detail_{_sel_deal_idx}",
-                table_name=None,
-                show_sql_expander=False,
-                row_bucket_col="_IMP_Color",
-                hide_cols=["_IMP_Color"],
-                height=calc_grid_height(1),
-            )
 
             # Scroll to bottom after all content is rendered.
             st_components.html(

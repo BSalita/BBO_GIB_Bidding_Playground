@@ -1473,8 +1473,11 @@ def run_pipeline(
                     if k not in data:
                         raise RuntimeError(f"Checkpoint missing key {k!r} for {direction}_{vul}/S{seat}")
                 total_count += data["counts"]
-                total_par += data["par_sums"]
-                total_ev += data["ev_sums"]
+                # Flip par/EV sign for E/W so Avg_Par/Avg_EV become seat-relative
+                # (positive = good for acting side) instead of NS-relative.
+                par_ev_sign = -1 if direction in ("E", "W") else 1
+                total_par += par_ev_sign * data["par_sums"]
+                total_ev += par_ev_sign * data["ev_sums"]
                 del data
             
             with np.errstate(divide='ignore', invalid='ignore'):
@@ -1649,6 +1652,13 @@ def run_pipeline(
         log(f"{label}: {fmt_time(sec)} ({pct:.1f}%)")
     log("=" * 70)
     
+    log("\n>>> ACTION REQUIRED: Avg_Par/Avg_EV are now seat-relative (v3.1).")
+    log(">>> Back out the abs() workaround in plugins/bbo_bidding_queries_api_handlers.py:")
+    log(">>>   1. Change `base = abs(mean_par_val)` to `base = mean_par_val` (2 locations)")
+    log(">>>   2. Remove `+ float(policy_bonus)` from ai_bt_only score_val line")
+    log(">>>   3. Remove `acting_sign` multiplication from base score (no longer needed)")
+    log(">>> Then rebuild bbo_bt_seat1.py with the new stats file.\n")
+
     # Sample output
     log("\nSample results (first 5):")
     sample = result_df.head(5)

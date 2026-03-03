@@ -504,6 +504,7 @@ bt_seat1_file = dataPath.joinpath("bbo_bt_compiled.parquet")  # Pre-compiled BT 
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
 bt_aggregates_file = dataPath.joinpath("bbo_bt_aggregate.parquet")
 bt_categories_file = dataPath.joinpath("bbo_bt_categories.parquet")  # 103 bid-category boolean flags (Phase 4)
+custom_category_overrides_file = dataPath.joinpath("bbo_custom_category_overrides.csv")  # optional compiled overrides
 # bt_ev_stats: no longer loaded separately; reused from bt_stats_df (bbo_bt_criteria_seat1_df.parquet)
 # which contains all v2 EV/Par columns from the consolidated bbo_bt_ev_gpu.py pipeline.
 auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
@@ -587,11 +588,18 @@ def _strip_inline_comment(s: str) -> str:
     return s.strip()
 
 
-def _load_auction_criteria() -> list[tuple[str, list[str]]]:
-    """Load criteria.csv and return list of (partial_auction, [criteria...]).
+_AUCTION_CRITERIA_FLAGS = {"is_artificial"}
+
+
+def _load_auction_criteria() -> list[tuple[str, list[str], set[str]]]:
+    """Load criteria.csv and return list of (partial_auction, [criteria...], {flags}).
     
     CSV format: partial_auction,criterion1,criterion2,...
     Example row: 1c,SL_S >= SL_H,HCP >= 12
+    
+    Known flags (e.g. ``is_artificial``) are extracted into the flags set and
+    excluded from the criteria list. Entries that contain only flags (no real
+    criteria) are still returned so the overlay builder can consume them.
     
     Comments:
     - Lines starting with # are skipped entirely
@@ -659,12 +667,17 @@ def _load_auction_criteria() -> list[tuple[str, list[str]]]:
 
                 # Strip inline comments from each criterion cell (kept for robustness).
                 criteria: list[str] = []
+                flags: set[str] = set()
                 for c in row[1:]:
                     c_clean = _strip_inline_comment(str(c or ""))
-                    if c_clean:
+                    if not c_clean:
+                        continue
+                    if c_clean.lower() in _AUCTION_CRITERIA_FLAGS:
+                        flags.add(c_clean.lower())
+                    else:
                         criteria.append(c_clean)
-                if criteria:
-                    criteria_list.append((partial_auction, criteria))
+                if criteria or flags:
+                    criteria_list.append((partial_auction, criteria, flags))
     except Exception as e:
         print(f"[auction-criteria] Error loading {auction_criteria_file}: {e}")
     
@@ -699,8 +712,13 @@ def _build_custom_criteria_overlay(available_criteria_names: set[str] | None = N
     criteria_list = _load_auction_criteria()
     overlay: list[dict[str, Any]] = []
     unknown_criteria: list[str] = []
-    for partial_auction, criteria in criteria_list:
-        seat = partial_auction.count("-") + 1
+    for partial_auction, criteria, flags in criteria_list:
+        # For regex patterns, expand optional (P-)? groups to include
+        # the passes, then strip metacharacters before counting dashes.
+        # This ensures correct seat computation (wraps to 1-4).
+        _pa_for_seat = re.sub(r'\(P-\)\?', 'P-', partial_auction)
+        _pa_for_seat = re.sub(r'[\\^$.*+?\[\]{}()|]', '', _pa_for_seat)
+        seat = (_pa_for_seat.count("-") % 4) + 1
         if seat not in VALID_SEATS:
             continue
         normalized_criteria: list[str] = []
@@ -723,9 +741,10 @@ def _build_custom_criteria_overlay(available_criteria_names: set[str] | None = N
             normalized_criteria.append(c0)
             unknown_criteria.append(c0)
 
-        overlay.append(
-            {"partial": partial_auction.strip().upper(), "seat": int(seat), "criteria": normalized_criteria}  # Canonical UPPERCASE
-        )
+        entry: dict[str, Any] = {"partial": partial_auction.strip().upper(), "seat": int(seat), "criteria": normalized_criteria}
+        if flags:
+            entry["flags"] = flags
+        overlay.append(entry)
 
     # Provide a UI-friendly "rules" list for `/custom-criteria-info`.
     # (Older UI expects stats["rules"] and stats["rules_applied"].)
@@ -857,7 +876,9 @@ def _apply_auction_criteria(
     
     rejected_rows: list[dict] = []
     
-    for partial_auction, criteria in criteria_list:
+    for partial_auction, criteria, _flags in criteria_list:
+        if not criteria:
+            continue
         # Hybrid matching: literal prefix for simple patterns, regex for complex ones
         if is_regex_pattern(partial_auction):
             # Regex path - auto-anchor for prefix matching
@@ -1603,6 +1624,8 @@ class AiModelAdvancedPathStartRequest(BaseModel):
     w_guard_sacrifice: float = 0.7
     w_guard_tricks: float = 30.0
     permissive_pass: bool = True
+    logic_mode: str = "all_logic"  # one of: all_logic, ai_bt_only, guardrails_only
+    use_guardrails_v2: bool = False
 
 
 class CustomCriteriaImpactRequest(BaseModel):
@@ -2663,8 +2686,19 @@ def _heavy_init() -> None:
         _log_memory("after load bt_completed_agg_df")
 
         # Load bid-category flags (optional, Phase 4 output).
+        bt_categories_base_df = None
         bt_categories_df = None
         bt_category_cols: list[str] | None = None
+        bt_category_base_cols: list[str] | None = None
+        custom_category_override_stats: Dict[str, Any] = {
+            "file_path": str(custom_category_overrides_file),
+            "file_exists": bool(custom_category_overrides_file.exists()),
+            "rows_read": 0,
+            "rows_valid": 0,
+            "rows_invalid": 0,
+            "bt_index_count": 0,
+            "categories_overridden": [],
+        }
         if bt_categories_file.exists():
             try:
                 print(f"[init] Loading bt_categories_df from {bt_categories_file} (category flags)...")
@@ -2676,7 +2710,7 @@ def _heavy_init() -> None:
                 cols_to_load = (["bt_index"] if "bt_index" in cols else []) + bt_category_cols
                 if not cols_to_load:
                     raise ValueError(f"{bt_categories_file} is missing required join key column 'bt_index'")
-                bt_categories_df = (
+                bt_categories_base_df = (
                     scan.select(cols_to_load)
                     .drop_nulls(subset=["bt_index"])
                     .with_columns(pl.col("bt_index").cast(pl.UInt32))
@@ -2686,7 +2720,7 @@ def _heavy_init() -> None:
                 )
                 elapsed_cats = time.perf_counter() - t0_cats
                 cats_info = _format_file_info(
-                    df=bt_categories_df,
+                    df=bt_categories_base_df,
                     file_path=pathlib.Path(bt_categories_file),
                     elapsed_secs=elapsed_cats,
                 )
@@ -2698,6 +2732,33 @@ def _heavy_init() -> None:
                 bt_category_cols = None
         else:
             print("[init] bt_categories_df not found (optional): bbo_bt_categories.parquet")
+        bt_category_base_cols = list(bt_category_cols or [])
+
+        # Load optional category overrides and merge into effective category table.
+        try:
+            override_wide_df, custom_category_override_stats = _load_custom_category_overrides_csv(
+                custom_category_overrides_file
+            )
+            bt_categories_df, bt_category_cols = _merge_bt_categories_with_overrides(
+                bt_categories_base_df,
+                bt_category_cols,
+                override_wide_df,
+            )
+            if override_wide_df is not None:
+                print(
+                    "[init] custom category overrides: "
+                    f"{custom_category_override_stats.get('rows_valid', 0)} valid rows, "
+                    f"{custom_category_override_stats.get('bt_index_count', 0)} bt_index entries, "
+                    f"{len(custom_category_override_stats.get('categories_overridden') or [])} categories"
+                )
+                _update_loading_status(
+                    5,
+                    "Applying custom category overrides...",
+                    "custom_category_overrides",
+                    f"{custom_category_override_stats.get('rows_valid', 0)} rows",
+                )
+        except Exception as e:
+            print(f"[init] WARNING: Failed to load custom category overrides: {e}")
         _log_memory("after load bt_categories_df")
 
         # Load new rules detailed metrics (optional)
@@ -2790,7 +2851,10 @@ def _heavy_init() -> None:
             else:
                 print(f"[init] bid feature cache not found (optional): {bid_feature_cache_file.name}")
         except Exception as e:
-            raise RuntimeError(f"Failed loading bid feature cache: {e}") from e
+            print(f"[init] WARNING: bid feature cache skipped (stale/missing manifest): {e}")
+            bid_feature_cache_df = None
+            bid_feature_cache_index = None
+            bid_feature_cache_manifest = None
 
         augmented_csr_edge_cache_df: Optional[pl.DataFrame] = None
         augmented_csr_edge_cache_index: Optional[Dict[str, Any]] = None
@@ -2953,6 +3017,8 @@ def _heavy_init() -> None:
             STATE["results"] = results
             STATE["bt_stats_df"] = bt_stats_df
             STATE["bt_completed_agg_df"] = bt_completed_agg_df  # For fast wrong-bid-stats (63MB in-memory)
+            STATE["bt_categories_base_df"] = bt_categories_base_df
+            STATE["bt_category_base_cols"] = bt_category_base_cols
             STATE["bt_categories_df"] = bt_categories_df
             STATE["bt_category_cols"] = bt_category_cols
             STATE["bt_index_arr"] = bt_index_arr
@@ -2961,6 +3027,7 @@ def _heavy_init() -> None:
             STATE["bt_index_sorted_pos"] = bt_index_sorted_pos
             STATE["custom_criteria_overlay"] = overlay
             STATE["custom_criteria_stats"] = custom_criteria_stats
+            STATE["custom_category_override_stats"] = custom_category_override_stats
             STATE["available_criteria_names"] = available_criteria_names
             STATE["new_rules_df"] = new_rules_df
             STATE["deal_to_bt_index_df"] = deal_to_bt_index_df  # Precomputed deal→[bt_indices] DataFrame (or None)
@@ -3095,6 +3162,147 @@ def start_init(background_tasks: BackgroundTasks) -> InitResponse:
         return InitResponse(status="failed")
 
 
+def _load_custom_category_overrides_csv(
+    file_path: pathlib.Path,
+) -> tuple[pl.DataFrame | None, Dict[str, Any]]:
+    """Load long-form category overrides CSV and return wide DataFrame keyed by bt_index."""
+    stats: Dict[str, Any] = {
+        "file_path": str(file_path),
+        "file_exists": bool(file_path.exists()),
+        "rows_read": 0,
+        "rows_valid": 0,
+        "rows_invalid": 0,
+        "bt_index_count": 0,
+        "categories_overridden": [],
+    }
+    if not file_path.exists():
+        return None, stats
+    try:
+        raw = pl.read_csv(file_path, ignore_errors=True)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read custom category overrides CSV: {e}") from e
+
+    stats["rows_read"] = int(raw.height)
+    if raw.is_empty():
+        return None, stats
+
+    cols_lower = {str(c).strip().lower(): str(c) for c in raw.columns}
+    required = ["bt_index", "category", "value"]
+    missing = [c for c in required if c not in cols_lower]
+    if missing:
+        raise ValueError(
+            f"{file_path.name} missing required column(s): {', '.join(missing)}. "
+            "Expected columns include bt_index, category, value."
+        )
+
+    bt_idx_col = cols_lower["bt_index"]
+    cat_col = cols_lower["category"]
+    val_col = cols_lower["value"]
+
+    normalized = (
+        raw.with_row_index("_ord")
+        .with_columns(
+            pl.col(bt_idx_col).cast(pl.Int64, strict=False).alias("bt_index"),
+            pl.col(cat_col)
+            .cast(pl.Utf8, strict=False)
+            .str.strip_chars()
+            .str.to_lowercase()
+            .str.replace(r"^is_", "")
+            .map_elements(lambda x: f"is_{x}" if x else "", return_dtype=pl.Utf8)
+            .alias("category"),
+            pl.col(val_col)
+            .cast(pl.Utf8, strict=False)
+            .str.strip_chars()
+            .str.to_lowercase()
+            .alias("_value_raw"),
+        )
+        .with_columns(
+            pl.when(pl.col("_value_raw").is_in(["1", "true", "t", "yes", "y", "on"]))
+            .then(pl.lit(True))
+            .when(pl.col("_value_raw").is_in(["0", "false", "f", "no", "n", "off"]))
+            .then(pl.lit(False))
+            .otherwise(pl.lit(None))
+            .alias("value_bool")
+        )
+    )
+
+    valid = normalized.filter(
+        pl.col("bt_index").is_not_null()
+        & (pl.col("bt_index") >= 0)
+        & pl.col("category").str.starts_with("is_")
+        & (pl.col("category").str.len_chars() > 3)
+        & pl.col("value_bool").is_not_null()
+    )
+    stats["rows_valid"] = int(valid.height)
+    stats["rows_invalid"] = int(max(0, int(normalized.height - valid.height)))
+
+    if valid.is_empty():
+        return None, stats
+
+    dedup = (
+        valid.sort("_ord")
+        .group_by(["bt_index", "category"])
+        .agg(pl.col("value_bool").last().alias("value_bool"))
+    )
+
+    wide = dedup.pivot(index="bt_index", on="category", values="value_bool").sort("bt_index")
+    override_cols = [c for c in wide.columns if c != "bt_index" and c.startswith("is_")]
+    wide = wide.select(["bt_index"] + override_cols)
+    stats["bt_index_count"] = int(wide.height)
+    stats["categories_overridden"] = sorted(override_cols)
+    return wide, stats
+
+
+def _merge_bt_categories_with_overrides(
+    base_df: pl.DataFrame | None,
+    base_cols: list[str] | None,
+    override_wide_df: pl.DataFrame | None,
+) -> tuple[pl.DataFrame | None, list[str] | None]:
+    """Merge base bt_categories with override matrix (override wins when present)."""
+    override_cols = []
+    if override_wide_df is not None:
+        override_cols = [c for c in override_wide_df.columns if c != "bt_index" and c.startswith("is_")]
+    base_cols = list(base_cols or [])
+    all_cols = sorted(set(base_cols) | set(override_cols))
+
+    if base_df is None:
+        if override_wide_df is None:
+            return None, None
+        merged = override_wide_df.with_columns(
+            pl.col("bt_index").cast(pl.UInt32),
+            *[pl.col(c).fill_null(False).cast(pl.Boolean).alias(c) for c in override_cols],
+        ).sort("bt_index")
+        return merged, all_cols
+
+    merged = base_df
+    missing_base = [c for c in all_cols if c not in merged.columns]
+    if missing_base:
+        merged = merged.with_columns([pl.lit(False).cast(pl.Boolean).alias(c) for c in missing_base])
+
+    if override_wide_df is not None and override_cols:
+        ov = override_wide_df.with_columns(pl.col("bt_index").cast(pl.UInt32))
+        merged = merged.join(ov, on="bt_index", how="left", suffix="_ov")
+        merged = merged.with_columns(
+            [
+                pl.coalesce(pl.col(f"{c}_ov"), pl.col(c), pl.lit(False)).cast(pl.Boolean).alias(c)
+                for c in override_cols
+            ]
+        )
+        ov_drop = [f"{c}_ov" for c in override_cols if f"{c}_ov" in merged.columns]
+        if ov_drop:
+            merged = merged.drop(ov_drop)
+
+    keep_cols = ["bt_index"] + all_cols
+    present_keep = [c for c in keep_cols if c in merged.columns]
+    merged = (
+        merged.select(present_keep)
+        .with_columns(pl.col("bt_index").cast(pl.UInt32))
+        .unique(subset=["bt_index"])
+        .sort("bt_index")
+    )
+    return merged, all_cols
+
+
 @app.get("/custom-criteria-info")
 def get_custom_criteria_info() -> Dict[str, Any]:
     """Get info about custom auction criteria loaded from CSV (hot-reloadable overlay)."""
@@ -3114,8 +3322,8 @@ def get_custom_criteria_rules() -> Dict[str, Any]:
     """Get all custom criteria rules from the CSV file."""
     criteria_list = _load_auction_criteria()
     rules = [
-        {"partial_auction": partial, "criteria": criteria}
-        for partial, criteria in criteria_list
+        {"partial_auction": partial, "criteria": criteria, "flags": sorted(flags) if flags else []}
+        for partial, criteria, flags in criteria_list
     ]
     return {
         "file_path": str(auction_criteria_file),
@@ -3247,6 +3455,44 @@ def reload_custom_criteria() -> Dict[str, Any]:
         return {"success": True, "message": "Custom criteria overlay reloaded successfully", "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
+
+
+@app.get("/custom-category-overrides-info")
+def get_custom_category_overrides_info() -> Dict[str, Any]:
+    """Get info about custom category overrides loaded from CSV."""
+    with _STATE_LOCK:
+        if not STATE["initialized"]:
+            return {"initialized": False, "stats": None}
+        stats = STATE.get("custom_category_override_stats", {})
+    return {
+        "initialized": True,
+        "overrides_file": str(custom_category_overrides_file),
+        "stats": stats,
+    }
+
+
+@app.post("/custom-category-overrides-reload")
+def reload_custom_category_overrides() -> Dict[str, Any]:
+    """Hot-reload category overrides from CSV and rebuild effective category table."""
+    _ensure_ready()
+    try:
+        with _STATE_LOCK:
+            base_df = STATE.get("bt_categories_base_df")
+            base_cols = STATE.get("bt_category_base_cols") or []
+        override_wide_df, stats = _load_custom_category_overrides_csv(custom_category_overrides_file)
+        effective_df, effective_cols = _merge_bt_categories_with_overrides(base_df, base_cols, override_wide_df)
+        with _STATE_LOCK:
+            STATE["bt_categories_df"] = effective_df
+            STATE["bt_category_cols"] = effective_cols
+            STATE["custom_category_override_stats"] = stats
+        return {
+            "success": True,
+            "message": "Custom category overrides reloaded successfully",
+            "stats": stats,
+            "effective_categories": len(effective_cols or []),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Category override reload failed: {e}")
 
 
 def _ensure_ready() -> Tuple[
@@ -3849,7 +4095,9 @@ def _filter_auctions_by_hand_criteria(
         matched_partial = None
         
         # Check each criterion set
-        for partial_auction, criteria in criteria_list:
+        for partial_auction, criteria, _flags in criteria_list:
+            if not criteria:
+                continue
             # Hybrid matching: literal prefix for simple patterns, regex for complex ones
             if pattern_matches(partial_auction, auction_norm):
                 # This auction matches this partial - check criteria
@@ -4566,6 +4814,8 @@ def ai_model_advanced_path_start(req: AiModelAdvancedPathStartRequest) -> Dict[s
             w_guard_sacrifice=float(req.w_guard_sacrifice),
             w_guard_tricks=float(req.w_guard_tricks),
             permissive_pass=bool(req.permissive_pass),
+            logic_mode=str(req.logic_mode or "all_logic"),
+            use_guardrails_v2=bool(getattr(req, "use_guardrails_v2", False)),
         )
 
     CORE.start_job(job_id=job_id, payload=req.model_dump(), run_fn=_run)

@@ -1914,6 +1914,13 @@ def evaluate_sl_criterion(
             return False if fail_on_missing else None
         return eval_comparison(lv, op, num_val)
     
+    # Boolean literals
+    crit_lower = criterion.strip().lower()
+    if crit_lower == "false":
+        return False
+    if crit_lower == "true":
+        return True
+
     # Try complex expression with logical operators (e.g., SL_D > SL_H | SL_D > SL_S)
     if is_complex_expression(criterion):
         return evaluate_complex_expression(criterion, dealer, seat, deal_row, fail_on_missing)
