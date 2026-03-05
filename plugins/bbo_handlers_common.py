@@ -433,7 +433,12 @@ def apply_custom_criteria_overlay_to_bt_row(
     if not auction_norm:
         return bt_row
 
-    # Ensure existing criteria are lists before appending
+    candidate_bid = str(bt_row.get("candidate_bid") or "").strip().upper()
+    auction_with_candidate = (
+        f"{auction_norm}-{candidate_bid}" if candidate_bid else auction_norm
+    )
+
+    # Ensure existing criteria are lists before appending/replacing
     for seat in SEAT_RANGE:
         col = f"Agg_Expr_Seat_{seat}"
         if col in bt_row:
@@ -443,8 +448,10 @@ def apply_custom_criteria_overlay_to_bt_row(
         partial = str(rule.get("partial") or "")
         if not partial:
             continue
-        # Hybrid matching: literal prefix for simple patterns, regex for complex ones
-        if not pattern_matches(partial, auction_norm):
+        # Match against either:
+        # - row prefix auction (Auction), for prefix-level rules
+        # - concrete child auction (Auction-candidate_bid), for bid-specific rules
+        if not (pattern_matches(partial, auction_norm) or pattern_matches(partial, auction_with_candidate)):
             continue
 
         try:
@@ -454,11 +461,15 @@ def apply_custom_criteria_overlay_to_bt_row(
         if seat < 1 or seat > 4:
             continue
 
-        crit_to_add = rule.get("criteria") or []
+        col = f"Agg_Expr_Seat_{seat}"
+        crit_to_add = [str(c) for c in (rule.get("criteria") or []) if c is not None]
+        flags = set(str(f).strip().lower() for f in (rule.get("flags") or set()) if f is not None)
+        if "replace_criteria" in flags:
+            bt_row[col] = crit_to_add
+            continue
         if not crit_to_add:
             continue
 
-        col = f"Agg_Expr_Seat_{seat}"
         existing = bt_row.get(col) or []
         combined = list(existing)
         for c in crit_to_add:

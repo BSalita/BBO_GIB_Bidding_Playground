@@ -598,6 +598,8 @@ def compute_guardrail_penalty(
     enable_tricks_shortfall_check: bool = True,
     enable_underbid_checks: bool = True,
     is_raise_of_partner_suit: bool = False,
+    opp_shown_strains: set[str] | None = None,
+    w_opp_suit_trespass: float = 200.0,
     debug_equivalence_bypass: bool = False,
 ) -> tuple[float, list[str]]:
     """Compute a non-negative guardrail penalty to subtract from the bid score.
@@ -1213,6 +1215,30 @@ def compute_guardrail_penalty(
                         f"(-{p:.0f})"
                     )
 
+        # 12. OPP_SUIT_TRESPASS
+        #     Bidding a suit that an opponent has naturally shown is almost
+        #     always wrong — they announced length/strength there and will
+        #     sit behind declarer.  Exempt only when the bidder holds a
+        #     self-sufficient (6+ cards) or rebiddable suit per BT criteria.
+        if opp_shown_strains and bid_strain in opp_shown_strains and not is_artificial_probe:
+            _has_rebiddable = False
+            if bt_acting_criteria:
+                _crit_upper = " ".join(str(c) for c in bt_acting_criteria).upper()
+                _has_rebiddable = (
+                    f"TWICE_REBIDDABLE_{bid_strain}" in _crit_upper
+                    or f"REBIDDABLE_{bid_strain}" in _crit_upper
+                )
+            _self_sufficient = bool(self_len is not None and self_len >= 6)
+            if not (_has_rebiddable or _self_sufficient):
+                _len_note = f"; self has {self_len}" if self_len is not None else ""
+                p = float(w_opp_suit_trespass)
+                penalty += p
+                reasons.append(
+                    f"OPP_SUIT_TRESPASS: bid {bid} in {bid_strain} which opponent "
+                    f"has shown{_len_note}; need 6+ cards or rebiddable criteria "
+                    f"to compete in opponent's suit (-{p:.0f})"
+                )
+
     # ==================================================================
     # UNDERBID CHECKS (only when par belongs to our side)
     # ==================================================================
@@ -1268,6 +1294,36 @@ def _token_bidder_dir(token_idx: int, dealer_actual: str | None) -> str:
 def _partner_dir(direction: str | None) -> str:
     d = str(direction or "").strip().upper()
     return {"N": "S", "S": "N", "E": "W", "W": "E"}.get(d, "N")
+
+
+def opponent_shown_natural_strains(
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer: str | None,
+) -> set[str]:
+    """Return the set of natural suit strains (C/D/H/S) bid by opponents.
+
+    Only includes natural suit bids (not NT, Pass, Double, Redouble).
+    Doubles and artificial bids are excluded because we can't reliably
+    distinguish them here; only explicit suit calls count.
+    """
+    result: set[str] = set()
+    if not auction_tokens or not acting_direction:
+        return result
+    act = str(acting_direction or "").strip().upper()
+    opp_dirs = {"N": {"E", "W"}, "E": {"N", "S"},
+                "S": {"E", "W"}, "W": {"N", "S"}}.get(act, set())
+    if not opp_dirs:
+        return result
+    for i, tk in enumerate(auction_tokens):
+        tk_s = str(tk or "").strip().upper()
+        m = re.match(r"^[1-7]\s*([CDHS])", tk_s)
+        if not m:
+            continue
+        bidder = _token_bidder_dir(i, dealer)
+        if bidder in opp_dirs:
+            result.add(m.group(1).upper())
+    return result
 
 
 def _parse_contract_bid_text(bid_text: str) -> tuple[int, str] | None:

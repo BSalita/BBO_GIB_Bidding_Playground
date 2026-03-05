@@ -588,7 +588,7 @@ def _strip_inline_comment(s: str) -> str:
     return s.strip()
 
 
-_AUCTION_CRITERIA_FLAGS = {"is_artificial"}
+_AUCTION_CRITERIA_FLAGS = {"is_artificial", "replace_criteria"}
 
 
 def _load_auction_criteria() -> list[tuple[str, list[str], set[str]]]:
@@ -597,7 +597,7 @@ def _load_auction_criteria() -> list[tuple[str, list[str], set[str]]]:
     CSV format: partial_auction,criterion1,criterion2,...
     Example row: 1c,SL_S >= SL_H,HCP >= 12
     
-    Known flags (e.g. ``is_artificial``) are extracted into the flags set and
+    Known flags (e.g. ``is_artificial``, ``replace_criteria``) are extracted into the flags set and
     excluded from the criteria list. Entries that contain only flags (no real
     criteria) are still returned so the overlay builder can consume them.
     
@@ -1281,6 +1281,12 @@ class ResolveAuctionPathRequest(BaseModel):
     Used by Auction Builder to fetch criteria and metadata for an entire path in one call.
     """
     auction: str
+
+
+class BTDDMeanTricksRequest(BaseModel):
+    """Get mean DD trick count from the BT node matching an auction's terminal contract."""
+    auctions: list[str]
+    dealer: str
 
 
 class DealsMatchingAuctionRequest(BaseModel):
@@ -3853,6 +3859,21 @@ def resolve_auction_path(req: ResolveAuctionPathRequest) -> Dict[str, Any]:
         return _attach_hot_reload_info(resp, reload_info)
     except Exception as e:
         _log_and_raise("resolve-auction-path", e)
+
+
+@app.post("/bt-dd-mean-tricks")
+def bt_dd_mean_tricks(req: BTDDMeanTricksRequest) -> Dict[str, Any]:
+    """Get BT node mean DD tricks for each auction's terminal contract."""
+    state, reload_info, handler_module = _prepare_handler_call()
+    try:
+        resp = handler_module.handle_bt_dd_mean_tricks(
+            state=state,
+            auctions=req.auctions,
+            dealer=req.dealer,
+        )
+        return _attach_hot_reload_info(resp, reload_info)
+    except Exception as e:
+        _log_and_raise("bt-dd-mean-tricks", e)
 
 
 @app.post("/find-bt-auctions-by-contracts")

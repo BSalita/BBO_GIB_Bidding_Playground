@@ -36,6 +36,7 @@ import sys
 import re
 from typing import Any, Dict, List, Literal, Optional, Set
 
+import plotly.graph_objects as go  # type: ignore[import-not-found]
 import mlBridge.mlBridgeLib as mlBridgeLib
 
 from bbo_custom_questions_lib import (
@@ -5096,6 +5097,442 @@ def _hand_total_points(hand: str) -> int:
     return hcp + dist
 
 
+def _hand_dist_points(hand: str) -> int:
+    """Distribution points only (void=3, singleton=2, doubleton=1)."""
+    suits = str(hand or "").split(".")
+    return sum(max(0, 3 - len(s)) for s in suits)
+
+
+def _render_batch_deal_radar(
+    sel_result: dict,
+    deal_row: dict | None,
+    dealer: str,
+) -> None:
+    """Render a Plotly radar (polar) chart comparing Actual vs AI metrics.
+
+    Spokes cover DD tricks, DD score, EV, IMPs, hand-evaluation metrics
+    (HCP, QT, LTC, DP, TP) for the declaring side, and auction length.
+    Values are normalised to [0, 1] so differently-scaled metrics fit on
+    the same chart.
+    """
+    from bbo_hand_eval_lib import parse_hand_cards, count_quick_tricks, count_hand_ltc
+
+    directions = ["N", "E", "S", "W"]
+
+    def _declarer_dir(auction: str | None) -> str | None:
+        if not auction:
+            return None
+        return get_declarer_for_auction(auction, dealer)
+
+    actual_auction = sel_result.get("Actual_Auction")
+    ai_auction = sel_result.get("AI_Auction")
+
+    actual_decl = _declarer_dir(actual_auction)
+    ai_decl = _declarer_dir(ai_auction)
+
+    def _partner_dir(d: str | None) -> str | None:
+        if d is None:
+            return None
+        idx = directions.index(d) if d in directions else None
+        return directions[(idx + 2) % 4] if idx is not None else None
+
+    def _partnership_hcp(d: str | None) -> int | None:
+        if d is None or deal_row is None:
+            return None
+        p = _partner_dir(d)
+        hd = deal_row.get(f"HCP_{d}")
+        hp = deal_row.get(f"HCP_{p}") if p else None
+        if hd is None and hp is None:
+            hand_d = str(deal_row.get(f"Hand_{d}", "") or "")
+            hand_p = str(deal_row.get(f"Hand_{p}", "") or "") if p else ""
+            hd = _hand_hcp(hand_d) if hand_d else None
+            hp = _hand_hcp(hand_p) if hand_p else None
+        if hd is None or hp is None:
+            return None
+        return int(hd) + int(hp)
+
+    def _partnership_tp(d: str | None) -> int | None:
+        if d is None or deal_row is None:
+            return None
+        p = _partner_dir(d)
+        td = deal_row.get(f"Total_Points_{d}")
+        tp = deal_row.get(f"Total_Points_{p}") if p else None
+        if td is None and tp is None:
+            hand_d = str(deal_row.get(f"Hand_{d}", "") or "")
+            hand_p = str(deal_row.get(f"Hand_{p}", "") or "") if p else ""
+            td = _hand_total_points(hand_d) if hand_d else None
+            tp = _hand_total_points(hand_p) if hand_p else None
+        if td is None or tp is None:
+            return None
+        return int(td) + int(tp)
+
+    def _partnership_qt(d: str | None) -> float | None:
+        if d is None or deal_row is None:
+            return None
+        p = _partner_dir(d)
+        total = 0.0
+        for dd in (d, p):
+            if dd is None:
+                continue
+            hand = str(deal_row.get(f"Hand_{dd}", "") or "")
+            cards = parse_hand_cards(hand)
+            if not cards:
+                return None
+            qt, _ = count_quick_tricks(cards)
+            total += qt
+        return total
+
+    def _partnership_ltc(d: str | None) -> int | None:
+        if d is None or deal_row is None:
+            return None
+        p = _partner_dir(d)
+        total = 0
+        for dd in (d, p):
+            if dd is None:
+                continue
+            hand = str(deal_row.get(f"Hand_{dd}", "") or "")
+            cards = parse_hand_cards(hand)
+            if not cards:
+                return None
+            ltc, _ = count_hand_ltc(cards)
+            total += ltc
+        return total
+
+    def _partnership_dp(d: str | None) -> int | None:
+        if d is None or deal_row is None:
+            return None
+        p = _partner_dir(d)
+        total = 0
+        for dd in (d, p):
+            if dd is None:
+                continue
+            hand = str(deal_row.get(f"Hand_{dd}", "") or "")
+            if not hand:
+                return None
+            total += _hand_dist_points(hand)
+        return total
+
+    def _auction_length(auction: str | None) -> int | None:
+        if not auction:
+            return None
+        return len([t for t in auction.split("-") if t.strip()])
+
+    actual_tricks = sel_result.get("Actual_Tricks")
+    ai_tricks = sel_result.get("AI_Tricks")
+    dd_score_actual = sel_result.get("DD_Score_Actual")
+    dd_score_ai = sel_result.get("DD_Score_AI")
+    ev_actual = sel_result.get("EV_Actual")
+    ev_ai = sel_result.get("EV_AI")
+    imp_actual = sel_result.get("IMP_Actual")
+    imp_ai = sel_result.get("IMP_AI")
+    par_score = sel_result.get("Par")
+
+    hcp_actual = _partnership_hcp(actual_decl)
+    hcp_ai = _partnership_hcp(ai_decl)
+    tp_actual = _partnership_tp(actual_decl)
+    tp_ai = _partnership_tp(ai_decl)
+    qt_actual = _partnership_qt(actual_decl)
+    qt_ai = _partnership_qt(ai_decl)
+    ltc_actual = _partnership_ltc(actual_decl)
+    ltc_ai = _partnership_ltc(ai_decl)
+    dp_actual = _partnership_dp(actual_decl)
+    dp_ai = _partnership_dp(ai_decl)
+    len_actual = _auction_length(actual_auction)
+    len_ai = _auction_length(ai_auction)
+
+    spoke_defs: list[tuple[str, Any, Any, float, float, bool]] = [
+        # (label, actual_val, ai_val, min_bound, max_bound, invert)
+        # invert=True means lower is better (LTC, auction length)
+        ("DD Tricks", actual_tricks, ai_tricks, 0, 13, False),
+        ("DD Score", dd_score_actual, dd_score_ai, -1500, 1500, False),
+        ("EV", ev_actual, ev_ai, -1500, 1500, False),
+        ("IMP vs Par", imp_actual, imp_ai, -15, 15, False),
+        ("HCP", hcp_actual, hcp_ai, 0, 40, False),
+        ("Total Pts", tp_actual, tp_ai, 0, 50, False),
+        ("Quick Tricks", qt_actual, qt_ai, 0, 12, False),
+        ("LTC", ltc_actual, ltc_ai, 0, 24, True),
+        ("Dist Pts", dp_actual, dp_ai, 0, 15, False),
+        ("Auction Len", len_actual, len_ai, 1, 25, True),
+    ]
+
+    if par_score is not None:
+        spoke_defs.insert(4, ("Par", par_score, par_score, -1500, 1500, False))
+
+    def _norm(val: Any, lo: float, hi: float, invert: bool) -> float | None:
+        if val is None or (isinstance(val, float) and (pd.isna(val) or np.isnan(val))):
+            return None
+        v = float(val)
+        clamped = max(lo, min(hi, v))
+        n = (clamped - lo) / (hi - lo) if hi != lo else 0.5
+        return (1.0 - n) if invert else n
+
+    labels: list[str] = []
+    actual_vals: list[float] = []
+    ai_vals: list[float] = []
+    hover_actual: list[str] = []
+    hover_ai: list[str] = []
+
+    for label, a_raw, ai_raw, lo, hi, inv in spoke_defs:
+        a_n = _norm(a_raw, lo, hi, inv)
+        ai_n = _norm(ai_raw, lo, hi, inv)
+        if a_n is None and ai_n is None:
+            continue
+        labels.append(label)
+        actual_vals.append(a_n if a_n is not None else 0.0)
+        ai_vals.append(ai_n if ai_n is not None else 0.0)
+
+        def _fmt(v: Any) -> str:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return "n/a"
+            if isinstance(v, float):
+                return f"{v:.1f}"
+            return str(v)
+
+        hover_actual.append(f"{label}: {_fmt(a_raw)}")
+        hover_ai.append(f"{label}: {_fmt(ai_raw)}")
+
+    if not labels:
+        return
+
+    labels.append(labels[0])
+    actual_vals.append(actual_vals[0])
+    ai_vals.append(ai_vals[0])
+    hover_actual.append(hover_actual[0])
+    hover_ai.append(hover_ai[0])
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=actual_vals,
+        theta=labels,
+        fill="toself",
+        name="Actual",
+        line=dict(color="#1f77b4", width=2),
+        fillcolor="rgba(31, 119, 180, 0.15)",
+        hovertext=hover_actual,
+        hoverinfo="text+name",
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=ai_vals,
+        theta=labels,
+        fill="toself",
+        name="AI Model",
+        line=dict(color="#ff7f0e", width=2),
+        fillcolor="rgba(255, 127, 14, 0.15)",
+        hovertext=hover_ai,
+        hoverinfo="text+name",
+    ))
+
+    actual_contract = sel_result.get("Actual_Contract", "")
+    ai_contract = sel_result.get("AI_Contract", "")
+    title_parts = ["Actual vs AI"]
+    if actual_contract or ai_contract:
+        title_parts.append(f"({actual_contract or '?'} vs {ai_contract or '?'})")
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 1], showticklabels=False),
+            angularaxis=dict(tickfont=dict(size=11)),
+        ),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+        title=dict(text=" ".join(title_parts), font=dict(size=14)),
+        margin=dict(t=60, b=40, l=60, r=60),
+        height=420,
+    )
+
+    st.plotly_chart(fig, use_container_width=True, key=f"_batch_radar_{sel_result.get('Deal', '')}")
+
+
+def _classify_contract(contract_str: str | None) -> str:
+    """Classify a contract string into Partial / Game / Small Slam / Grand Slam / Pass."""
+    if not contract_str or not str(contract_str).strip():
+        return "Pass"
+    c = str(contract_str).strip().upper()
+    if c in ("PASS", "P", "PASSED", "PASSOUT"):
+        return "Pass"
+    m = re.match(r"(\d)", c)
+    if not m:
+        return "Pass"
+    level = int(m.group(1))
+    if level == 7:
+        return "Grand Slam"
+    if level == 6:
+        return "Small Slam"
+    strain = ""
+    rest = c[1:].lstrip()
+    for s in ("NT", "N", "S", "H", "D", "C"):
+        if rest.startswith(s):
+            strain = s
+            break
+    if strain in ("N", "NT"):
+        return "Game" if level >= 3 else "Partial"
+    if strain in ("S", "H"):
+        return "Game" if level >= 4 else "Partial"
+    return "Game" if level >= 5 else "Partial"
+
+
+_CONTRACT_TYPE_ORDER = ["Partial", "Game", "Small Slam", "Grand Slam", "Pass"]
+
+
+def _render_batch_stacked_bars(
+    all_results: list[dict],
+    deal_row_map: dict[int, dict],
+) -> None:
+    """Render stacked bar charts grouped by contract type.
+
+    Three chart groups side-by-side:
+      1. HCP (NS vs EW)
+      2. Total Points (NS vs EW)
+      3. IMP Diff by contract type
+    """
+    if not all_results:
+        return
+
+    records: list[dict] = []
+    for r in all_results:
+        if r.get("Error"):
+            continue
+        deal_idx = r.get("Deal")
+        dealer = r.get("Dealer", "N")
+        ai_contract = r.get("AI_Contract")
+        ct = _classify_contract(ai_contract)
+
+        dr = deal_row_map.get(int(deal_idx)) if deal_idx is not None else None
+
+        hcp_ns: int | None = None
+        hcp_ew: int | None = None
+        tp_ns: int | None = None
+        tp_ew: int | None = None
+
+        if dr:
+            ns_dirs = ("N", "S")
+            ew_dirs = ("E", "W")
+            hcp_vals_ns, hcp_vals_ew = [], []
+            tp_vals_ns, tp_vals_ew = [], []
+            for d in ns_dirs:
+                h = dr.get(f"HCP_{d}")
+                t = dr.get(f"Total_Points_{d}")
+                hand = str(dr.get(f"Hand_{d}", "") or "")
+                if h is None and hand:
+                    h = _hand_hcp(hand)
+                if t is None and hand:
+                    t = _hand_total_points(hand)
+                if h is not None:
+                    hcp_vals_ns.append(int(h))
+                if t is not None:
+                    tp_vals_ns.append(int(t))
+            for d in ew_dirs:
+                h = dr.get(f"HCP_{d}")
+                t = dr.get(f"Total_Points_{d}")
+                hand = str(dr.get(f"Hand_{d}", "") or "")
+                if h is None and hand:
+                    h = _hand_hcp(hand)
+                if t is None and hand:
+                    t = _hand_total_points(hand)
+                if h is not None:
+                    hcp_vals_ew.append(int(h))
+                if t is not None:
+                    tp_vals_ew.append(int(t))
+            if len(hcp_vals_ns) == 2:
+                hcp_ns = sum(hcp_vals_ns)
+            if len(hcp_vals_ew) == 2:
+                hcp_ew = sum(hcp_vals_ew)
+            if len(tp_vals_ns) == 2:
+                tp_ns = sum(tp_vals_ns)
+            if len(tp_vals_ew) == 2:
+                tp_ew = sum(tp_vals_ew)
+
+        imp_diff = r.get("IMP_Diff")
+        if isinstance(imp_diff, float) and pd.isna(imp_diff):
+            imp_diff = None
+
+        records.append({
+            "Contract_Type": ct,
+            "HCP_NS": hcp_ns,
+            "HCP_EW": hcp_ew,
+            "TP_NS": tp_ns,
+            "TP_EW": tp_ew,
+            "IMP_Diff": imp_diff,
+        })
+
+    if not records:
+        return
+
+    df = pd.DataFrame(records)
+
+    present_types = [t for t in _CONTRACT_TYPE_ORDER if t in df["Contract_Type"].values]
+    if not present_types:
+        return
+
+    grouped = df.groupby("Contract_Type", sort=False)
+    counts = grouped.size().reindex(present_types, fill_value=0)
+
+    x_labels = [f"{t}\n(n={counts[t]})" for t in present_types]
+
+    from plotly.subplots import make_subplots  # type: ignore[import-not-found]
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=("Avg HCP by Side", "Avg Total Points by Side", "Avg IMP Diff (AI−Actual)"),
+        horizontal_spacing=0.08,
+    )
+
+    hcp_ns_means = [grouped["HCP_NS"].mean().get(t) for t in present_types]
+    hcp_ew_means = [grouped["HCP_EW"].mean().get(t) for t in present_types]
+    tp_ns_means = [grouped["TP_NS"].mean().get(t) for t in present_types]
+    tp_ew_means = [grouped["TP_EW"].mean().get(t) for t in present_types]
+    imp_means = [grouped["IMP_Diff"].mean().get(t) for t in present_types]
+
+    def _fmt_hover(vals: list) -> list[str]:
+        return [f"{v:.1f}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "n/a" for v in vals]
+
+    fig.add_trace(go.Bar(
+        x=x_labels, y=hcp_ns_means, name="NS",
+        marker_color="#1f77b4", text=_fmt_hover(hcp_ns_means), textposition="inside",
+        legendgroup="NS", showlegend=True,
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=x_labels, y=hcp_ew_means, name="EW",
+        marker_color="#ff7f0e", text=_fmt_hover(hcp_ew_means), textposition="inside",
+        legendgroup="EW", showlegend=True,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=x_labels, y=tp_ns_means, name="NS",
+        marker_color="#1f77b4", text=_fmt_hover(tp_ns_means), textposition="inside",
+        legendgroup="NS", showlegend=False,
+    ), row=1, col=2)
+    fig.add_trace(go.Bar(
+        x=x_labels, y=tp_ew_means, name="EW",
+        marker_color="#ff7f0e", text=_fmt_hover(tp_ew_means), textposition="inside",
+        legendgroup="EW", showlegend=False,
+    ), row=1, col=2)
+
+    imp_colors = [
+        "#2ca02c" if v is not None and not (isinstance(v, float) and pd.isna(v)) and v > 0
+        else "#d62728" if v is not None and not (isinstance(v, float) and pd.isna(v)) and v < 0
+        else "#999999"
+        for v in imp_means
+    ]
+    fig.add_trace(go.Bar(
+        x=x_labels, y=imp_means, name="IMP Diff",
+        marker_color=imp_colors, text=_fmt_hover(imp_means), textposition="outside",
+        showlegend=False,
+    ), row=1, col=3)
+
+    fig.update_layout(
+        barmode="group",
+        height=380,
+        margin=dict(t=50, b=30, l=40, r=20),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5),
+        title=dict(text="Batch Results by Contract Type", font=dict(size=14)),
+    )
+    fig.update_yaxes(title_text="HCP", row=1, col=1)
+    fig.update_yaxes(title_text="Total Points", row=1, col=2)
+    fig.update_yaxes(title_text="IMPs", row=1, col=3)
+
+    st.plotly_chart(fig, use_container_width=True, key="_batch_stacked_bars")
+
+
 # ---------------------------------------------------------------------------
 # On-the-fly DDS augmentation (follows mlBridgeAugmentLib patterns)
 # ---------------------------------------------------------------------------
@@ -5500,16 +5937,52 @@ def parse_csv_to_boards(content: str) -> list[dict]:
     return boards
 
 
+def _parse_deal_index_ranges(text: str, max_index: int = 10_000) -> list[int]:
+    """Parse a deal-index range expression into a sorted list of unique indices.
+
+    Accepted formats (comma or space delimited):
+      ``5``         → [5]
+      ``1-10``      → [1, 2, ..., 10]
+      ``220+``      → [220, 221, ..., max_index]
+      ``1-10, 200, 220+``  → union of above
+    """
+    indices: set[int] = set()
+    tokens = re.split(r"[,\s]+", text.strip())
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.endswith("+"):
+            start = int(tok[:-1])
+            indices.update(range(start, max_index + 1))
+        elif "-" in tok:
+            parts = tok.split("-", 1)
+            lo, hi = int(parts[0]), int(parts[1])
+            indices.update(range(lo, hi + 1))
+        else:
+            indices.add(int(tok))
+    return sorted(indices)
+
+
 def _render_batch_input_from_deals_df() -> dict[str, Any]:
     """Render controls for DB-backed source and return normalized config."""
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b = st.columns([3, 1])
     with col_a:
-        start_index = st.number_input("Start Deal Index", min_value=1, value=1, step=1, key="_batch_start_db")
+        ranges_text = st.text_input(
+            "Deal Index Ranges",
+            value="1-25",
+            key="_batch_ranges_db",
+            help="Examples: ``1-25``  ``1-10, 200, 220+``  ``42``  Commas or spaces delimit ranges.  Press Enter to run.",
+            on_change=lambda: st.session_state.__setitem__("_batch_run_on_enter", True),
+        )
     with col_b:
-        deal_count = st.number_input("Number of Deals", min_value=1, max_value=500, value=25, step=25, key="_batch_count_db")
-    with col_c:
         seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
-    return {"start_index": int(start_index), "deal_count": int(deal_count), "seed": int(seed), "boards": []}
+    try:
+        indices = _parse_deal_index_ranges(ranges_text)
+    except Exception:
+        indices = []
+        st.error("Invalid range expression. Use formats like ``1-25``, ``200``, ``220+``.")
+    return {"indices": indices, "ranges_text": ranges_text, "seed": int(seed), "boards": []}
 
 
 def _render_batch_input_from_pbn() -> dict[str, Any]:
@@ -5531,7 +6004,6 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
             pbn_content = pbn_file.read().decode("utf-8", errors="replace")
             parsed_boards = parse_pbn_file_to_boards(pbn_content)
             st.session_state["_arena_pbn_boards"] = parsed_boards
-            st.session_state["_batch_count_pbn"] = len(parsed_boards)
             st.success(f"Loaded **{len(parsed_boards)}** board(s) from `{pbn_file.name}`.")
         except Exception as e:
             st.error(f"Failed to parse PBN file: {e}")
@@ -5541,42 +6013,34 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
             pbn_content = _download_text_from_url(pbn_url, "PBN")
             parsed_boards = parse_pbn_file_to_boards(pbn_content)
             st.session_state["_arena_pbn_boards"] = parsed_boards
-            st.session_state["_batch_count_pbn"] = len(parsed_boards)
             st.success(f"Downloaded and parsed **{len(parsed_boards)}** board(s) from URL.")
         except Exception as e:
             st.error(f"Failed to download/parse PBN URL: {e}")
 
     boards = st.session_state.get("_arena_pbn_boards") or []
     n_boards = len(boards)
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b = st.columns([3, 1])
     with col_a:
-        start_board = st.number_input(
-            "Start Board",
-            min_value=1,
-            max_value=max(1, n_boards),
-            value=1,
-            step=1,
-            key="_batch_start_pbn",
+        default_range = f"1-{n_boards}" if n_boards > 0 else "1-25"
+        ranges_text = st.text_input(
+            "Board Index Ranges",
+            value=default_range,
+            key="_batch_ranges_pbn",
             disabled=(n_boards == 0),
+            help="Examples: ``1-25``  ``1-10, 20, 30+``  Commas or spaces delimit ranges.  Press Enter to run.",
+            on_change=lambda: st.session_state.__setitem__("_batch_run_on_enter", True),
         )
     with col_b:
-        remaining = max(1, n_boards - int(start_board) + 1)
-        deal_count = st.number_input(
-            "Number of Boards",
-            min_value=1,
-            max_value=remaining,
-            value=remaining,
-            step=1,
-            key="_batch_count_pbn",
-            disabled=(n_boards == 0),
-        )
-    with col_c:
         seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
     if n_boards == 0:
         st.info("Provide a local PBN file or URL, then click Download.")
-    start_0 = int(start_board) - 1
-    selected_boards = boards[start_0 : start_0 + int(deal_count)]
-    return {"start_index": int(start_board), "deal_count": int(deal_count), "seed": int(seed), "boards": selected_boards}
+    try:
+        board_indices = _parse_deal_index_ranges(ranges_text, max_index=max(1, n_boards))
+    except Exception:
+        board_indices = []
+        st.error("Invalid range expression. Use formats like ``1-25``, ``20``, ``30+``.")
+    selected_boards = [boards[i - 1] for i in board_indices if 1 <= i <= n_boards]
+    return {"seed": int(seed), "boards": selected_boards}
 
 
 def _render_batch_input_from_csv() -> dict[str, Any]:
@@ -5595,7 +6059,6 @@ def _render_batch_input_from_csv() -> dict[str, Any]:
             csv_content = csv_file.read().decode("utf-8", errors="replace")
             parsed_boards = parse_csv_to_boards(csv_content)
             st.session_state["_arena_csv_boards"] = parsed_boards
-            st.session_state["_batch_count_csv"] = len(parsed_boards)
             st.success(f"Loaded **{len(parsed_boards)}** row(s) from `{csv_file.name}`.")
         except Exception as e:
             st.error(f"Failed to parse CSV file: {e}")
@@ -5605,29 +6068,34 @@ def _render_batch_input_from_csv() -> dict[str, Any]:
             csv_content = _download_text_from_url(csv_url, "CSV")
             parsed_boards = parse_csv_to_boards(csv_content)
             st.session_state["_arena_csv_boards"] = parsed_boards
-            st.session_state["_batch_count_csv"] = len(parsed_boards)
             st.success(f"Downloaded and parsed **{len(parsed_boards)}** row(s) from URL.")
         except Exception as e:
             st.error(f"Failed to download/parse CSV URL: {e}")
 
     boards = st.session_state.get("_arena_csv_boards") or []
     n_boards = len(boards)
-    col_b, col_c = st.columns(2)
-    with col_b:
-        deal_count = st.number_input(
-            "Number of Deals",
-            min_value=1,
-            max_value=max(1, n_boards),
-            value=n_boards if n_boards > 0 else 1,
-            step=1,
-            key="_batch_count_csv",
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        default_range = f"1-{n_boards}" if n_boards > 0 else "1-25"
+        ranges_text = st.text_input(
+            "Deal Index Ranges",
+            value=default_range,
+            key="_batch_ranges_csv",
             disabled=(n_boards == 0),
+            help="Examples: ``1-25``  ``1-10, 20, 30+``  Commas or spaces delimit ranges.  Press Enter to run.",
+            on_change=lambda: st.session_state.__setitem__("_batch_run_on_enter", True),
         )
-    with col_c:
+    with col_b:
         seed = st.number_input("Random Seed", min_value=0, value=0, key="_batch_seed")
     if n_boards == 0:
         st.info("Provide a local CSV file or URL, then click Download.")
-    return {"start_index": 1, "deal_count": int(deal_count), "seed": int(seed), "boards": boards[: int(deal_count)]}
+    try:
+        board_indices = _parse_deal_index_ranges(ranges_text, max_index=max(1, n_boards))
+    except Exception:
+        board_indices = []
+        st.error("Invalid range expression. Use formats like ``1-25``, ``20``, ``30+``.")
+    selected_boards = [boards[i - 1] for i in board_indices if 1 <= i <= n_boards]
+    return {"seed": int(seed), "boards": selected_boards}
 
 
 # ---------------------------------------------------------------------------
@@ -5736,8 +6204,7 @@ def render_ai_model_batch_arena():
     else:
         input_cfg = _render_batch_input_from_csv()
 
-    start_index = int(input_cfg["start_index"])
-    deal_count = int(input_cfg["deal_count"])
+    _db_indices: list[int] = list(input_cfg.get("indices") or [])
     seed = int(input_cfg["seed"])
     _external_boards_for_run = list(input_cfg.get("boards") or [])
 
@@ -5747,6 +6214,8 @@ def render_ai_model_batch_arena():
         run_clicked = st.button("▶ Run Batch", key="_batch_run")
     with btn_col2:
         cancel_clicked = st.button("⏹ Cancel", key="_batch_cancel")
+    if st.session_state.pop("_batch_run_on_enter", False):
+        run_clicked = True
     live_results_container = st.container()
 
     if cancel_clicked:
@@ -5897,7 +6366,10 @@ def render_ai_model_batch_arena():
         # DB mode: pre-fetch all rows in one batch API call                  #
         # ------------------------------------------------------------------ #
         if not _use_external:
-            indices = list(range(int(start_index), int(start_index) + int(deal_count)))
+            indices = list(_db_indices)
+            if not indices:
+                st.warning("No deal indices specified. Check the Deal Index Ranges input.")
+                return
             status_text.text("")
             try:
                 deals_resp = api_post(
@@ -6171,37 +6643,48 @@ def render_ai_model_batch_arena():
             actual_contract = _contract_str(actual_auction, dealer)
             ai_contract = _contract_str(ai_auction, dealer)
 
-            # Actual tricks/result: use the real play data from deal_row when
-            # available (PBN Tricks / Result columns).  Fall back to DD only
-            # when no actual-play data exists.
-            _actual_tricks_raw = deal_row.get("Tricks")
-            _actual_result_raw = deal_row.get("Result")
-            if _actual_tricks_raw is not None:
+            # BT node mean DD tricks: fetch from bt_stats_df via API.
+            # One batched call for both auctions.
+            _bt_mean_auctions = [a for a in [actual_auction, ai_auction] if a and a.strip()]
+            _bt_mean_map: dict[str, float | None] = {}
+            if _bt_mean_auctions:
                 try:
-                    actual_tricks = int(_actual_tricks_raw)
-                except (ValueError, TypeError):
-                    actual_tricks = None
-            else:
-                actual_tricks = _dd_tricks(actual_auction, dealer, deal_row)
-            if _actual_result_raw is not None:
-                try:
-                    actual_result = int(_actual_result_raw)
-                except (ValueError, TypeError):
-                    actual_result = None
-            else:
-                actual_result = _result(actual_auction, dealer, deal_row)
+                    _bt_resp = api_post(
+                        "/bt-dd-mean-tricks",
+                        {"auctions": _bt_mean_auctions, "dealer": dealer},
+                        timeout=5,
+                    )
+                    _bt_mean_map = _bt_resp.get("results") or {}
+                except Exception:
+                    pass
 
-            ai_dd_tricks = _dd_tricks(ai_auction, dealer, deal_row)
-            ai_result = _result(ai_auction, dealer, deal_row)
+            def _bt_mean_result(auction: str | None) -> float | None:
+                """Compute mean over/under tricks from BT mean DD tricks."""
+                if not auction:
+                    return None
+                mean_tricks = _bt_mean_map.get(auction.strip())
+                if mean_tricks is None:
+                    return None
+                c = parse_contract_from_auction(auction)
+                if not c:
+                    return None
+                level_i, _, _ = c
+                return round(float(mean_tricks) - (int(level_i) + 6), 1)
+
+            actual_tricks = _bt_mean_map.get((actual_auction or "").strip())
+            ai_dd_tricks = _bt_mean_map.get((ai_auction or "").strip())
+            actual_result = _bt_mean_result(actual_auction)
+            ai_result = _bt_mean_result(ai_auction)
 
             # Contract-score view (declarer-side) for table display.
+            _deal_row_for_score: dict = deal_row  # type: ignore[assignment]
             def _contract_score_or_passout(auction: str | None) -> int | None:
                 if not auction:
                     return None
                 toks = [t.strip().upper() for t in auction.split("-") if t.strip()]
                 if all(t == "P" for t in toks):
                     return 0
-                return get_dd_score_for_auction(auction, dealer, deal_row)
+                return get_dd_score_for_auction(auction, dealer, _deal_row_for_score)
 
             actual_score_contract = _contract_score_or_passout(actual_auction)
             ai_score_contract = _contract_score_or_passout(ai_auction)
@@ -6490,8 +6973,8 @@ def render_ai_model_batch_arena():
 
             _ba_payload = {
                 "timestamp": _ba_dt.now(_ba_tz.utc).isoformat(),
-                "start_index": int(start_index),
-                "deal_count": int(deal_count),
+                "deal_ranges": input_cfg.get("ranges_text"),
+                "deal_count": len(results),
                 "seed": int(seed),
                 "deals_processed": len(results),
                 "imp_running_total": imp_running,
@@ -6520,10 +7003,14 @@ def render_ai_model_batch_arena():
         st.download_button(
             "📥 Export Results (CSV)",
             data=csv_bytes,
-            file_name=f"ai_model_batch_{int(start_index)}_{int(deal_count)}_{ts}.csv",
+            file_name=f"ai_model_batch_{len(all_results)}deals_{ts}.csv",
             mime="text/csv",
             key="_batch_export",
         )
+
+        # ---- Aggregate stacked bar charts by contract type ----
+        _agg_deal_row_map: dict[int, dict] = st.session_state.get("_arena_deal_row_map") or {}
+        _render_batch_stacked_bars(all_results, _agg_deal_row_map)
 
         # ---- Row-click: deal diagram then single-row detail ----
         _sel_result: dict | None = st.session_state.get("_batch_selected_result")
@@ -6613,6 +7100,13 @@ def render_ai_model_batch_arena():
                 row_bucket_col="_IMP_Color",
                 hide_cols=["_IMP_Color"],
                 height=calc_grid_height(1),
+            )
+
+            # 2b. Radar chart — Actual vs AI comparison
+            _render_batch_deal_radar(
+                _sel_result,
+                _deal_row,
+                _sel_result.get("Dealer", "N"),
             )
 
             # 3. Expert Chat for selected batch deal (provider-select with All compare).
@@ -6737,8 +7231,9 @@ def _render_batch_results_df(
                 elif imp > 0:
                     return ["background-color: #ccffcc"] * len(row)
                 return [""] * len(row)
+            _fmt_1f = lambda x: f"{x:.1f}" if x is not None and not (isinstance(x, float) and pd.isna(x)) else ""
             styled = df.style.apply(_color_row, axis=1).format(
-                {col: "{:.1f}" for col in ("EV_Actual", "EV_AI") if col in df.columns}
+                {col: _fmt_1f for col in ("EV_Actual", "EV_AI", "Actual_Tricks", "AI_Tricks", "Actual_Result", "AI_Result") if col in df.columns}
             )
             container.dataframe(styled, width="stretch", hide_index=True)
         else:

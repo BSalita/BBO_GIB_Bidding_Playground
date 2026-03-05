@@ -597,3 +597,72 @@ def pivot_bt_seat_stats(
         }
 
     return result
+
+
+def get_bt_dd_mean_tricks(
+    bt_stats_df: Any,  # pl.DataFrame
+    bt_index: int,
+    declarer: str,
+    strain: str,
+    dealer: str,
+) -> float | None:
+    """Look up the mean DD trick count for a specific bt_index/declarer/strain.
+
+    Parameters
+    ----------
+    bt_stats_df : pl.DataFrame
+        Precomputed stats DataFrame with DD_S{seat}_{strain}_mean_S{seat} columns.
+    bt_index : int
+        BT node index to look up.
+    declarer : str
+        Compass direction of the declarer (N/E/S/W).
+    strain : str
+        Contract strain: C/D/H/S/N (N for notrump).
+    dealer : str
+        Compass direction of the dealer (N/E/S/W).
+
+    Returns
+    -------
+    float or None
+        Mean DD trick count (e.g. 9.3) or None if not found.
+    """
+    import polars as pl
+
+    if bt_stats_df is None:
+        return None
+
+    strain = str(strain).upper()
+    if strain == "NT":
+        strain = "N"
+    if strain not in ("C", "D", "H", "S", "N"):
+        return None
+
+    declarer = str(declarer).upper()
+    dealer = str(dealer).upper()
+
+    # Map declarer direction to seat number
+    try:
+        dealer_idx = _DIRECTIONS.index(dealer)
+        decl_idx = _DIRECTIONS.index(declarer)
+        seat = ((decl_idx - dealer_idx) % 4) + 1
+    except ValueError:
+        return None
+
+    # v3 seat-relative column
+    col_name = f"DD_S{seat}_{strain}_mean_S{seat}"
+
+    try:
+        row = bt_stats_df.filter(pl.col("bt_index") == bt_index)
+        if row.height == 0:
+            return None
+        val = row[col_name][0]
+        if val is None:
+            # v2 fallback
+            col_v2 = f"DD_{declarer}_{strain}_mean_S1"
+            if col_v2 in row.columns:
+                val = row[col_v2][0]
+        if val is not None:
+            return round(float(val), 1)
+    except Exception:
+        return None
+    return None
