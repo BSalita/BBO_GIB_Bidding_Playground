@@ -69,6 +69,7 @@ from bbo_bid_details_lib import (
 from bbo_explanation_lib import (
     compute_common_sense_adjustments,
     compute_common_sense_hard_override,
+    compute_forced_non_pass_policy,
     compute_partner_major_game_commit_adjustment,
     compute_pass_signoff_bonus,
     compute_post_game_slam_gate_adjustment,
@@ -76,6 +77,7 @@ from bbo_explanation_lib import (
     compute_non_rebiddable_suit_rebid_penalty,
     compute_eeo_from_bid_details,
     compute_guardrail_penalty,
+    extract_second_pass_opening_context,
     expected_from_hist,
     hand_controls,
     opponent_shown_natural_strains,
@@ -9696,7 +9698,13 @@ def handle_bid_details(
     deals_sample_df = matched_df.select(cols)
 
     cfg = BidDetailsConfig(topk=int(topk), include_phase2a=bool(include_phase2a), include_honor_location=False)
-    computed = compute_bid_details_from_sample(deals_sample_df, seat_dir=seat_dir or "N", pinned_row=None, cfg=cfg)
+    computed = compute_bid_details_from_sample(
+        deals_sample_df,
+        next_seat=int(next_seat),
+        seat_dir=seat_dir or "N",
+        pinned_row=None,
+        cfg=cfg,
+    )
     if include_timing:
         now = time.perf_counter()
         timing["bid_details_compute_ms"] = (now - t_mark) * 1000
@@ -11771,6 +11779,7 @@ def _is_auction_complete_list(bids: List[str]) -> bool:
 def handle_ai_model_advanced_path(
     state: Dict[str, Any],
     *,
+    auction_prefix: str = "",
     deal_row_idx: int = -1,
     deal_row_dict: Dict[str, Any] | None = None,
     seed: int = 0,
@@ -12340,7 +12349,156 @@ def handle_ai_model_advanced_path(
         suit_hcp = sum(honors.get(c.upper(), 0) for c in suit_cards)
         return suit_hcp >= 4 or (sl + suit_hcp) >= 6
 
-    tokens: List[str] = []
+    def _apply_direct_overcall_gap_rescue(
+        *,
+        passed_opts_now: List[Dict[str, Any]],
+        filtered_bids_now: List[Dict[str, Any]],
+        next_bids_now: List[Dict[str, Any]],
+        tokens_now: List[str],
+        acting_side_now: str,
+        acting_dir_now: str,
+        deal_row_now: Dict[str, Any],
+        bt_seat_now: int,
+        dealer_rot_now: str,
+        dealer_actual_now: str,
+        deal_row_idx_now: int,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], str | None]:
+        """Rescue plausible direct overcalls when BT gaps leave only Pass."""
+        passed_non_pass_now = [
+            o for o in list(passed_opts_now or [])
+            if str((o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+        ]
+        if passed_non_pass_now or not filtered_bids_now or not deal_row_now:
+            return passed_opts_now, filtered_bids_now, None
+
+        opp_natural: list[tuple[int, str, str]] = []
+        our_non_pass = 0
+        for i, tk in enumerate(list(tokens_now or [])):
+            bid = str(tk or "").strip().upper()
+            if bid in ("", "P", "PASS", "D", "X", "DOUBLE", "R", "XX", "REDOUBLE"):
+                continue
+            bidder_dir = _token_bidder_dir_for_dealer(i, dealer_actual_now)
+            bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
+            if len(bid) >= 2 and bid[0].isdigit() and bid[1:] in ("C", "D", "H", "S"):
+                if bidder_side == acting_side_now:
+                    our_non_pass += 1
+                else:
+                    opp_natural.append((int(bid[0]), bid[1:], bidder_dir))
+            elif bidder_side == acting_side_now:
+                our_non_pass += 1
+
+        if our_non_pass != 0 or not opp_natural:
+            return passed_opts_now, filtered_bids_now, None
+
+        last_opp_level, last_opp_strain, _ = opp_natural[-1]
+        hand_pbn = str(deal_row_now.get(f"Hand_{acting_dir_now}", "") or "").strip()
+        sl_map: dict[str, int] = {}
+        if hand_pbn and "." in hand_pbn:
+            parts = hand_pbn.split(".")
+            if len(parts) == 4:
+                sl_map = {"S": len(parts[0]), "H": len(parts[1]), "D": len(parts[2]), "C": len(parts[3])}
+
+        tp_raw = deal_row_now.get(f"Total_Points_{acting_dir_now}")
+        hcp_raw = deal_row_now.get(f"HCP_{acting_dir_now}")
+        tp_val = float(tp_raw) if tp_raw is not None else None
+        hcp_val = float(hcp_raw) if hcp_raw is not None else None
+        next_by_bid = {
+            str((nb or {}).get("bid", "") or "").strip().upper(): nb
+            for nb in (next_bids_now or [])
+        }
+
+        lowest_suit_bid: dict[str, str] = {}
+        promoted: list[dict[str, Any]] = []
+        promoted_names: set[str] = set()
+
+        for entry in list(filtered_bids_now):
+            if str(entry.get("filter_reason", "")).strip().lower() != "criteria_fail":
+                continue
+            bid = str(entry.get("bid", "") or "").strip().upper()
+            if len(bid) < 2 or not bid[0].isdigit():
+                continue
+            level = int(bid[0])
+            strain = bid[1:]
+            nb = next_by_bid.get(bid)
+            if nb is None:
+                continue
+            if (
+                nb.get("bt_index") is None
+                or bool((nb or {}).get("is_dead_end", False))
+                or not bool((nb or {}).get("can_complete", True))
+            ):
+                continue
+
+            if strain in ("C", "D", "H", "S"):
+                if strain == last_opp_strain:
+                    continue
+                if int(sl_map.get(strain, 0) or 0) < 5:
+                    continue
+                if (tp_val is not None and tp_val < 12.0) and (hcp_val is not None and hcp_val < 10.0):
+                    continue
+                prev = lowest_suit_bid.get(strain)
+                if prev is None or level < int(prev[0]):
+                    lowest_suit_bid[strain] = bid
+                continue
+
+            if strain == "N":
+                if level != 3:
+                    continue
+                if hcp_val is None or hcp_val < 18.0:
+                    continue
+                if not _has_stopper_in_suit(
+                    last_opp_strain,
+                    acting_dir_now,
+                    deal_row_now,
+                    int(bt_seat_now),
+                    dealer_rot_now,
+                    int(deal_row_idx_now),
+                ):
+                    continue
+                nb_copy = dict(nb)
+                nb_copy["_direct_overcall_gap_rescue"] = True
+                nb_copy["_direct_overcall_gap_rescue_reason"] = (
+                    f"DIRECT_OVERCALL_GAP_RESCUE: pass-only after opponent natural "
+                    f"{last_opp_level}{last_opp_strain}; strong stopper-based 3N restored for scoring"
+                )
+                promoted.append(nb_copy)
+                promoted_names.add(bid)
+
+        for bid in lowest_suit_bid.values():
+            nb = next_by_bid.get(bid)
+            if nb is None:
+                continue
+            nb_copy = dict(nb)
+            nb_copy["_direct_overcall_gap_rescue"] = True
+            nb_copy["_direct_overcall_gap_rescue_reason"] = (
+                f"DIRECT_OVERCALL_GAP_RESCUE: pass-only after opponent natural "
+                f"{last_opp_level}{last_opp_strain}; restored cheapest natural 5-card "
+                f"overcall {bid} for scoring"
+            )
+            promoted.append(nb_copy)
+            promoted_names.add(bid)
+
+        if not promoted:
+            return passed_opts_now, filtered_bids_now, None
+
+        new_passed_opts = list(passed_opts_now or []) + promoted
+        new_filtered = [
+            e for e in list(filtered_bids_now or [])
+            if str(e.get("bid", "")).strip().upper() not in promoted_names
+        ]
+        gate_reason = None
+        if (tp_val is not None and tp_val >= 18.0) or (hcp_val is not None and hcp_val >= 17.0):
+            new_passed_opts = [
+                o for o in list(new_passed_opts or [])
+                if str((o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+            ]
+            gate_reason = (
+                f"DIRECT_OVERCALL_GAP_RESCUE: strong hand after opponent natural "
+                f"{last_opp_level}{last_opp_strain}; pass blocked while restored non-pass actions exist"
+            )
+        return new_passed_opts, new_filtered, gate_reason
+
+    tokens: List[str] = [t.strip().upper() for t in normalize_auction_input(auction_prefix).split("-") if t.strip()] if auction_prefix else []
     # Convention-aware memory across steps (direction -> flag).
     forcing_heart_shown_by_dir: Dict[str, bool] = {}
     takeout_double_shown_by_dir: Dict[str, bool] = {}
@@ -12540,10 +12698,10 @@ def handle_ai_model_advanced_path(
                 "acting_direction": acting_dir_step,
                 "chosen_bid": "P",
                 "likely_final_contract": None,
-                "likely_par_score_ns": _avg_par_ns,
-                "likely_par_score_acting": (
+                "likely_par_score_ns": (
                     round(float(acting_sign_step) * float(_avg_par_ns), 2) if _avg_par_ns is not None else None
                 ),
+                "likely_par_score_acting": round(float(_avg_par_ns), 2) if _avg_par_ns is not None else None,
                 "source": "pass_fallback_avg_par",
             }
             step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
@@ -12975,6 +13133,100 @@ def handle_ai_model_advanced_path(
             except Exception:
                 pass
 
+        # --- Natural response rescue for opener-response dead ends ----------
+        # When partner opens at the one level, RHO passes, and BT criteria leave
+        # responder with only Pass, re-admit obvious natural new-suit responses
+        # so scoring can choose them and existing non-pass pass-block logic can
+        # suppress the second pass with constructive values.
+        if use_guardrails_v2 and deal_row and _bids_criteria_filtered:
+            try:
+                _orr_has_non_pass = any(
+                    str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                    for _o in list(passed_opts or [])
+                )
+                if not _orr_has_non_pass:
+                    _orr_ctx = extract_second_pass_opening_context(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir_step,
+                        dealer_actual=dealer_actual,
+                    )
+                    _orr_opening = str((_orr_ctx or {}).get("opening_bid") or "")
+                    _orr_opening_match = re.match(r"^1([CDHS])$", _orr_opening)
+                    if _orr_ctx is not None and _orr_opening_match is not None:
+                        _orr_opening_strain = str(_orr_opening_match.group(1))
+                        _orr_strain_rank = {"C": 0, "D": 1, "H": 2, "S": 3}
+                        _orr_tp: float | None = None
+                        try:
+                            _orr_tp_raw = deal_row.get(f"Total_Points_{acting_dir_step}")
+                            if _orr_tp_raw is not None:
+                                _orr_tp = float(_orr_tp_raw)
+                        except Exception:
+                            pass
+                        _orr_hand = str(deal_row.get(f"Hand_{acting_dir_step}", "") or "").strip()
+                        _orr_sl_map: dict[str, int] = {}
+                        if _orr_hand and "." in _orr_hand:
+                            _orr_parts = _orr_hand.split(".")
+                            if len(_orr_parts) == 4:
+                                _orr_sl_map = {
+                                    "S": len(_orr_parts[0]),
+                                    "H": len(_orr_parts[1]),
+                                    "D": len(_orr_parts[2]),
+                                    "C": len(_orr_parts[3]),
+                                }
+                        if _orr_tp is not None and _orr_sl_map:
+                            _orr_next_bids_by_bid: dict[str, dict] = {
+                                str(nb.get("bid", "")).strip().upper(): nb for nb in (next_bids or [])
+                            }
+                            _orr_promoted: list[str] = []
+                            for _orr_entry in list(_bids_criteria_filtered):
+                                if str(_orr_entry.get("filter_reason", "")).strip().lower() != "criteria_fail":
+                                    continue
+                                _orr_bid = str(_orr_entry.get("bid", "")).strip().upper()
+                                _orr_bid_match = re.match(r"^([12])([CDHS])$", _orr_bid)
+                                if _orr_bid_match is None:
+                                    continue
+                                _orr_bid_level = int(_orr_bid_match.group(1))
+                                _orr_bid_strain = str(_orr_bid_match.group(2))
+                                if _orr_bid_strain == _orr_opening_strain:
+                                    continue
+                                _orr_support = int(_orr_sl_map.get(_orr_bid_strain, 0) or 0)
+                                if _orr_support < 4:
+                                    continue
+                                _orr_expected_level = (
+                                    1
+                                    if _orr_strain_rank.get(_orr_bid_strain, -1) > _orr_strain_rank.get(_orr_opening_strain, -1)
+                                    else 2
+                                )
+                                if _orr_bid_level != _orr_expected_level:
+                                    continue
+                                _orr_min_tp = 6.0 if _orr_bid_level == 1 else 12.0
+                                if _orr_tp < _orr_min_tp:
+                                    continue
+                                _orr_nb = _orr_next_bids_by_bid.get(_orr_bid)
+                                if _orr_nb is None:
+                                    continue
+                                if bool((_orr_nb or {}).get("is_dead_end", False)):
+                                    continue
+                                if not bool((_orr_nb or {}).get("can_complete", True)):
+                                    continue
+                                _orr_nb_copy = dict(_orr_nb)
+                                _orr_nb_copy["_opening_response_new_suit_rescue"] = True
+                                _orr_nb_copy["_opening_response_new_suit_rescue_reason"] = (
+                                    f"OPENING_RESPONSE_NEW_SUIT_RESCUE: partner opened {_orr_opening}, "
+                                    f"RHO passed, self has {_orr_support} {_orr_bid_strain} and "
+                                    f"TP={_orr_tp:.0f}; injecting natural response {_orr_bid}"
+                                )
+                                passed_opts.append(_orr_nb_copy)
+                                _orr_promoted.append(_orr_bid)
+                            if _orr_promoted:
+                                _bids_criteria_filtered = [
+                                    e for e in _bids_criteria_filtered
+                                    if str(e.get("bid", "")).strip().upper() not in _orr_promoted
+                                ]
+                                step_rec["opening_response_new_suit_rescue"] = list(_orr_promoted)
+            except Exception:
+                pass
+
         # --- NT raise rescue: partner opened 1NT/2NT, responder has enough
         # HCP for game but the BT's 3N criteria are too strict for this hand
         # (e.g. singleton blocks SL_H >= 2).  Inject 3N (or 4N) into the
@@ -13073,6 +13325,30 @@ def handle_ai_model_advanced_path(
                                         e for e in _bids_criteria_filtered
                                         if str(e.get("bid", "")).strip().upper() != _ntr_target
                                     ]
+            except Exception:
+                pass
+
+        # --- Direct-overcall gap rescue -----------------------------------
+        # BT can under-specify strong direct overcalls and leave only Pass
+        # after criteria filtering. In that case, re-admit sane natural bids
+        # so scoring can choose the least-worst action instead of auto-passing.
+        if use_guardrails_v2 and deal_row and _bids_criteria_filtered:
+            try:
+                passed_opts, _bids_criteria_filtered, _dor_gate_reason = _apply_direct_overcall_gap_rescue(
+                    passed_opts_now=passed_opts,
+                    filtered_bids_now=_bids_criteria_filtered,
+                    next_bids_now=next_bids,
+                    tokens_now=tokens,
+                    acting_side_now=acting_side_step,
+                    acting_dir_now=acting_dir_step,
+                    deal_row_now=deal_row,
+                    bt_seat_now=int(seat_bt),
+                    dealer_rot_now=dealer_rot,
+                    dealer_actual_now=dealer_actual,
+                    deal_row_idx_now=int(deal_row_idx),
+                )
+                if _dor_gate_reason:
+                    step_rec["hard_gate_reason"] = _dor_gate_reason
             except Exception:
                 pass
 
@@ -13792,10 +14068,10 @@ def handle_ai_model_advanced_path(
                 "acting_direction": acting_dir_step,
                 "chosen_bid": "P",
                 "likely_final_contract": None,
-                "likely_par_score_ns": _avg_par_ns,
-                "likely_par_score_acting": (
+                "likely_par_score_ns": (
                     round(float(acting_sign_step) * float(_avg_par_ns), 2) if _avg_par_ns is not None else None
                 ),
+                "likely_par_score_acting": round(float(_avg_par_ns), 2) if _avg_par_ns is not None else None,
                 "source": "criteria_empty_pass_avg_par",
             }
             step_rec["elapsed_ms"] = round((time.perf_counter() - t_step0) * 1000, 1)
@@ -13880,6 +14156,11 @@ def handle_ai_model_advanced_path(
                         _r for _r in list(_bids_criteria_filtered or [])
                         if str((_r or {}).get("filter_reason", "")).strip().lower() == "cannot_complete"
                     ]
+                    _blocked_criteria_fail = [
+                        _r for _r in list(_bids_criteria_filtered or [])
+                        if str((_r or {}).get("filter_reason", "")).strip().lower() == "criteria_fail"
+                        and str((_r or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                    ]
                     _self_tp_step = None
                     _self_sl_step_single: Dict[str, int] | None = None
                     try:
@@ -13893,7 +14174,7 @@ def handle_ai_model_advanced_path(
                         if _h:
                             _parts = _h.split(".")
                             if len(_parts) == 4:
-                                _self_sl_step = {
+                                _self_sl_step_single = {
                                     "S": len(str(_parts[0] or "")),
                                     "H": len(str(_parts[1] or "")),
                                     "D": len(str(_parts[2] or "")),
@@ -13912,6 +14193,7 @@ def handle_ai_model_advanced_path(
                         current_best_bid=bid1,
                         legal_non_pass_candidates=list(_legal_non_pass_candidates or []),
                         blocked_candidates=list(_blocked_cannot_complete or []),
+                        criteria_failed_candidates=list(_blocked_criteria_fail or []),
                     )
                     if bool((_cs_hard or {}).get("apply")):
                         _ov_bid = str((_cs_hard or {}).get("selected_bid") or "").strip().upper()
@@ -13949,10 +14231,10 @@ def handle_ai_model_advanced_path(
                 "acting_direction": acting_dir_step,
                 "chosen_bid": bid1,
                 "likely_final_contract": None,
-                "likely_par_score_ns": _avg_par_ns,
-                "likely_par_score_acting": (
+                "likely_par_score_ns": (
                     round(float(acting_sign_step) * float(_avg_par_ns), 2) if _avg_par_ns is not None else None
                 ),
+                "likely_par_score_acting": round(float(_avg_par_ns), 2) if _avg_par_ns is not None else None,
                 "source": "single_valid_bid_avg_par",
             }
             if not _single_hard_gate_applied:
@@ -14356,12 +14638,12 @@ def handle_ai_model_advanced_path(
                     if _tk_dir == partner_dir and _tk_u not in ("", "P", "PASS", "X", "XX"):
                         partner_last_bid = _tk_u
                         break
-                # Smolen-style acceptance: partner's 3H often asks opener to show
-                # 3-card spade support; reward spade continuation here.
+                # Forced-major acceptance: partner's 3H often asks opener to show
+                # spade support; reward spade continuation here.
                 if partner_last_bid == "3H" and bid_strain_local == "S" and int(bid_level_local) >= 3:
                     bonus = 165.0 if int(bid_level_local) >= 4 else 140.0
                     reason = (
-                        "SMOLEN_SPADE_ACCEPT_PRIORITY: partner's forcing 3H asks for spade-fit clarification; "
+                        "FORCED_MAJOR_ACCEPT_PRIORITY: partner's forcing 3H asks for spade-fit clarification; "
                         f"reward {b} (+{bonus:.0f})"
                     )
                     return bonus, penalty, reason
@@ -14390,7 +14672,7 @@ def handle_ai_model_advanced_path(
                 return 0.0, 0.0, None
             return bonus, penalty, reason
 
-        def _compute_smolen_spade_commit_adjustment(
+        def _compute_forced_major_game_commit_adjustment(
             *,
             bid_text: str,
             bid_level_local: int | None,
@@ -14398,10 +14680,10 @@ def handle_ai_model_advanced_path(
             auction_tokens: List[str],
             acting_direction: str,
         ) -> Tuple[float, float, str | None]:
-            """After ...3H-P-3S-P, prefer responder committing to 4S over pass.
+            """After ...3H-P-3S-P, prefer game commitment over pass.
 
-            This captures the common Smolen continuation where opener's 3S accepts
-            responder's spade shape; responder with game values should place 4S.
+            This captures a generic forced-major game continuation where opener's
+            3S acceptance leaves responder in a game-going auction.
             """
             bonus = 0.0
             penalty = 0.0
@@ -14423,7 +14705,7 @@ def handle_ai_model_advanced_path(
                 if b in ("P", "PASS"):
                     penalty = 220.0
                     reason = (
-                        "SMOLEN_GAME_COMMIT: opener accepted with 3S after forcing 3H; "
+                        "FORCED_MAJOR_GAME_COMMIT: opener accepted with 3S after forcing 3H; "
                         "penalize pass in game-going context (-220)"
                     )
                     return bonus, penalty, reason
@@ -14431,7 +14713,7 @@ def handle_ai_model_advanced_path(
                 if bid_strain_local == "S" and bid_level_local is not None and int(bid_level_local) >= 4:
                     bonus = 220.0
                     reason = (
-                        "SMOLEN_GAME_COMMIT: opener accepted with 3S after forcing 3H; "
+                        "FORCED_MAJOR_GAME_COMMIT: opener accepted with 3S after forcing 3H; "
                         f"reward spade game commitment {b} (+220)"
                     )
                     return bonus, penalty, reason
@@ -14972,6 +15254,7 @@ def handle_ai_model_advanced_path(
                     f"source={source}"
                 ),
             }
+            breakdown["special_case_notes"] = [breakdown["simple_raise_reason"]]
             return (final, breakdown)
 
         def _v2_level_acceptable_missing_criteria_rescue(
@@ -15095,6 +15378,7 @@ def handle_ai_model_advanced_path(
                     f"source={source}"
                 ),
             }
+            breakdown["special_case_notes"] = [breakdown["missing_criteria_rescue_reason"]]
             return (final, breakdown)
 
         def _score_one(opt: Dict[str, Any]) -> Tuple[float, str, float, float, bool, Dict[str, Any]]:
@@ -15110,6 +15394,27 @@ def handle_ai_model_advanced_path(
                 if phase_name == "early_uncontested":
                     return 1.0
                 return 1.0
+
+            def _special_case_breakdown_fields(opt_local: Dict[str, Any]) -> Dict[str, Any]:
+                special_notes: list[str] = []
+                out: Dict[str, Any] = {}
+                for src_key, dst_key in (
+                    ("_simple_raise_pre_rescue_reason", "simple_raise_pre_rescue_reason"),
+                    ("_nt_raise_rescue_reason", "nt_raise_rescue_reason"),
+                    ("_direct_overcall_gap_rescue_reason", "direct_overcall_gap_rescue_reason"),
+                ):
+                    reason = opt_local.get(src_key)
+                    if not reason:
+                        continue
+                    reason_str = str(reason).strip()
+                    if not reason_str:
+                        continue
+                    out[dst_key] = reason_str
+                    if reason_str not in special_notes:
+                        special_notes.append(reason_str)
+                if special_notes:
+                    out["special_case_notes"] = special_notes
+                return out
 
             base_phase_mult = _base_phase_multiplier(score_phase)
             bid_contract = _parse_contract_bid_text(bid1)
@@ -15196,7 +15501,115 @@ def handle_ai_model_advanced_path(
                 except Exception:
                     pass
                 try:
-                    _sm_b, _sm_p, _sm_r = _compute_smolen_spade_commit_adjustment(
+                    _self_tp_actual = deal_row.get(f"Total_Points_{acting_dir}")
+                    if _self_tp_actual is not None:
+                        _self_tp_actual = float(_self_tp_actual)
+                except Exception:
+                    _self_tp_actual = None
+                try:
+                    _self_hcp_actual = deal_row.get(f"HCP_{acting_dir}")
+                    if _self_hcp_actual is not None:
+                        _self_hcp_actual = float(_self_hcp_actual)
+                except Exception:
+                    _self_hcp_actual = None
+                try:
+                    _self_hand_actual = str(deal_row.get(f"Hand_{acting_dir}", "") or "").strip() or None
+                except Exception:
+                    _self_hand_actual = None
+                try:
+                    _has_non_pass = any(
+                        str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                        for _o in list(passed_opts or [])
+                    )
+                    if _has_non_pass:
+                        _constructive_reasons: list[str] = []
+                        _pass_expr = [str(_x or "").strip().upper() for _x in list(opt.get("agg_expr") or [])]
+
+                        def _upper_bound_excess(metric_name: str, actual_value: float | None) -> tuple[float, float] | None:
+                            if actual_value is None:
+                                return None
+                            best_cap: float | None = None
+                            for _expr in _pass_expr:
+                                if not _expr:
+                                    continue
+                                _m = re.fullmatch(rf"{metric_name}\s*(<=|<)\s*(-?\d+(?:\.\d+)?)", _expr)
+                                if not _m:
+                                    continue
+                                _op = str(_m.group(1))
+                                _cap = float(_m.group(2))
+                                _eff_cap = _cap if _op == "<=" else (_cap - 1.0)
+                                best_cap = _eff_cap if best_cap is None else min(best_cap, _eff_cap)
+                            if best_cap is None or actual_value <= best_cap:
+                                return None
+                            return best_cap, float(actual_value - best_cap)
+
+                        _tp_excess = _upper_bound_excess("TOTAL_POINTS", _self_tp_actual)
+                        if _tp_excess is not None and _self_tp_actual is not None:
+                            _tp_cap, _tp_over = _tp_excess
+                            _tp_pen = min(220.0, 30.0 * float(_tp_over))
+                            pass_penalty += _tp_pen
+                            _constructive_reasons.append(
+                                "PASS_RANGE_TOO_STRONG: pass criteria cap Total_Points at "
+                                f"{_tp_cap:.0f}; self has {_self_tp_actual:.0f} (-{_tp_pen:.0f})"
+                            )
+
+                        _hcp_excess = _upper_bound_excess("HCP", _self_hcp_actual)
+                        if _hcp_excess is not None and _self_hcp_actual is not None:
+                            _hcp_cap, _hcp_over = _hcp_excess
+                            _hcp_pen = min(160.0, 20.0 * float(_hcp_over))
+                            pass_penalty += _hcp_pen
+                            _constructive_reasons.append(
+                                "PASS_RANGE_TOO_STRONG: pass criteria cap HCP at "
+                                f"{_hcp_cap:.0f}; self has {_self_hcp_actual:.0f} (-{_hcp_pen:.0f})"
+                            )
+
+                        try:
+                            _contract_positions: list[int] = []
+                            _contract_sides: set[str] = set()
+                            _last_contract_idx: int | None = None
+                            _last_contract_level: int | None = None
+                            _last_contract_strain: str | None = None
+                            for _idx, _tok in enumerate(list(tokens or [])):
+                                _parsed = _parse_contract_bid_text(str(_tok or "").strip().upper())
+                                if _parsed is None:
+                                    continue
+                                _lvl, _strain = _parsed
+                                _contract_positions.append(_idx)
+                                _contract_sides.add(_dir_side(_token_bidder_dir(_idx)))
+                                _last_contract_idx = _idx
+                                _last_contract_level = int(_lvl)
+                                _last_contract_strain = str(_strain)
+
+                            _partner_dir_local = _partner_dir(acting_dir)
+                            _last_bidder = _token_bidder_dir(_last_contract_idx) if _last_contract_idx is not None else None
+                            _game_min = 3 if _last_contract_strain == "N" else (4 if _last_contract_strain in ("H", "S") else 5)
+                            if (
+                                _last_contract_idx is not None
+                                and _last_contract_level is not None
+                                and len(_contract_sides) == 1
+                                and len(_contract_positions) >= 2
+                                and _partner_dir_local
+                                and _last_bidder == _partner_dir_local
+                                and int(_last_contract_level) < int(_game_min)
+                                and _self_tp_actual is not None
+                                and float(_self_tp_actual) >= 13.0
+                            ):
+                                _extras_pen = 140.0 + min(80.0, 20.0 * max(0.0, float(_self_tp_actual) - 13.0))
+                                pass_penalty += _extras_pen
+                                _constructive_reasons.append(
+                                    "CONSTRUCTIVE_BELOW_GAME_PASS_PENALTY: partner made the last below-game contract bid, "
+                                    f"constructive continuations exist, and self has {_self_tp_actual:.0f} Total_Points (-{_extras_pen:.0f})"
+                                )
+                        except Exception:
+                            pass
+
+                        if _constructive_reasons:
+                            _pass_reason = "; ".join(_constructive_reasons)
+                            pass_penalty_reason = _pass_reason if not pass_penalty_reason else f"{pass_penalty_reason}; {_pass_reason}"
+                except Exception:
+                    pass
+                try:
+                    _sm_b, _sm_p, _sm_r = _compute_forced_major_game_commit_adjustment(
                         bid_text=bid1,
                         bid_level_local=bid_level,
                         bid_strain_local=bid_strain,
@@ -15209,8 +15622,37 @@ def handle_ai_model_advanced_path(
                 except Exception:
                     pass
 
-                # Apply perspective flip (same as non-Pass base)
+                pass_hard_blocked = bool(
+                    score_phase in ("opening", "early_uncontested") and has_level1_contract_choice
+                )
+                pass_hard_block_reason: str | None = None
+                if pass_hard_blocked:
+                    pass_hard_block_reason = (
+                        "BT_OPENING_PASS_BLOCK: legal BT level-1 opening available; "
+                        "pass cannot override an opening bid"
+                    )
+                else:
+                    try:
+                        _forced_non_pass = compute_forced_non_pass_policy(
+                            auction_tokens=list(tokens or []),
+                            acting_direction=acting_dir,
+                            dealer_actual=dealer_actual,
+                            has_non_pass_choice=bool(_has_non_pass),
+                            self_total_points=_self_tp_actual,
+                            self_hcp=_self_hcp_actual,
+                            self_hand=_self_hand_actual,
+                        )
+                    except Exception:
+                        _forced_non_pass = {"hard_block": False, "reason": None}
+                    if bool((_forced_non_pass or {}).get("hard_block")):
+                        pass_hard_blocked = True
+                        pass_hard_block_reason = str((_forced_non_pass or {}).get("reason") or "FORCED_NON_PASS_GAME_VALUES")
+
+                # Apply perspective flip (same as non-Pass base), unless BT opening
+                # policy hard-blocks pass while a legal level-1 opening exists.
                 final_score = float(acting_sign) * float(score_val) + float(pass_bonus) - float(pass_penalty)
+                if pass_hard_blocked:
+                    final_score = float("-inf")
                 return final_score, bid1, 0.0, 0.0, False, {
                     "pass_score": float(score_val),
                     "pass_source": _pass_source,
@@ -15218,6 +15660,8 @@ def handle_ai_model_advanced_path(
                     "pass_bonus_reason": pass_bonus_reason,
                     "pass_penalty": float(pass_penalty),
                     "pass_penalty_reason": pass_penalty_reason,
+                    "pass_hard_blocked": pass_hard_blocked,
+                    "pass_hard_block_reason": pass_hard_block_reason,
                     "score_phase": score_phase,
                     "has_level1_contract_choice": bool(has_level1_contract_choice),
                     "acting_sign": float(acting_sign),
@@ -15292,6 +15736,7 @@ def handle_ai_model_advanced_path(
                         "acting_sign": float(acting_sign),
                         "final_score": round(float(base_shrunk), 2),
                     }
+                    breakdown.update(_special_case_breakdown_fields(opt))
                     return float(base_shrunk), bid1, 0.0, 0.0, False, breakdown
                 # else: cache row lacks stats → fall through to full bid-details scoring
 
@@ -15693,7 +16138,7 @@ def handle_ai_model_advanced_path(
                 bid_strain_local=bid_strain,
                 acting_direction=acting_dir,
             )
-            smolen_spade_commit_bonus, smolen_spade_commit_penalty, smolen_spade_commit_reason = _compute_smolen_spade_commit_adjustment(
+            forced_major_game_commit_bonus, forced_major_game_commit_penalty, forced_major_game_commit_reason = _compute_forced_major_game_commit_adjustment(
                 bid_text=bid1,
                 bid_level_local=bid_level,
                 bid_strain_local=bid_strain,
@@ -16266,13 +16711,13 @@ def handle_ai_model_advanced_path(
                     "slam_likely_make_ev_source": _ev_source if "_ev_source" in locals() else None,
                     "final_score": None,
                 }
+                breakdown.update(_special_case_breakdown_fields(opt))
                 return float("-inf"), bid1, d_ms, p2_ms, hit, breakdown
 
             try:
-                # Avg_Par is stored as NS-relative in this scorer path; convert to
-                # acting-side utility so EW seats optimize correctly.
+                # Bid-details `mean_par` is already normalized into acting-side utility.
                 mean_par_val = float(mean_par) if mean_par is not None else 0.0
-                base = float(acting_sign) * mean_par_val
+                base = mean_par_val
                 
                 # Bayesian Shrinkage for low-N bids
                 matched_n = float(details.get("matched_deals_total_excluding_pinned") or details.get("matched_deals_total") or 0.0)
@@ -16314,8 +16759,8 @@ def handle_ai_model_advanced_path(
                         - float(partner_major_detour_penalty)
                         + float(forcing_heart_fit_bonus)
                         - float(forcing_heart_detour_penalty)
-                        + float(smolen_spade_commit_bonus)
-                        - float(smolen_spade_commit_penalty)
+                        + float(forced_major_game_commit_bonus)
+                        - float(forced_major_game_commit_penalty)
                         + float(takeout_double_trigger_bonus)
                         - float(takeout_double_trigger_penalty)
                         + float(takeout_double_explore_bonus)
@@ -16372,9 +16817,9 @@ def handle_ai_model_advanced_path(
                     "forcing_heart_fit_bonus": round(float(forcing_heart_fit_bonus), 2),
                     "forcing_heart_detour_penalty": round(float(forcing_heart_detour_penalty), 2),
                     "forcing_heart_reason": forcing_heart_reason,
-                    "smolen_spade_commit_bonus": round(float(smolen_spade_commit_bonus), 2),
-                    "smolen_spade_commit_penalty": round(float(smolen_spade_commit_penalty), 2),
-                    "smolen_spade_commit_reason": smolen_spade_commit_reason,
+                    "forced_major_game_commit_bonus": round(float(forced_major_game_commit_bonus), 2),
+                    "forced_major_game_commit_penalty": round(float(forced_major_game_commit_penalty), 2),
+                    "forced_major_game_commit_reason": forced_major_game_commit_reason,
                     "takeout_double_explore_bonus": round(float(takeout_double_explore_bonus), 2),
                     "takeout_double_explore_penalty": round(float(takeout_double_explore_penalty), 2),
                     "takeout_double_explore_reason": takeout_double_explore_reason,
@@ -16425,6 +16870,7 @@ def handle_ai_model_advanced_path(
                     "acting_sign": float(acting_sign),
                     "final_score": round(float(score_val), 2),
                 }
+                breakdown.update(_special_case_breakdown_fields(opt))
                 try:
                     _top = par_topk[0] if isinstance(par_topk, list) and len(par_topk) > 0 and isinstance(par_topk[0], dict) else None
                     if _top is not None:
@@ -16434,8 +16880,8 @@ def handle_ai_model_advanced_path(
                         _aps = _top.get("avg_par_score")
                         if _aps is not None:
                             _aps_f = float(_aps)
-                            breakdown["likely_par_score_from_top_contract_ns"] = round(_aps_f, 2)
-                            breakdown["likely_par_score_from_top_contract_acting"] = round(float(acting_sign) * _aps_f, 2)
+                            breakdown["likely_par_score_from_top_contract_ns"] = round(float(acting_sign) * _aps_f, 2)
+                            breakdown["likely_par_score_from_top_contract_acting"] = round(_aps_f, 2)
                 except Exception:
                     pass
                 return float(score_val), bid1, d_ms, p2_ms, hit, breakdown
@@ -16568,6 +17014,11 @@ def handle_ai_model_advanced_path(
                     _r for _r in list(_bids_criteria_filtered or [])
                     if str((_r or {}).get("filter_reason", "")).strip().lower() == "cannot_complete"
                 ]
+                _blocked_criteria_fail = [
+                    _r for _r in list(_bids_criteria_filtered or [])
+                    if str((_r or {}).get("filter_reason", "")).strip().lower() == "criteria_fail"
+                    and str((_r or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                ]
                 _self_tp_step = None
                 _self_sl_step: Dict[str, int] | None = None
                 try:
@@ -16599,6 +17050,7 @@ def handle_ai_model_advanced_path(
                     current_best_bid=best_bid,
                     legal_non_pass_candidates=list(_legal_non_pass_candidates or []),
                     blocked_candidates=list(_blocked_cannot_complete or []),
+                    criteria_failed_candidates=list(_blocked_criteria_fail or []),
                 )
                 if bool((_cs_hard or {}).get("apply")):
                     _ov_bid = str((_cs_hard or {}).get("selected_bid") or "").strip().upper()
@@ -16681,19 +17133,19 @@ def handle_ai_model_advanced_path(
                         _likely_contract = f"{_c} by {_p}" if _c and _p else (_c or None)
                         _aps = _topk[0].get("avg_par_score")
                         if _aps is not None:
-                            _likely_top_par_ns = float(_aps)
+                            _likely_top_par_ns = float(acting_sign) * float(_aps)
                 _mean_par = _chosen_row.get("mean_par")
-                _mean_par_ns = float(_mean_par) if _mean_par is not None else None
+                _mean_par_ns = float(acting_sign) * float(_mean_par) if _mean_par is not None else None
+                _mean_par_acting = float(_mean_par) if _mean_par is not None else None
             else:
                 _mean_par_ns = None
+                _mean_par_acting = None
             step_rec["bidder_view"] = {
                 "acting_direction": acting_dir,
                 "chosen_bid": best_bid,
                 "likely_final_contract": _likely_contract,
                 "likely_par_score_ns": round(float(_mean_par_ns), 2) if _mean_par_ns is not None else None,
-                "likely_par_score_acting": (
-                    round(float(acting_sign) * float(_mean_par_ns), 2) if _mean_par_ns is not None else None
-                ),
+                "likely_par_score_acting": round(float(_mean_par_acting), 2) if _mean_par_acting is not None else None,
                 "likely_top_contract_par_score_ns": round(float(_likely_top_par_ns), 2) if _likely_top_par_ns is not None else None,
                 "source": "chosen_bid_details",
             }
@@ -17234,13 +17686,15 @@ def handle_critical_mistake_analysis(
             "acting_direction": step_belief.get("acting_direction", direction),
             "chosen_bid": str(best_row.get("bid", "")).strip().upper(),
             "likely_final_contract": best_row.get("likely_final_contract"),
-            "likely_par_score_ns": _safe_float(best_row.get("mean_par")),
+            "likely_par_score_ns": None,
             "likely_par_score_acting": None,
             "source": "best_alternative_bid_details",
         }
         _best_par_acting = _safe_float(best_row.get("mean_par"))
         if _best_par_acting is not None:
-            best_belief["likely_par_score_acting"] = float((1.0 if actor_pair == "NS" else -1.0) * _best_par_acting)
+            _actor_sign = 1.0 if actor_pair == "NS" else -1.0
+            best_belief["likely_par_score_acting"] = float(_best_par_acting)
+            best_belief["likely_par_score_ns"] = float(_actor_sign * _best_par_acting)
 
         rows.append(
             {

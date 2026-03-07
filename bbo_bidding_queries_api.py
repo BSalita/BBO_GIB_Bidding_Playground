@@ -1610,6 +1610,7 @@ class GreedyModelPathRequest(BaseModel):
 
 class AiModelAdvancedPathStartRequest(BaseModel):
     """Request to start an async AI Model (Advanced) path job (avoid client timeouts)."""
+    auction_prefix: str = ""
     # When deal_row_idx is -1 (sentinel), deal_row_dict must be provided (PBN/CSV on-the-fly deals).
     deal_row_idx: int = -1
     # Full deal row dict for on-the-fly deals (PBN/CSV) that are not in the BBO database.
@@ -4817,6 +4818,7 @@ def ai_model_advanced_path_start(req: AiModelAdvancedPathStartRequest) -> Dict[s
     def _run() -> Dict[str, Any]:
         return handler_module.handle_ai_model_advanced_path(
             state=state,
+            auction_prefix=str(req.auction_prefix or ""),
             deal_row_idx=int(req.deal_row_idx),
             deal_row_dict=req.deal_row_dict,
             seed=int(req.seed or 0),

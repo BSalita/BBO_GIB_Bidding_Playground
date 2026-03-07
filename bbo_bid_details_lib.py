@@ -209,6 +209,34 @@ def _role_dirs_for_deal(dealer: str, next_seat: int) -> dict[str, str]:
     }
 
 
+def _pair_for_direction(direction: str) -> str:
+    d = str(direction or "").strip().upper()
+    return "NS" if d in {"N", "S"} else "EW"
+
+
+def _relative_contract_key(contract_key: str, *, dealer: str, next_seat: int) -> tuple[str, str, str | None]:
+    """Map an absolute contract owner/declarer to SELF/OPP-relative labels."""
+    lhs, rhs = contract_key.split(" ", 1)
+    rhs_u = rhs.strip().upper()
+    role_dirs = _role_dirs_for_deal(dealer, int(next_seat))
+    role_by_dir = {v: k for k, v in role_dirs.items()}
+    self_pair = _pair_for_direction(role_dirs["SELF"])
+
+    if rhs_u in {"N", "E", "S", "W"}:
+        declarer = role_by_dir.get(rhs_u)
+        if declarer is None:
+            pair = "SELF" if _pair_for_direction(rhs_u) == self_pair else "OPP"
+            return f"{lhs} {pair}", pair, None
+        pair = "SELF" if declarer in {"SELF", "PARTNER"} else "OPP"
+        return f"{lhs} {declarer}", pair, declarer
+
+    if rhs_u in {"NS", "EW"}:
+        pair = "SELF" if rhs_u == self_pair else "OPP"
+        return f"{lhs} {pair}", pair, None
+
+    raise ValueError(f"Unrecognized contract owner: {contract_key!r}")
+
+
 @dataclass(frozen=True)
 class BidDetailsConfig:
     topk: int = 10
@@ -219,7 +247,8 @@ class BidDetailsConfig:
 def compute_bid_details_from_sample(
     deals_sample_df: pl.DataFrame,
     *,
-    seat_dir: str,
+    next_seat: int,
+    seat_dir: Optional[str] = None,
     pinned_row: Optional[dict[str, Any]] = None,
     cfg: BidDetailsConfig = BidDetailsConfig(),
 ) -> dict[str, Any]:
@@ -227,23 +256,35 @@ def compute_bid_details_from_sample(
 
     Assumptions:
     - `deals_sample_df` has already had the pinned deal excluded if `pinned_row` is provided.
+    - `ParScore` / `ParContracts` are normalized per row into SELF-vs-OPP perspective
+      using that row's own dealer and the acting `next_seat`.
     - Par contract distribution is computed from `ParContracts` with 1/len(labels) mass split per deal.
     - Percentiles are computed vs the sampled matched set (after pinned exclusion).
     """
-    seat_dir_u = str(seat_dir or "").strip().upper()
-    if seat_dir_u not in {"N", "E", "S", "W"}:
-        raise ValueError(f"seat_dir must be one of N/E/S/W, got: {seat_dir!r}")
+    next_seat_i = max(1, min(4, int(next_seat)))
 
-    required = {"index", "ParScore", "ParContracts"}
+    required = {"index", "Dealer", "ParScore", "ParContracts"}
     missing = [c for c in required if c not in deals_sample_df.columns]
     if missing:
         raise ValueError(f"Matched deals missing required columns: {missing}")
 
-    par_scores = _to_float_list(deals_sample_df.get_column("ParScore"))
-    if not par_scores:
+    acting_par_scores: list[float] = []
+    for row in deals_sample_df.iter_rows(named=True):
+        try:
+            par_score = row.get("ParScore")
+            if par_score is None:
+                continue
+            dealer = str(row.get("Dealer", "N")).strip().upper() or "N"
+            self_dir = _role_dirs_for_deal(dealer, next_seat_i)["SELF"]
+            acting_sign = 1.0 if self_dir in {"N", "S"} else -1.0
+            acting_par_scores.append(acting_sign * float(par_score))
+        except Exception:
+            continue
+
+    if not acting_par_scores:
         raise ValueError("ParScore contains no numeric values in the matched sample.")
 
-    par_scores_sorted = sorted(par_scores)
+    par_scores_sorted = sorted(acting_par_scores)
     n = len(par_scores_sorted)
     mean = float(sum(par_scores_sorted) / n)
     median = _quantile(par_scores_sorted, 0.5)
@@ -268,29 +309,33 @@ def compute_bid_details_from_sample(
 
     par_contracts_col = deals_sample_df.get_column("ParContracts").to_list()
     par_score_col = deals_sample_df.get_column("ParScore").to_list()
+    dealer_col = deals_sample_df.get_column("Dealer").to_list()
 
-    for raw_contracts, ps in zip(par_contracts_col, par_score_col, strict=False):
+    for dealer_raw, raw_contracts, ps in zip(dealer_col, par_contracts_col, par_score_col, strict=False):
         labels = _flatten_par_contracts(raw_contracts)
         if not labels:
             continue
+        dealer = str(dealer_raw or "N").strip().upper() or "N"
         try:
             ps_f = float(ps) if ps is not None else None
         except Exception:
             ps_f = None
+        acting_ps_f = None
+        if ps_f is not None:
+            self_dir = _role_dirs_for_deal(dealer, next_seat_i)["SELF"]
+            acting_sign = 1.0 if self_dir in {"N", "S"} else -1.0
+            acting_ps_f = acting_sign * ps_f
         w = 1.0 / len(labels)
         for lab in labels:
-            key = _canonical_contract_key(lab)
+            abs_key = _canonical_contract_key(lab)
+            key, pair_rel, _declarer_rel = _relative_contract_key(abs_key, dealer=dealer, next_seat=next_seat_i)
             contract_counts[key] += w  # type: ignore[arg-type]
-            if ps_f is not None:
-                contract_par_score_mass[key] = contract_par_score_mass.get(key, 0.0) + (w * ps_f)
+            if acting_ps_f is not None:
+                contract_par_score_mass[key] = contract_par_score_mass.get(key, 0.0) + (w * acting_ps_f)
                 contract_weight_mass[key] = contract_weight_mass.get(key, 0.0) + w
             # Track pair-level entropy distincts
             try:
-                side = key.split(" ", 1)[1].strip().upper()
-                if side in {"NS", "EW"}:
-                    distinct_pairs.add(f"{key.split(' ', 1)[0]} {side}")
-                elif side in {"N", "E", "S", "W"}:
-                    distinct_pairs.add(f"{key.split(' ', 1)[0]} {'NS' if side in {'N','S'} else 'EW'}")
+                distinct_pairs.add(f"{key.split(' ', 1)[0]} {pair_rel}")
             except Exception:
                 pass
 
@@ -302,16 +347,16 @@ def compute_bid_details_from_sample(
     entropy_full = _entropy_nats(probs_full)
 
     # Pair-level distribution
-    pair_counts: Counter[str] = Counter()
+    pair_counts: dict[str, float] = {}
     for k, w in contract_counts.items():
         try:
             lhs, rhs = k.split(" ", 1)
             rhs_u = rhs.strip().upper()
-            if rhs_u in {"NS", "EW"}:
+            if rhs_u in {"SELF", "OPP"}:
                 pair_key = f"{lhs} {rhs_u}"
             else:
-                pair_key = f"{lhs} {'NS' if rhs_u in {'N','S'} else 'EW'}"
-            pair_counts[pair_key] += float(w)
+                pair_key = f"{lhs} {'SELF' if rhs_u in {'SELF', 'PARTNER'} else 'OPP'}"
+            pair_counts[pair_key] = pair_counts.get(pair_key, 0.0) + float(w)
         except Exception:
             continue
     pair_total = float(sum(pair_counts.values())) or 1.0
@@ -323,8 +368,8 @@ def compute_bid_details_from_sample(
     for key, w in top:
         lhs, rhs = key.split(" ", 1)
         rhs_u = rhs.strip().upper()
-        pair = rhs_u if rhs_u in {"NS", "EW"} else ("NS" if rhs_u in {"N", "S"} else "EW")
-        declarer = rhs_u if rhs_u in {"N", "E", "S", "W"} else None
+        pair = rhs_u if rhs_u in {"SELF", "OPP"} else ("SELF" if rhs_u in {"SELF", "PARTNER"} else "OPP")
+        declarer = rhs_u if rhs_u in {"SELF", "PARTNER", "LHO", "RHO"} else None
         avg_par_score = None
         if key in contract_par_score_mass and contract_weight_mass.get(key, 0.0) > 0:
             avg_par_score = float(contract_par_score_mass[key] / contract_weight_mass[key])

@@ -78,6 +78,7 @@ class CoreService:
 
     def __init__(self, *, plugins_dir: pathlib.Path) -> None:
         self.plugins_dir = pathlib.Path(plugins_dir)
+        self.project_root = self.plugins_dir.parent
         self.state_lock = threading.Lock()
         self.state: dict[str, Any] = default_state()
 
@@ -96,6 +97,18 @@ class CoreService:
         self._jobs_max = 200
         self._jobs_ttl_s = 30 * 60  # 30 minutes
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="core-jobs")
+        # Reload shared helper modules before reloading endpoint plugins so
+        # edits to non-plugin libraries (for example bbo_explanation_lib.py)
+        # are visible without restarting the API server.
+        self._shared_reload_targets: list[tuple[str, pathlib.Path]] = [
+            ("bbo_bidding_queries_lib", self.project_root / "bbo_bidding_queries_lib.py"),
+            ("bbo_bid_ranking_lib", self.project_root / "bbo_bid_ranking_lib.py"),
+            ("bbo_bid_details_lib", self.project_root / "bbo_bid_details_lib.py"),
+            ("bbo_explanation_lib", self.project_root / "bbo_explanation_lib.py"),
+            ("bbo_hand_eval_lib", self.project_root / "bbo_hand_eval_lib.py"),
+            ("plugins.bbo_handlers_common", self.plugins_dir / "bbo_handlers_common.py"),
+            ("plugins.bbo_bt_custom_criteria_overlay", self.plugins_dir / "bbo_bt_custom_criteria_overlay.py"),
+        ]
 
     @property
     def store(self) -> "DataStore":
@@ -140,8 +153,16 @@ class CoreService:
             raise ImportError(f"Plugin '{name}' not found")
         return mod
 
+    def _reload_module_by_name(self, module_name: str) -> Any:
+        """Import or reload a module by fully-qualified name."""
+        if module_name in sys.modules:
+            mod = sys.modules[module_name]
+            if hasattr(mod, "__spec__") and mod.__spec__ is not None:
+                return importlib.reload(mod)
+        return importlib.import_module(module_name)
+
     def reload_plugins(self) -> dict[str, object]:
-        """Reload modules in plugins/ if mtime changed.
+        """Reload plugins/ and selected shared helper modules if mtime changed.
 
         Returns metadata dict: {"reloaded": bool, "mtime": float|None, "reloaded_at": float|None}
         """
@@ -156,6 +177,12 @@ class CoreService:
                 t = p.stat().st_mtime
                 if t > current_mtime:
                     current_mtime = t
+            for _, p in self._shared_reload_targets:
+                if not p.exists():
+                    continue
+                t = p.stat().st_mtime
+                if t > current_mtime:
+                    current_mtime = t
         except FileNotFoundError:
             return {"reloaded": False, "mtime": None, "reloaded_at": None}
 
@@ -166,23 +193,31 @@ class CoreService:
             self._plugins_last_reload_epoch_s = time.time()
             self._plugins_mtime = current_mtime
 
+            helper_plugin_module_names = {
+                module_name.split(".", 1)[1]
+                for module_name, _ in self._shared_reload_targets
+                if module_name.startswith("plugins.")
+            }
+
+            for module_name, module_path in self._shared_reload_targets:
+                if not module_path.exists():
+                    continue
+                try:
+                    self._reload_module_by_name(module_name)
+                except Exception as e:
+                    self.plugins["_last_reload_error"] = str(e)
+
             # Reload all .py files in plugins/
             for p in self.plugins_dir.glob("*.py"):
                 if p.name == "__init__.py":
                     continue
                 try:
                     module_name = p.stem
+                    if module_name in helper_plugin_module_names:
+                        continue
                     full_module_name = f"plugins.{module_name}"
 
-                    # Reload if already imported; otherwise import.
-                    if full_module_name in sys.modules:
-                        mod = sys.modules[full_module_name]
-                        if hasattr(mod, "__spec__") and mod.__spec__ is not None:
-                            module = importlib.reload(mod)
-                        else:
-                            module = importlib.import_module(full_module_name)
-                    else:
-                        module = importlib.import_module(full_module_name)
+                    module = self._reload_module_by_name(full_module_name)
 
                     # Store by short name for callers: plugins["bbo_bidding_queries_api_handlers"]
                     self.plugins[module_name] = module

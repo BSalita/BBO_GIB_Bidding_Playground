@@ -27,6 +27,7 @@ import requests
 import base64
 import io
 import json
+import numbers
 import numpy as np
 from datetime import datetime, timezone
 import importlib.metadata as importlib_metadata
@@ -35,6 +36,7 @@ import os
 import sys
 import re
 from typing import Any, Dict, List, Literal, Optional, Set
+from urllib.parse import quote, urljoin, urlparse
 
 import plotly.graph_objects as go  # type: ignore[import-not-found]
 import mlBridge.mlBridgeLib as mlBridgeLib
@@ -71,6 +73,8 @@ from plugins.bbo_handlers_common import (
 )
 
 from bbo_explanation_lib import (
+    compute_constructive_pass_penalty,
+    compute_forced_non_pass_policy,
     compute_partner_major_game_commit_adjustment,
     compute_pass_signoff_bonus,
     compute_post_game_slam_gate_adjustment,
@@ -111,6 +115,7 @@ BATCH_ARENA_NOTES_MAX_CHARS = 200
 BATCH_ARENA_NOTES_CSV = pathlib.Path(__file__).resolve().parent / "data" / "batch_arena_notes.csv"
 AUCTION_BUILDER_LAST_PIN_TXT = pathlib.Path(__file__).resolve().parent / "data" / "auction_builder_last_pinned_deal_index.txt"
 CUSTOM_QUESTIONS_CSV = pathlib.Path(__file__).resolve().parent / "data" / "bbo_custom_questions.csv"
+BATCH_ARENA_EXPORT_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 
 
 def _auction_builder_load_last_pinned_deal_index() -> int:
@@ -181,6 +186,151 @@ def _auction_builder_atomic_write_csv(df: pl.DataFrame, path: pathlib.Path) -> N
     with tmp.open("w", encoding="utf-8", newline="") as f:
         df.write_csv(f)
     tmp.replace(path)
+
+
+def _atomic_write_text(path: pathlib.Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8", newline="")
+    tmp.replace(path)
+
+
+def _json_safe_export_value(value: Any) -> Any:
+    """Convert nested values to JSON-safe builtins for export manifests."""
+    import math
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, pathlib.Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe_export_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_export_value(v) for v in value]
+    try:
+        f = float(value)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except Exception:
+        return str(value)
+
+
+def _sanitize_filename_component(value: Any, *, allow_plus: bool = False) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return "unknown"
+    allowed = r"A-Za-z0-9._"
+    if allow_plus:
+        allowed += r"\+"
+    allowed += r"-"
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(rf"[^{allowed}]", "_", s)
+    s = re.sub(r"_+", "_", s).strip("._")
+    return s or "unknown"
+
+
+def _sanitize_range_expr_for_filename(ranges_text: Any) -> str:
+    s = str(ranges_text or "").strip()
+    if not s:
+        return "all"
+    s = re.sub(r"\s*,\s*", "_", s)
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_+\-]", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "all"
+
+
+def _batch_result_export_path(*, batch_mode: str, input_cfg: dict[str, Any]) -> pathlib.Path:
+    source_type = str(input_cfg.get("source_type") or "").strip().lower()
+    if batch_mode == "Deals DF":
+        range_token = _sanitize_range_expr_for_filename(input_cfg.get("ranges_text"))
+        return BATCH_ARENA_EXPORT_ROOT / "deals" / f"result_{range_token}.csv"
+
+    source_name = str(input_cfg.get("source_name") or "").strip()
+    filename_regex = str(input_cfg.get("filename_regex") or "").strip()
+    if batch_mode == "PBN Local/URL":
+        subdir = "pbn"
+        if source_type == "url":
+            stem = _sanitize_filename_component(source_name, allow_plus=True)
+        else:
+            stem = _sanitize_filename_component(source_name or "pbn_input")
+        if filename_regex:
+            stem = f"{stem}__rx_{_sanitize_filename_component(filename_regex)}"
+        return BATCH_ARENA_EXPORT_ROOT / subdir / f"result_{stem}.csv"
+
+    subdir = "csv"
+    if source_type == "url":
+        stem = _sanitize_filename_component(source_name, allow_plus=True)
+        if not stem.lower().endswith(".csv"):
+            stem = f"{stem}.csv"
+    else:
+        stem = _sanitize_filename_component(source_name or "input.csv")
+        if not stem.lower().endswith(".csv"):
+            stem = f"{stem}.csv"
+    return BATCH_ARENA_EXPORT_ROOT / subdir / f"result_{stem}"
+
+
+def _batch_results_to_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if "Source" in df.columns:
+        cols = ["Source"] + [c for c in df.columns if c != "Source"]
+        df = df.loc[:, cols]
+    return df
+
+
+def _auto_export_batch_results(
+    *,
+    all_results: list[dict],
+    batch_mode: str,
+    input_cfg: dict[str, Any],
+    seed: int,
+    auction_filter_mode: str,
+    ai_logic_mode: str,
+    ai_logic_mode_label: str,
+    use_guardrails_v2: bool,
+) -> dict[str, pathlib.Path]:
+    export_path = _batch_result_export_path(batch_mode=batch_mode, input_cfg=input_cfg)
+    json_path = export_path.with_suffix(".json")
+    results_df = _batch_results_to_dataframe(all_results)
+    csv_text = results_df.to_csv(index=False)
+    _atomic_write_text(export_path, csv_text)
+
+    export_payload = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "source": "ai_model_batch_arena",
+        "batch_mode": batch_mode,
+        "settings": {
+            "seed": int(seed),
+            "auction_filter_mode": auction_filter_mode,
+            "ai_logic_mode": ai_logic_mode,
+            "ai_logic_mode_label": ai_logic_mode_label,
+            "use_guardrails_v2": bool(use_guardrails_v2),
+        },
+        "input": {
+            "source_type": input_cfg.get("source_type"),
+            "source_name": input_cfg.get("source_name"),
+            "filename_regex": input_cfg.get("filename_regex"),
+            "ranges_text": input_cfg.get("ranges_text"),
+            "indices": input_cfg.get("indices"),
+            "boards": input_cfg.get("boards"),
+        },
+        "result_files": {
+            "csv_path": str(export_path),
+            "json_path": str(json_path),
+        },
+        "result_summary": {
+            "deal_count": len(all_results),
+            "columns": list(results_df.columns),
+        },
+        "results_csv_text": csv_text,
+        "results_rows": all_results,
+    }
+    _atomic_write_text(
+        json_path,
+        json.dumps(_json_safe_export_value(export_payload), indent=2),
+    )
+    return {"csv_path": export_path, "json_path": json_path}
 
 
 def auction_builder_upsert_or_delete_note(*, deal_index: int, note: str) -> None:
@@ -278,6 +428,32 @@ def _batch_arena_deal_key(sel_result: dict, deal_row: dict | None) -> str:
             return "pbn:" + hashlib.sha1(hands.encode()).hexdigest()[:12]
     # Last resort: use the Deal identifier from the result row
     return f"deal:{sel_result.get('Deal', '?')}"
+
+
+def _batch_arena_result_row_key(
+    *,
+    deal_idx: Any,
+    row_source: str,
+    row_pos: int,
+    use_external: bool,
+    row_idx: Any = None,
+) -> str:
+    """Stable per-result key for batch arena state maps.
+
+    External boards can reuse the same board number across different source files,
+    so ``Deal`` alone is not unique. Use ``Source + Deal + row position`` there.
+    For DB-backed rows, prefer the unique parquet row index when available.
+    """
+    source_part = str(row_source or "").strip() or "local"
+    deal_part = str(deal_idx if deal_idx is not None else "?").strip() or "?"
+    if use_external:
+        return f"ext:{source_part}:{deal_part}:{int(row_pos)}"
+    if row_idx is not None:
+        try:
+            return f"db_row:{int(row_idx)}"
+        except Exception:
+            pass
+    return f"db:{deal_part}:{int(row_pos)}"
 
 
 def prepend_all_seats_prefix(pattern: str) -> str:
@@ -1635,6 +1811,38 @@ def to_aggrid_safe_pandas(df: pl.DataFrame) -> pd.DataFrame:
     return pandas_df
 
 
+def _aggrid_is_null_or_numeric_series(series: pd.Series) -> bool:
+    """Return True when all non-null/non-empty values can be parsed as numbers.
+
+    AgGrid can treat pandas object columns as text, which causes lexicographic
+    sorting ("100" before "20"). This helper identifies columns that are
+    semantically numeric even though nulls/strings forced an object dtype.
+    """
+    try:
+        if pd.api.types.is_bool_dtype(series.dtype):
+            return False
+        if pd.api.types.is_numeric_dtype(series.dtype):
+            return True
+        
+        s = pd.Series(series.dropna())
+        if len(s) == 0:
+            return False
+            
+        # Treat empty strings as null for numeric checking
+        if pd.api.types.is_string_dtype(s) or pd.api.types.is_object_dtype(s):
+            s = pd.Series(s.loc[s.astype(str).str.strip() != ""])
+            
+        if len(s) == 0:
+            return False
+            
+        # Try to convert remaining values to numeric.
+        # If the conversion doesn't introduce any new NaNs, the column is numeric.
+        numeric_s = pd.Series(pd.to_numeric(s, errors="coerce"))
+        return bool(numeric_s.notna().all())
+    except Exception:
+        return False
+
+
 def render_aggrid(
     records: Any,
     key: str,
@@ -1807,12 +2015,44 @@ def render_aggrid(
     # Build the grid options
     # Use helper to avoid Arrow LargeUtf8 incompatibility with streamlit-aggrid's JS frontend
     pandas_df = to_aggrid_safe_pandas(df)
-    
+
+    # Coerce object-dtype columns that are semantically numeric (numbers + nulls)
+    # to float64 so GridOptionsBuilder.from_dataframe() infers numeric type and
+    # AgGrid sorts them numerically without any custom JS comparator.
+    numeric_cols_for_aggrid: list[str] = []
+    for col, series in pandas_df.items():
+        try:
+            if _aggrid_is_null_or_numeric_series(series):
+                pandas_df[str(col)] = pd.to_numeric(series, errors="coerce")
+                numeric_cols_for_aggrid.append(str(col))
+        except Exception:
+            pass
+
     gb = GridOptionsBuilder.from_dataframe(pandas_df)
-    # Disable pagination entirely to allow scrolling within the fixed height
     gb.configure_pagination(enabled=False)
-    # Make all columns read-only (not editable), resizable, filterable, sortable.
     gb.configure_default_column(resizable=True, filter=True, sortable=True, editable=False)
+
+    # streamlit-aggrid's JS frontend can receive stringified values; type=["numericColumn"]
+    # alone does not reliably force numeric sort. Use a comparator that parses values.
+    _numeric_comparator = JsCode("""
+        function(valueA, valueB) {
+            var a = valueA == null || valueA === '' ? null : Number(valueA);
+            var b = valueB == null || valueB === '' ? null : Number(valueB);
+            if (Number.isNaN(a)) a = null;
+            if (Number.isNaN(b)) b = null;
+            if (a === null && b === null) return 0;
+            if (a === null) return 1;
+            if (b === null) return -1;
+            return a - b;
+        }
+    """)
+    for col in numeric_cols_for_aggrid:
+        gb.configure_column(
+            col,
+            type=["numericColumn"],
+            filter="agNumberColumnFilter",
+            comparator=_numeric_comparator,
+        )
     
     # Custom formatting for columns that should display as percentages
     pct_cols = [c for c in df.columns if 
@@ -1856,7 +2096,7 @@ def render_aggrid(
         "Matches": 115, "Deals": 100,
         "Avg_EV": 105, "EV_NV": 100, "EV_V": 90,
         "Avg_Par": 110, "Par_NV": 100, "Par_V": 90,
-        "Criteria Count": 150, "Complete": 110,
+        "Criteria Count": 150, "Complete": 110, "BT Error": 135,
         # Rankings-style stats columns (NV/V split)
         "Matches_NV": 130, "Matches_V": 125,
         "Avg Par_NV": 130, "Avg Par_V": 125,
@@ -1951,30 +2191,29 @@ def render_aggrid(
             tooltipField=tooltip_field,
         )
     
-    # Add tooltips for columns with potentially long values
-    # These columns show full content on hover to handle truncation
-    tooltip_columns = [
-        "Exprs", "Expr", "Failed Exprs", "Failed_Exprs",
-        "Criteria", "Failed_Criteria", "Failed Criteria",
-        "Agg_Expr_Seat_1", "Agg_Expr_Seat_2", "Agg_Expr_Seat_3", "Agg_Expr_Seat_4",
-        "Invalid_Criteria_S1", "Invalid_Criteria_S2", "Invalid_Criteria_S3", "Invalid_Criteria_S4",
-        "Wrong_Bid_S1", "Wrong_Bid_S2", "Wrong_Bid_S3", "Wrong_Bid_S4",
-        "Hand_N", "Hand_E", "Hand_S", "Hand_W",
-        "ParContracts", "EV_ParContracts", "Contract",
-        "Description", "Notes", "Comment",
-    ]
-    for col in tooltip_columns:
-        if col in df.columns:
-            # Check for a _full version first
-            full_col = f"{col}_full"
-            tooltip_field = full_col if full_col in df.columns else col
-            # Only configure if not already configured above
-            if col not in ("Agg_Expr", "Categories"):
-                gb.configure_column(col, tooltipField=tooltip_field)
+    # Show full cell contents on hover for all columns so narrow columns remain usable.
+    # When a `<col>_full` helper column exists, use it as the tooltip source.
+    for col in df.columns:
+        if col in ("Agg_Expr", "Categories"):
+            continue
+        full_col = f"{col}_full"
+        tooltip_field = full_col if full_col in df.columns else col
+        gb.configure_column(col, tooltipField=tooltip_field)
     
     # Auction column can be wide - constrain it
     if "Auction" in df.columns:
         gb.configure_column("Auction", width=250, minWidth=250, maxWidth=350)
+
+    # Keep BT Error narrow; full text is available via tooltip.
+    for _bt_error_col in ("BT Error", "BT_Error"):
+        if _bt_error_col in df.columns:
+            gb.configure_column(
+                _bt_error_col,
+                width=135,
+                minWidth=135,
+                maxWidth=135,
+                suppressSizeToFit=True,
+            )
     
     gb.configure_grid_options(
         rowHeight=25,
@@ -2101,7 +2340,7 @@ def render_aggrid(
         update_on=effective_update_on,
         data_return_mode=DataReturnMode.AS_INPUT,
         custom_css=custom_css,
-        allow_unsafe_jscode=True if (row_pass_fail_col or row_bucket_col) else False,
+        allow_unsafe_jscode=bool(row_pass_fail_col or row_bucket_col or numeric_cols_for_aggrid),
     )
     
     selected_rows: Any = response.get("selected_rows", [])
@@ -5217,8 +5456,8 @@ def _render_batch_deal_radar(
             return None
         return len([t for t in auction.split("-") if t.strip()])
 
-    actual_tricks = sel_result.get("Actual_Tricks")
-    ai_tricks = sel_result.get("AI_Tricks")
+    actual_tricks = sel_result.get("BT_Tricks_Actual")
+    ai_tricks = sel_result.get("BT_Tricks_AI")
     dd_score_actual = sel_result.get("DD_Score_Actual")
     dd_score_ai = sel_result.get("DD_Score_AI")
     ev_actual = sel_result.get("EV_Actual")
@@ -5339,7 +5578,7 @@ def _render_batch_deal_radar(
         height=420,
     )
 
-    st.plotly_chart(fig, use_container_width=True, key=f"_batch_radar_{sel_result.get('Deal', '')}")
+    st.plotly_chart(fig, width="stretch", key=f"_batch_radar_{sel_result.get('Deal', '')}")
 
 
 def _classify_contract(contract_str: str | None) -> str:
@@ -5375,7 +5614,7 @@ _CONTRACT_TYPE_ORDER = ["Partial", "Game", "Small Slam", "Grand Slam", "Pass"]
 
 def _render_batch_stacked_bars(
     all_results: list[dict],
-    deal_row_map: dict[int, dict],
+    deal_row_map: dict[Any, dict],
 ) -> None:
     """Render stacked bar charts grouped by contract type.
 
@@ -5392,11 +5631,16 @@ def _render_batch_stacked_bars(
         if r.get("Error"):
             continue
         deal_idx = r.get("Deal")
-        dealer = r.get("Dealer", "N")
         ai_contract = r.get("AI_Contract")
         ct = _classify_contract(ai_contract)
 
-        dr = deal_row_map.get(int(deal_idx)) if deal_idx is not None else None
+        row_key = r.get("_Batch_Row_Key")
+        dr = deal_row_map.get(row_key) if row_key is not None else None
+        if dr is None and deal_idx is not None:
+            try:
+                dr = deal_row_map.get(int(deal_idx))
+            except Exception:
+                dr = None
 
         hcp_ns: int | None = None
         hcp_ew: int | None = None
@@ -5530,7 +5774,7 @@ def _render_batch_stacked_bars(
     fig.update_yaxes(title_text="Total Points", row=1, col=2)
     fig.update_yaxes(title_text="IMPs", row=1, col=3)
 
-    st.plotly_chart(fig, use_container_width=True, key="_batch_stacked_bars")
+    st.plotly_chart(fig, width="stretch", key="_batch_stacked_bars")
 
 
 # ---------------------------------------------------------------------------
@@ -5849,6 +6093,168 @@ def _download_text_from_url(url: str, label: str) -> str:
     return resp.text
 
 
+def _annotate_boards_with_source_name(boards: list[dict[str, Any]], source_name: str) -> list[dict[str, Any]]:
+    source_s = str(source_name or "").strip()
+    out: list[dict[str, Any]] = []
+    for board in boards:
+        row = dict(board)
+        if source_s:
+            row["Source"] = source_s
+        out.append(row)
+    return out
+
+
+def _normalize_github_raw_url(url: str) -> str:
+    """Convert GitHub blob/raw URLs into a direct raw-content URL."""
+    fetch_url = str(url or "").strip()
+    if "github.com" in fetch_url and "/blob/" in fetch_url:
+        fetch_url = fetch_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    return fetch_url
+
+
+def _compile_optional_filename_regex(pattern: str) -> re.Pattern[str] | None:
+    pattern_s = str(pattern or "").strip()
+    if not pattern_s:
+        return None
+    try:
+        return re.compile(pattern_s, flags=re.IGNORECASE)
+    except re.error as e:
+        raise ValueError(f"Invalid filename regex: {e}") from e
+
+
+def _enumerate_github_directory_file_urls(directory_url: str) -> list[str] | None:
+    """Return raw file URLs for a GitHub tree URL, or None if not a GitHub directory URL."""
+    parsed = urlparse(str(directory_url or "").strip())
+    if parsed.netloc.lower() != "github.com":
+        return None
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) < 5 or parts[2].lower() != "tree":
+        return None
+
+    owner, repo, _, ref = parts[:4]
+    repo_path = "/".join(parts[4:])
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(repo_path, safe='/')}?ref={quote(ref, safe='')}"
+    resp = requests.get(api_url, timeout=30, headers={"Accept": "application/vnd.github+json"})
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, list):
+        raise ValueError("GitHub directory URL did not return a directory listing.")
+
+    file_urls: list[str] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type") or "").lower() != "file":
+            continue
+        download_url = str(entry.get("download_url") or "").strip()
+        if download_url:
+            file_urls.append(download_url)
+    return file_urls
+
+
+def _enumerate_indexed_directory_file_urls(directory_url: str) -> list[str]:
+    """Enumerate file links from a generic HTML directory listing page."""
+    html = _download_text_from_url(directory_url, "PBN directory")
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for href in hrefs:
+        href_s = str(href or "").strip()
+        if not href_s or href_s.startswith(("#", "javascript:", "mailto:")):
+            continue
+        full_url = urljoin(directory_url, href_s)
+        parsed = urlparse(full_url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if clean_url in seen:
+            continue
+        seen.add(clean_url)
+        urls.append(clean_url)
+    return urls
+
+
+def _resolve_pbn_urls_from_input(url: str, filename_regex: str = "") -> tuple[list[str], bool]:
+    """Resolve a single PBN/LIN URL or a directory URL into file URLs.
+
+    Returns:
+        (file_urls, is_directory_source)
+    """
+    url_s = str(url or "").strip()
+    if not url_s:
+        raise ValueError("PBN URL is empty.")
+
+    filename_re = _compile_optional_filename_regex(filename_regex)
+    normalized_url = _normalize_github_raw_url(url_s)
+    path_lower = urlparse(normalized_url).path.lower()
+    looks_like_file = path_lower.endswith((".pbn", ".lin"))
+    looks_like_github_dir = "github.com" in url_s and "/tree/" in url_s
+
+    if not looks_like_file:
+        candidate_urls: list[str] | None = None
+        if looks_like_github_dir:
+            candidate_urls = _enumerate_github_directory_file_urls(url_s)
+        if candidate_urls is None:
+            candidate_urls = _enumerate_indexed_directory_file_urls(url_s)
+
+        filtered: list[str] = []
+        seen_filtered: set[str] = set()
+        for candidate in candidate_urls:
+            candidate_norm = _normalize_github_raw_url(candidate)
+            basename = pathlib.PurePosixPath(urlparse(candidate_norm).path).name
+            if not basename:
+                continue
+            if not basename.lower().endswith((".pbn", ".lin")):
+                continue
+            if filename_re and not filename_re.search(basename):
+                continue
+            if candidate_norm in seen_filtered:
+                continue
+            seen_filtered.add(candidate_norm)
+            filtered.append(candidate_norm)
+
+        filtered.sort(key=lambda s: pathlib.PurePosixPath(urlparse(s).path).name.lower())
+        if not filtered:
+            regex_note = f" matching regex `{filename_regex}`" if str(filename_regex or "").strip() else ""
+            raise ValueError(f"No .pbn/.lin files found in directory URL{regex_note}.")
+        return filtered, True
+
+    basename = pathlib.PurePosixPath(urlparse(normalized_url).path).name
+    if filename_re and basename and not filename_re.search(basename):
+        raise ValueError(f"Single-file URL basename `{basename}` does not match filename regex.")
+    return [normalized_url], False
+
+
+def _load_pbn_boards_from_url_input(url: str, filename_regex: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load boards from a direct file URL or a directory URL containing PBN/LIN files."""
+    file_urls, is_directory_source = _resolve_pbn_urls_from_input(url, filename_regex=filename_regex)
+    all_boards: list[dict[str, Any]] = []
+    loaded_files: list[str] = []
+    per_file_counts: list[tuple[str, int]] = []
+
+    for file_url in file_urls:
+        content = _download_text_from_url(file_url, "PBN")
+        file_name = pathlib.PurePosixPath(urlparse(file_url).path).name
+        boards = _annotate_boards_with_source_name(parse_pbn_file_to_boards(content), file_name)
+        if not boards:
+            continue
+        all_boards.extend(boards)
+        loaded_files.append(file_url)
+        per_file_counts.append((file_name, len(boards)))
+
+    if not all_boards:
+        raise ValueError("No valid boards found in the provided PBN/LIN URL input.")
+
+    return all_boards, {
+        "is_directory_source": bool(is_directory_source),
+        "loaded_file_urls": loaded_files,
+        "loaded_file_names": [name for name, _ in per_file_counts],
+        "loaded_file_count": len(loaded_files),
+        "filename_regex": str(filename_regex or "").strip(),
+        "per_file_board_counts": per_file_counts,
+    }
+
+
 def parse_csv_to_boards(content: str) -> list[dict]:
     """Parse CSV input into normalized board dicts used by batch arena.
 
@@ -5982,7 +6388,14 @@ def _render_batch_input_from_deals_df() -> dict[str, Any]:
     except Exception:
         indices = []
         st.error("Invalid range expression. Use formats like ``1-25``, ``200``, ``220+``.")
-    return {"indices": indices, "ranges_text": ranges_text, "seed": int(seed), "boards": []}
+    return {
+        "indices": indices,
+        "ranges_text": ranges_text,
+        "seed": int(seed),
+        "boards": [],
+        "source_type": "ranges",
+        "source_name": str(ranges_text or "").strip(),
+    }
 
 
 def _render_batch_input_from_pbn() -> dict[str, Any]:
@@ -5993,38 +6406,89 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
             "PBN URL",
             key="_batch_pbn_url",
             value="https://raw.githubusercontent.com/BSalita/Calculate_PBN_Results/refs/heads/master/DDS_Camrose24_1-%20BENCAM22%20v%20WBridge5.pbn",
+            on_change=lambda: st.session_state.__setitem__("_batch_pbn_download_on_enter", True),
         )
     with dl_col:
-        download_clicked = st.button("Download", key="_batch_pbn_download", use_container_width=True)
+        download_clicked = st.button("Download", key="_batch_pbn_download", width="stretch")
+    pbn_filename_regex = st.text_input(
+        "Filename Regex (optional)",
+        key="_batch_pbn_filename_regex",
+        placeholder=r"^R\d+\.PBN$",
+        help=(
+            "When the URL points to a directory, load only filenames whose basename matches this regex. "
+            "Blank means load all `.pbn` / `.lin` files in the directory."
+        ),
+        on_change=lambda: st.session_state.__setitem__("_batch_pbn_download_on_enter", True),
+    )
+    st.caption(
+        "Direct file URLs still work as before. If the URL is a GitHub directory (`.../tree/...`) or "
+        "a server directory index, all `.pbn` / `.lin` files are loaded automatically; the filename regex filters basenames."
+    )
+    download_triggered_by_enter = bool(st.session_state.pop("_batch_pbn_download_on_enter", False))
+    if download_triggered_by_enter:
+        download_clicked = True
 
     pbn_file = st.file_uploader("Upload PBN File", type=["pbn"], key="_batch_pbn_upload")
 
     if pbn_file is not None:
         try:
-            pbn_content = pbn_file.read().decode("utf-8", errors="replace")
-            parsed_boards = parse_pbn_file_to_boards(pbn_content)
-            st.session_state["_arena_pbn_boards"] = parsed_boards
-            st.success(f"Loaded **{len(parsed_boards)}** board(s) from `{pbn_file.name}`.")
+            upload_sig = f"{pbn_file.name}:{getattr(pbn_file, 'size', 'na')}"
+            if st.session_state.get("_batch_pbn_upload_sig") != upload_sig:
+                with st.spinner(f"Loading and parsing `{pbn_file.name}`..."):
+                    pbn_content = pbn_file.read().decode("utf-8", errors="replace")
+                    parsed_boards = _annotate_boards_with_source_name(
+                        parse_pbn_file_to_boards(pbn_content),
+                        str(pbn_file.name or "pbn_input.pbn"),
+                    )
+                    st.session_state["_arena_pbn_boards"] = parsed_boards
+                    st.session_state["_arena_pbn_source_type"] = "file"
+                    st.session_state["_arena_pbn_source_name"] = str(pbn_file.name or "pbn_input.pbn")
+                    st.session_state.pop("_arena_pbn_load_meta", None)
+                    st.session_state["_batch_ranges_pbn"] = "1+"
+                    st.session_state["_batch_run_on_enter"] = True
+                    st.session_state["_batch_pbn_upload_sig"] = upload_sig
+            st.success(f"Loaded **{len(st.session_state.get('_arena_pbn_boards') or [])}** board(s) from `{pbn_file.name}`.")
         except Exception as e:
             st.error(f"Failed to parse PBN file: {e}")
+    else:
+        st.session_state.pop("_batch_pbn_upload_sig", None)
 
     if download_clicked:
         try:
-            pbn_content = _download_text_from_url(pbn_url, "PBN")
-            parsed_boards = parse_pbn_file_to_boards(pbn_content)
-            st.session_state["_arena_pbn_boards"] = parsed_boards
-            st.success(f"Downloaded and parsed **{len(parsed_boards)}** board(s) from URL.")
+            with st.spinner("Downloading and parsing PBN/LIN file(s)..."):
+                parsed_boards, load_meta = _load_pbn_boards_from_url_input(pbn_url, filename_regex=pbn_filename_regex)
+                st.session_state["_arena_pbn_boards"] = parsed_boards
+                st.session_state["_arena_pbn_source_type"] = "url"
+                st.session_state["_arena_pbn_source_name"] = str(pbn_url or "").strip()
+                st.session_state["_arena_pbn_load_meta"] = load_meta
+                st.session_state["_batch_ranges_pbn"] = "1+"
+                st.session_state["_batch_run_on_enter"] = True
+            if load_meta.get("is_directory_source"):
+                st.success(
+                    f"Downloaded and parsed **{len(parsed_boards)}** board(s) from "
+                    f"**{int(load_meta.get('loaded_file_count') or 0)}** file(s) in the directory URL."
+                )
+            else:
+                st.success(f"Downloaded and parsed **{len(parsed_boards)}** board(s) from URL.")
         except Exception as e:
             st.error(f"Failed to download/parse PBN URL: {e}")
 
     boards = st.session_state.get("_arena_pbn_boards") or []
+    load_meta = st.session_state.get("_arena_pbn_load_meta") or {}
+    loaded_file_names = list(load_meta.get("loaded_file_names") or [])
+    if loaded_file_names:
+        preview_names = ", ".join(loaded_file_names[:8])
+        if len(loaded_file_names) > 8:
+            preview_names += f", ... (+{len(loaded_file_names) - 8} more)"
+        st.caption(f"Matched PBN/LIN files: {preview_names}")
     n_boards = len(boards)
     col_a, col_b = st.columns([3, 1])
     with col_a:
         default_range = f"1-{n_boards}" if n_boards > 0 else "1-25"
+        if "_batch_ranges_pbn" not in st.session_state:
+            st.session_state["_batch_ranges_pbn"] = default_range
         ranges_text = st.text_input(
             "Board Index Ranges",
-            value=default_range,
             key="_batch_ranges_pbn",
             disabled=(n_boards == 0),
             help="Examples: ``1-25``  ``1-10, 20, 30+``  Commas or spaces delimit ranges.  Press Enter to run.",
@@ -6040,7 +6504,14 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
         board_indices = []
         st.error("Invalid range expression. Use formats like ``1-25``, ``20``, ``30+``.")
     selected_boards = [boards[i - 1] for i in board_indices if 1 <= i <= n_boards]
-    return {"seed": int(seed), "boards": selected_boards}
+    return {
+        "seed": int(seed),
+        "boards": selected_boards,
+        "ranges_text": ranges_text,
+        "source_type": st.session_state.get("_arena_pbn_source_type") or "",
+        "source_name": st.session_state.get("_arena_pbn_source_name") or "",
+        "filename_regex": str(pbn_filename_regex or "").strip(),
+    }
 
 
 def _render_batch_input_from_csv() -> dict[str, Any]:
@@ -6049,25 +6520,40 @@ def _render_batch_input_from_csv() -> dict[str, Any]:
     with url_col:
         csv_url = st.text_input("CSV URL", key="_batch_csv_url", placeholder="https://.../file.csv")
     with dl_col:
-        download_clicked = st.button("Download", key="_batch_csv_download", use_container_width=True)
+        download_clicked = st.button("Download", key="_batch_csv_download", width="stretch")
 
     csv_file = st.file_uploader("Upload CSV File", type=["csv"], key="_batch_csv_upload")
     st.caption("CSV header row must include: Deals, Dealer, Vul. It may include additional columns.")
 
     if csv_file is not None:
         try:
-            csv_content = csv_file.read().decode("utf-8", errors="replace")
-            parsed_boards = parse_csv_to_boards(csv_content)
-            st.session_state["_arena_csv_boards"] = parsed_boards
-            st.success(f"Loaded **{len(parsed_boards)}** row(s) from `{csv_file.name}`.")
+            upload_sig = f"{csv_file.name}:{getattr(csv_file, 'size', 'na')}"
+            if st.session_state.get("_batch_csv_upload_sig") != upload_sig:
+                with st.spinner(f"Loading and parsing `{csv_file.name}`..."):
+                    csv_content = csv_file.read().decode("utf-8", errors="replace")
+                    parsed_boards = parse_csv_to_boards(csv_content)
+                    st.session_state["_arena_csv_boards"] = parsed_boards
+                    st.session_state["_arena_csv_source_type"] = "file"
+                    st.session_state["_arena_csv_source_name"] = str(csv_file.name or "input.csv")
+                    st.session_state["_batch_ranges_csv"] = "1+"
+                    st.session_state["_batch_run_on_enter"] = True
+                    st.session_state["_batch_csv_upload_sig"] = upload_sig
+            st.success(f"Loaded **{len(st.session_state.get('_arena_csv_boards') or [])}** row(s) from `{csv_file.name}`.")
         except Exception as e:
             st.error(f"Failed to parse CSV file: {e}")
+    else:
+        st.session_state.pop("_batch_csv_upload_sig", None)
 
     if download_clicked:
         try:
-            csv_content = _download_text_from_url(csv_url, "CSV")
-            parsed_boards = parse_csv_to_boards(csv_content)
-            st.session_state["_arena_csv_boards"] = parsed_boards
+            with st.spinner("Downloading and parsing CSV file..."):
+                csv_content = _download_text_from_url(csv_url, "CSV")
+                parsed_boards = parse_csv_to_boards(csv_content)
+                st.session_state["_arena_csv_boards"] = parsed_boards
+                st.session_state["_arena_csv_source_type"] = "url"
+                st.session_state["_arena_csv_source_name"] = str(csv_url or "").strip()
+                st.session_state["_batch_ranges_csv"] = "1+"
+                st.session_state["_batch_run_on_enter"] = True
             st.success(f"Downloaded and parsed **{len(parsed_boards)}** row(s) from URL.")
         except Exception as e:
             st.error(f"Failed to download/parse CSV URL: {e}")
@@ -6077,9 +6563,10 @@ def _render_batch_input_from_csv() -> dict[str, Any]:
     col_a, col_b = st.columns([3, 1])
     with col_a:
         default_range = f"1-{n_boards}" if n_boards > 0 else "1-25"
+        if "_batch_ranges_csv" not in st.session_state:
+            st.session_state["_batch_ranges_csv"] = default_range
         ranges_text = st.text_input(
             "Deal Index Ranges",
-            value=default_range,
             key="_batch_ranges_csv",
             disabled=(n_boards == 0),
             help="Examples: ``1-25``  ``1-10, 20, 30+``  Commas or spaces delimit ranges.  Press Enter to run.",
@@ -6095,7 +6582,13 @@ def _render_batch_input_from_csv() -> dict[str, Any]:
         board_indices = []
         st.error("Invalid range expression. Use formats like ``1-25``, ``20``, ``30+``.")
     selected_boards = [boards[i - 1] for i in board_indices if 1 <= i <= n_boards]
-    return {"seed": int(seed), "boards": selected_boards}
+    return {
+        "seed": int(seed),
+        "boards": selected_boards,
+        "ranges_text": ranges_text,
+        "source_type": st.session_state.get("_arena_csv_source_type") or "",
+        "source_name": st.session_state.get("_arena_csv_source_name") or "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -6295,6 +6788,17 @@ def render_ai_model_batch_arena():
         # Positive means AI outscored Actual (vs par). Negative means AI worse.
         return int(imp_ai) - int(imp_actual)
 
+    def _ev_imp_vs_par_signed(
+        ev_ns: float | None,
+        par_score: int | None,
+    ) -> int | None:
+        """Signed IMP from NS-relative EV minus NS-relative par score."""
+        if ev_ns is None or par_score is None:
+            return None
+        diff = float(ev_ns) - float(par_score)
+        sign = 1 if diff >= 0 else -1
+        return sign * calculate_imp(int(round(abs(diff))))
+
     # ---- Helper: NS-relative EV (precomputed, ignores X/XX) ----
     def _ev_ns(auction: str | None, dealer: str, deal_row: dict) -> float | None:
         if not auction:
@@ -6350,6 +6854,9 @@ def render_ai_model_batch_arena():
     if run_clicked:
         st.session_state["_arena_batch_cancel"] = False
         st.session_state["_arena_batch_results"] = []
+        st.session_state["_arena_batch_auto_export_path"] = None
+        st.session_state["_arena_batch_auto_export_json_path"] = None
+        st.session_state["_arena_batch_auto_export_error"] = None
 
         progress_bar = st.progress(0, text="Starting batch...")
         status_text = st.empty()
@@ -6398,17 +6905,17 @@ def render_ai_model_batch_arena():
                 )
                 deal_rows_raw = filtered_rows
 
-            deal_row_map: dict[int, dict] = {}
+            deal_rows_by_index: dict[int, dict] = {}
             for dr in deal_rows_raw:
                 try:
-                    deal_row_map[int(dr["index"])] = dr
+                    deal_rows_by_index[int(dr["index"])] = dr
                 except Exception:
                     continue
 
-            if not deal_row_map:
+            if not deal_rows_by_index:
                 st.warning("No deal rows found for the requested index range.")
                 return
-            indices = sorted(deal_row_map.keys())
+            indices = sorted(deal_rows_by_index.keys())
         else:
             # External mode (PBN/CSV): records already parsed; lookups happen per-row below
             if auction_filter_mode != "All Auctions":
@@ -6427,30 +6934,118 @@ def render_ai_model_batch_arena():
                 )
                 _external_boards_for_run = filtered_boards
             indices = list(range(len(_external_boards_for_run)))
-            deal_row_map = {}
+            deal_rows_by_index = {}
             if not _external_boards_for_run:
                 st.warning("No external records loaded. Provide PBN/CSV input first.")
                 return
 
         results: list[dict] = []
-        _ai_steps_map: dict[int, list] = {}
+        deal_row_map: dict[str, dict] = {}
+        _ai_steps_map: dict[str, list] = {}
         imp_running = 0
+        ev_imp_running = 0
         t_batch_start = time.perf_counter()
+        batch_completed = False
+        live_results_render_seq = 0
 
         def _push_live_results() -> None:
+            nonlocal live_results_render_seq
             st.session_state["_arena_batch_results"] = list(results)
             # Keep supporting maps in sync with live results so row-click
             # detail works even if the batch is cancelled mid-run.
             st.session_state["_arena_deal_row_map"] = deal_row_map
             st.session_state["_arena_ai_steps_map"] = _ai_steps_map
             if results:
+                live_results_render_seq += 1
                 _render_batch_results_df(
                     results,
                     live_results_placeholder,
                     interactive=False,
-                    aggrid_key="_batch_results_live",
+                    aggrid_key=f"_batch_results_live_{live_results_render_seq}",
                     height=min(520, max(180, 40 + len(results) * 28)),
                 )
+
+        def _append_unique_bt_error_note(notes: list[str], note: Any, *, step: int | None = None) -> None:
+            note_str = str(note or "").strip()
+            if not note_str:
+                return
+            if step is not None:
+                note_str = f"Step {step}: {note_str}"
+            if note_str not in notes:
+                notes.append(note_str)
+
+        def _append_reasonish_notes_from_dict(notes: list[str], data: Any, *, step: int | None = None, prefix: str = "") -> None:
+            if not isinstance(data, dict):
+                return
+            for _k, _v in data.items():
+                if _v is None:
+                    continue
+                _key = str(_k or "")
+                _label = f"{prefix}{_key}: " if prefix else ""
+                if _key.endswith("_reason"):
+                    _append_unique_bt_error_note(notes, f"{_label}{_v}", step=step)
+                elif _key.endswith("_reasons") and isinstance(_v, list):
+                    for _item in _v:
+                        _append_unique_bt_error_note(notes, f"{_label}{_item}", step=step)
+                elif _key in ("special_case_notes", "guard_reasons", "common_sense_reason_codes") and isinstance(_v, list):
+                    for _item in _v:
+                        _append_unique_bt_error_note(notes, f"{_label}{_item}", step=step)
+
+        def _collect_special_case_bt_error_notes(ai_steps_detail_local: list[dict[str, Any]]) -> list[str]:
+            notes: list[str] = []
+            for _step_data in ai_steps_detail_local or []:
+                if not isinstance(_step_data, dict):
+                    continue
+                _step_no = _step_data.get("step")
+                try:
+                    _step_no = int(_step_no) if _step_no is not None else None
+                except Exception:
+                    _step_no = None
+                _append_reasonish_notes_from_dict(notes, _step_data, step=_step_no)
+
+                for _filtered in _step_data.get("all_bids_filtered") or []:
+                    if not isinstance(_filtered, dict):
+                        continue
+                    _fbid = str(_filtered.get("bid") or "").strip().upper()
+                    _freason = str(_filtered.get("filter_reason") or "").strip()
+                    if _fbid and _freason:
+                        _append_unique_bt_error_note(
+                            notes,
+                            f"blocked { _fbid }: {_freason}",
+                            step=_step_no,
+                        )
+
+                _chosen_bid = str(
+                    _step_data.get("chosen_bid")
+                    or ((_step_data.get("bidder_view") or {}).get("chosen_bid"))
+                    or ""
+                ).strip().upper()
+                for _score_row in _step_data.get("bid_scores") or []:
+                    if not isinstance(_score_row, dict):
+                        continue
+                    if _score_row.get("hard_blocked") or _score_row.get("pass_hard_blocked"):
+                        _blocked_bid = str(_score_row.get("bid") or "").strip().upper()
+                        _blocked_reason = (
+                            _score_row.get("hard_block_reason")
+                            or _score_row.get("pass_hard_block_reason")
+                        )
+                        if _blocked_bid and _blocked_reason:
+                            _append_unique_bt_error_note(
+                                notes,
+                                f"blocked {_blocked_bid}: {_blocked_reason}",
+                                step=_step_no,
+                            )
+                if not _chosen_bid:
+                    continue
+                _chosen_score_row = None
+                for _score_row in _step_data.get("bid_scores") or []:
+                    if str((_score_row or {}).get("bid") or "").strip().upper() == _chosen_bid:
+                        _chosen_score_row = _score_row
+                        break
+                if not isinstance(_chosen_score_row, dict):
+                    continue
+                _append_reasonish_notes_from_dict(notes, _chosen_score_row, step=_step_no)
+            return notes
 
         for i in range(len(indices)):
             # ---- Cancel check ----
@@ -6464,11 +7059,20 @@ def render_ai_model_batch_arena():
             # ---------------------------------------------------------------- #
             # Resolve deal_row and key fields depending on source mode         #
             # ---------------------------------------------------------------- #
+            row_source = ""
+            result_row_key = ""
             if not _use_external:
                 deal_idx = indices[i]
-                deal_row = deal_row_map.get(deal_idx)
+                deal_row = deal_rows_by_index.get(deal_idx)
+                result_row_key = _batch_arena_result_row_key(
+                    deal_idx=deal_idx,
+                    row_source=row_source,
+                    row_pos=i,
+                    use_external=False,
+                    row_idx=deal_row.get("_row_idx") if deal_row else None,
+                )
                 if deal_row is None:
-                    results.append({"Deal": deal_idx, "Error": "not_found"})
+                    results.append({"Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "not_found"})
                     _push_live_results()
                     progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — not found — IMP: {imp_running:+d}")
                     continue
@@ -6477,14 +7081,27 @@ def render_ai_model_batch_arena():
                 actual_auction = str(deal_row.get("bid", "") or "").strip()
                 row_idx = deal_row.get("_row_idx")
                 if row_idx is None:
-                    results.append({"Deal": deal_idx, "Error": "no_row_idx"})
+                    results.append({"Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "no_row_idx"})
                     _push_live_results()
                     progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — no _row_idx — IMP: {imp_running:+d}")
                     continue
+                deal_row_map[result_row_key] = deal_row
             else:
                 # External mode (PBN/CSV): look up the board in BBO DB by hand strings
                 src_board = _external_boards_for_run[i]
+                row_source = str(
+                    src_board.get("Source")
+                    or src_board.get("_source_file")
+                    or input_cfg.get("source_name")
+                    or ""
+                ).strip()
                 deal_idx = src_board.get("board") or (i + 1)
+                result_row_key = _batch_arena_result_row_key(
+                    deal_idx=deal_idx,
+                    row_source=row_source,
+                    row_pos=i,
+                    use_external=True,
+                )
                 dealer = str(src_board.get("dealer", "N")).upper()
                 # Normalize PBN vul tags to DB format ("All" → "Both", etc.)
                 vul = {"All": "Both", "None": "None", "NS": "NS", "EW": "EW"}.get(
@@ -6504,7 +7121,7 @@ def render_ai_model_batch_arena():
                     )
                     matches = lookup_resp.get("matches") or []
                 except Exception as _lu_err:
-                    results.append({"Deal": deal_idx, "Error": f"lookup_error: {_lu_err}"})
+                    results.append({"Source": row_source, "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": f"lookup_error: {_lu_err}"})
                     _push_live_results()
                     progress_bar.progress((i + 1) / len(indices), text=f"Board {i+1}/{len(indices)} — lookup error — IMP: {imp_running:+d}")
                     continue
@@ -6533,7 +7150,7 @@ def render_ai_model_batch_arena():
                         _pbn_val = src_board.get(_pbn_key)
                         if _pbn_val is not None:
                             deal_row[_pbn_key] = _pbn_val
-                    deal_row_map[deal_idx] = deal_row
+                    deal_row_map[result_row_key] = deal_row
                     row_idx = None  # no DB index — will use deal_row_dict path
                 else:
                     deal_row = dict(matches[0])
@@ -6567,11 +7184,19 @@ def render_ai_model_batch_arena():
                         if _pbn_val is not None:
                             deal_row[_pbn_key] = _pbn_val
                     # Store matched row in map so the deal diagram appears on row-click
-                    deal_row_map[deal_idx] = deal_row
+                    deal_row_map[result_row_key] = deal_row
                     row_idx = deal_row.get("_row_idx")
 
             # ---- Start AI Model async job ----
-            progress_bar.progress(i / len(indices), text=f"Deal {i+1}/{len(indices)} (index {deal_idx}) — IMP: {imp_running:+d} — running AI Model...")
+            elapsed_batch_s = max(time.perf_counter() - t0, 1e-9)
+            deals_per_s = i / elapsed_batch_s if i > 0 else 0.0
+            progress_bar.progress(
+                i / len(indices),
+                text=(
+                    f"Deal {i+1}/{len(indices)} (index {deal_idx}) — IMP: {imp_running:+d} — "
+                    f"running AI Model... {deals_per_s:.2f} deals/s"
+                ),
+            )
             _ai_start_params: dict[str, Any]
             if row_idx is not None:
                 # DB deal: use pre-computed bitmap via row index (fast path).
@@ -6600,13 +7225,13 @@ def render_ai_model_batch_arena():
                 )
                 job_id = str(start_resp.get("job_id") or "").strip()
             except Exception as e:
-                results.append({"Deal": deal_idx, "Error": f"start_failed: {e}"})
+                results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": f"start_failed: {e}"})
                 _push_live_results()
                 progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — start failed — IMP: {imp_running:+d}")
                 continue
 
             if not job_id:
-                results.append({"Deal": deal_idx, "Error": "no_job_id"})
+                results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "no_job_id"})
                 _push_live_results()
                 continue
 
@@ -6625,14 +7250,14 @@ def render_ai_model_batch_arena():
                     res = job.get("result") or {}
                     ai_auction = str(res.get("auction") or "").strip()
                     ai_steps_detail = res.get("steps_detail") or []
-                    _ai_steps_map[deal_idx] = ai_steps_detail
+                    _ai_steps_map[result_row_key] = ai_steps_detail
                     poll_ok = True
                     break
                 elif status_val == "failed":
-                    results.append({"Deal": deal_idx, "Error": f"job_failed: {job.get('error')}"})
+                    results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": f"job_failed: {job.get('error')}"})
                     break
             else:
-                results.append({"Deal": deal_idx, "Error": "timeout"})
+                results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "timeout"})
 
             if not poll_ok:
                 _push_live_results()
@@ -6699,6 +7324,13 @@ def render_ai_model_batch_arena():
             par_contracts_raw = deal_row.get("ParContracts")
             par_contracts = _format_par_contracts(par_contracts_raw) or ""
 
+            ev_imp_actual = _ev_imp_vs_par_signed(actual_ev, par_score)
+            ev_imp_ai = _ev_imp_vs_par_signed(ai_ev, par_score)
+            ev_imp_diff = None
+            if ev_imp_actual is not None and ev_imp_ai is not None:
+                ev_imp_diff = int(ev_imp_ai) - int(ev_imp_actual)
+                ev_imp_running += int(ev_imp_diff)
+
             imp_actual = _imp_vs_par_signed(actual_score_contract, par_score, actual_auction, dealer)
             imp_ai = _imp_vs_par_signed(ai_score_contract, par_score, ai_auction, dealer)
             imp = _imp_diff(imp_actual, imp_ai)
@@ -6749,10 +7381,16 @@ def render_ai_model_batch_arena():
                     _prior.append(_strain_err)
             except Exception:
                 pass
+            try:
+                _error_flags.extend(_collect_special_case_bt_error_notes(ai_steps_detail))
+            except Exception:
+                pass
             _error_str = "; ".join(_error_flags) if _error_flags else ""
 
             results.append({
+                "Source": row_source if _use_external else "",
                 "Deal": deal_idx,
+                "_Batch_Row_Key": result_row_key,
                 "Dealer": dealer,
                 "Vul": vul,
                 "Divergence": _div_str,
@@ -6761,14 +7399,18 @@ def render_ai_model_batch_arena():
                 "AI_Auction": ai_auction,
                 "Actual_Contract": actual_contract,
                 "AI_Contract": ai_contract,
-                "Actual_Tricks": actual_tricks,
-                "AI_Tricks": ai_dd_tricks,
+                "BT_Tricks_Actual": actual_tricks,
+                "BT_Tricks_AI": ai_dd_tricks,
                 "Actual_Result": actual_result,
                 "AI_Result": ai_result,
                 "DD_Score_Actual": actual_score_contract,
                 "DD_Score_AI": ai_score_contract,
                 "EV_Actual": actual_ev,
                 "EV_AI": ai_ev,
+                "EV_IMP_Actual": ev_imp_actual,
+                "EV_IMP_AI": ev_imp_ai,
+                "EV_IMP_Diff": ev_imp_diff,
+                "EV_IMP_Running": ev_imp_running,
                 "Par": par_score,
                 "ParContracts": par_contracts,
                 "IMP_Actual": imp_actual,
@@ -6850,6 +7492,9 @@ def render_ai_model_batch_arena():
                     "dd_score_ai_ns": ai_score_ns,
                     "ev_actual_ns": actual_ev,
                     "ev_ai_ns": ai_ev,
+                    "ev_imp_actual": ev_imp_actual,
+                    "ev_imp_ai": ev_imp_ai,
+                    "ev_imp_diff": ev_imp_diff,
                     "par": par_score,
                     "par_contracts": par_contracts,
                     "imp_actual": imp_actual,
@@ -6875,6 +7520,27 @@ def render_ai_model_batch_arena():
             # Loop completed without cancel
             elapsed_total = time.perf_counter() - t_batch_start
             status_text.text(f"Batch complete: {len(results)} deals in {elapsed_total:.1f}s. IMP running total: {imp_running:+d}")
+            batch_completed = True
+
+        if batch_completed and results:
+            try:
+                export_paths = _auto_export_batch_results(
+                    all_results=results,
+                    batch_mode=batch_mode,
+                    input_cfg=input_cfg,
+                    seed=int(seed),
+                    auction_filter_mode=str(auction_filter_mode),
+                    ai_logic_mode=str(ai_logic_mode),
+                    ai_logic_mode_label=str(ai_logic_mode_label),
+                    use_guardrails_v2=bool(use_guardrails_v2),
+                )
+                st.session_state["_arena_batch_auto_export_path"] = str(export_paths["csv_path"])
+                st.session_state["_arena_batch_auto_export_json_path"] = str(export_paths["json_path"])
+                st.session_state["_arena_batch_auto_export_error"] = None
+            except Exception as e:
+                st.session_state["_arena_batch_auto_export_path"] = None
+                st.session_state["_arena_batch_auto_export_json_path"] = None
+                st.session_state["_arena_batch_auto_export_error"] = f"{e}"
 
         # Store results and rerun — the interactive table is rendered outside
         # this block (always, on every rerun) so there is never a duplicate.
@@ -6996,32 +7662,68 @@ def render_ai_model_batch_arena():
     if all_results:
         _render_batch_results_df(all_results, st, interactive=True, aggrid_key="_batch_results_main")
 
+        _auto_export_path = st.session_state.get("_arena_batch_auto_export_path")
+        _auto_export_json_path = st.session_state.get("_arena_batch_auto_export_json_path")
+        _auto_export_error = st.session_state.get("_arena_batch_auto_export_error")
+        if _auto_export_path:
+            try:
+                _export_display = pathlib.Path(str(_auto_export_path))
+                _export_rel = _export_display.relative_to(pathlib.Path(__file__).resolve().parent)
+                if _auto_export_json_path:
+                    _json_display = pathlib.Path(str(_auto_export_json_path))
+                    _json_rel = _json_display.relative_to(pathlib.Path(__file__).resolve().parent)
+                    st.caption(
+                        f"Auto-exported batch results to `{_export_rel.as_posix()}` "
+                        f"and `{_json_rel.as_posix()}`."
+                    )
+                else:
+                    st.caption(f"Auto-exported batch results to `{_export_rel.as_posix()}`.")
+            except Exception:
+                if _auto_export_json_path:
+                    st.caption(
+                        f"Auto-exported batch results to `{_auto_export_path}` "
+                        f"and `{_auto_export_json_path}`."
+                    )
+                else:
+                    st.caption(f"Auto-exported batch results to `{_auto_export_path}`.")
+        elif _auto_export_error:
+            st.warning(f"Automatic batch export failed: {_auto_export_error}")
+
         # Export button
         results_df = pd.DataFrame(all_results)
         csv_bytes = results_df.to_csv(index=False).encode("utf-8")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _download_name = None
+        try:
+            if _auto_export_path:
+                _download_name = pathlib.Path(str(_auto_export_path)).name
+        except Exception:
+            _download_name = None
+        if not _download_name:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _download_name = f"ai_model_batch_{len(all_results)}deals_{ts}.csv"
         st.download_button(
             "📥 Export Results (CSV)",
             data=csv_bytes,
-            file_name=f"ai_model_batch_{len(all_results)}deals_{ts}.csv",
+            file_name=_download_name,
             mime="text/csv",
             key="_batch_export",
         )
 
         # ---- Aggregate stacked bar charts by contract type ----
-        _agg_deal_row_map: dict[int, dict] = st.session_state.get("_arena_deal_row_map") or {}
+        _agg_deal_row_map: dict[str, dict] = st.session_state.get("_arena_deal_row_map") or {}
         _render_batch_stacked_bars(all_results, _agg_deal_row_map)
 
         # ---- Row-click: deal diagram then single-row detail ----
         _sel_result: dict | None = st.session_state.get("_batch_selected_result")
-        _deal_row_map: dict[int, dict] = st.session_state.get("_arena_deal_row_map") or {}
-        _ai_steps_map_ss: dict[int, list] = st.session_state.get("_arena_ai_steps_map") or {}
+        _deal_row_map: dict[str, dict] = st.session_state.get("_arena_deal_row_map") or {}
+        _ai_steps_map_ss: dict[str, list] = st.session_state.get("_arena_ai_steps_map") or {}
         if _sel_result:
             _sel_deal_idx = _sel_result.get("Deal")
+            _sel_row_key = str(_sel_result.get("_Batch_Row_Key") or "")
             st.divider()
 
             # 1. Deal diagram
-            _deal_row = _deal_row_map.get(int(_sel_deal_idx)) if _sel_deal_idx is not None else None
+            _deal_row = _deal_row_map.get(_sel_row_key) if _sel_row_key else None
             if _deal_row:
                 _diag_deal = dict(_deal_row)
                 _diag_deal.setdefault("ParScore", _sel_result.get("Par"))
@@ -7052,7 +7754,7 @@ def render_ai_model_batch_arena():
                         _dv = _deal_row.get(_dk)
                         if _dv is not None:
                             _ba_dbg_deal[_dk] = _dv
-                _ba_dbg_steps = _ai_steps_map_ss.get(int(_sel_deal_idx)) if _sel_deal_idx is not None else []
+                _ba_dbg_steps = _ai_steps_map_ss.get(_sel_row_key) if _sel_row_key else []
                 _ba_dbg_payload = {
                     "source": "ai_model_batch_arena",
                     "timestamp": _ba_dbg_dt.now(_ba_dbg_tz.utc).isoformat(),
@@ -7218,31 +7920,8 @@ def _render_batch_results_df(
     if not results:
         return
 
-    if not interactive:
-        # Plain styled pandas table — used during the live batch-update loop.
-        df = pd.DataFrame(results)
-        if "IMP_Diff" in df.columns:
-            def _color_row(row):
-                imp = row.get("IMP_Diff")
-                if imp is None or pd.isna(imp):
-                    return [""] * len(row)
-                if imp < 0:
-                    return ["background-color: #ffcccc"] * len(row)
-                elif imp > 0:
-                    return ["background-color: #ccffcc"] * len(row)
-                return [""] * len(row)
-            _fmt_1f = lambda x: f"{x:.1f}" if x is not None and not (isinstance(x, float) and pd.isna(x)) else ""
-            styled = df.style.apply(_color_row, axis=1).format(
-                {col: _fmt_1f for col in ("EV_Actual", "EV_AI", "Actual_Tricks", "AI_Tricks", "Actual_Result", "AI_Result") if col in df.columns}
-            )
-            container.dataframe(styled, width="stretch", hide_index=True)
-        else:
-            container.dataframe(df, width="stretch", hide_index=True)
-        return
-
-    # ---- Interactive AgGrid with row-click support ----
-    # Map IMP_Diff to a bucket column for row colouring:
-    #   Invalid (red) = AI did worse, Valid (green) = AI did better, Neutral = tied/unknown
+    # Use AgGrid for both live and final renders so column typing/sorting stays
+    # consistent throughout the batch lifecycle.
     enriched: list[dict] = []
     for r in results:
         row = dict(r)
@@ -7258,19 +7937,27 @@ def _render_batch_results_df(
         else:
             row["_IMP_Color"] = "Neutral"  # no class → white
         enriched.append(row)
+    enriched = _batch_results_to_dataframe(enriched).to_dict("records")
 
-    selected_records = render_aggrid(
-        enriched,
-        key=aggrid_key,
-        table_name=None,
-        show_sql_expander=False,
-        row_bucket_col="_IMP_Color",
-        hide_cols=["_IMP_Color"],
-        update_on=["selectionChanged"],
-        height=height if height is not None else calc_grid_height(len(enriched), max_height=600),
-    )
+    def _render_batch_grid() -> list[dict[str, Any]]:
+        return render_aggrid(
+            enriched,
+            key=aggrid_key,
+            table_name=None,
+            show_sql_expander=False,
+            row_bucket_col="_IMP_Color",
+            hide_cols=["_IMP_Color", "_Batch_Row_Key"],
+            update_on=["selectionChanged"] if interactive else [],
+            height=height if height is not None else calc_grid_height(len(enriched), max_height=600),
+        )
 
-    if selected_records:
+    if hasattr(container, "__enter__") and hasattr(container, "__exit__"):
+        with container:
+            selected_records = _render_batch_grid()
+    else:
+        selected_records = _render_batch_grid()
+
+    if interactive and selected_records:
         st.session_state["_batch_selected_result"] = selected_records[0]
 
 
@@ -12241,9 +12928,62 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     except Exception:
                         pass_bonus = 0.0
                         pass_bonus_reason = None
-                    pass_score = float(pass_score) + float(pass_bonus)
+                    pass_penalty = 0.0
+                    pass_penalty_reason = None
+                    try:
+                        _self_tp_actual = None
+                        _self_hcp_actual = None
+                        _self_hand_actual = None
+                        if pinned_deal and acting_dir_adv:
+                            _self_tp_raw = pinned_deal.get(f"Total_Points_{acting_dir_adv}")
+                            if _self_tp_raw is not None:
+                                _self_tp_actual = float(_self_tp_raw)
+                            _self_hcp_raw = pinned_deal.get(f"HCP_{acting_dir_adv}")
+                            if _self_hcp_raw is not None:
+                                _self_hcp_actual = float(_self_hcp_raw)
+                            _self_hand_actual = str(pinned_deal.get(f"Hand_{acting_dir_adv}", "") or "").strip() or None
+                        _has_non_pass = any(
+                            str((_r or {}).get("Bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                            for _r in list(advanced_rows or [])
+                        )
+                        _pass_agg_expr = None
+                        if isinstance(pr, dict):
+                            for _k in ("Agg_Expr", "agg_expr", "Expr", "expr"):
+                                _v = pr.get(_k)
+                                if isinstance(_v, list):
+                                    _pass_agg_expr = _v
+                                    break
+                        pass_penalty, pass_penalty_reason = compute_constructive_pass_penalty(
+                            auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                            acting_direction=acting_dir_adv,
+                            dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                            has_non_pass_choice=bool(_has_non_pass),
+                            self_total_points=_self_tp_actual,
+                            self_hcp=_self_hcp_actual,
+                            pass_agg_expr=_pass_agg_expr,
+                        )
+                        forced_non_pass = compute_forced_non_pass_policy(
+                            auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                            acting_direction=acting_dir_adv,
+                            dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                            has_non_pass_choice=bool(_has_non_pass),
+                            self_total_points=_self_tp_actual,
+                            self_hcp=_self_hcp_actual,
+                            self_hand=_self_hand_actual,
+                        )
+                    except Exception:
+                        pass_penalty = 0.0
+                        pass_penalty_reason = None
+                        forced_non_pass = {"hard_block": False, "reason": None}
+                    pass_score = float(pass_score) + float(pass_bonus) - float(pass_penalty)
                     if pass_bonus_reason:
                         pass_note = f"{pass_note}; {pass_bonus_reason}"
+                    if pass_penalty_reason:
+                        pass_note = f"{pass_note}; {pass_penalty_reason}"
+                    if bool((forced_non_pass or {}).get("hard_block")):
+                        pass_score = float("-inf")
+                        _forced_reason = str((forced_non_pass or {}).get("reason") or "FORCED_NON_PASS_GAME_VALUES")
+                        pass_note = f"{pass_note}; {_forced_reason}"
                     pass_row_dict = {
                         "Bid": "P",
                         "Error": f"Synthetic row: Pass is not BT-backed (no /bid-details evidence); {pass_note}.",
