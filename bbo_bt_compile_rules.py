@@ -13,8 +13,10 @@ import time
 import os
 import gc
 import argparse
+import math
+import re
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List, Tuple
 from tqdm import tqdm
 
 DEFAULT_BASE_DIR = pathlib.Path(r"e:\bridge\data\bbo\bidding")
@@ -23,6 +25,8 @@ DEFAULT_INPUT_MERGED_NAME = "bbo_bt_merged_rules.parquet"
 DEFAULT_OUTPUT_NAME = "bbo_bt_compiled.parquet"
 
 CHUNK_SIZE = 5_000_000  # 5M rows per chunk
+
+_INEQ_PATTERN = re.compile(r'^(\w+)\s*(>=|<=|>|<|==)\s*(-?\d+)$')
 
 
 def _parse_args() -> argparse.Namespace:
@@ -47,6 +51,96 @@ def format_size(size_bytes: int) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024
     return f"{size:.2f} TB"
+
+
+def _sanitize_same_metric_numeric_contradictions(criteria: List[str] | None) -> List[str]:
+    """Drop impossible same-metric numeric ranges from one criteria list.
+
+    Learned prefix rules can accumulate into impossible bounds during compile,
+    e.g. ``SL_C >= 3`` and ``SL_C <= 2`` on the same seat. When that happens,
+    drop only the contradictory metric's numeric constraints and keep the rest
+    of the criteria list intact.
+
+    This source fix is intentionally narrow: it resolves contradictions within a
+    single numeric metric only. It does not attempt broader cross-metric checks
+    such as impossible suit-total combinations.
+    """
+    if not criteria:
+        return []
+
+    inequalities: Dict[Tuple[str, str], int] = {}
+    equality_values: Dict[str, set[int]] = {}
+    other: List[str] = []
+    ineq_format: Dict[Tuple[str, str], str] = {}
+
+    for crit in criteria:
+        crit_str = str(crit).strip()
+        if not crit_str:
+            continue
+        match = _INEQ_PATTERN.match(crit_str)
+        if not match:
+            if crit_str not in other:
+                other.append(crit_str)
+            continue
+
+        var_name, op, value_str = match.groups()
+        value = int(value_str)
+        key = (var_name, op)
+
+        if op == "==":
+            equality_values.setdefault(var_name, set()).add(value)
+
+        if key not in inequalities:
+            inequalities[key] = value
+            ineq_format[key] = f"{var_name} {op} {value}"
+            continue
+
+        existing = inequalities[key]
+        if op in (">=", ">"):
+            if value < existing:
+                inequalities[key] = value
+                ineq_format[key] = f"{var_name} {op} {value}"
+        elif op in ("<=", "<"):
+            if value > existing:
+                inequalities[key] = value
+                ineq_format[key] = f"{var_name} {op} {value}"
+
+    contradictory_vars: set[str] = set()
+    vars_seen = {var_name for var_name, _op in inequalities.keys()}
+    for var_name in vars_seen:
+        lo = -math.inf
+        hi = math.inf
+
+        ge_val = inequalities.get((var_name, ">="))
+        if ge_val is not None:
+            lo = max(lo, ge_val)
+        gt_val = inequalities.get((var_name, ">"))
+        if gt_val is not None:
+            lo = max(lo, gt_val + 1)
+        le_val = inequalities.get((var_name, "<="))
+        if le_val is not None:
+            hi = min(hi, le_val)
+        lt_val = inequalities.get((var_name, "<"))
+        if lt_val is not None:
+            hi = min(hi, lt_val - 1)
+
+        eq_vals = equality_values.get(var_name, set())
+        if eq_vals:
+            if len(eq_vals) > 1:
+                contradictory_vars.add(var_name)
+                continue
+            eq_val = next(iter(eq_vals))
+            lo = max(lo, eq_val)
+            hi = min(hi, eq_val)
+
+        if lo > hi:
+            contradictory_vars.add(var_name)
+
+    return sorted(
+        fmt
+        for (var_name, _op), fmt in ineq_format.items()
+        if var_name not in contradictory_vars
+    ) + other
 
 def process_chunk(chunk: pl.DataFrame, prefix_dfs_by_len: Dict[int, pl.DataFrame], chunk_num: int = 0, show_progress: bool = True) -> pl.DataFrame:
     """Process a single chunk: apply all prefix-length joins and combine rules."""
@@ -149,12 +243,25 @@ def process_chunk(chunk: pl.DataFrame, prefix_dfs_by_len: Dict[int, pl.DataFrame
     for seat in range(1, 5):
         base_col = f"Agg_Expr_Seat_{seat}"
         mcol = f"_m{seat}"
+        combined_col = f"_combined_{seat}"
         chunk = chunk.with_columns(
             pl.concat_list([pl.col(base_col), pl.col(mcol)])
             .list.eval(pl.element().filter(pl.element().is_not_null()))
             .list.unique()
+            .alias(combined_col)
+        )
+        chunk = chunk.with_columns(
+            pl.when(pl.col(mcol).list.len() > 0)
+            .then(
+                pl.col(combined_col).map_elements(
+                    _sanitize_same_metric_numeric_contradictions,
+                    return_dtype=pl.List(pl.Utf8),
+                )
+            )
+            .otherwise(pl.col(combined_col))
             .alias(base_col)
         )
+        chunk = chunk.drop(combined_col)
     
     # Drop temp columns
     drop_cols = ["_idx", "_norm", "_tokens", "_len"] + [f"_m{s}" for s in range(1, 5)]

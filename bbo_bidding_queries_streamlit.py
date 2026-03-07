@@ -7188,7 +7188,7 @@ def render_ai_model_batch_arena():
                     row_idx = deal_row.get("_row_idx")
 
             # ---- Start AI Model async job ----
-            elapsed_batch_s = max(time.perf_counter() - t0, 1e-9)
+            elapsed_batch_s = max(time.perf_counter() - t_batch_start, 1e-9)
             deals_per_s = i / elapsed_batch_s if i > 0 else 0.0
             progress_bar.progress(
                 i / len(indices),
@@ -12970,6 +12970,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             self_total_points=_self_tp_actual,
                             self_hcp=_self_hcp_actual,
                             self_hand=_self_hand_actual,
+                            pass_agg_expr=[str(_x) for _x in list(_pass_agg_expr or []) if str(_x).strip()],
                         )
                     except Exception:
                         pass_penalty = 0.0

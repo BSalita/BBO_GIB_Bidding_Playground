@@ -62,18 +62,19 @@ _SELF_TP_FLOORS: dict[int, float] = {
 # Tricks required per level (level + 6).
 _TRICKS_REQUIRED: dict[int, int] = {i: i + 6 for i in range(1, 8)}
 
-# Partnership game thresholds used by the "forced non-pass" responder guardrail.
+# Partnership game thresholds used by the "forced non-pass" guardrails.
 # These are intentionally simple bridge heuristics:
 # - NT game: 25 combined HCP
 # - Major game: 26 combined Total_Points
 # - Minor game: 29 combined Total_Points
 #
-# The guardrail currently targets the specific "second pass" shape:
-# partner opens, RHO passes, and responder is considering pass.  If the acting
-# hand plus partner's opening floor already reaches the applicable game target,
-# pass is hard-blocked whenever any non-pass continuation exists.  This forces
-# the scorer to choose the least-worst constructive action instead of allowing a
-# clearly impossible sign-off.
+# These guardrails currently cover:
+# - responder's second-pass shape: `partner opening - pass - ?`
+# - opener rebid gap shape: `opening - pass - response - pass - ?`
+#
+# In both cases, pass is hard-blocked whenever the auction shape or explicit
+# pass-node caps make signoff impossible while some legal non-pass continuation
+# still exists.
 _FORCED_NON_PASS_GAME_HCP_NT = 25.0
 _FORCED_NON_PASS_GAME_TP_MAJOR = 26.0
 _FORCED_NON_PASS_GAME_TP_MINOR = 29.0
@@ -444,29 +445,7 @@ def compute_constructive_pass_penalty(
     tp_actual = float(self_total_points) if isinstance(self_total_points, (int, float)) else None
     hcp_actual = float(self_hcp) if isinstance(self_hcp, (int, float)) else None
 
-    def _upper_bound_excess(metric_name: str, actual_value: float | None) -> tuple[float, float] | None:
-        if actual_value is None:
-            return None
-        best_cap: float | None = None
-        for raw_expr in list(pass_agg_expr or []):
-            try:
-                s = str(raw_expr or "").strip().upper()
-            except Exception:
-                continue
-            if not s:
-                continue
-            m = re.fullmatch(rf"{metric_name}\s*(<=|<)\s*(-?\d+(?:\.\d+)?)", s)
-            if not m:
-                continue
-            op = str(m.group(1))
-            cap = float(m.group(2))
-            eff_cap = cap if op == "<=" else (cap - 1.0)
-            best_cap = eff_cap if best_cap is None else min(best_cap, eff_cap)
-        if best_cap is None or actual_value <= best_cap:
-            return None
-        return best_cap, float(actual_value - best_cap)
-
-    tp_excess = _upper_bound_excess("TOTAL_POINTS", tp_actual)
+    tp_excess = _upper_bound_excess_from_exprs("TOTAL_POINTS", tp_actual, pass_agg_expr)
     if tp_excess is not None:
         tp_cap, tp_over = tp_excess
         tp_pen = min(220.0, 30.0 * float(tp_over))
@@ -476,7 +455,7 @@ def compute_constructive_pass_penalty(
             f"{tp_cap:.0f}; self has {tp_actual:.0f} (-{tp_pen:.0f})"
         )
 
-    hcp_excess = _upper_bound_excess("HCP", hcp_actual)
+    hcp_excess = _upper_bound_excess_from_exprs("HCP", hcp_actual, pass_agg_expr)
     if hcp_excess is not None:
         hcp_cap, hcp_over = hcp_excess
         hcp_pen = min(160.0, 20.0 * float(hcp_over))
@@ -549,11 +528,13 @@ def compute_forced_non_pass_policy(
     self_total_points: float | None,
     self_hcp: float | None,
     self_hand: str | None = None,
+    pass_agg_expr: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Return hard-block policy for impossible second-pass signoffs.
+    """Return hard-block policy for impossible early signoffs.
 
-    This is the shared "can't pass" rule for the uncontested opening shape:
-    `partner opening - pass - ?`.
+    This is the shared "can't pass" rule for early uncontested shapes:
+    - `partner opening - pass - ?`
+    - `opening - pass - response - pass - ?`
 
     Policy:
     - If partner opened `1NT` or `2NT`, treat that as at least 15 / 20 HCP.
@@ -568,10 +549,18 @@ def compute_forced_non_pass_policy(
       same `estimate_partnership_tricks()` heuristic used elsewhere in the
       scorer. The intent is to catch distributional game hands that should not
       be allowed to die with a second pass.
+    - If opener is on rebid after an uncontested response and the current Pass
+      node's explicit HCP / Total_Points caps are violated, hard-block pass.
+      This catches BT range gaps where opener is "too strong to sign off" but
+      the natural continuation buckets are too narrow.
 
     The block only applies when a non-pass continuation exists. If the BT truly
     offers no non-pass call, pass remains available so the auction can continue
     with the least-bad legal action elsewhere in the scorer.
+
+    Additionally, if the current Pass node itself still carries a forcing flag
+    like `Forcing_One_Round`, treat that as an active partnership obligation and
+    hard-block pass while a legal non-pass continuation exists.
     """
     out: dict[str, Any] = {
         "hard_block": False,
@@ -582,12 +571,77 @@ def compute_forced_non_pass_policy(
         return out
 
     try:
+        forcing_tokens = {
+            str(tok).strip().upper()
+            for tok in list(pass_agg_expr or [])
+            if str(tok).strip()
+        }
+        if "FORCING_ONE_ROUND" in forcing_tokens:
+            out["hard_block"] = True
+            out["reason"] = (
+                "FORCED_NON_PASS_FORCING_ONE_ROUND: current Pass node still carries "
+                "Forcing_One_Round, so pass cannot override a live forcing auction "
+                "while legal non-pass continuations exist"
+            )
+            out["context"] = {
+                "metric": "forcing_flag",
+                "forcing_flag": "Forcing_One_Round",
+                "pass_agg_expr": [str(tok) for tok in list(pass_agg_expr or []) if str(tok).strip()],
+            }
+            return out
+
         second_pass_ctx = extract_second_pass_opening_context(
             auction_tokens=list(auction_tokens or []),
             acting_direction=acting_direction,
             dealer_actual=dealer_actual,
         )
         if second_pass_ctx is None:
+            opener_rebid_ctx = extract_opener_rebid_pass_context(
+                auction_tokens=list(auction_tokens or []),
+                acting_direction=acting_direction,
+                dealer_actual=dealer_actual,
+            )
+            if opener_rebid_ctx is None:
+                return out
+
+            tp_actual = float(self_total_points) if isinstance(self_total_points, (int, float)) else None
+            hcp_actual = float(self_hcp) if isinstance(self_hcp, (int, float)) else None
+            tp_excess = _upper_bound_excess_from_exprs("TOTAL_POINTS", tp_actual, pass_agg_expr)
+            hcp_excess = _upper_bound_excess_from_exprs("HCP", hcp_actual, pass_agg_expr)
+            if tp_excess is None and hcp_excess is None:
+                return out
+
+            reason_bits: list[str] = []
+            context: dict[str, Any] = {
+                "opening_bid": str(opener_rebid_ctx.get("opening_bid") or ""),
+                "response_bid": str(opener_rebid_ctx.get("response_bid") or ""),
+                "metric": "rebid_gap",
+            }
+            if tp_excess is not None and tp_actual is not None:
+                tp_cap, tp_over = tp_excess
+                reason_bits.append(
+                    f"Pass node caps Total_Points at {tp_cap:.0f} but self has {tp_actual:.0f}"
+                )
+                context["self_total_points"] = float(tp_actual)
+                context["tp_cap"] = float(tp_cap)
+                context["tp_over"] = float(tp_over)
+            if hcp_excess is not None and hcp_actual is not None:
+                hcp_cap, hcp_over = hcp_excess
+                reason_bits.append(
+                    f"Pass node caps HCP at {hcp_cap:.0f} but self has {hcp_actual:.0f}"
+                )
+                context["self_hcp"] = float(hcp_actual)
+                context["hcp_cap"] = float(hcp_cap)
+                context["hcp_over"] = float(hcp_over)
+
+            out["hard_block"] = True
+            out["reason"] = (
+                "FORCED_NON_PASS_REBID_GAP: opener cannot sign off after "
+                f"{context['opening_bid']}-P-{context['response_bid']}-P when "
+                + "; ".join(reason_bits)
+                + " and legal non-pass continuations exist"
+            )
+            out["context"] = context
             return out
 
         opening_bid = str(second_pass_ctx.get("opening_bid") or "")
@@ -1258,6 +1312,10 @@ def compute_guardrail_penalty(
     # Hard policy with confidence-gated exception:
     # no non-sacrifice overbids unless partner is sufficiently constrained and
     # value-push evidence supports the target level.
+    support_major_game_equiv = bool(
+        is_raise_of_partner_suit and bid_strain in ("H", "S") and nt_major_game_equiv and not par_is_opponents
+    )
+
     if top_rank is not None and bid_rank is not None and bid_rank > top_rank and not par_is_opponents:
         rank_gap = int(bid_rank) - int(top_rank)
         tp_conf = _tp_hist_confidence(partner_tp_hist)
@@ -1274,7 +1332,12 @@ def compute_guardrail_penalty(
         value_push_evidence = tp_supports_level or tricks_support_level
         allow_confident_value_push = bool(partner_confidence >= 0.75 and value_push_evidence)
 
-        if not allow_confident_value_push:
+        if support_major_game_equiv:
+            reasons.append(
+                "NO_NON_SAC_OVERBID_BYPASS: partner-major support context treats 3NT and 4M "
+                "as equivalent game targets"
+            )
+        elif not allow_confident_value_push:
             # 1.0 at low confidence, down to 0.15 at very high confidence.
             hard_scale = max(0.15, 1.0 - 0.85 * float(partner_confidence))
             hard_p = max(0.0, float(rank_gap) * float(w_non_sac_overbid_hard) * hard_scale)
@@ -1692,6 +1755,64 @@ def _partner_dir(direction: str | None) -> str:
     return {"N": "S", "S": "N", "E": "W", "W": "E"}.get(d, "N")
 
 
+def _upper_bound_excess_from_exprs(
+    metric_name: str,
+    actual_value: float | None,
+    exprs: list[Any] | None,
+) -> tuple[float, float] | None:
+    """Return (effective_cap, excess) for the tightest upper bound in `exprs`."""
+    if actual_value is None:
+        return None
+    best_cap: float | None = None
+    for raw_expr in list(exprs or []):
+        try:
+            s = str(raw_expr or "").strip().upper()
+        except Exception:
+            continue
+        if not s:
+            continue
+        m = re.fullmatch(rf"{metric_name}\s*(<=|<)\s*(-?\d+(?:\.\d+)?)", s)
+        if not m:
+            continue
+        op = str(m.group(1))
+        cap = float(m.group(2))
+        eff_cap = cap if op == "<=" else (cap - 1.0)
+        best_cap = eff_cap if best_cap is None else min(best_cap, eff_cap)
+    if best_cap is None or actual_value <= best_cap:
+        return None
+    return best_cap, float(actual_value - best_cap)
+
+
+def extract_pass_range_caps(pass_agg_expr: list[Any] | None) -> dict[str, float | None]:
+    """Extract the tightest explicit Pass caps for Total_Points and HCP."""
+    tp_cap: float | None = None
+    hcp_cap: float | None = None
+    for raw_expr in list(pass_agg_expr or []):
+        try:
+            expr = str(raw_expr or "").strip().upper()
+        except Exception:
+            continue
+        if not expr:
+            continue
+        tp_match = re.fullmatch(r"TOTAL_POINTS\s*(<=|<)\s*(-?\d+(?:\.\d+)?)", expr)
+        if tp_match is not None:
+            cap = float(tp_match.group(2))
+            if str(tp_match.group(1)) == "<":
+                cap -= 1.0
+            tp_cap = cap if tp_cap is None else min(tp_cap, cap)
+            continue
+        hcp_match = re.fullmatch(r"HCP\s*(<=|<)\s*(-?\d+(?:\.\d+)?)", expr)
+        if hcp_match is not None:
+            cap = float(hcp_match.group(2))
+            if str(hcp_match.group(1)) == "<":
+                cap -= 1.0
+            hcp_cap = cap if hcp_cap is None else min(hcp_cap, cap)
+    return {
+        "tp_cap": tp_cap,
+        "hcp_cap": hcp_cap,
+    }
+
+
 def extract_second_pass_opening_context(
     *,
     auction_tokens: list[str],
@@ -1757,6 +1878,115 @@ def extract_second_pass_opening_context(
         "partner_direction": partner_direction,
         "acting_direction": act,
     }
+
+
+def extract_opener_rebid_pass_context(
+    *,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+) -> dict[str, Any] | None:
+    """Normalize uncontested opener-rebid pass shapes: `opening-P-response-P-?`.
+
+    Leading opening passes are allowed, so `P-1S-P-1N-P` is treated the same as
+    `1S-P-1N-P` for opener-side heuristics.
+    """
+    act = str(acting_direction or "").strip().upper()
+    if act not in ("N", "E", "S", "W"):
+        return None
+
+    toks = [str(t or "").strip().upper() for t in list(auction_tokens or []) if str(t or "").strip()]
+    if len(toks) < 4:
+        return None
+
+    opening_idx: int | None = None
+    opening_bid = ""
+    for i, tk in enumerate(toks):
+        lvl = _parse_bid_level(tk)
+        st = _parse_bid_strain(tk)
+        if lvl is None or st is None:
+            continue
+        opening_idx = i
+        opening_bid = tk
+        break
+
+    if opening_idx is None or len(toks) != (opening_idx + 4):
+        return None
+    if toks[opening_idx + 1] not in ("P", "PASS") or toks[opening_idx + 3] not in ("P", "PASS"):
+        return None
+
+    response_bid = toks[opening_idx + 2]
+    response_level = _parse_bid_level(response_bid)
+    response_strain = _parse_bid_strain(response_bid)
+    if response_level is None or response_strain is None:
+        return None
+
+    opener_direction = _token_bidder_dir(int(opening_idx), dealer_actual)
+    if opener_direction != act:
+        return None
+    responder_direction = _token_bidder_dir(int(opening_idx + 2), dealer_actual)
+    if responder_direction != _partner_dir(act):
+        return None
+
+    next_to_act = _token_bidder_dir(len(toks), dealer_actual)
+    if next_to_act != act:
+        return None
+
+    return {
+        "tokens": toks,
+        "opening_idx": int(opening_idx),
+        "leading_passes": int(opening_idx),
+        "opening_bid": opening_bid,
+        "response_bid": response_bid,
+        "response_level": int(response_level),
+        "response_strain": str(response_strain),
+        "opener_direction": opener_direction,
+        "responder_direction": responder_direction,
+        "acting_direction": act,
+    }
+
+
+def extract_early_constructive_range_gap_context(
+    *,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+) -> dict[str, Any] | None:
+    """Return a normalized early constructive pass-gap context.
+
+    Supported shapes:
+    - responder second pass: `partner opening - pass - ?`
+    - opener rebid gap: `opening - pass - response - pass - ?`
+    """
+    second_pass_ctx = extract_second_pass_opening_context(
+        auction_tokens=list(auction_tokens or []),
+        acting_direction=acting_direction,
+        dealer_actual=dealer_actual,
+    )
+    if second_pass_ctx is not None:
+        return {
+            **second_pass_ctx,
+            "kind": "response_new_suit",
+            "partner_bid": str(second_pass_ctx.get("opening_bid") or ""),
+            "reference_strain": str(second_pass_ctx.get("opening_strain") or ""),
+            "partner_direction": str(second_pass_ctx.get("partner_direction") or ""),
+        }
+
+    opener_rebid_ctx = extract_opener_rebid_pass_context(
+        auction_tokens=list(auction_tokens or []),
+        acting_direction=acting_direction,
+        dealer_actual=dealer_actual,
+    )
+    if opener_rebid_ctx is not None:
+        return {
+            **opener_rebid_ctx,
+            "kind": "opener_rebid",
+            "partner_bid": str(opener_rebid_ctx.get("response_bid") or ""),
+            "reference_strain": str(_parse_bid_strain(opener_rebid_ctx.get("opening_bid")) or ""),
+            "partner_direction": str(opener_rebid_ctx.get("responder_direction") or ""),
+        }
+
+    return None
 
 
 def opponent_shown_natural_strains(
@@ -2098,6 +2328,63 @@ def compute_common_sense_hard_override(
         "combined_total_points_expected": tp_combined,
         "current_best_bid": best_bid,
     }
+
+    def _strain_rank(strain: str | None) -> int:
+        order = {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}
+        return int(order.get(str(strain or "").upper(), -1))
+
+    # Whitelist 0: with equal 5-5 or 6-6 suits, prefer the higher-ranked suit.
+    try:
+        best_contract = _parse_contract_bid_text(best_bid)
+        if best_contract is not None and isinstance(sl, dict) and sl:
+            best_level, best_strain = int(best_contract[0]), str(best_contract[1])
+            if best_strain in ("C", "D", "H", "S"):
+                same_level_suits: list[tuple[str, int]] = []
+                for row in legal:
+                    row_bid = str((row or {}).get("bid", "") or "").strip().upper()
+                    row_contract = _parse_contract_bid_text(row_bid)
+                    if row_contract is None:
+                        continue
+                    row_level, row_strain = int(row_contract[0]), str(row_contract[1])
+                    if row_level != best_level or row_strain not in ("C", "D", "H", "S"):
+                        continue
+                    row_len = sl.get(row_strain)
+                    if row_len is None:
+                        continue
+                    same_level_suits.append((row_strain, int(row_len)))
+
+                best_len = sl.get(best_strain)
+                if best_len is not None and int(best_len) in (5, 6):
+                    same_len_suits = sorted(
+                        {
+                            str(row_strain)
+                            for row_strain, row_len in same_level_suits
+                            if int(row_len) == int(best_len)
+                        },
+                        key=_strain_rank,
+                    )
+                    if len(same_len_suits) >= 2:
+                        preferred_strain = same_len_suits[-1]
+                        if _strain_rank(preferred_strain) > _strain_rank(best_strain):
+                            selected_bid = f"{best_level}{preferred_strain}"
+                            if any(
+                                str((row or {}).get("bid", "") or "").strip().upper() == selected_bid
+                                for row in legal
+                            ):
+                                return {
+                                    "apply": True,
+                                    "selected_bid": selected_bid,
+                                    "reason_codes": ["equal_length_higher_suit_preference"],
+                                    "reason": "COMMON_SENSE_HARD_OVERRIDE: prefer higher-ranked suit with equal 5-5 or 6-6 shape",
+                                    "evidence": {
+                                        **evidence,
+                                        "equal_length": int(best_len),
+                                        "same_level_suits": same_len_suits,
+                                        "preferred_strain": preferred_strain,
+                                    },
+                                }
+    except Exception:
+        pass
 
     # Whitelist A: double over opponent NT partscore.
     try:

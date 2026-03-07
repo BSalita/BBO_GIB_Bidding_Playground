@@ -190,6 +190,118 @@ def enrich_bt_row_with_agg_expr(
 _INEQ_PATTERN = re.compile(r'^(\w+)\s*(>=|<=|>|<|==)\s*(-?\d+)$')
 
 
+def _dedupe_criteria_least_restrictive_with_notes(criteria: List[str]) -> Tuple[List[str], List[str]]:
+    """Deduplicate criteria and drop impossible numeric ranges.
+
+    Runtime rows can inherit learned prefix rules that become mutually exclusive
+    after compilation, e.g. ``SL_C >= 3`` and ``SL_C <= 2`` on the same seat.
+    Those contradictions collapse the criteria mask to zero and make otherwise
+    reasonable continuations disappear. When that happens, we drop only the
+    contradictory metric's numeric bounds and keep the rest of the seat criteria.
+
+    Scope note: this helper only resolves contradictions within the same numeric
+    metric (for example ``SL_C >= 3`` vs ``SL_C <= 2``). It does not yet try to
+    resolve broader cross-metric inconsistencies such as impossible suit-total
+    combinations or ``HCP`` versus ``Total_Points`` conflicts.
+    """
+    if not criteria:
+        return [], []
+
+    # Track inequalities: (var_name, operator) -> best_value
+    inequalities: Dict[Tuple[str, str], int] = {}
+    # Track all seen equality values so conflicting == constraints can be detected
+    equality_values: Dict[str, set[int]] = {}
+    # Track non-numeric criteria (preserve order)
+    other: List[str] = []
+    # Track original inequality strings to preserve spacing/formatting
+    ineq_format: Dict[Tuple[str, str], str] = {}
+
+    for crit in criteria:
+        crit_str = str(crit).strip()
+        match = _INEQ_PATTERN.match(crit_str)
+        if match:
+            var_name, op, value_str = match.groups()
+            value = int(value_str)
+            key = (var_name, op)
+
+            if op == "==":
+                equality_values.setdefault(var_name, set()).add(value)
+
+            if key not in inequalities:
+                inequalities[key] = value
+                ineq_format[key] = f"{var_name} {op} {value}"
+            else:
+                existing = inequalities[key]
+                # For lower bounds (>=, >): keep smallest (least restrictive)
+                if op in (">=", ">"):
+                    if value < existing:
+                        inequalities[key] = value
+                        ineq_format[key] = f"{var_name} {op} {value}"
+                # For upper bounds (<=, <): keep largest (least restrictive)
+                elif op in ("<=", "<"):
+                    if value > existing:
+                        inequalities[key] = value
+                        ineq_format[key] = f"{var_name} {op} {value}"
+                # For ==: first wins for formatting, but we still track all seen values above
+        else:
+            # Non-numeric criterion - add if not already present
+            if crit_str not in other:
+                other.append(crit_str)
+
+    contradictory_vars: set[str] = set()
+    notes: List[str] = []
+    vars_seen = {var_name for var_name, _op in inequalities.keys()}
+
+    for var_name in sorted(vars_seen):
+        lo = -math.inf
+        hi = math.inf
+
+        ge_val = inequalities.get((var_name, ">="))
+        if ge_val is not None:
+            lo = max(lo, ge_val)
+        gt_val = inequalities.get((var_name, ">"))
+        if gt_val is not None:
+            lo = max(lo, gt_val + 1)
+        le_val = inequalities.get((var_name, "<="))
+        if le_val is not None:
+            hi = min(hi, le_val)
+        lt_val = inequalities.get((var_name, "<"))
+        if lt_val is not None:
+            hi = min(hi, lt_val - 1)
+
+        eq_vals = equality_values.get(var_name, set())
+        if eq_vals:
+            if len(eq_vals) > 1:
+                contradictory_vars.add(var_name)
+                notes.append(
+                    f"IMPOSSIBLE_RANGE_DROPPED: {var_name} had conflicting equality constraints "
+                    f"{sorted(eq_vals)}; dropped numeric constraints for {var_name}"
+                )
+                continue
+            eq_val = next(iter(eq_vals))
+            lo = max(lo, eq_val)
+            hi = min(hi, eq_val)
+
+        if lo > hi:
+            contradictory_vars.add(var_name)
+            lo_txt = str(int(lo)) if lo != -math.inf else "-inf"
+            hi_txt = str(int(hi)) if hi != math.inf else "inf"
+            notes.append(
+                f"IMPOSSIBLE_RANGE_DROPPED: {var_name} had contradictory numeric bounds "
+                f"(effective range {lo_txt}..{hi_txt}); dropped numeric constraints for {var_name}"
+            )
+
+    # Combine: inequalities first (sorted for consistency), then other.
+    # Any metric with an impossible range is removed entirely so the remaining
+    # criteria stay satisfiable.
+    result = sorted(
+        fmt
+        for (var_name, _op), fmt in ineq_format.items()
+        if var_name not in contradictory_vars
+    ) + other
+    return result, notes
+
+
 def dedupe_criteria_least_restrictive(criteria: List[str]) -> List[str]:
     """Deduplicate criteria list, keeping least restrictive bounds for each variable.
     
@@ -204,47 +316,7 @@ def dedupe_criteria_least_restrictive(criteria: List[str]) -> List[str]:
         ["HCP >= 3", "HCP >= 5", "HCP <= 10"]  -> ["HCP >= 3", "HCP <= 10"]
         ["SL_S >= 4", "SL_S >= 2", "Balanced"] -> ["SL_S >= 2", "Balanced"]
     """
-    if not criteria:
-        return []
-    
-    # Track inequalities: (var_name, operator) -> best_value
-    inequalities: Dict[Tuple[str, str], int] = {}
-    # Track non-numeric criteria (preserve order)
-    other: List[str] = []
-    # Track original inequality strings to preserve spacing/formatting
-    ineq_format: Dict[Tuple[str, str], str] = {}
-    
-    for crit in criteria:
-        crit_str = str(crit).strip()
-        match = _INEQ_PATTERN.match(crit_str)
-        if match:
-            var_name, op, value_str = match.groups()
-            value = int(value_str)
-            key = (var_name, op)
-            
-            if key not in inequalities:
-                inequalities[key] = value
-                ineq_format[key] = f"{var_name} {op} {value}"
-            else:
-                existing = inequalities[key]
-                # For lower bounds (>=, >): keep smallest (least restrictive)
-                if op in ('>=', '>'):
-                    if value < existing:
-                        inequalities[key] = value
-                        ineq_format[key] = f"{var_name} {op} {value}"
-                # For upper bounds (<=, <): keep largest (least restrictive)
-                elif op in ('<=', '<'):
-                    if value > existing:
-                        inequalities[key] = value
-                        ineq_format[key] = f"{var_name} {op} {value}"
-                # For ==: first wins (can't merge different equality values)
-        else:
-            # Non-numeric criterion - add if not already present
-            if crit_str not in other:
-                other.append(crit_str)
-    
-    # Combine: inequalities first (sorted for consistency), then other
-    result = sorted(ineq_format.values()) + other
+    result, _notes = _dedupe_criteria_least_restrictive_with_notes(criteria)
     return result
 
 
@@ -389,18 +461,24 @@ def dedupe_criteria_all_seats(bt_row: dict[str, Any]) -> dict[str, Any]:
     """Deduplicate criteria for all seats in a BT row.
     
     Modifies the row in place and returns it.
-    Uses least-restrictive bounds when deduplicating.
+    Uses least-restrictive bounds when deduplicating, and drops impossible
+    same-metric numeric ranges while recording notes in
+    ``Criteria_Contradictions_Seat_*``.
     """
     for seat in SEAT_RANGE:
         col = f"Agg_Expr_Seat_{seat}"
+        notes_col = f"Criteria_Contradictions_Seat_{seat}"
         if col in bt_row:
             # Handle both list and pipe-separated categorical string
             val = bt_row.get(col)
             lst = _ensure_list_criteria(val)
             if lst:
-                bt_row[col] = dedupe_criteria_least_restrictive(lst)
+                deduped, notes = _dedupe_criteria_least_restrictive_with_notes(lst)
+                bt_row[col] = deduped
+                bt_row[notes_col] = notes
             else:
                 bt_row[col] = []
+                bt_row[notes_col] = []
     return bt_row
 
 
