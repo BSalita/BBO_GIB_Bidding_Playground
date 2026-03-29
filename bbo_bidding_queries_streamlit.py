@@ -1,9 +1,14 @@
 """Streamlit frontend for BBO GIB Bidding Playground.
 
-All heavy work is delegated to the FastAPI service defined in
+All heavy work is delegated to the main FastAPI service defined in
 `bbo_bidding_queries_api.py`.
 
-Run the server first (takes about 8-10 minutes to complete):
+This repo also has split API surfaces (`bbo_bidding_queries_api_live.py`,
+`bbo_bidding_queries_api_oracle.py`, and `bbo_bidding_queries_api_shared.py`),
+but the current Streamlit app still talks to `http://127.0.0.1:8000`, so the
+main API must be running first.
+
+Start the main API server (takes about 8-10 minutes to complete):
 
     python bbo_bidding_queries_api.py
 
@@ -36,7 +41,7 @@ import os
 import sys
 import re
 from typing import Any, Dict, List, Literal, Optional, Set
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import plotly.graph_objects as go  # type: ignore[import-not-found]
 import mlBridge.mlBridgeLib as mlBridgeLib
@@ -90,9 +95,20 @@ from bbo_hand_eval_lib import (
     estimate_quick_losers,
 )
 from chatlib.expert_chat import call_provider, call_providers_all
+from plugins.bad_auction_review import (
+    build_negative_imp_review_packets,
+    run_llm_reviews_for_packets,
+    summarize_review_records,
+)
+from plugins.auction_error_taxonomy import (
+    add_auction_error_taxonomy_to_row,
+    build_auction_error_summary_df,
+)
+from plugins.batch_arena_runner import BatchRunResult
 
-CHAT_PROVIDERS = ["OpenRouter"]
+CHAT_PROVIDERS = ["OpenAI", "OpenRouter"]
 DEFAULT_MODELS: dict[str, str] = {
+    "OpenAI": str(os.getenv("OPENAI_MODEL", "") or "").strip() or "gpt-5-mini",
     "OpenRouter": "openai/gpt-oss-120b",
 }
 
@@ -239,6 +255,30 @@ def _sanitize_range_expr_for_filename(ranges_text: Any) -> str:
     s = re.sub(r"[^A-Za-z0-9_+\-]", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "all"
+
+
+def _deal_source_display_label(source: Any) -> str:
+    """Return a compact source label for UI titles, e.g. 'R40' from 'R40.pbn'."""
+    s = str(source or "").strip()
+    if not s:
+        return ""
+    parsed = urlparse(s)
+    candidate = parsed.path if parsed.scheme and parsed.netloc else s
+    candidate = re.split(r"[\\/]", candidate.rstrip("/\\"))[-1]
+    if not candidate:
+        return ""
+    candidate = unquote(candidate)
+    # Remove a simple filename extension so titles stay compact.
+    return pathlib.PurePosixPath(candidate).stem or candidate
+
+
+def _format_batch_deal_diagram_title(deal_idx: Any, source: Any) -> str:
+    """Build the batch-arena deal diagram title, including source when present."""
+    deal_part = str(deal_idx).strip() if deal_idx is not None else "?"
+    source_label = _deal_source_display_label(source)
+    if source_label:
+        return f"📋 {source_label} Deal {deal_part}"
+    return f"📋 Deal {deal_part}"
 
 
 def _batch_result_export_path(*, batch_mode: str, input_cfg: dict[str, Any]) -> pathlib.Path:
@@ -1162,6 +1202,86 @@ def api_post(path: str, payload: Dict[str, Any], timeout: int | None = None) -> 
     return data
 
 
+def _extract_ai_model_override_steps(ai_model_steps: Any) -> list[dict[str, Any]]:
+    """Return a compact list of steps where a hard/common-sense gate fired."""
+    out: list[dict[str, Any]] = []
+    for step in list(ai_model_steps or []):
+        if not isinstance(step, dict):
+            continue
+        gate_reason = step.get("common_sense_gate_reason")
+        gate_applied = bool(step.get("common_sense_final_gate_applied"))
+        if not gate_applied and not gate_reason:
+            continue
+        out.append(
+            {
+                "step": step.get("step"),
+                "choice": step.get("choice"),
+                "gate_applied": gate_applied,
+                "gate_reason": gate_reason,
+            }
+        )
+    return out
+
+
+def _fetch_live_ai_model_debug_refresh(
+    *,
+    cache_key: str,
+    deal_row_idx: int | None,
+    deal_row_dict: dict[str, Any] | None,
+    seed: int,
+    logic_mode: str,
+    use_guardrails_v2: bool,
+    permissive_pass: bool,
+    max_steps: int = 24,
+    top_n: int = 12,
+    max_deals: int = 500,
+    start_timeout_s: int = 15,
+    poll_timeout_s: int = 10,
+    max_polls: int = 60,
+    poll_interval_s: float = 0.5,
+) -> dict[str, Any] | None:
+    """Run a fresh advanced-path solve for the debug dump, with simple session caching."""
+    cache = st.session_state.setdefault("_ai_model_debug_refresh_cache", {})
+    if cache_key in cache:
+        cached = cache.get(cache_key)
+        return cached if isinstance(cached, dict) else None
+
+    start_payload: dict[str, Any] = {
+        "deal_row_idx": int(deal_row_idx) if deal_row_idx is not None else -1,
+        "seed": int(seed),
+        "logic_mode": str(logic_mode),
+        "use_guardrails_v2": bool(use_guardrails_v2),
+        "max_steps": int(max_steps),
+        "top_n": int(top_n),
+        "max_deals": int(max_deals),
+        "permissive_pass": bool(permissive_pass),
+    }
+    if deal_row_idx is None and isinstance(deal_row_dict, dict) and deal_row_dict:
+        start_payload["deal_row_dict"] = deal_row_dict
+
+    start_resp = api_post("/ai-model-advanced-path/start", start_payload, timeout=start_timeout_s)
+    job_id = str(start_resp.get("job_id") or "").strip()
+    if not job_id:
+        return None
+
+    live_result: dict[str, Any] | None = None
+    for _ in range(int(max_polls)):
+        time.sleep(float(poll_interval_s))
+        job = api_get(f"/ai-model-advanced-path/status/{job_id}", timeout=poll_timeout_s)
+        status = str(job.get("status") or "").strip().lower()
+        if status == "completed":
+            result = job.get("result") or {}
+            if isinstance(result, dict):
+                live_result = result
+            break
+        if status in {"failed", "error"}:
+            break
+
+    if isinstance(live_result, dict):
+        cache[cache_key] = live_result
+    return live_result
+
+
 def _expert_chat_system_prompt(*, style: str = "Classic", compact: bool = True) -> str:
     """Return system prompt text for expert chat."""
     s = str(style or "Classic").strip().lower()
@@ -1893,6 +2013,13 @@ def render_aggrid(
         st.info("No rows to display.")
         return []
 
+    # Keep raw taxonomy payloads at the far right so primary decision columns
+    # remain visible without horizontal scrolling.
+    _taxonomy_cols = [c for c in ("Auction_Error_Taxonomy", "auction_error_taxonomy") if c in df.columns]
+    if _taxonomy_cols:
+        _front_cols = [c for c in df.columns if c not in _taxonomy_cols]
+        df = df.select(_front_cols + _taxonomy_cols)
+
     # ---------------------------------------------------------------------
     # SQL expander (always on by default)
     # ---------------------------------------------------------------------
@@ -2214,6 +2341,17 @@ def render_aggrid(
                 maxWidth=135,
                 suppressSizeToFit=True,
             )
+
+    # Keep auction taxonomy payload narrow; full content is available via tooltip.
+    for _taxonomy_col in ("Auction_Error_Taxonomy", "auction_error_taxonomy"):
+        if _taxonomy_col in df.columns:
+            gb.configure_column(
+                _taxonomy_col,
+                width=100,
+                minWidth=100,
+                maxWidth=100,
+                suppressSizeToFit=True,
+            )
     
     gb.configure_grid_options(
         rowHeight=25,
@@ -2344,11 +2482,22 @@ def render_aggrid(
     )
     
     selected_rows: Any = response.get("selected_rows", [])
-    # AgGrid returns a list of dicts or a list of dataframes depending on version
+    # AgGrid returns a list of dicts or a DataFrame depending on version.
     if selected_rows is not None and hasattr(selected_rows, "to_dict"):
         selected_records = selected_rows.to_dict("records")
     else:
         selected_records = list(selected_rows) if selected_rows is not None else []
+
+    # Prefer the explicit click payload when present. Some streamlit-aggrid event
+    # combinations can leave `selected_rows` stale across reruns, which makes the
+    # detail panel show a different row from the one the user just clicked.
+    try:
+        event_data = response.get("event_data") or response.get("eventData") or {}
+        clicked_row = event_data.get("data") if isinstance(event_data, dict) else None
+        if isinstance(clicked_row, dict) and clicked_row:
+            selected_records = [clicked_row]
+    except Exception:
+        pass
 
     # Option B: Copy panel (best-effort, works regardless of AgGrid clipboard support)
     if show_copy_panel and selected_records:
@@ -2485,24 +2634,58 @@ if bt_df_rows is not None and deal_df_rows is not None:
     st.info(f"📊 Loaded data: **{deal_df_rows:,}** deals, **{bt_df_rows:,}** bidding table entries")
 
 # ---------------------------------------------------------------------------
-# Auto-reload custom criteria overlay on every page refresh
+# Auto-refresh backend hot-reloadables on every page refresh
 # ---------------------------------------------------------------------------
-# This ensures CSV edits are picked up immediately without manual button clicks.
-# The reload is fast (just re-reads the CSV) so it's safe to do on every refresh.
+# This ensures hot-reloadable plugin edits and CSV overlay edits are picked up
+# immediately without manual button clicks. If the API process itself is stale
+# (non-plugin code changed), capture that status so the UI can warn clearly.
 
 def _auto_reload_criteria_overlay():
-    """Silently reload custom criteria overlay from CSV."""
+    """Silently reload backend hot-reloadables and capture sync status."""
     try:
         resp = requests.post(f"{API_BASE}/custom-criteria-reload", timeout=10)
         if resp.ok:
             data = resp.json()
             rules_count = data.get("stats", {}).get("rules_applied", 0)
-            # Store in session state for display in sidebar if needed
+            # Store status for lightweight display and stale-backend warnings.
             st.session_state["_criteria_overlay_rules"] = rules_count
+            hot_reload = bool(data.get("hot_reload", False))
+            hot_reload_at = data.get("hot_reload_at")
+            prev_hot_reload_at = st.session_state.get("_backend_hot_reload_at")
+            st.session_state["_backend_hot_reload"] = hot_reload
+            st.session_state["_backend_hot_reload_at"] = hot_reload_at
+            st.session_state["_backend_code_out_of_sync"] = bool(data.get("code_out_of_sync", False))
+            st.session_state["_backend_code_changed_files"] = list(data.get("code_changed_files") or [])
+            if hot_reload and hot_reload_at and hot_reload_at != prev_hot_reload_at:
+                # Backend plugin code changed; invalidate UI-held auction/batch results
+                # so a page refresh doesn't keep showing stale pre-reload auctions.
+                for _key in (
+                    "_arena_batch_results",
+                    "_arena_ai_steps_map",
+                    "_arena_batch_input_cfg",
+                    "_batch_selected_result",
+                    "_arena_cache_key",
+                    "_arena_cache_data",
+                ):
+                    st.session_state.pop(_key, None)
+                st.session_state["_backend_results_invalidated"] = True
     except Exception:
-        pass  # Silently ignore - criteria will use last loaded version
+        pass  # Silently ignore - the UI will use the last loaded backend state
 
 _auto_reload_criteria_overlay()
+
+if st.session_state.pop("_backend_results_invalidated", False):
+    st.info("Backend code reloaded. Cleared cached UI results; rerun the auction/batch to see updated output.")
+
+if st.session_state.get("_backend_code_out_of_sync"):
+    _changed_files = [str(x.get("file", "")) for x in st.session_state.get("_backend_code_changed_files", []) if str(x.get("file", "")).strip()]
+    _changed_preview = ", ".join(_changed_files[:3])
+    if len(_changed_files) > 3:
+        _changed_preview += f", +{len(_changed_files) - 3} more"
+    st.warning(
+        "Backend API code changed on disk but this server process has not reloaded it. "
+        f"Restart the API server to pick up: {_changed_preview or 'updated files'}."
+    )
 
 # ---------------------------------------------------------------------------
 # Page Render Functions - one per selectbox option
@@ -4706,7 +4889,7 @@ def render_bidding_arena():
                             f"DD_Score_{model_a}" if f"DD_Score_{model_a}" in sample_df.columns else None,
                             f"DD_Score_{model_b}" if f"DD_Score_{model_b}" in sample_df.columns else None,
                             "DD_Score_Model" if "DD_Score_Model" in sample_df.columns else None,
-                            "IMP_Diff",
+                            "Par_IMP_Diff",
                         ]
                         compare_cols = [c for c in compare_cols if c and c in comparison_df.columns]
                         compare_remaining = [c for c in comparison_df.columns if c not in compare_cols]
@@ -4811,7 +4994,7 @@ def render_bidding_arena():
                     f"DD_Score_{model_a}",
                     f"DD_Score_{model_b}",
                     "Rejection_Reason",
-                    "IMP_Diff",
+                    "Par_IMP_Diff",
                 ]
                 existing = [c for c in priority_cols if c in sample_df.columns]
                 remaining = [c for c in sample_df.columns if c not in existing]
@@ -5462,8 +5645,8 @@ def _render_batch_deal_radar(
     dd_score_ai = sel_result.get("DD_Score_AI")
     ev_actual = sel_result.get("EV_Actual")
     ev_ai = sel_result.get("EV_AI")
-    imp_actual = sel_result.get("IMP_Actual")
-    imp_ai = sel_result.get("IMP_AI")
+    imp_actual = sel_result.get("Par_IMP_Actual", sel_result.get("IMP_Actual"))
+    imp_ai = sel_result.get("Par_IMP_AI", sel_result.get("IMP_AI"))
     par_score = sel_result.get("Par")
 
     hcp_actual = _partnership_hcp(actual_decl)
@@ -5685,7 +5868,7 @@ def _render_batch_stacked_bars(
             if len(tp_vals_ew) == 2:
                 tp_ew = sum(tp_vals_ew)
 
-        imp_diff = r.get("IMP_Diff")
+        imp_diff = r.get("Par_IMP_Diff", r.get("IMP_Diff"))
         if isinstance(imp_diff, float) and pd.isna(imp_diff):
             imp_diff = None
 
@@ -5695,7 +5878,7 @@ def _render_batch_stacked_bars(
             "HCP_EW": hcp_ew,
             "TP_NS": tp_ns,
             "TP_EW": tp_ew,
-            "IMP_Diff": imp_diff,
+            "Par_IMP_Diff": imp_diff,
         })
 
     if not records:
@@ -5716,7 +5899,7 @@ def _render_batch_stacked_bars(
 
     fig = make_subplots(
         rows=1, cols=3,
-        subplot_titles=("Avg HCP by Side", "Avg Total Points by Side", "Avg IMP Diff (AI−Actual)"),
+        subplot_titles=("Avg HCP by Side", "Avg Total Points by Side", "Avg Par IMP Diff (AI−Actual)"),
         horizontal_spacing=0.08,
     )
 
@@ -5724,7 +5907,7 @@ def _render_batch_stacked_bars(
     hcp_ew_means = [grouped["HCP_EW"].mean().get(t) for t in present_types]
     tp_ns_means = [grouped["TP_NS"].mean().get(t) for t in present_types]
     tp_ew_means = [grouped["TP_EW"].mean().get(t) for t in present_types]
-    imp_means = [grouped["IMP_Diff"].mean().get(t) for t in present_types]
+    imp_means = [grouped["Par_IMP_Diff"].mean().get(t) for t in present_types]
 
     def _fmt_hover(vals: list) -> list[str]:
         return [f"{v:.1f}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "n/a" for v in vals]
@@ -5796,6 +5979,22 @@ def _get_dd_scoring_table() -> dict:
         _, scores_d, _ = precompute_contract_score_tables()
         _dd_scoring_cache = scores_d
     return _dd_scoring_cache
+
+
+def _canonicalize_pbn_to_north_prefix(pbn_str: str) -> str:
+    """Normalize dealer-relative PBN hand order to `N:hand_N hand_E hand_S hand_W`."""
+    pbn_s = str(pbn_str or "").strip()
+    if ":" not in pbn_s:
+        return pbn_s
+    dealer_token, hands_token = pbn_s.split(":", 1)
+    dealer = dealer_token.strip().upper()[:1]
+    hands = hands_token.strip().split()
+    if dealer not in "NESW" or len(hands) != 4:
+        return pbn_s
+    seat_order = ["N", "E", "S", "W"]
+    dealer_idx = seat_order.index(dealer)
+    by_seat = {seat_order[(dealer_idx + offset) % 4]: hands[offset] for offset in range(4)}
+    return f"N:{by_seat['N']} {by_seat['E']} {by_seat['S']} {by_seat['W']}"
 
 
 def _compute_board_dds_augmentation(pbn_str: str, dealer: str, vul: str) -> dict:
@@ -5921,8 +6120,10 @@ def _compute_board_sd_ev_augmentation(pbn_str: str, dealer: str, vul: str, produ
         return {}
 
     try:
-        # pbn_str is always "X:hand_n hand_e hand_s hand_w"; [2:] strips the "X:" prefix.
-        _, (_, ns_ew_rows) = _est_sd(pbn_str, produce)
+        # External-board PBN strings are dealer-relative for /pbn-lookup. Convert them
+        # back to fixed N/E/S/W order before hiding seats for single-dummy simulation.
+        canonical_pbn = _canonicalize_pbn_to_north_prefix(pbn_str)
+        _, (_, ns_ew_rows) = _est_sd(canonical_pbn, produce)
     except Exception:
         return {}
 
@@ -5994,6 +6195,12 @@ def parse_pbn_file_to_boards(content: str) -> list[dict]:
         dealer = current.get("dealer", "N")
         hands = current["_deal"]
         vul_raw = current.get("vul_raw", "None")
+        seat_order = ["N", "E", "S", "W"]
+        try:
+            dealer_idx = seat_order.index(str(dealer).upper()[:1])
+        except ValueError:
+            dealer_idx = 0
+        pbn_hands = [hands.get(seat_order[(dealer_idx + offset) % 4], "") for offset in range(4)]
         board: dict = {
             "board": current.get("board"),
             "dealer": dealer,
@@ -6003,7 +6210,7 @@ def parse_pbn_file_to_boards(content: str) -> list[dict]:
             "Hand_S": hands.get("S", ""),
             "Hand_W": hands.get("W", ""),
             "auction": _pbn_bids_to_dash(auction_tokens),
-            "pbn": f"{dealer}:{hands.get('N','')} {hands.get('E','')} {hands.get('S','')} {hands.get('W','')}",
+            "pbn": f"{dealer}:{' '.join(pbn_hands)}",
         }
         # PBN [Result] is always total tricks taken by declarer.
         # Derive Tricks (absolute) and Result (delta = Tricks - level - 6).
@@ -6370,6 +6577,25 @@ def _parse_deal_index_ranges(text: str, max_index: int = 10_000) -> list[int]:
     return sorted(indices)
 
 
+def _normalize_board_number(value: Any) -> int | None:
+    """Normalize an external board/deal identifier to an int when possible."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float) and float(value).is_integer():
+            return int(value)
+        value_s = str(value).strip()
+        if value_s.isdigit():
+            return int(value_s)
+    except Exception:
+        return None
+    return None
+
+
 def _render_batch_input_from_deals_df() -> dict[str, Any]:
     """Render controls for DB-backed source and return normalized config."""
     col_a, col_b = st.columns([3, 1])
@@ -6482,16 +6708,19 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
             preview_names += f", ... (+{len(loaded_file_names) - 8} more)"
         st.caption(f"Matched PBN/LIN files: {preview_names}")
     n_boards = len(boards)
+    board_numbers = [_normalize_board_number(board.get("board")) for board in boards]
+    has_explicit_board_numbers = any(num is not None for num in board_numbers)
+    max_board_number = max((num for num in board_numbers if num is not None), default=max(1, n_boards))
     col_a, col_b = st.columns([3, 1])
     with col_a:
         default_range = f"1-{n_boards}" if n_boards > 0 else "1-25"
         if "_batch_ranges_pbn" not in st.session_state:
             st.session_state["_batch_ranges_pbn"] = default_range
         ranges_text = st.text_input(
-            "Board Index Ranges",
+            "Deal Number Ranges",
             key="_batch_ranges_pbn",
             disabled=(n_boards == 0),
-            help="Examples: ``1-25``  ``1-10, 20, 30+``  Commas or spaces delimit ranges.  Press Enter to run.",
+            help="Matches the displayed `Deal` / PBN `[Board]` numbers. Examples: ``1-25``  ``1-10, 20, 30+``. Commas or spaces delimit ranges. Press Enter to run.",
             on_change=lambda: st.session_state.__setitem__("_batch_run_on_enter", True),
         )
     with col_b:
@@ -6499,11 +6728,22 @@ def _render_batch_input_from_pbn() -> dict[str, Any]:
     if n_boards == 0:
         st.info("Provide a local PBN file or URL, then click Download.")
     try:
-        board_indices = _parse_deal_index_ranges(ranges_text, max_index=max(1, n_boards))
+        board_indices = _parse_deal_index_ranges(ranges_text, max_index=max_board_number)
     except Exception:
         board_indices = []
         st.error("Invalid range expression. Use formats like ``1-25``, ``20``, ``30+``.")
-    selected_boards = [boards[i - 1] for i in board_indices if 1 <= i <= n_boards]
+    if has_explicit_board_numbers:
+        requested_board_numbers = set(board_indices)
+        selected_boards = [
+            board
+            for board, board_num in zip(boards, board_numbers)
+            if board_num is not None and board_num in requested_board_numbers
+        ]
+        if ranges_text.strip() and not selected_boards:
+            st.warning("No loaded PBN boards matched those deal numbers.")
+    else:
+        st.caption("Loaded PBN boards have no explicit `[Board]` numbers; using board positions instead.")
+        selected_boards = [boards[i - 1] for i in board_indices if 1 <= i <= n_boards]
     return {
         "seed": int(seed),
         "boards": selected_boards,
@@ -6759,19 +6999,14 @@ def render_ai_model_batch_arena():
             return -int(raw)
         return int(raw)
 
-    # ---- Helpers: signed IMP vs par (same declarer-side frame) ----
+    # ---- Helpers: signed IMP vs par (declarer-relative frame) ----
     def _imp_vs_par_signed(
         score_contract: int | None,
         par_score: int | None,
         auction: str | None,
         dealer: str,
     ) -> int | None:
-        """Signed IMP from contract DD score minus par score.
-
-        `score_contract` is from the contract declarer's perspective (make=+, down=-).
-        `ParScore` in deal rows is NS-relative, so convert par into the same declaring-side
-        frame for the auction being evaluated before taking the difference.
-        """
+        """Signed IMP from declarer-relative DD score minus declarer-relative par score."""
         if score_contract is None or par_score is None:
             return None
         decl = get_declarer_for_auction(auction or "", dealer)
@@ -6788,19 +7023,36 @@ def render_ai_model_batch_arena():
         # Positive means AI outscored Actual (vs par). Negative means AI worse.
         return int(imp_ai) - int(imp_actual)
 
-    def _ev_imp_vs_par_signed(
-        ev_ns: float | None,
-        par_score: int | None,
+    def _dd_imp_diff_signed(
+        actual_score: int | None,
+        ai_score: int | None,
     ) -> int | None:
-        """Signed IMP from NS-relative EV minus NS-relative par score."""
-        if ev_ns is None or par_score is None:
+        """Signed IMP from declarer-side AI DD score minus Actual DD score."""
+        if actual_score is None or ai_score is None:
             return None
-        diff = float(ev_ns) - float(par_score)
+        diff = int(ai_score) - int(actual_score)
+        sign = 1 if diff >= 0 else -1
+        return sign * calculate_imp(abs(diff))
+
+    def _ev_imp_vs_par_signed(
+        ev_declarer: float | None,
+        par_score: int | None,
+        auction: str | None,
+        dealer: str,
+    ) -> int | None:
+        """Signed IMP from declarer-relative EV minus declarer-relative par score."""
+        if ev_declarer is None or par_score is None:
+            return None
+        decl = get_declarer_for_auction(auction or "", dealer)
+        par_for_declarer = float(par_score)
+        if decl and str(decl).upper() in ("E", "W"):
+            par_for_declarer = -par_for_declarer
+        diff = float(ev_declarer) - par_for_declarer
         sign = 1 if diff >= 0 else -1
         return sign * calculate_imp(int(round(abs(diff))))
 
-    # ---- Helper: NS-relative EV (precomputed, ignores X/XX) ----
-    def _ev_ns(auction: str | None, dealer: str, deal_row: dict) -> float | None:
+    # ---- Helper: declarer-relative EV (precomputed, ignores X/XX) ----
+    def _ev_declarer(auction: str | None, dealer: str, deal_row: dict) -> float | None:
         if not auction:
             return None
         toks = [t.strip().upper() for t in auction.split("-") if t.strip()]
@@ -6813,9 +7065,6 @@ def render_ai_model_batch_arena():
             val = float(raw)
         except (ValueError, TypeError):
             return None
-        decl = get_declarer_for_auction(auction, dealer)
-        if decl and str(decl).upper() in ("E", "W"):
-            return round(-val, 1)
         return round(val, 1)
 
     def _json_safe_deal_row(row: dict) -> dict:
@@ -6942,7 +7191,12 @@ def render_ai_model_batch_arena():
         results: list[dict] = []
         deal_row_map: dict[str, dict] = {}
         _ai_steps_map: dict[str, list] = {}
+        # Reuse AI results within a batch when the same board appears multiple
+        # times (for example open/closed room in team games). The AI path depends
+        # on the deal plus run settings, not on the human auction we compare it to.
+        _ai_result_cache: dict[str, dict[str, Any]] = {}
         imp_running = 0
+        dd_imp_running = 0
         ev_imp_running = 0
         t_batch_start = time.perf_counter()
         batch_completed = False
@@ -7078,7 +7332,7 @@ def render_ai_model_batch_arena():
                     continue
                 dealer = str(deal_row.get("Dealer", "N")).upper()
                 vul = deal_row.get("Vul", "")
-                actual_auction = str(deal_row.get("bid", "") or "").strip()
+                actual_auction = normalize_auction_input(str(deal_row.get("bid", "") or "").strip())
                 row_idx = deal_row.get("_row_idx")
                 if row_idx is None:
                     results.append({"Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "no_row_idx"})
@@ -7107,7 +7361,7 @@ def render_ai_model_batch_arena():
                 vul = {"All": "Both", "None": "None", "NS": "NS", "EW": "EW"}.get(
                     str(src_board.get("vul", "None")), str(src_board.get("vul", "None"))
                 )
-                actual_auction = src_board.get("auction", "")
+                actual_auction = normalize_auction_input(str(src_board.get("auction", "") or "").strip())
 
                 progress_bar.progress(
                     i / len(indices),
@@ -7189,12 +7443,12 @@ def render_ai_model_batch_arena():
 
             # ---- Start AI Model async job ----
             elapsed_batch_s = max(time.perf_counter() - t_batch_start, 1e-9)
-            deals_per_s = i / elapsed_batch_s if i > 0 else 0.0
+            deals_per_min = (i * 60.0) / elapsed_batch_s if i > 0 else 0.0
             progress_bar.progress(
                 i / len(indices),
                 text=(
                     f"Deal {i+1}/{len(indices)} (index {deal_idx}) — IMP: {imp_running:+d} — "
-                    f"running AI Model... {deals_per_s:.2f} deals/s"
+                    f"running AI Model... {deals_per_min:.2f} deals/min"
                 ),
             )
             _ai_start_params: dict[str, Any]
@@ -7218,46 +7472,62 @@ def render_ai_model_batch_arena():
                     "use_guardrails_v2": bool(use_guardrails_v2),
                 }
             try:
-                start_resp = api_post(
-                    "/ai-model-advanced-path/start",
-                    _ai_start_params,
-                    timeout=15,
-                )
-                job_id = str(start_resp.get("job_id") or "").strip()
-            except Exception as e:
-                results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": f"start_failed: {e}"})
-                _push_live_results()
-                progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — start failed — IMP: {imp_running:+d}")
-                continue
+                _ai_cache_key = json.dumps(_ai_start_params, sort_keys=True, default=str)
+            except Exception:
+                _ai_cache_key = str(_ai_start_params)
 
-            if not job_id:
-                results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "no_job_id"})
-                _push_live_results()
-                continue
-
-            # ---- Poll until done ----
-            ai_auction = ""
-            ai_steps_detail: list[dict] = []
-            poll_ok = False
-            for _poll in range(300):  # up to ~150 seconds
-                time.sleep(0.5)
-                try:
-                    job = api_get(f"/ai-model-advanced-path/status/{job_id}", timeout=10)
-                except Exception:
-                    continue
-                status_val = str(job.get("status") or "")
-                if status_val == "completed":
-                    res = job.get("result") or {}
-                    ai_auction = str(res.get("auction") or "").strip()
-                    ai_steps_detail = res.get("steps_detail") or []
-                    _ai_steps_map[result_row_key] = ai_steps_detail
-                    poll_ok = True
-                    break
-                elif status_val == "failed":
-                    results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": f"job_failed: {job.get('error')}"})
-                    break
+            _cached_ai = _ai_result_cache.get(_ai_cache_key)
+            if isinstance(_cached_ai, dict):
+                ai_auction = normalize_auction_input(str(_cached_ai.get("auction") or "").strip())
+                ai_steps_detail = list(_cached_ai.get("steps_detail") or [])
+                _ai_steps_map[result_row_key] = ai_steps_detail
+                poll_ok = True
             else:
-                results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "timeout"})
+                poll_ok = False
+                try:
+                    start_resp = api_post(
+                        "/ai-model-advanced-path/start",
+                        _ai_start_params,
+                        timeout=15,
+                    )
+                    job_id = str(start_resp.get("job_id") or "").strip()
+                except Exception as e:
+                    results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": f"start_failed: {e}"})
+                    _push_live_results()
+                    progress_bar.progress((i + 1) / len(indices), text=f"Deal {i+1}/{len(indices)} — start failed — IMP: {imp_running:+d}")
+                    continue
+
+                if not job_id:
+                    results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "no_job_id"})
+                    _push_live_results()
+                    continue
+
+                # ---- Poll until done ----
+                ai_auction = ""
+                ai_steps_detail = []
+                for _poll in range(300):  # up to ~150 seconds
+                    time.sleep(0.5)
+                    try:
+                        job = api_get(f"/ai-model-advanced-path/status/{job_id}", timeout=10)
+                    except Exception:
+                        continue
+                    status_val = str(job.get("status") or "")
+                    if status_val == "completed":
+                        res = job.get("result") or {}
+                        ai_auction = normalize_auction_input(str(res.get("auction") or "").strip())
+                        ai_steps_detail = res.get("steps_detail") or []
+                        _ai_steps_map[result_row_key] = ai_steps_detail
+                        _ai_result_cache[_ai_cache_key] = {
+                            "auction": ai_auction,
+                            "steps_detail": list(ai_steps_detail or []),
+                        }
+                        poll_ok = True
+                        break
+                    elif status_val == "failed":
+                        results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": f"job_failed: {job.get('error')}"})
+                        break
+                else:
+                    results.append({"Source": row_source if _use_external else "", "Deal": deal_idx, "_Batch_Row_Key": result_row_key, "Error": "timeout"})
 
             if not poll_ok:
                 _push_live_results()
@@ -7317,25 +7587,29 @@ def render_ai_model_batch_arena():
             actual_score_ns = _dd_score_ns(actual_auction, dealer, deal_row)
             ai_score_ns = _dd_score_ns(ai_auction, dealer, deal_row)
 
-            actual_ev = _ev_ns(actual_auction, dealer, deal_row)
-            ai_ev = _ev_ns(ai_auction, dealer, deal_row)
+            actual_ev = _ev_declarer(actual_auction, dealer, deal_row)
+            ai_ev = _ev_declarer(ai_auction, dealer, deal_row)
 
             par_score = deal_row.get("ParScore")
             par_contracts_raw = deal_row.get("ParContracts")
             par_contracts = _format_par_contracts(par_contracts_raw) or ""
 
-            ev_imp_actual = _ev_imp_vs_par_signed(actual_ev, par_score)
-            ev_imp_ai = _ev_imp_vs_par_signed(ai_ev, par_score)
+            ev_imp_actual = _ev_imp_vs_par_signed(actual_ev, par_score, actual_auction, dealer)
+            ev_imp_ai = _ev_imp_vs_par_signed(ai_ev, par_score, ai_auction, dealer)
             ev_imp_diff = None
             if ev_imp_actual is not None and ev_imp_ai is not None:
                 ev_imp_diff = int(ev_imp_ai) - int(ev_imp_actual)
                 ev_imp_running += int(ev_imp_diff)
 
-            imp_actual = _imp_vs_par_signed(actual_score_contract, par_score, actual_auction, dealer)
-            imp_ai = _imp_vs_par_signed(ai_score_contract, par_score, ai_auction, dealer)
-            imp = _imp_diff(imp_actual, imp_ai)
-            if imp is not None:
-                imp_running += imp
+            par_imp_actual = _imp_vs_par_signed(actual_score_contract, par_score, actual_auction, dealer)
+            par_imp_ai = _imp_vs_par_signed(ai_score_contract, par_score, ai_auction, dealer)
+            par_imp_diff = _imp_diff(par_imp_actual, par_imp_ai)
+            if par_imp_diff is not None:
+                imp_running += par_imp_diff
+
+            dd_imp_diff = _dd_imp_diff_signed(actual_score_contract, ai_score_contract)
+            if dd_imp_diff is not None:
+                dd_imp_running += dd_imp_diff
 
             # ---- Divergence column: "step: AI_bid→actual_bid" or "✓" ----
             _div_str = ""
@@ -7387,7 +7661,7 @@ def render_ai_model_batch_arena():
                 pass
             _error_str = "; ".join(_error_flags) if _error_flags else ""
 
-            results.append({
+            _result_row = {
                 "Source": row_source if _use_external else "",
                 "Deal": deal_idx,
                 "_Batch_Row_Key": result_row_key,
@@ -7413,11 +7687,28 @@ def render_ai_model_batch_arena():
                 "EV_IMP_Running": ev_imp_running,
                 "Par": par_score,
                 "ParContracts": par_contracts,
-                "IMP_Actual": imp_actual,
-                "IMP_AI": imp_ai,
-                "IMP_Diff": imp,
-                "IMP_Running": imp_running,
-            })
+                "DD_IMP_Diff": dd_imp_diff,
+                "DD_IMP_Running": dd_imp_running,
+                "Par_IMP_Actual": par_imp_actual,
+                "Par_IMP_AI": par_imp_ai,
+                "Par_IMP_Diff": par_imp_diff,
+                "Par_IMP_Running": imp_running,
+            }
+            _result_row = add_auction_error_taxonomy_to_row(
+                _result_row,
+                dealer=dealer,
+                chosen_auction=ai_auction,
+                chosen_contract=ai_contract,
+                actual_auction=actual_auction,
+                actual_contract=actual_contract,
+                par_score=par_score,
+                par_contracts=(deal_row.get("ParContracts") if isinstance(deal_row, dict) else None) or par_contracts,
+                ai_model_steps=ai_steps_detail,
+                deal_context=deal_row,
+                chosen_dd_score=ai_score_contract,
+                chosen_ev_score=ai_ev,
+            )
+            results.append(_result_row)
             _push_live_results()
 
             # ---- Accumulate debug entry for this deal ----
@@ -7479,7 +7770,7 @@ def render_ai_model_batch_arena():
                             _divergence["all_bids_filtered"] = _step_data.get("all_bids_filtered")
                         break
 
-                _batch_debug_entries.append({
+                _batch_debug_entry = {
                     "deal_index": deal_idx,
                     "deal": _dbg_deal_info,
                     "dealer": dealer,
@@ -7490,19 +7781,34 @@ def render_ai_model_batch_arena():
                     "ai_contract": ai_contract,
                     "dd_score_actual_ns": actual_score_ns,
                     "dd_score_ai_ns": ai_score_ns,
-                    "ev_actual_ns": actual_ev,
-                    "ev_ai_ns": ai_ev,
+                    "ev_actual": actual_ev,
+                    "ev_ai": ai_ev,
                     "ev_imp_actual": ev_imp_actual,
                     "ev_imp_ai": ev_imp_ai,
                     "ev_imp_diff": ev_imp_diff,
                     "par": par_score,
                     "par_contracts": par_contracts,
-                    "imp_actual": imp_actual,
-                    "imp_ai": imp_ai,
-                    "imp_diff": imp,
+                    "imp_actual": par_imp_actual,
+                    "imp_ai": par_imp_ai,
+                    "imp_diff": par_imp_diff,
                     "divergence": _divergence,
                     "ai_model_steps": ai_steps_detail,
-                })
+                }
+                _batch_debug_entry = add_auction_error_taxonomy_to_row(
+                    _batch_debug_entry,
+                    dealer=dealer,
+                    chosen_auction=ai_auction,
+                    chosen_contract=ai_contract,
+                    actual_auction=actual_auction,
+                    actual_contract=actual_contract,
+                    par_score=par_score,
+                    par_contracts=_dbg_deal_info.get("ParContracts") or par_contracts,
+                    ai_model_steps=ai_steps_detail,
+                    deal_context=deal_row,
+                    chosen_dd_score=ai_score_contract,
+                    chosen_ev_score=ai_ev,
+                )
+                _batch_debug_entries.append(_batch_debug_entry)
             except Exception:
                 pass  # Debug accumulation is best-effort
 
@@ -7547,6 +7853,7 @@ def render_ai_model_batch_arena():
         st.session_state["_arena_batch_results"] = list(results)
         st.session_state["_arena_deal_row_map"] = deal_row_map
         st.session_state["_arena_ai_steps_map"] = _ai_steps_map
+        st.session_state["_arena_batch_input_cfg"] = dict(input_cfg)
         st.session_state["_batch_selected_result"] = None  # clear any stale selection
         st.rerun()
 
@@ -7637,6 +7944,7 @@ def render_ai_model_batch_arena():
                 _ws["vul"] = _we.get("vul")
                 _worst_deals_summary.append(_ws)
 
+            _ba_summary_df = build_auction_error_summary_df(results)
             _ba_payload = {
                 "timestamp": _ba_dt.now(_ba_tz.utc).isoformat(),
                 "deal_ranges": input_cfg.get("ranges_text"),
@@ -7644,6 +7952,7 @@ def render_ai_model_batch_arena():
                 "seed": int(seed),
                 "deals_processed": len(results),
                 "imp_running_total": imp_running,
+                "auction_error_summary": _ba_summary_df.to_dict("records"),
                 "worst_deals": _worst_deals_summary,
                 "deals": _batch_debug_entries,
             }
@@ -7709,17 +8018,109 @@ def render_ai_model_batch_arena():
             key="_batch_export",
         )
 
+        _deal_row_map: dict[str, dict] = st.session_state.get("_arena_deal_row_map") or {}
+        _ai_steps_map_ss: dict[str, list] = st.session_state.get("_arena_ai_steps_map") or {}
+
+        with st.expander("Negative IMP Reviews", expanded=False):
+            review_provider = st.selectbox(
+                "Provider",
+                options=CHAT_PROVIDERS,
+                index=0,
+                key="_arena_bad_auction_provider",
+            )
+            review_model = st.text_input(
+                "Model",
+                value=str(DEFAULT_MODELS.get(review_provider, "")),
+                key="_arena_bad_auction_model",
+            )
+            review_max_bad = st.number_input(
+                "Max bad deals",
+                min_value=1,
+                max_value=100,
+                value=25,
+                step=1,
+                key="_arena_bad_auction_max_bad",
+            )
+            review_min_imp = st.number_input(
+                "Minimum IMP loss",
+                min_value=1,
+                max_value=24,
+                value=1,
+                step=1,
+                key="_arena_bad_auction_min_imp",
+            )
+            if st.button("Review Negative IMP Deals", key="_arena_bad_auction_review_run"):
+                _provider_key = {
+                    "OpenAI": str(st.secrets.get("OPENAI_API_KEY", "") or ""),
+                    "Anthropic": str(st.secrets.get("ANTHROPIC_API_KEY", "") or ""),
+                    "Gemini": str(st.secrets.get("GEMINI_API_KEY", "") or ""),
+                    "OpenRouter": str(st.secrets.get("OPENROUTER_API_KEY", "") or ""),
+                    "Vercel": str(
+                        st.secrets.get("VERCEL_AI_GATEWAY_API_KEY", "")
+                        or st.secrets.get("AI_GATEWAY_API_KEY", "")
+                        or ""
+                    ),
+                }.get(review_provider, "")
+                if not _provider_key.strip():
+                    st.error(f"{review_provider} API key missing in Streamlit secrets.")
+                elif not _auto_export_json_path:
+                    st.error("Auto-export JSON path missing; rerun the batch before reviewing.")
+                else:
+                    try:
+                        _review_output_root = (
+                            pathlib.Path("quality_reports")
+                            / "bad_auctions"
+                            / f"{pathlib.Path(str(_auto_export_json_path)).stem}__{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        )
+                        _batch_result_for_review = BatchRunResult(
+                            results=list(all_results),
+                            deal_row_map=dict(_deal_row_map),
+                            ai_steps_map=dict(_ai_steps_map_ss),
+                            batch_debug_entries=[],
+                            batch_debug_payload={},
+                            export_paths={
+                                "csv_path": pathlib.Path(str(_auto_export_path)),
+                                "json_path": pathlib.Path(str(_auto_export_json_path)),
+                            },
+                            input_cfg=dict(st.session_state.get("_arena_batch_input_cfg") or {}),
+                        )
+                        _packet_paths = build_negative_imp_review_packets(
+                            batch_result=_batch_result_for_review,
+                            api_base=API_BASE,
+                            output_root=_review_output_root,
+                            max_bad_deals=int(review_max_bad),
+                            min_imp_loss=int(review_min_imp),
+                        )
+                        if not _packet_paths:
+                            st.info("No negative-IMP deals met the review threshold.")
+                        else:
+                            _review_records = run_llm_reviews_for_packets(
+                                packet_paths=_packet_paths,
+                                provider=str(review_provider),
+                                model=str(review_model or "").strip() or None,
+                                api_key=_provider_key,
+                                timeout_s=90,
+                            )
+                            _summary_path = summarize_review_records(
+                                review_records=_review_records,
+                                output_root=_review_output_root,
+                                batch_result=_batch_result_for_review,
+                            )
+                            st.success(
+                                f"Reviewed {len(_review_records)} deal(s). Summary written to `{_summary_path.as_posix()}`."
+                            )
+                    except Exception as e:
+                        st.error(f"Negative IMP review failed: {e}")
+
         # ---- Aggregate stacked bar charts by contract type ----
-        _agg_deal_row_map: dict[str, dict] = st.session_state.get("_arena_deal_row_map") or {}
-        _render_batch_stacked_bars(all_results, _agg_deal_row_map)
+        _render_batch_stacked_bars(all_results, _deal_row_map)
 
         # ---- Row-click: deal diagram then single-row detail ----
         _sel_result: dict | None = st.session_state.get("_batch_selected_result")
-        _deal_row_map: dict[str, dict] = st.session_state.get("_arena_deal_row_map") or {}
-        _ai_steps_map_ss: dict[str, list] = st.session_state.get("_arena_ai_steps_map") or {}
         if _sel_result:
             _sel_deal_idx = _sel_result.get("Deal")
             _sel_row_key = str(_sel_result.get("_Batch_Row_Key") or "")
+            _sel_source = _sel_result.get("Source")
             st.divider()
 
             # 1. Deal diagram
@@ -7730,7 +8131,7 @@ def render_ai_model_batch_arena():
                 _diag_deal.setdefault("Score", _sel_result.get("DD_Score_AI"))
                 render_deal_diagram(
                     _diag_deal,
-                    title=f"📋 Deal {_sel_deal_idx}",
+                    title=_format_batch_deal_diagram_title(_sel_deal_idx, _sel_source),
                     show_header=True,
                     width_ratio=(3, 7),
                 )
@@ -7755,6 +8156,46 @@ def render_ai_model_batch_arena():
                         if _dv is not None:
                             _ba_dbg_deal[_dk] = _dv
                 _ba_dbg_steps = _ai_steps_map_ss.get(_sel_row_key) if _sel_row_key else []
+                _ba_live_res: dict[str, Any] | None = None
+                # Do not block Batch Arena row-click rendering on a fresh live solve.
+                # The stored per-deal batch steps are enough for the detail pane and
+                # debug dump; if a live refresh has already been cached this session,
+                # reuse it opportunistically.
+                _ba_live_refresh_error: str | None = None
+                try:
+                    _ba_cache_key = "|".join(
+                        [
+                            str(_sel_row_key or _sel_deal_idx or ""),
+                            str(ai_logic_mode),
+                            str(int(bool(use_guardrails_v2))),
+                            str(int(seed)),
+                        ]
+                    )
+                    _ba_live_cache = st.session_state.get("_ai_model_debug_refresh_cache") or {}
+                    _ba_live_res = _ba_live_cache.get(_ba_cache_key) if isinstance(_ba_live_cache, dict) else None
+                except Exception as _live_exc:
+                    _ba_live_refresh_error = str(_live_exc)
+                if isinstance(_ba_live_res, dict):
+                    _ba_dbg_steps = list(_ba_live_res.get("steps_detail") or [])
+                _ba_ai_auction = (
+                    str((_ba_live_res or {}).get("auction") or "").strip()
+                    or str(_sel_result.get("AI_Auction") or "").strip()
+                )
+                _ba_override_steps = _extract_ai_model_override_steps(_ba_dbg_steps)
+                _ba_ai_ev_declarer = _sel_result.get("EV_AI")
+                try:
+                    if isinstance(_ba_live_res, dict):
+                        _ba_ai_ev_ns_raw = (_ba_live_res or {}).get("ev_score_ns")
+                    else:
+                        _ba_ai_ev_ns_raw = None
+                    if _ba_ai_ev_ns_raw is not None:
+                        _ba_ai_ev_declarer = float(_ba_ai_ev_ns_raw)
+                        _ba_ai_decl = get_declarer_for_auction(_ba_ai_auction, str(_sel_result.get("Dealer") or "N"))
+                        if _ba_ai_decl and str(_ba_ai_decl).upper() in ("E", "W"):
+                            _ba_ai_ev_declarer = -float(_ba_ai_ev_declarer)
+                except Exception:
+                    _ba_ai_ev_declarer = _sel_result.get("EV_AI")
+
                 _ba_dbg_payload = {
                     "source": "ai_model_batch_arena",
                     "timestamp": _ba_dbg_dt.now(_ba_dbg_tz.utc).isoformat(),
@@ -7763,20 +8204,26 @@ def render_ai_model_batch_arena():
                     "dealer": _sel_result.get("Dealer"),
                     "vul": _sel_result.get("Vul"),
                     "actual_auction": _sel_result.get("Actual_Auction"),
-                    "ai_auction": _sel_result.get("AI_Auction"),
+                    "ai_model_auction": _ba_ai_auction,
+                    "ai_auction": _ba_ai_auction,
                     "actual_contract": _sel_result.get("Actual_Contract"),
-                    "ai_contract": _sel_result.get("AI_Contract"),
+                    "ai_contract": (_ba_live_res or {}).get("contract") or _sel_result.get("AI_Contract"),
                     "dd_score_actual_ns": _sel_result.get("DD_Score_Actual"),
-                    "dd_score_ai_ns": _sel_result.get("DD_Score_AI"),
-                    "ev_actual_ns": _sel_result.get("EV_Actual"),
-                    "ev_ai_ns": _sel_result.get("EV_AI"),
+                    "dd_score_ai_ns": (_ba_live_res or {}).get("dd_score_ns") if isinstance(_ba_live_res, dict) else _sel_result.get("DD_Score_AI"),
+                    "ev_actual": _sel_result.get("EV_Actual"),
+                    "ev_ai": _ba_ai_ev_declarer,
                     "par": _sel_result.get("Par"),
                     "par_contracts": _sel_result.get("ParContracts"),
-                    "imp_actual": _sel_result.get("IMP_Actual"),
-                    "imp_ai": _sel_result.get("IMP_AI"),
-                    "imp_diff": _sel_result.get("IMP_Diff"),
+                    "imp_actual": _sel_result.get("Par_IMP_Actual", _sel_result.get("IMP_Actual")),
+                    "imp_ai": _sel_result.get("Par_IMP_AI", _sel_result.get("IMP_AI")),
+                    "imp_diff": _sel_result.get("Par_IMP_Diff", _sel_result.get("IMP_Diff")),
                     "divergence": _sel_result.get("Divergence"),
                     "ai_model_steps": _ba_dbg_steps or [],
+                    "override_steps": _ba_override_steps,
+                    "current_path_bids": [t for t in _ba_ai_auction.split("-") if t],
+                    "live_refresh_applied": bool(_ba_live_res),
+                    "live_refresh_error": _ba_live_refresh_error,
+                    "auction_error_taxonomy": _sel_result.get("auction_error_taxonomy"),
                 }
                 _ba_dbg_path.write_text(
                     _ba_dbg_json.dumps(_ba_dbg_payload, indent=2, default=str),
@@ -7787,7 +8234,7 @@ def render_ai_model_batch_arena():
 
             # 2. Single-row detail — same colour as the clicked row
             _display_result = {k: v for k, v in _sel_result.items() if not k.startswith("_")}
-            _imp_val = _display_result.get("IMP_Diff")
+            _imp_val = _batch_dd_color_metric(_display_result)
             if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):
                 _imp_int = int(_imp_val)
                 _imp_color = "Invalid" if _imp_int < 0 else ("Valid" if _imp_int > 0 else "Neutral")
@@ -7898,6 +8345,26 @@ def render_ai_model_batch_arena():
             )
 
 
+def _batch_dd_color_metric(row: dict[str, Any]) -> int | None:
+    """Return declarer-side DD IMP swing: positive means AI scored better."""
+    actual_raw = row.get("DD_Score_Actual")
+    ai_raw = row.get("DD_Score_AI")
+    try:
+        if actual_raw is None or ai_raw is None:
+            return None
+        actual_val = float(actual_raw)
+        ai_val = float(ai_raw)
+        if pd.isna(actual_val) or pd.isna(ai_val):
+            return None
+    except Exception:
+        return None
+    diff = ai_val - actual_val
+    if diff == 0:
+        return 0
+    sign = 1 if diff > 0 else -1
+    return sign * calculate_imp(int(round(abs(diff))))
+
+
 def _render_batch_results_df(
     results: list[dict],
     container,
@@ -7906,7 +8373,7 @@ def _render_batch_results_df(
     aggrid_key: str = "_batch_results_grid",
     height: int | None = None,
 ) -> None:
-    """Render the batch results DataFrame with color-coded IMP_Diff rows.
+    """Render the batch results DataFrame with declarer-side DD row colors.
 
     Args:
         results: List of result dicts produced by the batch loop.
@@ -7920,12 +8387,73 @@ def _render_batch_results_df(
     if not results:
         return
 
+    summary_df = build_auction_error_summary_df(results)
+
+    def _render_summary() -> list[dict[str, Any]]:
+        if summary_df.empty:
+            return []
+        st.markdown("#### Auction Error Summary")
+        return render_aggrid(
+            summary_df,
+            key=f"{aggrid_key}_auction_error_summary",
+            table_name="auction_error_summary",
+            show_sql_expander=False,
+            update_on=["selectionChanged", "cellClicked"],
+            height=calc_grid_height(len(summary_df), max_height=320),
+        )
+
+    def _matches_summary_row(result_row: dict[str, Any], summary_row: dict[str, Any]) -> bool:
+        final_family = str(result_row.get("Final_Error_Family") or "other")
+        severity = str(result_row.get("Error_Severity") or "")
+        decision_family = str(result_row.get("Decision_Error_Family") or "other")
+        return (
+            final_family == str(summary_row.get("Final_Error_Family") or "other")
+            and severity == str(summary_row.get("Error_Severity") or "")
+            and decision_family == str(summary_row.get("Decision_Error_Family") or "other")
+        )
+
+    def _render_summary_matches(selected_summary_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not selected_summary_rows:
+            return []
+        selected_summary = selected_summary_rows[0]
+        matching_results = [row for row in results if _matches_summary_row(row, selected_summary)]
+        if not matching_results:
+            return []
+        selected_error_type = str(selected_summary.get("Error_Type") or "").strip()
+        title_suffix = f" ({selected_error_type})" if selected_error_type else ""
+        colored_matches: list[dict[str, Any]] = []
+        for row in matching_results:
+            colored_row = dict(row)
+            imp = _batch_dd_color_metric(colored_row)
+            if imp is not None and not (isinstance(imp, float) and pd.isna(imp)):
+                imp_int = int(imp)
+                if imp_int < 0:
+                    colored_row["_IMP_Color"] = "Invalid"
+                elif imp_int > 0:
+                    colored_row["_IMP_Color"] = "Valid"
+                else:
+                    colored_row["_IMP_Color"] = "Neutral"
+            else:
+                colored_row["_IMP_Color"] = "Neutral"
+            colored_matches.append(colored_row)
+        st.markdown(f"#### Deals For Selected Summary Row{title_suffix}")
+        return render_aggrid(
+            _batch_results_to_dataframe(colored_matches).to_dict("records"),
+            key=f"{aggrid_key}_auction_error_matches",
+            table_name="auction_error_matches",
+            show_sql_expander=False,
+            row_bucket_col="_IMP_Color",
+            hide_cols=["_IMP_Color", "_Batch_Row_Key"],
+            update_on=["selectionChanged", "cellClicked"] if interactive else [],
+            height=calc_grid_height(len(matching_results), max_height=320),
+        )
+
     # Use AgGrid for both live and final renders so column typing/sorting stays
     # consistent throughout the batch lifecycle.
     enriched: list[dict] = []
     for r in results:
         row = dict(r)
-        imp = row.get("IMP_Diff")
+        imp = _batch_dd_color_metric(row)
         if imp is not None and not (isinstance(imp, float) and pd.isna(imp)):
             imp_int = int(imp)
             if imp_int < 0:
@@ -7947,16 +8475,22 @@ def _render_batch_results_df(
             show_sql_expander=False,
             row_bucket_col="_IMP_Color",
             hide_cols=["_IMP_Color", "_Batch_Row_Key"],
-            update_on=["selectionChanged"] if interactive else [],
+            update_on=["selectionChanged", "cellClicked"] if interactive else [],
             height=height if height is not None else calc_grid_height(len(enriched), max_height=600),
         )
 
     if hasattr(container, "__enter__") and hasattr(container, "__exit__"):
         with container:
+            selected_summary_rows = _render_summary()
+            summary_match_rows = _render_summary_matches(selected_summary_rows)
             selected_records = _render_batch_grid()
     else:
+        selected_summary_rows = _render_summary()
+        summary_match_rows = _render_summary_matches(selected_summary_rows)
         selected_records = _render_batch_grid()
 
+    if interactive and summary_match_rows:
+        st.session_state["_batch_selected_result"] = summary_match_rows[0]
     if interactive and selected_records:
         st.session_state["_batch_selected_result"] = selected_records[0]
 
@@ -12729,21 +13263,35 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             guard_reasons = []
 
                         # Additional bridge-texture guardrail for suit rebids.
+                        rebid_hard_blocked = False
                         try:
                             if float(w_guard) > 0:
-                                _nr_p, _nr_reason = compute_non_rebiddable_suit_rebid_penalty(
+                                _self_suit_lengths_adv = None
+                                if _self_hand_str:
+                                    _parts_adv = _self_hand_str.split(".")
+                                    if len(_parts_adv) == 4:
+                                        _self_suit_lengths_adv = {
+                                            "S": len(str(_parts_adv[0] or "")),
+                                            "H": len(str(_parts_adv[1] or "")),
+                                            "D": len(str(_parts_adv[2] or "")),
+                                            "C": len(str(_parts_adv[3] or "")),
+                                        }
+                                _nr_p, _nr_reason, _nr_hard = compute_non_rebiddable_suit_rebid_penalty(
                                     bid_text=bid0,
                                     auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
                                     acting_direction=acting_dir_adv,
                                     dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
                                     bt_acting_criteria=crit if isinstance(crit, list) else [],
+                                    self_suit_lengths=_self_suit_lengths_adv if isinstance(_self_suit_lengths_adv, dict) else None,
                                 )
                                 non_rebiddable_rebid_penalty = float(_nr_p) * float(w_guard)
+                                rebid_hard_blocked = bool(_nr_hard)
                                 if _nr_reason:
                                     guard_reasons = list(guard_reasons or [])
                                     guard_reasons.append(_nr_reason)
                         except Exception:
                             non_rebiddable_rebid_penalty = 0.0
+                            rebid_hard_blocked = False
 
                         # Bonus for directly committing to game in a strongly
                         # rebiddable major already shown by acting player.
@@ -12826,6 +13374,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             score += partner_major_game_bonus
                             score -= partner_major_detour_penalty
                             score -= post_game_slam_gate_penalty
+                            if rebid_hard_blocked:
+                                score = -1.0e9
                         except Exception:
                             score = None
 
@@ -16038,6 +16588,20 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     except Exception:
                         pass
 
+                    _dbg_taxonomy = add_auction_error_taxonomy_to_row(
+                        {},
+                        dealer=dealer if 'dealer' in dir() else None,
+                        chosen_auction=ai_model_auction_text,
+                        actual_auction=actual_auction if 'actual_auction' in dir() else None,
+                        best_auction=best_auction_text if 'best_auction_text' in dir() else None,
+                        par_score=(pinned_deal or {}).get("ParScore") if isinstance(pinned_deal, dict) else None,
+                        par_contracts=(pinned_deal or {}).get("ParContracts") if isinstance(pinned_deal, dict) else None,
+                        ai_model_steps=_dbg_ai_steps,
+                        deal_context=pinned_deal if isinstance(pinned_deal, dict) else None,
+                        chosen_dd_score=ai_model_dd_score if 'ai_model_dd_score' in dir() else None,
+                        chosen_ev_score=ai_model_ev if 'ai_model_ev' in dir() else None,
+                    ).get("auction_error_taxonomy")
+
                     _dbg_payload = {
                         "timestamp": _dbg_dt.now(_dbg_tz.utc).isoformat(),
                         "pinned_deal": _dbg_deal,
@@ -16048,7 +16612,9 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "actual_auction": actual_auction if 'actual_auction' in dir() else None,
                         "completion_rows": _dbg_completion,
                         "ai_model_steps": _dbg_ai_steps,
+                        "override_steps": _extract_ai_model_override_steps(_dbg_ai_steps),
                         "advanced_table_rows": _dbg_advanced,
+                        "auction_error_taxonomy": _dbg_taxonomy,
                         "current_path_bids": [
                             str(s.get("bid", "")) for s in (current_path or []) if isinstance(s, dict)
                         ],

@@ -96,7 +96,14 @@ from bbo_explanation_lib import (
     render_counterfactual_why_not,
     render_recommendation_explanation,
 )
-from bbo_hand_eval_lib import estimate_partnership_tricks, pivot_bt_seat_stats, get_bt_dd_mean_tricks
+from bbo_hand_eval_lib import (
+    count_hand_ltc,
+    count_suit_ltc,
+    estimate_partnership_tricks,
+    parse_hand_cards,
+    pivot_bt_seat_stats,
+    get_bt_dd_mean_tricks,
+)
 
 from mlBridge.mlBridgeBiddingLib import DIRECTIONS
 import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
@@ -596,61 +603,15 @@ def _compute_cumulative_deal_mask(
     
     if deal_df is None:
         return None
-
-    dealer_series = deal_df["Dealer"]
-    global_mask: pl.Series | None = None
-    
-    # For each seat 1..up_to_seat, AND in the criteria
-    for seat_i in range(1, up_to_seat + 1):
-        criteria_list = bt_row.get(f"Agg_Expr_Seat_{seat_i}") or []
-        if not criteria_list:
-            continue
-            
-        seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat_i, {})
-        if not seat_criteria_for_seat:
-            continue
-
-        # Find valid criteria
-        sample_criteria_df = None
-        for dealer in DIRECTIONS:
-            sample_criteria_df = seat_criteria_for_seat.get(dealer)
-            if sample_criteria_df is not None and not sample_criteria_df.is_empty():
-                break
-        
-        if sample_criteria_df is None:
-            continue
-            
-        available_cols = set(sample_criteria_df.columns)
-        valid_criteria = [c for c in criteria_list if c in available_cols]
-        
-        if not valid_criteria:
-            continue
-
-        # Build per-dealer masks for this seat
-        seat_mask: pl.Series | None = None
-        for dealer in DIRECTIONS:
-            dealer_mask = dealer_series == dealer
-            if not dealer_mask.any():
-                continue
-
-            seat_criteria_df = seat_criteria_for_seat.get(dealer)
-            if seat_criteria_df is None or seat_criteria_df.is_empty():
-                continue
-
-            combined = dealer_mask
-            for crit in valid_criteria:
-                combined = combined & seat_criteria_df[crit]
-                if not combined.any():
-                    combined = None
-                    break
-
-            if combined is not None:
-                seat_mask = combined if seat_mask is None else (seat_mask | combined)
-        
-        # AND this seat's mask into global mask
-        if seat_mask is not None:
-            global_mask = seat_mask if global_mask is None else (global_mask & seat_mask)
-
+    criteria_row = {
+        f"Agg_Expr_Seat_{seat_i}": (bt_row.get(f"Agg_Expr_Seat_{seat_i}") or [])
+        for seat_i in range(1, int(up_to_seat) + 1)
+    }
+    global_mask, _invalid = _build_criteria_mask_for_all_seats(
+        deal_df,
+        criteria_row,
+        deal_criteria_by_seat_dfs,
+    )
     return global_mask
 
 
@@ -673,49 +634,13 @@ def _compute_deal_count_with_base_mask(
     # If no new criteria, just count the base mask
     if not criteria_list:
         return int(base_mask.sum()) if base_mask is not None else 0
-    
-    seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat_i, {})
-    if not seat_criteria_for_seat:
-        return int(base_mask.sum()) if base_mask is not None else 0
 
-    # Find valid criteria
-    sample_criteria_df = None
-    for dealer in DIRECTIONS:
-        sample_criteria_df = seat_criteria_for_seat.get(dealer)
-        if sample_criteria_df is not None and not sample_criteria_df.is_empty():
-            break
-    
-    if sample_criteria_df is None:
-        return int(base_mask.sum()) if base_mask is not None else 0
-        
-    available_cols = set(sample_criteria_df.columns)
-    valid_criteria = [c for c in criteria_list if c in available_cols]
-    
-    if not valid_criteria:
-        return int(base_mask.sum()) if base_mask is not None else 0
-
-    dealer_series = deal_df["Dealer"]
-    new_seat_mask: pl.Series | None = None
-    
-    for dealer in DIRECTIONS:
-        dealer_mask = dealer_series == dealer
-        if not dealer_mask.any():
-            continue
-
-        seat_criteria_df = seat_criteria_for_seat.get(dealer)
-        if seat_criteria_df is None or seat_criteria_df.is_empty():
-            continue
-
-        combined = dealer_mask
-        for crit in valid_criteria:
-            combined = combined & seat_criteria_df[crit]
-            if not combined.any():
-                combined = None
-                break
-
-        if combined is not None:
-            new_seat_mask = combined if new_seat_mask is None else (new_seat_mask | combined)
-
+    criteria_row = {f"Agg_Expr_Seat_{seat_i}": criteria_list}
+    new_seat_mask, _invalid = _build_criteria_mask_for_all_seats(
+        deal_df,
+        criteria_row,
+        deal_criteria_by_seat_dfs,
+    )
     if new_seat_mask is None:
         return 0
     
@@ -756,42 +681,12 @@ def _compute_deal_mask_with_base_mask(
         except Exception:
             return None
 
-    seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat_i, {})
-    if not seat_criteria_for_seat:
-        return base_mask
-
-    # Find valid criteria
-    sample_criteria_df = None
-    for dealer in DIRECTIONS:
-        sample_criteria_df = seat_criteria_for_seat.get(dealer)
-        if sample_criteria_df is not None and not sample_criteria_df.is_empty():
-            break
-    if sample_criteria_df is None:
-        return base_mask
-
-    available_cols = set(sample_criteria_df.columns)
-    valid_criteria = [c for c in criteria_list if c in available_cols]
-    if not valid_criteria:
-        return base_mask
-
-    dealer_series = deal_df["Dealer"]
-    new_seat_mask: pl.Series | None = None
-    for dealer in DIRECTIONS:
-        dealer_mask = dealer_series == dealer
-        if not dealer_mask.any():
-            continue
-        seat_criteria_df = seat_criteria_for_seat.get(dealer)
-        if seat_criteria_df is None or seat_criteria_df.is_empty():
-            continue
-        combined = dealer_mask
-        for crit in valid_criteria:
-            combined = combined & seat_criteria_df[crit]
-            if not combined.any():
-                combined = None
-                break
-        if combined is not None:
-            new_seat_mask = combined if new_seat_mask is None else (new_seat_mask | combined)
-
+    criteria_row = {f"Agg_Expr_Seat_{seat_i}": criteria_list}
+    new_seat_mask, _invalid = _build_criteria_mask_for_all_seats(
+        deal_df,
+        criteria_row,
+        deal_criteria_by_seat_dfs,
+    )
     if new_seat_mask is None:
         return None
     return (base_mask & new_seat_mask) if base_mask is not None else new_seat_mask
@@ -821,54 +716,12 @@ def _compute_seat_stats_for_bt_row(
         # callers can distinguish "no criteria" from "criteria with no matching deals".
         return {"matching_deal_count": 0, "stats": None, "expr": [], "invalid_criteria": []}
 
-    # Build a global mask over deals using the precomputed bitmaps for this seat.
-    dealer_series = deal_df["Dealer"]
-    global_mask: pl.Series | None = None
-    
-    # Track criteria that don't have bitmap columns (invalid/missing criteria)
-    invalid_criteria: list[str] = []
-    valid_criteria: list[str] = []
-
-    seat_criteria_for_seat = deal_criteria_by_seat_dfs.get(seat_i, {})
-    if not seat_criteria_for_seat:
-        return {"matching_deal_count": 0, "stats": None, "expr": criteria_list, "invalid_criteria": list(criteria_list)}
-
-    # Check which criteria have bitmap columns (use first available dealer's df)
-    sample_criteria_df = None
-    for dealer in DIRECTIONS:
-        sample_criteria_df = seat_criteria_for_seat.get(dealer)
-        if sample_criteria_df is not None and not sample_criteria_df.is_empty():
-            break
-    
-    if sample_criteria_df is not None:
-        available_cols = set(sample_criteria_df.columns)
-        for crit in criteria_list:
-            if crit in available_cols:
-                valid_criteria.append(crit)
-            else:
-                invalid_criteria.append(crit)
-    else:
-        invalid_criteria = list(criteria_list)
-
-    for dealer in DIRECTIONS:
-        dealer_mask = dealer_series == dealer
-        if not dealer_mask.any():
-            continue
-
-        seat_criteria_df = seat_criteria_for_seat.get(dealer)
-        if seat_criteria_df is None or seat_criteria_df.is_empty():
-            continue
-
-        combined = dealer_mask
-        for crit in valid_criteria:
-            combined = combined & seat_criteria_df[crit]
-            if not combined.any():
-                combined = None
-                break
-
-        if combined is not None:
-            global_mask = combined if global_mask is None else (global_mask | combined)
-
+    criteria_row = {criteria_col: criteria_list}
+    global_mask, invalid_criteria = _build_criteria_mask_for_all_seats(
+        deal_df,
+        criteria_row,
+        deal_criteria_by_seat_dfs,
+    )
     if global_mask is None or not global_mask.any():
         return {"matching_deal_count": 0, "stats": None, "expr": criteria_list, "invalid_criteria": invalid_criteria}
 
@@ -1801,7 +1654,7 @@ def handle_random_auction_sequences(
             if expr_val is not None:
                 for s in range(1, 5):
                     col_s = f"Agg_Expr_Seat_{s}"
-                    if col_s not in base or base.get(col_s) is None:
+                    if col_s not in base or not base.get(col_s):
                         base[col_s] = expr_val if s == step_seat else []
         base_row = _apply_all_rules_to_bt_row(base, state)
         # Agg_Expr_Seat_1 now contains pre-compiled merged rules
@@ -2347,6 +2200,15 @@ def handle_deal_criteria_failures_batch(
             if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
                 untracked.append(crit_s)
                 continue
+
+            texture_result, texture_annot = _evaluate_suit_texture_criterion(
+                crit_s, dealer, seat, row
+            )
+            if texture_result is True:
+                continue
+            if texture_result is False:
+                failed.append(str(texture_annot or crit_s))
+                continue
             
             # Fall back to bitmap lookup for other criteria
             if criteria_df is not None and crit_s in available_cols:
@@ -2367,7 +2229,7 @@ def handle_deal_criteria_failures_batch(
 
         # Annotate failed criteria with actual values (e.g., 'HCP <= 11' -> 'HCP(10) <= 11')
         failed_annotated = [
-            annotate_criterion_with_value(c, dealer, seat, row) for c in failed
+            c if "(len=" in str(c) else annotate_criterion_with_value(c, dealer, seat, row) for c in failed
         ]
 
         results.append({
@@ -2386,12 +2248,565 @@ def handle_deal_criteria_failures_batch(
     }
 
 
+def _evaluate_suit_texture_criterion(
+    criterion: str,
+    dealer: str,
+    seat: int,
+    deal_row: Dict[str, Any],
+    auction_tokens: List[str] | None = None,
+) -> Tuple[bool | None, str | None]:
+    """Evaluate suit-texture metadata from the actual hand when available."""
+    crit_s = str(criterion or "").strip()
+    crit_u = crit_s.upper()
+    stop_m = re.match(r"^STOP_IN_([CDHS])$", crit_u)
+    m = re.match(
+        r"^(BIDDABLE|REBIDDABLE|STRONG_REBIDDABLE|TWICE_REBIDDABLE)_([CDHS])$",
+        crit_u,
+    )
+    direction = seat_to_direction(str(dealer or "N").upper(), int(seat))
+    hand_str = str((deal_row or {}).get(f"Hand_{direction}", "") or "").strip()
+    if not hand_str or "." not in hand_str:
+        return None, None
+    parts = hand_str.split(".")
+    if len(parts) != 4:
+        return None, None
+
+    if stop_m:
+        stop_suit = str(stop_m.group(1))
+        stop_idx = {"S": 0, "H": 1, "D": 2, "C": 3}[stop_suit]
+        stop_cards = str(parts[stop_idx] or "").upper()
+        stop_len = len(stop_cards)
+        stop_passes = bool(
+            ("A" in stop_cards)
+            or ("K" in stop_cards and stop_len >= 2)
+            or ("Q" in stop_cards and stop_len >= 3)
+        )
+        return stop_passes, f"{crit_s}(cards={stop_cards or '-'})"
+
+    if not m:
+        return None, None
+
+    suit = str(m.group(2))
+    suit_idx = {"S": 0, "H": 1, "D": 2, "C": 3}[suit]
+    suit_cards = str(parts[suit_idx] or "").upper()
+    suit_len = len(suit_cards)
+    suit_hcp = sum({"A": 4, "K": 3, "Q": 2, "J": 1}.get(c, 0) for c in suit_cards)
+    top4 = sum(1 for c in suit_cards if c in "AKQJ")
+    top3 = sum(1 for c in suit_cards if c in "AKQ")
+
+    family = str(m.group(1))
+    dealer_u = str(dealer or "N").upper()
+    actor_dir = seat_to_direction(dealer_u, int(seat))
+
+    prior_suits: List[str] = []
+    seen_suits: set[str] = set()
+    for i, tk in enumerate(list(auction_tokens or [])):
+        tk_u = str(tk or "").strip().upper()
+        bidder_dir = seat_to_direction(dealer_u, (int(i) % 4) + 1)
+        if bidder_dir != actor_dir:
+            continue
+        parsed = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", tk_u)
+        if not parsed:
+            continue
+        bid_suit = str(parsed.group(2)).upper()
+        bid_suit = "N" if bid_suit in ("N", "NT") else bid_suit
+        if bid_suit not in ("C", "D", "H", "S"):
+            continue
+        if bid_suit not in seen_suits:
+            prior_suits.append(bid_suit)
+            seen_suits.add(bid_suit)
+
+    # Project convention:
+    # - Rebiddable = 6 cards, or 5 very good ones.
+    # - Twice rebiddable = 7 cards, or 6 very good ones.
+    very_good_suit = bool(suit_hcp >= 5 or top3 >= 2 or top4 >= 3)
+    passes: bool | None = None
+    if family == "BIDDABLE":
+        passes = bool(suit_len >= 5 and (suit_hcp >= 2 or top4 >= 1))
+    elif family == "REBIDDABLE":
+        if len(prior_suits) >= 2 and suit == prior_suits[1]:
+            first_suit = str(prior_suits[0])
+            first_len = len(str(parts[{"S": 0, "H": 1, "D": 2, "C": 3}[first_suit]] or ""))
+            passes = bool(suit_len >= 5 and first_len >= suit_len)
+            annotated = (
+                f"{crit_s}(second_suit_rebid len={suit_len}, first_suit={first_suit}, first_len={first_len})"
+            )
+            return passes, annotated
+        passes = bool(suit_len >= 6 or (suit_len >= 5 and very_good_suit))
+    elif family == "STRONG_REBIDDABLE":
+        passes = bool(suit_len >= 6 and (suit_hcp >= 4 or top3 >= 2 or top4 >= 3))
+    elif family == "TWICE_REBIDDABLE":
+        passes = bool(suit_len >= 7 or (suit_len >= 6 and very_good_suit))
+
+    annotated = (
+        f"{crit_s}(len={suit_len}, suit_hcp={suit_hcp}, top4={top4})"
+        if passes is not None
+        else crit_s
+    )
+    return passes, annotated
+
+
+def _maybe_rescue_blocked_second_suit_rebid(
+    *,
+    auction_tokens: List[str],
+    acting_direction: str,
+    dealer_actual: str,
+    self_suit_lengths: Dict[str, int] | None,
+    current_best_bid: str,
+    blocked_candidates: List[Dict[str, Any]] | None,
+) -> Dict[str, Any] | None:
+    """Narrow rescue for semantically valid blocked second-suit rebids."""
+    best_m = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", str(current_best_bid or "").strip().upper())
+    if best_m is None or str(best_m.group(2)).upper() not in ("N", "NT"):
+        return None
+    sl = dict(self_suit_lengths or {})
+    if not sl:
+        return None
+
+    directions = ("N", "E", "S", "W")
+    dealer_u = str(dealer_actual or "N").strip().upper()
+    if dealer_u not in directions:
+        dealer_u = "N"
+    dealer_idx = directions.index(dealer_u)
+
+    shown: List[str] = []
+    seen: set[str] = set()
+    for i, tk in enumerate(list(auction_tokens or [])):
+        bidder_dir = directions[(dealer_idx + int(i)) % 4]
+        if bidder_dir != acting_direction:
+            continue
+        parsed = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", str(tk or "").strip().upper())
+        if parsed is None:
+            continue
+        suit = str(parsed.group(2)).upper()
+        suit = "N" if suit in ("N", "NT") else suit
+        if suit not in ("C", "D", "H", "S"):
+            continue
+        if suit not in seen:
+            shown.append(suit)
+            seen.add(suit)
+    if len(shown) < 2:
+        return None
+
+    first_suit = str(shown[0])
+    second_suit = str(shown[1])
+    first_len = sl.get(first_suit)
+    second_len = sl.get(second_suit)
+    if first_len is None or second_len is None:
+        return None
+
+    candidates: List[tuple[float, Dict[str, Any]]] = []
+    for row in list(blocked_candidates or []):
+        bid = str((row or {}).get("bid", "") or "").strip().upper()
+        parsed = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", bid)
+        if parsed is None:
+            continue
+        bid_suit = str(parsed.group(2)).upper()
+        bid_suit = "N" if bid_suit in ("N", "NT") else bid_suit
+        if bid_suit != second_suit:
+            continue
+        if int(second_len) < 5 or int(first_len) < int(second_len):
+            continue
+        bid_level = int(parsed.group(1))
+        pref = float(int(second_len) * 25) - float(bid_level * 20)
+        candidates.append((pref, row))
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            -float(item[0]),
+            str((item[1] or {}).get("bid", "") or "").strip().upper(),
+        )
+    )
+    chosen = candidates[0][1]
+    chosen_bid = str((chosen or {}).get("bid", "") or "").strip().upper()
+    if not chosen_bid:
+        return None
+    return {
+        "apply": True,
+        "selected_bid": chosen_bid,
+        "reason_codes": ["blocked_second_suit_rebid_rescue"],
+        "reason": (
+            "COMMON_SENSE_HARD_OVERRIDE: prefer valid second-suit rebid "
+            f"{chosen_bid} over NT when BT marks it cannot_complete"
+        ),
+        "evidence": {
+            "current_best_bid": str(current_best_bid or "").strip().upper(),
+            "shown_suits": shown,
+            "first_suit": first_suit,
+            "first_len": int(first_len),
+            "second_suit": second_suit,
+            "second_len": int(second_len),
+            "selected_source": "blocked_cannot_complete",
+        },
+    }
+
+
+def _maybe_rescue_blocked_preference_return(
+    *,
+    auction_tokens: List[str],
+    acting_direction: str,
+    dealer_actual: str,
+    self_suit_lengths: Dict[str, int] | None,
+    current_best_bid: str,
+    surviving_non_pass_candidates: List[Dict[str, Any]] | None,
+    criteria_failed_candidates: List[Dict[str, Any]] | None,
+) -> Dict[str, Any] | None:
+    """Prefer a cheap return to partner's first suit over pass in two-suit preference spots."""
+    best_u = str(current_best_bid or "").strip().upper()
+    if best_u not in ("P", "PASS"):
+        return None
+    sl = dict(self_suit_lengths or {})
+    if not sl:
+        return None
+
+    directions = ("N", "E", "S", "W")
+    dealer_u = str(dealer_actual or "N").strip().upper()
+    if dealer_u not in directions:
+        dealer_u = "N"
+    dealer_idx = directions.index(dealer_u)
+
+    partner_dir = {
+        "N": "S",
+        "S": "N",
+        "E": "W",
+        "W": "E",
+    }.get(str(acting_direction or "").strip().upper())
+    if not partner_dir:
+        return None
+
+    partner_suits: List[str] = []
+    self_suits: set[str] = set()
+    first_side_bidder: str | None = None
+    current_contract_level: int | None = None
+    for i, tk in enumerate(list(auction_tokens or [])):
+        tk_u = str(tk or "").strip().upper()
+        if len(tk_u) < 2 or not tk_u[0].isdigit():
+            continue
+        bidder_dir = directions[(dealer_idx + int(i)) % 4]
+        bidder_side = "NS" if bidder_dir in ("N", "S") else "EW"
+        acting_side = "NS" if acting_direction in ("N", "S") else "EW"
+        if first_side_bidder is None and bidder_side == acting_side:
+            first_side_bidder = bidder_dir
+        suit = tk_u[1:]
+        if suit == "NT":
+            suit = "N"
+        if suit not in ("C", "D", "H", "S"):
+            continue
+        current_contract_level = int(tk_u[0])
+        if bidder_dir == partner_dir:
+            if suit not in partner_suits:
+                partner_suits.append(suit)
+        elif bidder_dir == acting_direction:
+            self_suits.add(suit)
+    if len(partner_suits) < 2:
+        return None
+    if self_suits & set(partner_suits):
+        return None
+    if not bool(first_side_bidder and first_side_bidder != acting_direction):
+        return None
+    _last_contract_level: int | None = None
+    _last_contract_strain: str | None = None
+    for tk in list(auction_tokens or []):
+        tk_u = str(tk or "").strip().upper()
+        parsed = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", tk_u)
+        if parsed is None:
+            continue
+        _last_contract_level = int(parsed.group(1))
+        _last_contract_strain = str(parsed.group(2)).upper()
+        _last_contract_strain = "N" if _last_contract_strain in ("N", "NT") else _last_contract_strain
+    if _last_contract_level is not None:
+        if _last_contract_level > 3:
+            return None
+        if _last_contract_level == 3 and _last_contract_strain == "N":
+            return None
+
+    first_suit = str(partner_suits[0])
+    second_suit = str(partner_suits[1])
+    first_len = sl.get(first_suit)
+    second_len = sl.get(second_suit)
+    if first_len is None or second_len is None or int(first_len) < int(second_len):
+        return None
+
+    for row in list(surviving_non_pass_candidates or []):
+        bid = str((row or {}).get("bid", "") or "").strip().upper()
+        parsed = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", bid)
+        if parsed is None:
+            continue
+        bid_level = int(parsed.group(1))
+        bid_suit = str(parsed.group(2)).upper()
+        bid_suit = "N" if bid_suit in ("N", "NT") else bid_suit
+        if bid_suit == first_suit:
+            continue
+        if current_contract_level is None or bid_level <= (int(current_contract_level) + 1):
+            return None
+
+    candidates: List[tuple[float, Dict[str, Any]]] = []
+    for row in list(criteria_failed_candidates or []):
+        bid = str((row or {}).get("bid", "") or "").strip().upper()
+        parsed = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", bid)
+        if parsed is None:
+            continue
+        bid_level = int(parsed.group(1))
+        bid_suit = str(parsed.group(2)).upper()
+        bid_suit = "N" if bid_suit in ("N", "NT") else bid_suit
+        if bid_suit != first_suit:
+            continue
+        if current_contract_level is not None and bid_level > (int(current_contract_level) + 1):
+            continue
+        pref = float(int(first_len) * 25) - float(int(second_len) * 10) - float(bid_level * 20)
+        candidates.append((pref, row))
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            -float(item[0]),
+            str((item[1] or {}).get("bid", "") or "").strip().upper(),
+        )
+    )
+    chosen = candidates[0][1]
+    chosen_bid = str((chosen or {}).get("bid", "") or "").strip().upper()
+    if not chosen_bid:
+        return None
+    return {
+        "apply": True,
+        "selected_bid": chosen_bid,
+        "reason_codes": ["blocked_preference_return_rescue"],
+        "reason": (
+            "COMMON_SENSE_HARD_OVERRIDE: prefer cheapest return to partner's first suit "
+            f"{chosen_bid} over pass when only remote jumps survive"
+        ),
+        "evidence": {
+            "current_best_bid": best_u,
+            "partner_suits": partner_suits,
+            "first_suit": first_suit,
+            "second_suit": second_suit,
+            "first_len": int(first_len),
+            "second_len": int(second_len),
+            "selected_source": "criteria_fail_preference_return",
+        },
+    }
+
+
+def _maybe_rescue_blocked_nt_slam_followup(
+    *,
+    self_total_points: float | None,
+    current_best_bid: str,
+    blocked_candidates: List[Dict[str, Any]] | None,
+    criteria_failed_candidates: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any] | None:
+    """Prefer a blocked NT slam try over settling for 3NT with clear extras."""
+    best_u = str(current_best_bid or "").strip().upper()
+    if best_u not in ("3N", "3NT"):
+        return None
+    tp_self = float(self_total_points) if isinstance(self_total_points, (int, float)) else None
+    if tp_self is None or tp_self < 20.0:
+        return None
+
+    def _pick(rows: List[Dict[str, Any]] | None, target_bid: str) -> Dict[str, Any] | None:
+        tgt = str(target_bid or "").strip().upper()
+        for row in list(rows or []):
+            bid = str((row or {}).get("bid", "") or "").strip().upper()
+            if bid == tgt:
+                return row
+        return None
+
+    candidate_pool: List[tuple[float, str, Dict[str, Any] | None, str]] = []
+    for source_name, rows in (
+        ("blocked_cannot_complete", list(blocked_candidates or [])),
+        ("criteria_fail", list(criteria_failed_candidates or [])),
+    ):
+        row_4n = _pick(rows, "4N")
+        if row_4n is not None:
+            pref = 250.0 if source_name == "blocked_cannot_complete" else 235.0
+            candidate_pool.append((pref, "4N", row_4n, source_name))
+        row_6n = _pick(rows, "6N")
+        if row_6n is not None and tp_self >= 22.0:
+            pref = 200.0 if source_name == "blocked_cannot_complete" else 185.0
+            candidate_pool.append((pref, "6N", row_6n, source_name))
+
+    if not candidate_pool:
+        return None
+
+    candidate_pool.sort(key=lambda item: (-float(item[0]), str(item[1])))
+    _pref, chosen_bid, _row, source_name = candidate_pool[0]
+    return {
+        "apply": True,
+        "selected_bid": chosen_bid,
+        "reason_codes": ["blocked_nt_slam_followup_rescue"],
+        "reason": (
+            "COMMON_SENSE_HARD_OVERRIDE: prefer blocked NT slam continuation "
+            f"{chosen_bid} over 3NT signoff with strong extras"
+        ),
+        "evidence": {
+            "current_best_bid": best_u,
+            "self_total_points": float(tp_self),
+            "selected_source": source_name,
+            "selected_nt_followup": chosen_bid,
+        },
+    }
+
+
+def _maybe_rescue_blocked_major_game_followup(
+    *,
+    auction_tokens: List[str],
+    acting_direction: str,
+    dealer_actual: str,
+    self_total_points: float | None,
+    self_suit_lengths: Dict[str, int] | None,
+    current_best_bid: str,
+    blocked_candidates: List[Dict[str, Any]] | None,
+    criteria_failed_candidates: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any] | None:
+    """Prefer blocked major-suit game over fragile 3NT after partner repeats a major."""
+    best_u = str(current_best_bid or "").strip().upper()
+    if best_u not in ("3N", "3NT"):
+        return None
+    sl = dict(self_suit_lengths or {})
+    if not sl:
+        return None
+
+    partner_dir = {
+        "N": "S",
+        "S": "N",
+        "E": "W",
+        "W": "E",
+    }.get(str(acting_direction or "").strip().upper())
+    if not partner_dir:
+        return None
+
+    directions = ("N", "E", "S", "W")
+    dealer_u = str(dealer_actual or "N").strip().upper()
+    if dealer_u not in directions:
+        dealer_u = "N"
+    dealer_idx = directions.index(dealer_u)
+
+    partner_major_suits: List[str] = []
+    side_major_suits: List[str] = []
+    current_contract_level: int | None = None
+    current_contract_strain: str | None = None
+    for i, tk in enumerate(list(auction_tokens or [])):
+        parsed = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", str(tk or "").strip().upper())
+        if parsed is None:
+            continue
+        bidder_dir = directions[(dealer_idx + int(i)) % 4]
+        bid_level = int(parsed.group(1))
+        bid_strain = str(parsed.group(2)).upper()
+        bid_strain = "N" if bid_strain in ("N", "NT") else bid_strain
+        current_contract_level = bid_level
+        current_contract_strain = bid_strain
+        if bid_strain in ("H", "S") and bidder_dir in (str(acting_direction or "").strip().upper(), partner_dir):
+            side_major_suits.append(bid_strain)
+        if bidder_dir == partner_dir and bid_strain in ("H", "S"):
+            partner_major_suits.append(bid_strain)
+
+    if current_contract_level is None:
+        return None
+    if current_contract_level > 3 or (current_contract_level == 3 and current_contract_strain not in ("H", "S", "N")):
+        return None
+    if not partner_major_suits:
+        return None
+
+    target_suit = str(partner_major_suits[-1])
+    if side_major_suits.count(target_suit) < 2:
+        return None
+    acting_len = sl.get(target_suit)
+    if acting_len is None or int(acting_len) < 3:
+        return None
+    target_bid = f"4{target_suit}"
+
+    def _pick(rows: List[Dict[str, Any]] | None, target_bid_local: str) -> Dict[str, Any] | None:
+        tgt = str(target_bid_local or "").strip().upper()
+        for row in list(rows or []):
+            bid = str((row or {}).get("bid", "") or "").strip().upper()
+            if bid == tgt:
+                return row
+        return None
+
+    def _is_soft_point_threshold_miss(row: Dict[str, Any] | None) -> bool:
+        if row is None:
+            return False
+        trace = list((row or {}).get("criteria_trace") or [])
+        if not trace:
+            return False
+        failed = [entry for entry in trace if entry.get("passed") is False]
+        if not failed:
+            return False
+        saw_soft_tp_fail = False
+        for entry in failed:
+            crit = str((entry or {}).get("criterion", "") or "").strip().upper()
+            m = re.match(r"^TOTAL_POINTS\s*>=\s*([0-9]+(?:\.[0-9]+)?)$", crit)
+            if m is None or not isinstance(self_total_points, (int, float)):
+                return False
+            shortfall = float(m.group(1)) - float(self_total_points)
+            if shortfall <= 0.0 or shortfall > 1.0:
+                return False
+            saw_soft_tp_fail = True
+        return saw_soft_tp_fail
+
+    chosen_row = _pick(blocked_candidates, target_bid)
+    source_name = "blocked_cannot_complete"
+    if chosen_row is None:
+        soft_row = _pick(criteria_failed_candidates, target_bid)
+        if not _is_soft_point_threshold_miss(soft_row):
+            return None
+        chosen_row = soft_row
+        source_name = "criteria_fail_soft_tp"
+    if chosen_row is None:
+        return None
+
+    return {
+        "apply": True,
+        "selected_bid": target_bid,
+        "reason_codes": ["blocked_major_game_followup_rescue"],
+        "reason": (
+            "COMMON_SENSE_HARD_OVERRIDE: prefer blocked major-game follow-up "
+            f"{target_bid} over fragile NT signoff after partner repeated {target_suit}"
+        ),
+        "evidence": {
+            "current_best_bid": best_u,
+            "target_bid": target_bid,
+            "target_suit": target_suit,
+            "acting_support_len": int(acting_len),
+            "self_total_points": float(self_total_points) if isinstance(self_total_points, (int, float)) else None,
+            "selected_source": source_name,
+        },
+    }
+
+
+def _augment_inline_deal_row_dict_with_qt(
+    deal_row_dict: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    """Populate missing inline QT_* fields from Hand_* strings for custom deals."""
+    if deal_row_dict is None:
+        return None
+
+    augmented = dict(deal_row_dict)
+    for direction in DIRECTIONS:
+        hand_key = f"Hand_{direction}"
+        qt_key = f"QT_{direction}"
+        if augmented.get(qt_key) is not None:
+            continue
+        hand_str = str(augmented.get(hand_key) or "").strip()
+        if not hand_str:
+            continue
+        try:
+            hand_features = compute_hand_features(hand_str)
+            qt_val = hand_features.get("QT")
+            if qt_val is not None:
+                augmented[qt_key] = float(qt_val)
+        except Exception:
+            continue
+    return augmented
+
+
 def handle_deal_criteria_pass_batch(
     state: Dict[str, Any],
     deal_row_idx: int,
     dealer: str,
     checks: List[Dict[str, Any]],
     deal_row_dict: Dict[str, Any] | None = None,
+    auction_tokens: List[str] | None = None,
 ) -> Dict[str, Any]:
     """Fast pass/fail only version of /deal-criteria-eval-batch.
 
@@ -2412,7 +2827,9 @@ def handle_deal_criteria_pass_batch(
 
     # Resolve deal_row: prefer supplied dict (on-the-fly), else fetch from DB by index.
     if deal_row_dict is not None:
-        deal_row: Dict[str, Any] = deal_row_dict
+        deal_row = _augment_inline_deal_row_dict_with_qt(deal_row_dict)
+        assert deal_row is not None
+        deal_row_dict = deal_row
     else:
         if deal_df is None:
             raise ValueError("deal_df not loaded")
@@ -2512,6 +2929,15 @@ def handle_deal_criteria_pass_batch(
                 break
             # SL criterion that can't be evaluated => untracked => fail (matches UI "passes = no failed and no untracked").
             if parse_sl_comparison_relative(crit_s) is not None or parse_sl_comparison_numeric(crit_s) is not None:
+                passes = False
+                break
+
+            texture_result, _texture_annot = _evaluate_suit_texture_criterion(
+                crit_s, dealer_n, seat, deal_row, auction_tokens=auction_tokens
+            )
+            if texture_result is True:
+                continue
+            if texture_result is False:
                 passes = False
                 break
 
@@ -7479,6 +7905,105 @@ def _build_criteria_mask_for_dealer(
             .str.len_chars()
         )
 
+    def _suit_cards_expr(direction: str, suit: str) -> pl.Expr:
+        hand_col = f"Hand_{direction}"
+        idx = SUIT_IDX[suit]
+        return (
+            pl.col(hand_col)
+            .cast(pl.Utf8)
+            .str.split(".")
+            .list.get(idx)
+            .fill_null("")
+        )
+
+    def _dynamic_criterion_series(criterion: str, seat: int) -> tuple[bool, pl.Series | None]:
+        crit_s = str(criterion or "").strip()
+        crit_u = crit_s.upper()
+        seat_dir = _seat_dir_for_dealer(dealer_crit, seat)
+
+        # Convention/flow-control markers are metadata, not hand-shape predicates.
+        if crit_u.startswith("FORCING_TO_") or crit_u in ("FORCING_ONE_ROUND",):
+            return True, pl.Series([True] * int(deal_df.height))
+
+        parsed_rel = parse_sl_comparison_relative(crit_s)
+        if parsed_rel is not None:
+            left_s, op, right_s = parsed_rel
+            left_e = _sl_len_expr(seat_dir, left_s)
+            right_e = _sl_len_expr(seat_dir, right_s)
+            if op == ">=":
+                dyn = (left_e >= right_e)
+            elif op == "<=":
+                dyn = (left_e <= right_e)
+            elif op == ">":
+                dyn = (left_e > right_e)
+            elif op == "<":
+                dyn = (left_e < right_e)
+            elif op == "==":
+                dyn = (left_e == right_e)
+            elif op == "!=":
+                dyn = (left_e != right_e)
+            else:
+                return False, None
+            return True, deal_df.select(dyn.fill_null(False).alias("_dyn")).get_column("_dyn")
+
+        parsed_num = parse_sl_comparison_numeric(crit_s)
+        if parsed_num is not None:
+            suit, op, value = parsed_num
+            left_e = _sl_len_expr(seat_dir, suit)
+            right_v = int(value)
+            if op == ">=":
+                dyn = (left_e >= right_v)
+            elif op == "<=":
+                dyn = (left_e <= right_v)
+            elif op == ">":
+                dyn = (left_e > right_v)
+            elif op == "<":
+                dyn = (left_e < right_v)
+            elif op == "==":
+                dyn = (left_e == right_v)
+            elif op == "!=":
+                dyn = (left_e != right_v)
+            else:
+                return False, None
+            return True, deal_df.select(dyn.fill_null(False).alias("_dyn")).get_column("_dyn")
+
+        m = re.match(r"^(BIDDABLE|REBIDDABLE|STRONG_REBIDDABLE|TWICE_REBIDDABLE)_([CDHS])$", crit_u)
+        if m is None:
+            return False, None
+
+        family = str(m.group(1))
+        suit = str(m.group(2))
+        suit_cards = _suit_cards_expr(seat_dir, suit)
+        suit_len = _sl_len_expr(seat_dir, suit)
+        suit_hcp = (
+            suit_cards.str.count_matches("A") * 4
+            + suit_cards.str.count_matches("K") * 3
+            + suit_cards.str.count_matches("Q") * 2
+            + suit_cards.str.count_matches("J")
+        )
+        top4 = (
+            suit_cards.str.count_matches("A")
+            + suit_cards.str.count_matches("K")
+            + suit_cards.str.count_matches("Q")
+            + suit_cards.str.count_matches("J")
+        )
+        top3 = (
+            suit_cards.str.count_matches("A")
+            + suit_cards.str.count_matches("K")
+            + suit_cards.str.count_matches("Q")
+        )
+        very_good_suit = (suit_hcp >= 5) | (top3 >= 2) | (top4 >= 3)
+
+        if family == "BIDDABLE":
+            dyn = (suit_len >= 5) & ((suit_hcp >= 2) | (top4 >= 1))
+        elif family == "REBIDDABLE":
+            dyn = (suit_len >= 6) | ((suit_len >= 5) & very_good_suit)
+        elif family == "STRONG_REBIDDABLE":
+            dyn = (suit_len >= 6) & ((suit_hcp >= 4) | (top3 >= 2) | (top4 >= 3))
+        else:  # TWICE_REBIDDABLE
+            dyn = (suit_len >= 7) | ((suit_len >= 6) & very_good_suit)
+        return True, deal_df.select(dyn.fill_null(False).alias("_dyn")).get_column("_dyn")
+
     dealer_mask = deal_df["Dealer"] == dealer
     if not dealer_mask.any():
         return None, []
@@ -7499,37 +8024,19 @@ def _build_criteria_mask_for_dealer(
         available_cols = set(seat_criteria_df.columns)
         
         for crit in criteria_list:
-            if crit not in available_cols:
-                # Try dynamic suit-length comparisons (not precomputed as bitmap columns).
-                parsed = parse_sl_comparison_relative(str(crit))
-                if parsed is None:
+            handled, dyn_series = _dynamic_criterion_series(str(crit), int(seat))
+            if handled:
+                if dyn_series is None:
                     if crit not in invalid_criteria:
                         invalid_criteria.append(crit)
                     continue
-                left_s, op, right_s = parsed
-                seat_dir = _seat_dir_for_dealer(dealer_crit, seat)
-                left_e = _sl_len_expr(seat_dir, left_s)
-                right_e = _sl_len_expr(seat_dir, right_s)
-                if op == ">=":
-                    dyn = (left_e >= right_e)
-                elif op == "<=":
-                    dyn = (left_e <= right_e)
-                elif op == ">":
-                    dyn = (left_e > right_e)
-                elif op == "<":
-                    dyn = (left_e < right_e)
-                elif op == "==":
-                    dyn = (left_e == right_e)
-                elif op == "!=":
-                    dyn = (left_e != right_e)
-                else:
-                    if crit not in invalid_criteria:
-                        invalid_criteria.append(crit)
-                    continue
-                dyn_series = deal_df.select(dyn.fill_null(False).alias("_dyn")).get_column("_dyn")
                 all_seats_mask = all_seats_mask & dyn_series
                 if not all_seats_mask.any():
                     return None, invalid_criteria
+                continue
+            if crit not in available_cols:
+                if crit not in invalid_criteria:
+                    invalid_criteria.append(crit)
                 continue
             col = seat_criteria_df[crit]
             all_seats_mask = all_seats_mask & col
@@ -8345,7 +8852,7 @@ def handle_deals_matching_next_bid_criteria(
     row_dict = dict(bt_row)
     for s in range(1, 5):
         col_s = f"Agg_Expr_Seat_{s}"
-        if col_s not in row_dict or row_dict[col_s] is None:
+        if col_s not in row_dict or not row_dict[col_s]:
             row_dict[col_s] = row_dict.get("Expr") if s == int(next_seat) else []
     row_with_rules = _apply_all_rules_to_bt_row(row_dict, state)
 
@@ -9406,6 +9913,7 @@ def handle_bid_details(
     vul_filter: Optional[str] = None,
     *,
     deal_index: Optional[int] = None,
+    deal_row_dict: Optional[Dict[str, Any]] = None,
     topk: int = 10,
     include_phase2a: bool = True,
     phase2a_include_keycards: bool = True,
@@ -9448,6 +9956,11 @@ def handle_bid_details(
         int(seed or 0),
         str(vul_filter or ""),
         int(deal_index) if deal_index is not None else None,
+        (
+            json.dumps(deal_row_dict, sort_keys=True, default=str)
+            if isinstance(deal_row_dict, dict) and deal_row_dict
+            else None
+        ),
         int(topk),
         bool(include_phase2a),
         bool(phase2a_include_keycards),
@@ -9790,8 +10303,27 @@ def handle_bid_details(
     seat_dir: str | None = None
     degraded_mode: str | None = None
     degraded_reasons: list[str] = []
+    phase2a_pinned_index: int | None = None
+    display_pinned_deal_index: int | None = None
 
     if deal_index is not None:
+        try:
+            display_pinned_deal_index = int(deal_index)
+        except Exception:
+            display_pinned_deal_index = None
+
+    if isinstance(deal_row_dict, dict) and deal_row_dict:
+        pinned_row = dict(deal_row_dict)
+        if pinned_row is not None:
+            try:
+                dealer = str(pinned_row.get("Dealer", "N")).upper()
+                seat_dir = seat_to_direction(dealer, int(next_seat))
+            except Exception:
+                seat_dir = None
+        # Use a synthetic row id inside phase2a_debug so inline pinned deals do not
+        # collide with unrelated real rows that happen to share the same deal index.
+        phase2a_pinned_index = -1
+    elif deal_index is not None:
         pinned_row = _resolve_deal_row_by_deal_index(state, int(deal_index))
         if pinned_row is not None:
             try:
@@ -9807,6 +10339,7 @@ def handle_bid_details(
                 pinned_in_matches = False
             if pinned_in_matches:
                 matched_df = matched_df.filter(pl.col("index") != int(deal_index))
+        phase2a_pinned_index = display_pinned_deal_index
 
     matched_total_post_excl = int(matched_df.height)
 
@@ -9871,19 +10404,27 @@ def handle_bid_details(
                 include_keycards=bool(phase2a_include_keycards),
                 include_onside=bool(phase2a_include_onside),
             )
-            if pinned_row is not None and deal_index is not None:
+            if pinned_row is not None and phase2a_pinned_index is not None:
                 try:
-                    pinned_df = pl.DataFrame([pinned_row])
+                    pinned_row_for_phase2a = dict(pinned_row)
+                    pinned_row_for_phase2a["index"] = int(phase2a_pinned_index)
+                    pinned_df = pl.DataFrame([pinned_row_for_phase2a])
                     pinned_df = pinned_df.select([c for c in cols if c in pinned_df.columns])
                     if pinned_df.height == 1 and "index" in pinned_df.columns:
                         phase2a_debug_df = pl.concat([deals_sample_df, pinned_df], how="diagonal_relaxed")
                         phase2a_debug = compute_phase2a_auction_conditioned_posteriors(
                             phase2a_debug_df,
                             next_seat=int(next_seat),
-                            pinned_deal_index=int(deal_index),
+                            pinned_deal_index=int(phase2a_pinned_index),
                             include_keycards=bool(phase2a_include_keycards),
                             include_onside=bool(phase2a_include_onside),
                         )
+                        if (
+                            isinstance(phase2a_debug, dict)
+                            and isinstance(phase2a_debug.get("range_percentiles"), dict)
+                            and display_pinned_deal_index is not None
+                        ):
+                            phase2a_debug["range_percentiles"]["deal_index"] = int(display_pinned_deal_index)
                 except Exception:
                     phase2a_debug = None
         except Exception as e:
@@ -9914,7 +10455,7 @@ def handle_bid_details(
         "matched_deals_total": int(matched_total_pre_excl),
         "matched_deals_total_excluding_pinned": int(matched_total_post_excl),
         "matched_deals_sampled": int(deals_sample_df.height),
-        "pinned_deal_index": int(deal_index) if deal_index is not None else None,
+        "pinned_deal_index": display_pinned_deal_index,
         "pinned_deal_excluded": bool(pinned_in_matches),
         "degraded_mode": degraded_mode,
         "degraded_reasons": degraded_reasons,
@@ -10247,7 +10788,7 @@ def _handle_list_next_bids_walk_fallback(
         # Fill Agg_Expr columns from in-memory 'Expr' to avoid DuckDB hits
         for s in range(1, 5):
             col_s = f"Agg_Expr_Seat_{s}"
-            if col_s not in row_dict or row_dict[col_s] is None:
+            if col_s not in row_dict or not row_dict[col_s]:
                 row_dict[col_s] = row_dict.get("Expr") if s == next_seat else []
         
         # apply_overlay_and_dedupe handles CSV overlay and final cleanup
@@ -10454,7 +10995,7 @@ def _handle_resolve_auction_path_fallback(
         # Populate Agg_Expr columns from in-memory 'Expr' to avoid DuckDB hits
         for s in range(1, 5):
             col_s = f"Agg_Expr_Seat_{s}"
-            if col_s not in row_dict or row_dict[col_s] is None:
+            if col_s not in row_dict or not row_dict[col_s]:
                 row_dict[col_s] = row_dict.get("Expr") if s == step_seat else []
 
         # Apply CSV overlay logic if needed (via common helper)
@@ -11882,6 +12423,7 @@ def _trace_criteria_failures(
     deal_row: Dict[str, Any],
     state: Dict[str, Any],
     deal_row_dict: Dict[str, Any] | None = None,
+    auction_tokens: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """Evaluate each criterion individually and return pass/fail/value trace.
 
@@ -11900,6 +12442,18 @@ def _trace_criteria_failures(
                 passed = bool(sl_result)
                 annotated = annotate_criterion_with_value(crit_s, dealer, seat, row_source)
             else:
+                texture_result, texture_annot = _evaluate_suit_texture_criterion(
+                    crit_s,
+                    dealer,
+                    seat,
+                    row_source if isinstance(row_source, dict) else {},
+                    auction_tokens=auction_tokens,
+                )
+                if texture_result is not None:
+                    passed = bool(texture_result)
+                    annotated = texture_annot or crit_s
+                    trace.append({"criterion": crit_s, "passed": passed, "annotated": annotated})
+                    continue
                 # Try via criteria_pythonized_exprs_by_direction
                 direction = seat_to_direction(dealer, seat)
                 criteria_exprs = state.get("criteria_pythonized_exprs_by_direction") or {}
@@ -11991,7 +12545,9 @@ def handle_ai_model_advanced_path(
 
     # Resolve deal_row: prefer supplied dict (on-the-fly), else fetch from DB by index.
     if deal_row_dict is not None:
-        deal_row: Dict[str, Any] = deal_row_dict
+        deal_row = _augment_inline_deal_row_dict_with_qt(deal_row_dict)
+        assert deal_row is not None
+        deal_row_dict = deal_row
     else:
         if deal_df is None:
             return {"auction": "", "steps": 0, "elapsed_ms": 0, "error": "deal_df not loaded"}
@@ -12161,9 +12717,25 @@ def handle_ai_model_advanced_path(
         except Exception:
             return str(dealer or "N").upper()
 
-    def _is_underspecified_criteria(criteria_list: list[str]) -> bool:
+    def _is_nt_opening_response_context(prefix_now: str) -> bool:
+        """Return True for immediate responder actions after a 1NT or 2NT opening."""
+        prefix_u = str(prefix_now or "").strip().upper()
+        return prefix_u in {"1N-P", "2N-P"}
+
+    def _nt_opening_response_fallback_bid(prefix_now: str) -> str | None:
+        """Return the club inquiry fallback for immediate responses to 1NT/2NT."""
+        prefix_u = str(prefix_now or "").strip().upper()
+        if prefix_u == "1N-P":
+            return "2C"
+        if prefix_u == "2N-P":
+            return "3C"
+        return None
+
+    def _is_underspecified_criteria(criteria_list: list[str], *, prefix_now: str = "", bid_text: str = "") -> bool:
         """Check if criteria list is underspecified (missing both HCP and Total_Points)."""
         if not criteria_list:
+            return False
+        if _is_nt_opening_response_context(prefix_now):
             return False
         for crit in criteria_list:
             crit_upper = str(crit).upper()
@@ -12484,6 +13056,201 @@ def handle_ai_model_advanced_path(
 
         return bool(_visible_has_stopper_in_suit(bidder_view, suit))
 
+    def _hand_has_stopper_from_cards(cards: Dict[str, List[str]], suit: str) -> bool:
+        suit_u = str(suit or "").upper()
+        if suit_u not in ("C", "D", "H", "S"):
+            return False
+        suit_cards = list(cards.get(suit_u) or [])
+        suit_hcp = 0
+        for card in suit_cards:
+            card_u = str(card or "").strip().upper()
+            if card_u == "A":
+                suit_hcp += 4
+            elif card_u == "K":
+                suit_hcp += 3
+            elif card_u == "Q":
+                suit_hcp += 2
+            elif card_u == "J":
+                suit_hcp += 1
+        return suit_hcp >= 4 or (len(suit_cards) + suit_hcp) >= 6
+
+    def _bad_nt_correction_context(
+        *,
+        auction_tokens: List[str],
+        acting_direction: str,
+    ) -> Dict[str, Any] | None:
+        """Detect when partner's 3NT is dangerous and opener has a self-sufficient suit correction."""
+        try:
+            if deal_row is None or not hasattr(deal_row, "get"):
+                return None
+            acting_dir = str(acting_direction or "").strip().upper()
+            if acting_dir not in DIRECTIONS:
+                return None
+            partner_dir = _partner_dir(acting_dir)
+            if not partner_dir:
+                return None
+
+            toks_u = [str(t or "").strip().upper() for t in list(auction_tokens or [])]
+            partner_last_contract_idx: int | None = None
+            partner_last_contract_bid: str | None = None
+            for idx in range(len(toks_u) - 1, -1, -1):
+                tk_u = toks_u[idx]
+                if _token_bidder_dir_for_dealer(idx, dealer_actual) != partner_dir:
+                    continue
+                if _parse_contract_bid_text(tk_u) is None:
+                    continue
+                partner_last_contract_idx = int(idx)
+                partner_last_contract_bid = tk_u
+                break
+            if partner_last_contract_bid not in ("3N", "3NT"):
+                return None
+            if (
+                partner_last_contract_idx is None
+                or len(toks_u) - int(partner_last_contract_idx) - 1 != 1
+                or toks_u[-1] not in ("P", "PASS")
+            ):
+                return None
+
+            hand_str = str(deal_row.get(f"Hand_{acting_dir}", "") or "").strip()
+            cards = parse_hand_cards(hand_str)
+            if not cards:
+                return None
+            self_unstopped = [
+                suit for suit in ("C", "D", "H", "S")
+                if not _hand_has_stopper_from_cards(cards, suit)
+            ]
+            if len(self_unstopped) != 1:
+                return None
+            danger_suit = str(self_unstopped[0]).upper()
+
+            self_hcp_raw = deal_row.get(f"HCP_{acting_dir}")
+            self_tp_raw = deal_row.get(f"Total_Points_{acting_dir}")
+            self_hcp = float(self_hcp_raw) if isinstance(self_hcp_raw, (int, float)) else None
+            self_tp = float(self_tp_raw) if isinstance(self_tp_raw, (int, float)) else None
+            if (self_hcp is None or self_hcp < 17.0) and (self_tp is None or self_tp < 20.0):
+                return None
+
+            hand_ltc, per_suit_ltc = count_hand_ltc(cards)
+            candidates: list[dict[str, Any]] = []
+            for suit in ("H", "S", "D", "C"):
+                if suit == danger_suit:
+                    continue
+                suit_cards = list(cards.get(suit) or [])
+                suit_len = len(suit_cards)
+                suit_ltc = int(per_suit_ltc.get(suit, count_suit_ltc(suit_cards)))
+                if suit in ("H", "S"):
+                    if suit_len < 5 or suit_ltc > 1 or hand_ltc > 6:
+                        continue
+                    bid = f"4{suit}"
+                    priority = 300 + (40 if suit_ltc == 0 else 0) + (15 * max(0, suit_len - 4))
+                    if suit == "H":
+                        priority += 5
+                else:
+                    if suit_len < 6 or suit_ltc > 1 or hand_ltc > 5:
+                        continue
+                    bid = f"5{suit}"
+                    priority = 200 + (30 if suit_ltc == 0 else 0) + (12 * max(0, suit_len - 5))
+                candidates.append(
+                    {
+                        "bid": bid,
+                        "suit": suit,
+                        "suit_len": suit_len,
+                        "suit_ltc": suit_ltc,
+                        "priority": priority,
+                    }
+                )
+            if not candidates:
+                return None
+            candidates.sort(
+                key=lambda c: (
+                    int(c.get("priority", 0)),
+                    int(c.get("suit_len", 0)),
+                    -int(c.get("suit_ltc", 9)),
+                ),
+                reverse=True,
+            )
+            best = dict(candidates[0])
+            return {
+                "danger_suit": danger_suit,
+                "hand_ltc": int(hand_ltc),
+                "self_hcp": self_hcp,
+                "self_tp": self_tp,
+                "best_bid": str(best.get("bid") or ""),
+                "best_suit": str(best.get("suit") or ""),
+                "best_suit_len": int(best.get("suit_len", 0)),
+                "best_suit_ltc": int(best.get("suit_ltc", 9)),
+                "candidates": candidates,
+            }
+        except Exception:
+            return None
+
+    def _apply_bad_nt_correction_rescue(
+        *,
+        passed_opts_now: List[Dict[str, Any]],
+        filtered_bids_now: List[Dict[str, Any]],
+        next_bids_now: List[Dict[str, Any]],
+        tokens_now: List[str],
+        acting_dir_now: str,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], str | None]:
+        """Re-admit the best natural correction over a dubious partner 3NT."""
+        ctx = _bad_nt_correction_context(
+            auction_tokens=list(tokens_now or []),
+            acting_direction=str(acting_dir_now or "").strip().upper(),
+        )
+        if not ctx:
+            return passed_opts_now, filtered_bids_now, None
+
+        best_bid = str(ctx.get("best_bid") or "").strip().upper()
+        if not best_bid:
+            return passed_opts_now, filtered_bids_now, None
+
+        existing = {
+            str((_o or {}).get("bid", "") or "").strip().upper()
+            for _o in list(passed_opts_now or [])
+        }
+        if best_bid in existing:
+            return passed_opts_now, filtered_bids_now, None
+
+        next_by_bid = {
+            str((_nb or {}).get("bid", "") or "").strip().upper(): _nb
+            for _nb in list(next_bids_now or [])
+        }
+        nb = next_by_bid.get(best_bid)
+        promoted_source = None
+        if nb is not None and not (
+            nb.get("bt_index") is None
+            or bool((nb or {}).get("is_dead_end", False))
+            or not bool((nb or {}).get("can_complete", True))
+        ):
+            promoted_source = dict(nb)
+        else:
+            for entry in list(filtered_bids_now or []):
+                if str((entry or {}).get("bid", "") or "").strip().upper() == best_bid:
+                    promoted_source = dict(entry)
+                    break
+        if promoted_source is None:
+            return passed_opts_now, filtered_bids_now, None
+
+        nb_copy = dict(promoted_source)
+        nb_copy["_bad_nt_correction_rescue"] = True
+        nb_copy["_bad_nt_correction_reason"] = (
+            "BAD_NT_CORRECTION_RESCUE: partner 3NT leaves "
+            f"{ctx['danger_suit']} unstopped; self {ctx['best_suit']} len={ctx['best_suit_len']}, "
+            f"{ctx['best_suit']} LTC={ctx['best_suit_ltc']}, hand LTC={ctx['hand_ltc']} -> "
+            f"restore {best_bid} for scoring"
+        )
+        new_passed_opts = list(passed_opts_now or []) + [nb_copy]
+        new_filtered = [
+            entry
+            for entry in list(filtered_bids_now or [])
+            if str((entry or {}).get("bid", "") or "").strip().upper() != best_bid
+        ]
+        gate_reason = (
+            "BAD_NT_CORRECTION_RESCUE: partner 3NT leaves "
+            f"{ctx['danger_suit']} unstopped; promoted {best_bid}"
+        )
+        return new_passed_opts, new_filtered, gate_reason
+
     def _apply_direct_overcall_gap_rescue(
         *,
         passed_opts_now: List[Dict[str, Any]],
@@ -12614,6 +13381,142 @@ def handle_ai_model_advanced_path(
             )
         return new_passed_opts, new_filtered, gate_reason
 
+    def _apply_opening_gap_rescue(
+        *,
+        passed_opts_now: List[Dict[str, Any]],
+        filtered_bids_now: List[Dict[str, Any]],
+        next_bids_now: List[Dict[str, Any]],
+        tokens_now: List[str],
+        bidder_view_now: BidderViewState,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], str | None, str | None]:
+        """Restore a sane natural opening when BT leaves an opening seat pass-only."""
+        passed_non_pass_now = [
+            o for o in list(passed_opts_now or [])
+            if str((o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+        ]
+        if passed_non_pass_now or not filtered_bids_now:
+            return passed_opts_now, filtered_bids_now, None, None
+        if any(str(tk or "").strip().upper() not in ("", "P", "PASS") for tk in list(tokens_now or [])):
+            return passed_opts_now, filtered_bids_now, None, None
+
+        sl_map = {
+            str(k).upper(): int(v)
+            for k, v in dict(bidder_view_now.visible_hand.suit_lengths or {}).items()
+            if v is not None
+        }
+        tp_val = bidder_view_now.visible_hand.total_points
+        hcp_val = bidder_view_now.visible_hand.hcp
+        if tp_val is None and hcp_val is None:
+            return passed_opts_now, filtered_bids_now, None, None
+        if tp_val is None:
+            return passed_opts_now, filtered_bids_now, None, None
+
+        filtered_by_bid = {
+            str((entry or {}).get("bid", "") or "").strip().upper(): entry
+            for entry in list(filtered_bids_now or [])
+            if str((entry or {}).get("filter_reason", "") or "").strip().lower() == "criteria_fail"
+        }
+        next_by_bid = {
+            str((nb or {}).get("bid", "") or "").strip().upper(): nb
+            for nb in list(next_bids_now or [])
+            if str((nb or {}).get("bid", "") or "").strip()
+        }
+
+        def _candidate_for(bid_text: str) -> Dict[str, Any] | None:
+            bid_u = str(bid_text or "").strip().upper()
+            filtered_entry = filtered_by_bid.get(bid_u)
+            if filtered_entry is None:
+                return None
+            # Respect explicit strength gates from criteria. The rescue should only
+            # recover shape-oriented natural openings, not override point-count vetoes
+            # like HCP/TP/QT floors added via BT or custom overlay criteria.
+            failed_strength_gate = False
+            for trace_entry in list((filtered_entry or {}).get("criteria_trace") or []):
+                if not isinstance(trace_entry, dict):
+                    continue
+                if bool(trace_entry.get("passed", False)):
+                    continue
+                crit_txt = str(trace_entry.get("criterion", "") or "").strip()
+                if re.search(r"\b(?:HCP|Total_Points|QT)\b", crit_txt):
+                    failed_strength_gate = True
+                    break
+            if failed_strength_gate:
+                return None
+            nb = next_by_bid.get(bid_u)
+            if nb is None:
+                return None
+            if bool((nb or {}).get("is_dead_end", False)):
+                return None
+            if not bool((nb or {}).get("can_complete", True)):
+                return None
+            return dict(nb)
+
+        spades = int(sl_map.get("S", 0) or 0)
+        hearts = int(sl_map.get("H", 0) or 0)
+        diamonds = int(sl_map.get("D", 0) or 0)
+        clubs = int(sl_map.get("C", 0) or 0)
+        is_balanced_nt = (
+            min(spades, hearts, diamonds, clubs) >= 2
+            and max(spades, hearts, diamonds, clubs) <= 5
+        )
+
+        preferred_bids: list[str] = []
+        if (
+            hcp_val is not None
+            and 15.0 <= float(hcp_val) <= 17.0
+            and is_balanced_nt
+            and tp_val is not None
+            and float(tp_val) <= 18.0
+        ):
+            preferred_bids.append("1N")
+        if spades >= 5 and spades >= hearts:
+            preferred_bids.append("1S")
+        elif hearts >= 5:
+            preferred_bids.append("1H")
+        else:
+            if diamonds >= clubs and diamonds >= 3:
+                preferred_bids.append("1D")
+            if clubs >= diamonds and clubs >= 3:
+                preferred_bids.append("1C")
+            elif clubs >= 3 and "1C" not in preferred_bids:
+                preferred_bids.append("1C")
+            if diamonds >= 3 and "1D" not in preferred_bids:
+                preferred_bids.append("1D")
+        for fallback_bid in ("1S", "1H", "1D", "1C", "1N"):
+            if fallback_bid not in preferred_bids:
+                preferred_bids.append(fallback_bid)
+
+        chosen_bid: str | None = None
+        chosen_opt: Dict[str, Any] | None = None
+        for bid_text in preferred_bids:
+            cand = _candidate_for(bid_text)
+            if cand is None:
+                continue
+            chosen_bid = bid_text
+            chosen_opt = cand
+            break
+        if chosen_opt is None or chosen_bid is None:
+            return passed_opts_now, filtered_bids_now, None, None
+
+        tp_txt = f"{float(tp_val):.0f}" if isinstance(tp_val, (int, float)) else "?"
+        hcp_txt = f"{float(hcp_val):.0f}" if isinstance(hcp_val, (int, float)) else "?"
+        chosen_opt["_opening_gap_rescue"] = True
+        chosen_opt["_opening_gap_rescue_reason"] = (
+            f"OPENING_GAP_RESCUE: opening seat had pass-only after criteria filtering; "
+            f"self has HCP={hcp_txt}, TP={tp_txt}, shape {spades}={hearts}={diamonds}={clubs}; "
+            f"restored natural opening {chosen_bid}"
+        )
+        new_passed_opts = list(passed_opts_now or []) + [chosen_opt]
+        new_filtered = [
+            e for e in list(filtered_bids_now or [])
+            if str((e or {}).get("bid", "") or "").strip().upper() != chosen_bid
+        ]
+        gate_reason = (
+            f"OPENING_GAP_RESCUE: restored {chosen_bid} from pass-only opening state; "
+            "pass blocked while a natural opening exists"
+        )
+        return new_passed_opts, new_filtered, chosen_bid, gate_reason
+
     def _apply_early_constructive_range_gap_rescue(
         *,
         passed_opts_now: List[Dict[str, Any]],
@@ -12670,6 +13573,17 @@ def handle_ai_model_advanced_path(
             o for o in list(passed_opts_now or [])
             if str((o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
         ]
+        existing_levels_by_strain: dict[str, int] = {}
+        for _pp in list(passed_non_pass_now):
+            _pp_bid = str((_pp or {}).get("bid", "") or "").strip().upper()
+            _pp_m = re.match(r"^([1-7])([CDHS])$", _pp_bid)
+            if _pp_m is None:
+                continue
+            _pp_lvl = int(_pp_m.group(1))
+            _pp_st = str(_pp_m.group(2))
+            _prev_lvl = existing_levels_by_strain.get(_pp_st)
+            if _prev_lvl is None or _pp_lvl < _prev_lvl:
+                existing_levels_by_strain[_pp_st] = _pp_lvl
         if kind == "response_new_suit":
             if passed_non_pass_now:
                 return passed_opts_now, filtered_bids_now, [], None
@@ -12711,6 +13625,10 @@ def handle_ai_model_advanced_path(
                 continue
             if int(sl_map.get(bid_strain, 0) or 0) < 4:
                 continue
+            if kind == "opener_rebid":
+                existing_level = existing_levels_by_strain.get(bid_strain)
+                if existing_level is not None and existing_level <= bid_level:
+                    continue
             expected_level = 1 if suit_rank.get(bid_strain, -1) > suit_rank.get(reference_strain, -1) else 2
             if kind == "response_new_suit" and bid_level != expected_level:
                 continue
@@ -12786,6 +13704,812 @@ def handle_ai_model_advanced_path(
                 f"because pass range was too weak for the actual hand"
             )
         return new_passed_opts, new_filtered, promoted_names, gate_reason
+
+    INTENT_TYPE_FORCING_TO_LEVEL = "forcing_to_level"
+    INTENT_TYPE_HIGHER_LEVEL_PREFERENCE_REQUEST = "higher_level_preference_request"
+    INTENT_TYPE_OPENER_2NT_CLARIFICATION_REQUEST = "opener_2nt_clarification_request"
+
+    def _extract_metric_bounds_from_exprs(exprs: List[Any] | None) -> Dict[str, float | None]:
+        bounds: Dict[str, float | None] = {
+            "hcp_floor": None,
+            "hcp_cap": None,
+            "tp_floor": None,
+            "tp_cap": None,
+        }
+        metric_map = {
+            "HCP": ("hcp_floor", "hcp_cap"),
+            "TOTAL_POINTS": ("tp_floor", "tp_cap"),
+        }
+        for expr in list(exprs or []):
+            expr_u = str(expr or "").strip().upper()
+            if not expr_u:
+                continue
+            for metric_name, (floor_key, cap_key) in metric_map.items():
+                m = re.fullmatch(rf"{metric_name}\s*(<=|<|>=|>|==)\s*(-?\d+(?:\.\d+)?)", expr_u)
+                if m is None:
+                    continue
+                op = str(m.group(1))
+                raw_val = float(m.group(2))
+                if op in (">=", ">", "=="):
+                    floor_val = raw_val if op in (">=", "==") else (raw_val + 1.0)
+                    prev_floor = bounds.get(floor_key)
+                    bounds[floor_key] = floor_val if prev_floor is None else max(float(prev_floor), float(floor_val))
+                if op in ("<=", "<", "=="):
+                    cap_val = raw_val if op in ("<=", "==") else (raw_val - 1.0)
+                    prev_cap = bounds.get(cap_key)
+                    bounds[cap_key] = cap_val if prev_cap is None else min(float(prev_cap), float(cap_val))
+        return bounds
+
+    def _lookup_last_shown_range_for_direction(
+        acting_direction: str,
+        *,
+        auction_tokens: List[str] | None = None,
+        dealer_actual_now: str | None = None,
+    ) -> Dict[str, Any]:
+        info: Dict[str, Any] = {
+            "found": False,
+            "shown_bid": None,
+            "hcp_floor": None,
+            "hcp_cap": None,
+            "tp_floor": None,
+            "tp_cap": None,
+            "agg_expr": [],
+        }
+        try:
+            acting_dir_u = str(acting_direction or "").strip().upper()
+            for prev_step in reversed(list(steps_detail or [])):
+                prev_view = dict((prev_step or {}).get("bidder_view") or {})
+                prev_dir = str(prev_view.get("acting_direction") or "").strip().upper()
+                if prev_dir != acting_dir_u:
+                    continue
+                prev_bid = str(
+                    prev_view.get("chosen_bid")
+                    or (prev_step or {}).get("choice")
+                    or ""
+                ).strip().upper()
+                if re.fullmatch(r"[1-7](?:NT|[CDHSN])", prev_bid) is None:
+                    continue
+                for scored_bid in list((prev_step or {}).get("bid_scores") or []):
+                    scored_bid_text = str((scored_bid or {}).get("bid") or "").strip().upper()
+                    if scored_bid_text != prev_bid:
+                        continue
+                    agg_expr = list((scored_bid or {}).get("agg_expr") or [])
+                    bounds = _extract_metric_bounds_from_exprs(agg_expr)
+                    info.update(
+                        {
+                            "found": True,
+                            "shown_bid": prev_bid,
+                            "agg_expr": agg_expr,
+                            "hcp_floor": bounds.get("hcp_floor"),
+                            "hcp_cap": bounds.get("hcp_cap"),
+                            "tp_floor": bounds.get("tp_floor"),
+                            "tp_cap": bounds.get("tp_cap"),
+                        }
+                    )
+                    return info
+                info.update({"found": True, "shown_bid": prev_bid})
+                return info
+        except Exception:
+            return info
+        try:
+            toks = [str(t or "").strip().upper() for t in list(auction_tokens or []) if str(t or "").strip()]
+            dealer_now = str(dealer_actual_now or dealer_actual or "").strip().upper()
+            acting_dir_u = str(acting_direction or "").strip().upper()
+            last_bid_idx: int | None = None
+            last_bid_text: str | None = None
+            for idx in range(len(toks) - 1, -1, -1):
+                tok = toks[idx]
+                if re.fullmatch(r"[1-7](?:NT|[CDHSN])", tok) is None:
+                    continue
+                if _token_bidder_dir_for_dealer(idx, dealer_now) != acting_dir_u:
+                    continue
+                last_bid_idx = int(idx)
+                last_bid_text = tok
+                break
+            if last_bid_idx is None or last_bid_text is None:
+                return info
+
+            bt_row: Dict[str, Any] | None = None
+            parent_tokens = toks[:last_bid_idx]
+            if parent_tokens:
+                parent_bt_index = _resolve_bt_index_by_traversal(state, "-".join(parent_tokens))
+                if parent_bt_index is not None:
+                    bt_row = dict(_get_next_bt_rows_for_parent(state, int(parent_bt_index)).get(last_bid_text) or {})
+            else:
+                bt_openings_df = state.get("bt_openings_df")
+                if isinstance(bt_openings_df, pl.DataFrame) and not bt_openings_df.is_empty():
+                    opening_df = bt_openings_df.filter(pl.col("Auction") == str(last_bid_text).upper())
+                    if "seat" in opening_df.columns:
+                        opening_df = opening_df.filter(pl.col("seat") == 1)
+                    if opening_df.height > 0:
+                        bt_row = dict(opening_df.row(0, named=True))
+            if not bt_row:
+                return info
+
+            bt_idx = bt_row.get("bt_index")
+            try:
+                bt_idx_i = int(bt_idx) if bt_idx is not None else None
+            except Exception:
+                bt_idx_i = None
+            if bt_idx_i is not None:
+                try:
+                    bt_parquet_file = state.get("bt_seat1_file")
+                    if bt_parquet_file is not None:
+                        agg_expr_by_bt_index = _load_agg_expr_for_bt_indices([bt_idx_i], bt_parquet_file)
+                        if bt_idx_i in agg_expr_by_bt_index:
+                            bt_row.update(agg_expr_by_bt_index[bt_idx_i])
+                except Exception:
+                    pass
+
+            seat_num = int(last_bid_idx % 4) + 1
+            agg_expr = (
+                bt_row.get(f"Agg_Expr_Seat_{seat_num}")
+                or bt_row.get("Expr")
+                or []
+            )
+            bounds = _extract_metric_bounds_from_exprs(list(agg_expr or []))
+            info.update(
+                {
+                    "found": True,
+                    "shown_bid": last_bid_text,
+                    "agg_expr": list(agg_expr or []),
+                    "hcp_floor": bounds.get("hcp_floor"),
+                    "hcp_cap": bounds.get("hcp_cap"),
+                    "tp_floor": bounds.get("tp_floor"),
+                    "tp_cap": bounds.get("tp_cap"),
+                }
+            )
+            return info
+        except Exception:
+            return info
+        return info
+
+    def _invite_accept_non_minimum_info(
+        acting_direction: str,
+        *,
+        metric_preference: str = "any",
+        auction_tokens: List[str] | None = None,
+        dealer_actual_now: str | None = None,
+    ) -> Dict[str, Any]:
+        info = _lookup_last_shown_range_for_direction(
+            acting_direction,
+            auction_tokens=auction_tokens,
+            dealer_actual_now=dealer_actual_now,
+        )
+        acting_dir_u = str(acting_direction or "").strip().upper()
+        actual_hcp: float | None = None
+        actual_tp: float | None = None
+        try:
+            raw_hcp = deal_row.get(f"HCP_{acting_dir_u}")
+            if raw_hcp is not None:
+                actual_hcp = float(raw_hcp)
+        except Exception:
+            actual_hcp = None
+        try:
+            raw_tp = deal_row.get(f"Total_Points_{acting_dir_u}")
+            if raw_tp is not None:
+                actual_tp = float(raw_tp)
+        except Exception:
+            actual_tp = None
+        info["actual_hcp"] = actual_hcp
+        info["actual_tp"] = actual_tp
+        metric_pref = str(metric_preference or "any").strip().lower()
+        non_minimum_checks: List[bool] = []
+        if metric_pref == "hcp":
+            floor_val = info.get("hcp_floor")
+            if floor_val is not None and actual_hcp is not None:
+                non_minimum_checks.append(float(actual_hcp) > float(floor_val))
+        else:
+            tp_floor = info.get("tp_floor")
+            hcp_floor = info.get("hcp_floor")
+            if tp_floor is not None and actual_tp is not None:
+                non_minimum_checks.append(float(actual_tp) > float(tp_floor))
+            if hcp_floor is not None and actual_hcp is not None:
+                non_minimum_checks.append(float(actual_hcp) > float(hcp_floor))
+        info["metric_preference"] = metric_pref
+        info["is_non_minimum"] = bool(non_minimum_checks) and any(non_minimum_checks)
+        info["can_evaluate_non_minimum"] = bool(non_minimum_checks)
+        return info
+
+    def _hand_supports_invite_accept(
+        *,
+        strain: str,
+        support: int,
+        accept_score: int,
+        tp_val: float | None,
+        hcp_val: float | None,
+    ) -> tuple[bool, str]:
+        """Fallback accept support check when prior min/max range is unavailable."""
+        st = str(strain or "").upper()
+        if st == "N":
+            # Conservative NT fallback: only treat the hand as supporting game if
+            # it has clearly invitational-plus HCP opposite partner's invite.
+            supports = hcp_val is not None and float(hcp_val) >= 10.0
+            detail = f"HCP={float(hcp_val):.0f}" if isinstance(hcp_val, (int, float)) else "HCP=?"
+            return bool(supports), detail
+        supports = bool(support >= 4 and accept_score >= 4)
+        tp_txt = f"{float(tp_val):.0f}" if isinstance(tp_val, (int, float)) else "?"
+        hcp_txt = f"{float(hcp_val):.0f}" if isinstance(hcp_val, (int, float)) else "?"
+        detail = f"support={support}, accept_score={accept_score}, TP={tp_txt}, HCP={hcp_txt}"
+        return supports, detail
+
+    def _extract_higher_level_preference_request_context(
+        *,
+        auction_tokens: List[str],
+        acting_direction: str,
+        dealer_actual_now: str,
+        deal_row_local: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        """Infer when partner's high-level suit preference bid asks for accept/decline."""
+        acting_dir_u = str(acting_direction or "").upper()
+        partner_dir = _partner_dir(acting_dir_u)
+        if not acting_dir_u or not partner_dir or not deal_row_local:
+            return None
+
+        toks = [str(t or "").strip().upper() for t in list(auction_tokens or []) if str(t or "").strip()]
+        if not toks:
+            return None
+
+        last_non_pass_idx: int | None = None
+        for i in range(len(toks) - 1, -1, -1):
+            tk = toks[i]
+            if tk not in ("", "P", "PASS", "X", "XX"):
+                last_non_pass_idx = i
+                break
+        if last_non_pass_idx is None:
+            return None
+
+        last_bid = toks[last_non_pass_idx]
+        last_bidder = _token_bidder_dir_for_dealer(last_non_pass_idx, dealer_actual_now)
+        m = re.match(r"^4([CD])$", last_bid)
+        if m is None or last_bidder != partner_dir:
+            return None
+        strain = str(m.group(1))
+
+        contract_sides: set[str] = set()
+        contract_positions: list[int] = []
+        for i, tk in enumerate(toks):
+            parsed = _parse_contract_bid_text(tk)
+            if parsed is None:
+                continue
+            contract_positions.append(i)
+            contract_sides.add(_dir_side(_token_bidder_dir_for_dealer(i, dealer_actual_now)))
+        if len(contract_sides) != 1 or len(contract_positions) < 2:
+            return None
+
+        hand = str(deal_row_local.get(f"Hand_{acting_dir_u}", "") or "").strip()
+        if not hand or "." not in hand:
+            return None
+        parts = hand.split(".")
+        if len(parts) != 4:
+            return None
+        idx = {"S": 0, "H": 1, "D": 2, "C": 3}.get(strain, -1)
+        if idx < 0:
+            return None
+        support = len(parts[idx])
+
+        aces = 0
+        helpful_voids = 0
+        try:
+            aces, helpful_voids = hand_controls(hand)
+        except Exception:
+            aces = 0
+            helpful_voids = 0
+
+        tp_val: float | None = None
+        hcp_val: float | None = None
+        try:
+            raw_tp = deal_row_local.get(f"Total_Points_{acting_dir_u}")
+            if raw_tp is not None:
+                tp_val = float(raw_tp)
+        except Exception:
+            pass
+        try:
+            raw_hcp = deal_row_local.get(f"HCP_{acting_dir_u}")
+            if raw_hcp is not None:
+                hcp_val = float(raw_hcp)
+        except Exception:
+            pass
+
+        accept_score = 0
+        if support >= 5:
+            accept_score += 2
+        elif support >= 4:
+            accept_score += 1
+        if aces >= 1:
+            accept_score += 2
+        elif helpful_voids >= 1:
+            accept_score += 1
+        if tp_val is not None and tp_val >= 10.0:
+            accept_score += 1
+        if hcp_val is not None and hcp_val >= 8.0:
+            accept_score += 1
+        non_minimum_diag = _invite_accept_non_minimum_info(
+            acting_dir_u,
+            metric_preference="any",
+            auction_tokens=list(auction_tokens or []),
+            dealer_actual_now=dealer_actual_now,
+        )
+        fallback_support_ok, fallback_support_detail = _hand_supports_invite_accept(
+            strain=strain,
+            support=int(support),
+            accept_score=int(accept_score),
+            tp_val=tp_val,
+            hcp_val=hcp_val,
+        )
+        accept_allowed = (
+            bool(non_minimum_diag.get("is_non_minimum", False))
+            if bool(non_minimum_diag.get("can_evaluate_non_minimum", False))
+            else bool(fallback_support_ok)
+        )
+
+        return {
+            "intent_type": INTENT_TYPE_HIGHER_LEVEL_PREFERENCE_REQUEST,
+            "family": "fit_accept_or_decline",
+            "source": "auction_inference",
+            "source_bid": last_bid,
+            "actor_direction": partner_dir,
+            "responder_direction": acting_dir_u,
+            "strain": strain,
+            "target_bid": f"5{strain}",
+            "accept_bid": f"5{strain}",
+            "decline_bid": "P",
+            "target_level": 5,
+            "allow_decline": True,
+            "allow_level_cap_bypass": True,
+            "support": int(support),
+            "aces": int(aces),
+            "helpful_voids": int(helpful_voids),
+            "controls": int(aces) + int(helpful_voids),
+            "tp": tp_val,
+            "hcp": hcp_val,
+            "accept_score": int(accept_score),
+            "accept": bool(support >= 4 and accept_score >= 4 and accept_allowed),
+            "accept_non_minimum_ok": bool(non_minimum_diag.get("is_non_minimum", False)),
+            "accept_non_minimum_known": bool(non_minimum_diag.get("can_evaluate_non_minimum", False)),
+            "accept_fallback_support_ok": bool(fallback_support_ok),
+            "accept_fallback_support_detail": fallback_support_detail,
+            "accept_non_minimum_shown_bid": non_minimum_diag.get("shown_bid"),
+            "accept_non_minimum_hcp_floor": non_minimum_diag.get("hcp_floor"),
+            "accept_non_minimum_tp_floor": non_minimum_diag.get("tp_floor"),
+            "partner_bid": last_bid,
+        }
+
+    def _extract_opener_2nt_clarification_request_context(
+        *,
+        auction_tokens: List[str],
+        acting_direction: str,
+        dealer_actual_now: str,
+        deal_row_local: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        """Infer responder's 3m after opener's 2NT rebid as a clarification request."""
+        acting_dir_u = str(acting_direction or "").upper()
+        partner_dir = _partner_dir(acting_dir_u)
+        if not acting_dir_u or not partner_dir or not deal_row_local:
+            return None
+
+        toks = [str(t or "").strip().upper() for t in list(auction_tokens or []) if str(t or "").strip()]
+        if len(toks) < 4:
+            return None
+
+        last_non_pass_idx: int | None = None
+        for i in range(len(toks) - 1, -1, -1):
+            tk = toks[i]
+            if tk not in ("", "P", "PASS", "X", "XX"):
+                last_non_pass_idx = i
+                break
+        if last_non_pass_idx is None:
+            return None
+
+        last_bid = toks[last_non_pass_idx]
+        last_bidder = _token_bidder_dir_for_dealer(last_non_pass_idx, dealer_actual_now)
+        last_contract = _parse_contract_bid_text(last_bid)
+        if (
+            last_bidder != partner_dir
+            or last_contract is None
+            or int(last_contract[0]) != 3
+            or str(last_contract[1]).upper() not in ("C", "D")
+        ):
+            return None
+
+        trailing_passes = len(toks) - int(last_non_pass_idx) - 1
+        if trailing_passes != 1:
+            return None
+
+        opener_2nt_idx: int | None = None
+        for i in range(int(last_non_pass_idx) - 1, -1, -1):
+            tk = toks[i]
+            parsed = _parse_contract_bid_text(tk)
+            if parsed is None:
+                continue
+            if _token_bidder_dir_for_dealer(i, dealer_actual_now) != acting_dir_u:
+                continue
+            if int(parsed[0]) == 2 and str(parsed[1]).upper() == "N":
+                opener_2nt_idx = i
+            break
+        if opener_2nt_idx is None:
+            return None
+
+        partner_shown_majors: List[str] = []
+        for i, tk in enumerate(toks[: int(last_non_pass_idx)]):
+            parsed = _parse_contract_bid_text(tk)
+            if parsed is None:
+                continue
+            if _token_bidder_dir_for_dealer(i, dealer_actual_now) != partner_dir:
+                continue
+            strain = str(parsed[1]).upper()
+            if strain not in ("H", "S") or strain in partner_shown_majors:
+                continue
+            partner_shown_majors.append(strain)
+        if not partner_shown_majors:
+            return None
+
+        hand = str(deal_row_local.get(f"Hand_{acting_dir_u}", "") or "").strip()
+        if not hand or "." not in hand:
+            return None
+        parts = hand.split(".")
+        if len(parts) != 4:
+            return None
+
+        suit_idx = {"S": 0, "H": 1, "D": 2, "C": 3}
+        shown_major = str(partner_shown_majors[-1])
+        support = len(parts[suit_idx[shown_major]])
+        minor_strain = str(last_contract[1]).upper()
+
+        tp_val: float | None = None
+        hcp_val: float | None = None
+        try:
+            raw_tp = deal_row_local.get(f"Total_Points_{acting_dir_u}")
+            if raw_tp is not None:
+                tp_val = float(raw_tp)
+        except Exception:
+            pass
+        try:
+            raw_hcp = deal_row_local.get(f"HCP_{acting_dir_u}")
+            if raw_hcp is not None:
+                hcp_val = float(raw_hcp)
+        except Exception:
+            pass
+
+        rescue_bids: List[str] = []
+        bid_seen: set[str] = set()
+        suit_rank = {"C": 0, "D": 1, "H": 2, "S": 3, "N": 4}
+
+        def _add_bid(level: int, strain: str) -> None:
+            bid_txt = f"{int(level)}{str(strain).upper()}"
+            parsed = _parse_contract_bid_text(bid_txt)
+            if parsed is None or bid_txt in bid_seen:
+                return
+            if (
+                int(parsed[0]) < int(last_contract[0])
+                or (
+                    int(parsed[0]) == int(last_contract[0])
+                    and int(suit_rank.get(str(parsed[1]).upper(), -1)) <= int(suit_rank.get(minor_strain, -1))
+                )
+            ):
+                return
+            rescue_bids.append(bid_txt)
+            bid_seen.add(bid_txt)
+
+        _add_bid(3, shown_major)
+        _add_bid(3, "N")
+        if support >= 3:
+            _add_bid(4, shown_major)
+
+        if not rescue_bids:
+            return None
+
+        return {
+            "intent_type": INTENT_TYPE_OPENER_2NT_CLARIFICATION_REQUEST,
+            "family": "clarification_or_preference_followup",
+            "source": "auction_inference",
+            "source_bid": last_bid,
+            "actor_direction": partner_dir,
+            "responder_direction": acting_dir_u,
+            "strain": shown_major,
+            "clarification_minor": minor_strain,
+            "partner_bid": last_bid,
+            "partner_shown_majors": list(partner_shown_majors),
+            "rescue_bids": list(rescue_bids),
+            "target_bid": rescue_bids[0],
+            "target_level": 3,
+            "allow_decline": False,
+            "allow_level_cap_bypass": True,
+            "support": int(support),
+            "tp": tp_val,
+            "hcp": hcp_val,
+        }
+
+    def _infer_active_intent_contexts(
+        *,
+        auction_tokens: List[str],
+        acting_direction: str,
+        dealer_actual_now: str,
+        deal_row_local: Dict[str, Any],
+        forcing_heart_flags_now: Dict[str, bool] | None = None,
+    ) -> List[Dict[str, Any]]:
+        intents: List[Dict[str, Any]] = []
+        try:
+            pref_ctx = _extract_higher_level_preference_request_context(
+                auction_tokens=auction_tokens,
+                acting_direction=acting_direction,
+                dealer_actual_now=dealer_actual_now,
+                deal_row_local=deal_row_local,
+            )
+            if pref_ctx is not None:
+                intents.append(pref_ctx)
+        except Exception:
+            pass
+        try:
+            clarification_ctx = _extract_opener_2nt_clarification_request_context(
+                auction_tokens=auction_tokens,
+                acting_direction=acting_direction,
+                dealer_actual_now=dealer_actual_now,
+                deal_row_local=deal_row_local,
+            )
+            if clarification_ctx is not None:
+                intents.append(clarification_ctx)
+        except Exception:
+            pass
+        try:
+            acting_dir_u = str(acting_direction or "").upper()
+            partner_dir = _partner_dir(acting_dir_u)
+            if partner_dir and bool((forcing_heart_flags_now or {}).get(partner_dir, False)):
+                partner_bid = None
+                for i in range(len(list(auction_tokens or [])) - 1, -1, -1):
+                    tk = str((auction_tokens or [])[i] or "").strip().upper()
+                    parsed = _parse_contract_bid_text(tk)
+                    if parsed is None:
+                        continue
+                    if _token_bidder_dir_for_dealer(i, dealer_actual_now) != partner_dir:
+                        continue
+                    if str(parsed[1]).upper() != "H":
+                        continue
+                    partner_bid = tk
+                    break
+                intents.append(
+                    {
+                        "intent_type": INTENT_TYPE_FORCING_TO_LEVEL,
+                        "family": "forcing_continuation",
+                        "source": "convention_memory",
+                        "source_bid": partner_bid,
+                        "actor_direction": partner_dir,
+                        "responder_direction": acting_dir_u,
+                        "strain": "H",
+                        "target_level": 3,
+                        "allow_decline": False,
+                        "allow_level_cap_bypass": False,
+                    }
+                )
+        except Exception:
+            pass
+        return intents
+
+    def _build_active_intents_snapshot(
+        *,
+        auction_tokens: List[str],
+        dealer_actual_now: str,
+        deal_row_local: Dict[str, Any],
+        forcing_heart_flags_now: Dict[str, bool] | None = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        snapshot: Dict[str, List[Dict[str, Any]]] = {}
+        for direction in ("N", "E", "S", "W"):
+            intents = _infer_active_intent_contexts(
+                auction_tokens=auction_tokens,
+                acting_direction=direction,
+                dealer_actual_now=dealer_actual_now,
+                deal_row_local=deal_row_local,
+                forcing_heart_flags_now=forcing_heart_flags_now,
+            )
+            if intents:
+                snapshot[direction] = [dict(ctx) for ctx in intents]
+        return snapshot
+
+    def _build_convention_state_snapshot(
+        *,
+        auction_tokens: List[str],
+        dealer_actual_now: str,
+        deal_row_local: Dict[str, Any],
+        forcing_heart_flags_now: Dict[str, bool],
+        takeout_double_flags_now: Dict[str, bool],
+    ) -> Dict[str, Any]:
+        return {
+            "forcing_heart_shown_by_dir": dict(forcing_heart_flags_now or {}),
+            "takeout_double_shown_by_dir": dict(takeout_double_flags_now or {}),
+            "active_intents_by_dir": _build_active_intents_snapshot(
+                auction_tokens=auction_tokens,
+                dealer_actual_now=dealer_actual_now,
+                deal_row_local=deal_row_local,
+                forcing_heart_flags_now=forcing_heart_flags_now,
+            ),
+        }
+
+    def _apply_intent_continuation_fallback(
+        *,
+        passed_opts_now: List[Dict[str, Any]],
+        filtered_bids_now: List[Dict[str, Any]],
+        next_bids_now: List[Dict[str, Any]],
+        tokens_now: List[str],
+        acting_dir_now: str,
+        deal_row_now: Dict[str, Any],
+        dealer_actual_now: str,
+        forcing_heart_flags_now: Dict[str, bool] | None = None,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str], str | None, List[Dict[str, Any]]]:
+        """Apply intent-based continuation fallback when BT leaves a semantic gap."""
+        gate_reasons: List[str] = []
+        promoted_names: List[str] = []
+        passed_opts_out = list(passed_opts_now or [])
+        filtered_out = list(filtered_bids_now or [])
+
+        active_intents = _infer_active_intent_contexts(
+            auction_tokens=list(tokens_now or []),
+            acting_direction=acting_dir_now,
+            dealer_actual_now=dealer_actual_now,
+            deal_row_local=deal_row_now,
+            forcing_heart_flags_now=forcing_heart_flags_now,
+        )
+
+        try:
+            passed_opts_out, filtered_out, _ft3n_gate_reason = _apply_forcing_to_3n_pass_rescue(
+                passed_opts_now=passed_opts_out,
+                filtered_bids_now=filtered_out,
+                next_bids_now=next_bids_now,
+                acting_dir_now=acting_dir_now,
+                tokens_now=list(tokens_now or []),
+                forcing_heart_flags_now=forcing_heart_flags_now,
+            )
+            if _ft3n_gate_reason:
+                gate_reasons.append(_ft3n_gate_reason)
+        except Exception:
+            pass
+
+        existing_non_pass = {
+            str((o or {}).get("bid", "") or "").strip().upper()
+            for o in list(passed_opts_out or [])
+            if str((o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+        }
+
+        def _is_coherent_existing_non_pass(opt_local: Dict[str, Any]) -> bool:
+            bid_local = str((opt_local or {}).get("bid", "") or "").strip().upper()
+            if bid_local in ("", "P", "PASS"):
+                return False
+            if bool((opt_local or {}).get("is_dead_end", False)):
+                return False
+            if not bool((opt_local or {}).get("can_complete", True)):
+                return False
+            rescue_markers = (
+                "_intent_continuation_rescue",
+                "_minor_game_invite_accept_rescue",
+                "_nt_raise_rescue",
+                "_simple_raise_pre_rescue",
+                "_early_constructive_gap_rescue",
+                "_opener_rebid_gap_rescue",
+                "_direct_overcall_gap_rescue",
+            )
+            if any(bool((opt_local or {}).get(k, False)) for k in rescue_markers):
+                return False
+            return True
+
+        coherent_non_pass = [
+            o for o in list(passed_opts_out or [])
+            if _is_coherent_existing_non_pass(o)
+        ]
+        multi_bid_intent_active = any(
+            str((ctx or {}).get("intent_type") or "").strip() == INTENT_TYPE_OPENER_2NT_CLARIFICATION_REQUEST
+            and bool((ctx or {}).get("rescue_bids"))
+            for ctx in list(active_intents or [])
+        )
+        if coherent_non_pass and (not multi_bid_intent_active):
+            gate_reason = "; ".join(gate_reasons) if gate_reasons else None
+            return passed_opts_out, filtered_out, promoted_names, gate_reason, active_intents
+
+        next_by_bid = {
+            str((nb or {}).get("bid", "") or "").strip().upper(): nb
+            for nb in list(next_bids_now or [])
+            if str((nb or {}).get("bid", "") or "").strip()
+        }
+        filtered_by_bid = {
+            str((entry or {}).get("bid", "") or "").strip().upper(): entry
+            for entry in list(filtered_out or [])
+            if str((entry or {}).get("filter_reason", "") or "").strip().lower() == "criteria_fail"
+            and str((entry or {}).get("bid", "") or "").strip()
+        }
+        filtered_any_by_bid = {
+            str((entry or {}).get("bid", "") or "").strip().upper(): entry
+            for entry in list(filtered_out or [])
+            if str((entry or {}).get("bid", "") or "").strip()
+        }
+
+        for ctx in active_intents:
+            intent_type = str(ctx.get("intent_type") or "").strip()
+            target_bids: List[str] = []
+            force_preference = False
+            if intent_type == INTENT_TYPE_HIGHER_LEVEL_PREFERENCE_REQUEST:
+                if not bool(ctx.get("accept")):
+                    continue
+                target_bid = str(ctx.get("accept_bid") or ctx.get("target_bid") or "").strip().upper()
+                if target_bid:
+                    target_bids = [target_bid]
+            elif intent_type == INTENT_TYPE_OPENER_2NT_CLARIFICATION_REQUEST:
+                target_bids = [
+                    str(b or "").strip().upper()
+                    for b in list(ctx.get("rescue_bids") or [])
+                    if str(b or "").strip()
+                ]
+                force_preference = True
+            else:
+                continue
+            if not target_bids:
+                continue
+            for target_bid in target_bids:
+                if not target_bid or target_bid in existing_non_pass:
+                    continue
+                target_filtered = filtered_by_bid.get(target_bid)
+                target_filtered_any = filtered_any_by_bid.get(target_bid)
+                nb = next_by_bid.get(target_bid)
+                if target_filtered_any is None and nb is None:
+                    continue
+                tp_txt = f"{float(ctx['tp']):.0f}" if isinstance(ctx.get("tp"), (int, float)) else "?"
+                hcp_txt = f"{float(ctx['hcp']):.0f}" if isinstance(ctx.get("hcp"), (int, float)) else "?"
+                reason = (
+                    f"INTENT_CONTINUATION_RESCUE: partner's {ctx['partner_bid']} shows "
+                    f"{ctx['intent_type']} in {ctx['strain']}; self has {ctx['support']} card support, "
+                    f"TP={tp_txt}, HCP={hcp_txt}; restored {target_bid} for scoring"
+                )
+                if nb is not None and bool((nb or {}).get("is_dead_end", False)):
+                    continue
+                nb_copy = dict(nb or {})
+                if not nb_copy:
+                    source_entry = target_filtered_any or target_filtered
+                    if source_entry is None:
+                        continue
+                    nb_copy = {
+                        "bid": target_bid,
+                        "bt_index": source_entry.get("bt_index"),
+                        "agg_expr": list(source_entry.get("agg_expr") or []),
+                        "expr": list(source_entry.get("expr") or []),
+                        "matching_deal_count": source_entry.get("matching_deal_count", 0),
+                        "avg_ev": None,
+                        "avg_par": None,
+                        "can_complete": True,
+                        "is_dead_end": False,
+                    }
+                else:
+                    nb_copy["can_complete"] = bool(nb_copy.get("can_complete", True))
+                    nb_copy["is_dead_end"] = bool(nb_copy.get("is_dead_end", False))
+                if not bool(nb_copy.get("can_complete", True)):
+                    nb_copy["can_complete"] = True
+                nb_copy["_intent_continuation_rescue"] = True
+                nb_copy["_intent_continuation_type"] = str(ctx.get("intent_type") or "")
+                nb_copy["_intent_continuation_rescue_reason"] = reason
+                nb_copy["_intent_continuation_allow_level_cap_bypass"] = bool(
+                    ctx.get("allow_level_cap_bypass", False)
+                )
+                nb_copy["_intent_continuation_context"] = dict(ctx)
+                if force_preference:
+                    nb_copy["_forced_preference"] = True
+                # Legacy debug keys kept so existing UI/debug output remains readable.
+                nb_copy["_minor_game_invite_accept_rescue"] = True
+                nb_copy["_minor_game_invite_accept_rescue_reason"] = reason
+                nb_copy["_minor_game_invite_accept_context"] = dict(ctx)
+                passed_opts_out = list(passed_opts_out) + [nb_copy]
+                filtered_out = [
+                    e for e in list(filtered_out or [])
+                    if str(e.get("bid", "")).strip().upper() != target_bid
+                ]
+                existing_non_pass.add(target_bid)
+                promoted_names.append(target_bid)
+
+        coherent_non_pass = [
+            o for o in list(passed_opts_out or [])
+            if _is_coherent_existing_non_pass(o)
+        ]
+        if coherent_non_pass and (not multi_bid_intent_active):
+            gate_reason = "; ".join(gate_reasons) if gate_reasons else None
+            return passed_opts_out, filtered_out, promoted_names, gate_reason, active_intents
+
+        gate_reason = "; ".join(gate_reasons) if gate_reasons else None
+        return passed_opts_out, filtered_out, promoted_names, gate_reason, active_intents
 
     tokens: List[str] = [t.strip().upper() for t in normalize_auction_input(auction_prefix).split("-") if t.strip()] if auction_prefix else []
     # Convention-aware memory across steps (direction -> flag).
@@ -12878,7 +14602,7 @@ def handle_ai_model_advanced_path(
                 _bids_struct_filtered.append({"bid": bid0, "agg_expr": crits, "filter_reason": "no_bt_index"})
                 continue
             # WORKAROUND: Invalidate bids with underspecified criteria (missing HCP and Total_Points)
-            if _is_underspecified_criteria(crits):
+            if _is_underspecified_criteria(crits, prefix_now=bt_prefix, bid_text=bid0):
                 _bids_struct_filtered.append({"bid": bid0, "agg_expr": crits, "filter_reason": "underspecified", "matching_deal_count": opt.get("matching_deal_count")})
                 continue
             # Do NOT reject on can_complete yet; only after pass.
@@ -12915,6 +14639,13 @@ def handle_ai_model_advanced_path(
             acting_sign_step = 1.0
             acting_dir_step = "N"
         acting_side_step = "NS" if acting_dir_step in ("N", "S") else "EW"
+        convention_state_step = _build_convention_state_snapshot(
+            auction_tokens=list(tokens or []),
+            dealer_actual_now=dealer_actual,
+            deal_row_local=deal_row if isinstance(deal_row, dict) else {},
+            forcing_heart_flags_now=forcing_heart_shown_by_dir,
+            takeout_double_flags_now=takeout_double_shown_by_dir,
+        )
         bidder_view_step = build_bidder_view_state(
             auction_tokens=list(tokens or []),
             dealer_actual=dealer_actual,
@@ -12922,6 +14653,7 @@ def handle_ai_model_advanced_path(
             acting_direction=acting_dir_step,
             next_seat=int(seat_display),
             deal_row=deal_row if isinstance(deal_row, dict) else {},
+            convention_state=convention_state_step,
         )
 
         if not candidates:
@@ -13075,7 +14807,14 @@ def handle_ai_model_advanced_path(
         passed_opts: List[Dict[str, Any]] = []
         _bids_criteria_filtered: List[Dict[str, Any]] = []
         try:
-            pass_resp = handle_deal_criteria_pass_batch(state, int(deal_row_idx), dealer_rot, checks, deal_row_dict=deal_row_dict)
+            pass_resp = handle_deal_criteria_pass_batch(
+                state,
+                int(deal_row_idx),
+                dealer_rot,
+                checks,
+                deal_row_dict=deal_row_dict,
+                auction_tokens=list(tokens or []),
+            )
             results = pass_resp.get("results", []) or []
 
             # Re-merge results with candidates (Pass automatically passes)
@@ -13111,7 +14850,13 @@ def handle_ai_model_advanced_path(
                             "matching_deal_count": opt.get("matching_deal_count"),
                         }
                         _entry["criteria_trace"] = _trace_criteria_failures(
-                            crits_list, dealer_rot, seat_bt, deal_row, state, deal_row_dict
+                            crits_list,
+                            dealer_rot,
+                            seat_bt,
+                            deal_row,
+                            state,
+                            deal_row_dict,
+                            auction_tokens=list(tokens or []),
                         )
                         _bids_criteria_filtered.append(_entry)
         except Exception:
@@ -13164,6 +14909,7 @@ def handle_ai_model_advanced_path(
                                 dealer_rot,
                                 [{"seat": int(seat_bt), "criteria": list(_rr_crits)}],
                                 deal_row_dict=deal_row_dict,
+                                auction_tokens=list(tokens or []),
                             )
                             _overlay_results = _overlay_check.get("results", []) or []
                             if not _overlay_results or not bool((_overlay_results[0] or {}).get("passes", False)):
@@ -13214,13 +14960,63 @@ def handle_ai_model_advanced_path(
                             "filter_reason": "sl_sanity_fail",
                             "matching_deal_count": (_o or {}).get("matching_deal_count"),
                             "criteria_trace": _trace_criteria_failures(
-                                _crits, dealer_rot, int(seat_bt), deal_row, state, deal_row_dict
+                                _crits,
+                                dealer_rot,
+                                int(seat_bt),
+                                deal_row,
+                                state,
+                                deal_row_dict,
+                                auction_tokens=list(tokens or []),
                             ),
                         }
                     )
                     continue
                 _sl_kept.append(_o)
             passed_opts = _sl_kept
+        except Exception:
+            pass
+
+        # Immediate responses to an opening 1NT/2NT:
+        # treat the club inquiry as a true fallback. If ANY other bid
+        # (including Pass) survives criteria, prefer those and remove the
+        # fallback from competition. Only restore the club inquiry when
+        # nothing else passed.
+        try:
+            _nt_fallback_bid = _nt_opening_response_fallback_bid(bt_prefix)
+            if _nt_fallback_bid is not None:
+                _passed_other = [
+                    _o for _o in list(passed_opts or [])
+                    if str((_o or {}).get("bid", "") or "").strip().upper() != _nt_fallback_bid
+                ]
+                if _passed_other:
+                    if len(_passed_other) != len(list(passed_opts or [])):
+                        passed_opts = _passed_other
+                        _bids_criteria_filtered.append(
+                            {
+                                "bid": _nt_fallback_bid,
+                                "agg_expr": [],
+                                "filter_reason": "nt_opening_response_fallback_deferred",
+                                "matching_deal_count": None,
+                            }
+                        )
+                else:
+                    _fallback = None
+                    for _o in list(next_bids or []):
+                        _b = str((_o or {}).get("bid", "") or "").strip().upper()
+                        if _b != _nt_fallback_bid:
+                            continue
+                        _bt_i = (_o or {}).get("bt_index")
+                        _can_complete = bool((_o or {}).get("can_complete", True))
+                        _is_dead_end = bool((_o or {}).get("is_dead_end", False))
+                        if _bt_i is not None and _can_complete and (not _is_dead_end):
+                            _fallback = _o
+                            break
+                    if _fallback is not None:
+                        passed_opts = [_fallback]
+                        step_rec["hard_gate_reason"] = (
+                            f"NT_OPENING_RESPONSE_FALLBACK: no criteria-passing alternatives; "
+                            f"using {_nt_fallback_bid}"
+                        )
         except Exception:
             pass
 
@@ -13369,9 +15165,10 @@ def handle_ai_model_advanced_path(
                         pass
 
                     _sr_tp_ranges: dict[int, tuple[float, float]] = {
-                        2: (6.0, 9.0), 3: (10.0, 12.0),
-                        4: (13.0, 40.0), 5: (13.0, 40.0),
-                        6: (13.0, 40.0), 7: (13.0, 40.0),
+                        2: (6.0, 9.0),
+                        3: (10.0, 12.0),
+                        4: (13.0, 40.0),
+                        5: (13.0, 40.0),
                     }
                     _sr_next_bids_by_bid: dict[str, dict] = {
                         str(nb.get("bid", "")).strip().upper(): nb for nb in (next_bids or [])
@@ -13395,11 +15192,21 @@ def handle_ai_model_advanced_path(
                                 continue
                             if _sr_bid_strain not in _sr_partner_strains:
                                 continue
+                            _sr_partner_bid_count = int(_sr_partner_bid_counts.get(_sr_bid_strain, 0) or 0)
                             _sr_support = int(_sr_sl_map.get(_sr_bid_strain, 0) or 0)
                             # Default to known 8+ fit (4+ support), but allow 3-card
                             # raises when partner has rebid the strain (typically 5+).
-                            _sr_min_support = 3 if int(_sr_partner_bid_counts.get(_sr_bid_strain, 0) or 0) >= 2 else 4
+                            _sr_min_support = 3 if _sr_partner_bid_count >= 2 else 4
                             if _sr_support < _sr_min_support:
+                                continue
+                            # Direct jump-to-game raises after a single partner suit bid
+                            # suppress stronger exploratory methods (Jacoby 2NT, splinters,
+                            # cue-bids). Only rescue game+ raises once partner has repeated
+                            # the strain and a natural signoff is plausible.
+                            if _sr_bid_level >= 4 and _sr_partner_bid_count < 2:
+                                continue
+                            _sr_game_level = 5 if _sr_bid_strain in ("C", "D") else 4
+                            if _sr_bid_level > _sr_game_level:
                                 continue
                             _sr_rng = _sr_tp_ranges.get(_sr_bid_level)
                             if _sr_rng is None or not (_sr_rng[0] <= _sr_tp <= _sr_rng[1]):
@@ -13437,6 +15244,20 @@ def handle_ai_model_advanced_path(
         # Restore sane natural suit continuations so scoring can choose them
         # instead of defaulting to illegal signoff or junk jumps.
         if use_guardrails_v2 and deal_row and _bids_criteria_filtered:
+            try:
+                passed_opts, _bids_criteria_filtered, _ogr_bid, _ogr_gate_reason = _apply_opening_gap_rescue(
+                    passed_opts_now=passed_opts,
+                    filtered_bids_now=_bids_criteria_filtered,
+                    next_bids_now=next_bids,
+                    tokens_now=list(tokens or []),
+                    bidder_view_now=bidder_view_step,
+                )
+                if _ogr_bid:
+                    step_rec["opening_gap_rescue"] = [_ogr_bid]
+                if _ogr_gate_reason:
+                    step_rec["hard_gate_reason"] = _ogr_gate_reason
+            except Exception:
+                pass
             try:
                 passed_opts, _bids_criteria_filtered, _ecg_promoted, _ecg_gate_reason = _apply_early_constructive_range_gap_rescue(
                     passed_opts_now=passed_opts,
@@ -13479,13 +15300,24 @@ def handle_ai_model_advanced_path(
                 if not _ntr_already_has_nt:
                     _ntr_partner_nt_level: int | None = None
                     _ntr_partner_dir = _partner_dir(acting_dir_step)
-                    for _ti_ntr in range(len(tokens)):
+                    _last_contract_idx_ntr: int | None = None
+                    _last_contract_bid_ntr: str | None = None
+                    for _ti_ntr in range(len(tokens) - 1, -1, -1):
                         _tk_ntr = str(tokens[_ti_ntr] or "").strip().upper()
-                        _tk_dir_ntr = _token_bidder_dir_for_dealer(_ti_ntr, dealer_actual)
-                        if _tk_dir_ntr != _ntr_partner_dir:
+                        if re.fullmatch(r"[1-7](?:NT|[CDHSN])", _tk_ntr) is None:
                             continue
-                        _m_ntr = re.match(r"^([12])N(?:T)?$", _tk_ntr)
-                        if _m_ntr:
+                        _last_contract_idx_ntr = int(_ti_ntr)
+                        _last_contract_bid_ntr = _tk_ntr
+                        break
+                    if _last_contract_idx_ntr is not None and _last_contract_bid_ntr is not None:
+                        _tk_dir_ntr = _token_bidder_dir_for_dealer(_last_contract_idx_ntr, dealer_actual)
+                        _trailing_passes_ntr = len(list(tokens or [])) - int(_last_contract_idx_ntr) - 1
+                        _m_ntr = re.match(r"^([12])N(?:T)?$", _last_contract_bid_ntr)
+                        if (
+                            _tk_dir_ntr == _ntr_partner_dir
+                            and _trailing_passes_ntr == 1
+                            and _m_ntr is not None
+                        ):
                             _ntr_partner_nt_level = int(_m_ntr.group(1))
                     if _ntr_partner_nt_level is not None:
                         _ntr_self_hcp: float | None = None
@@ -13506,6 +15338,32 @@ def handle_ai_model_advanced_path(
                             if _ntr_nb is None and _ntr_target == "4N":
                                 _ntr_nb = _ntr_next_bids_by_bid.get("3N")
                                 _ntr_target = "3N"
+                            if _ntr_nb is not None:
+                                _ntr_accept_diag = _invite_accept_non_minimum_info(
+                                    acting_dir_step,
+                                    metric_preference="hcp",
+                                    auction_tokens=list(tokens or []),
+                                    dealer_actual_now=dealer_actual,
+                                )
+                                if (
+                                    _ntr_partner_nt_level == 2
+                                    and bool(_ntr_accept_diag.get("can_evaluate_non_minimum", False))
+                                    and not bool(_ntr_accept_diag.get("is_non_minimum", False))
+                                ):
+                                    _shown_bid = str(_ntr_accept_diag.get("shown_bid") or "?")
+                                    _shown_floor = _ntr_accept_diag.get("hcp_floor")
+                                    _shown_floor_txt = (
+                                        f"{float(_shown_floor):.0f}"
+                                        if isinstance(_shown_floor, (int, float))
+                                        else "?"
+                                    )
+                                    step_rec["nt_raise_rescue_blocked_reason"] = (
+                                        "NT_RAISE_RESCUE_BLOCKED_MINIMUM: "
+                                        f"accepting partner's {_ntr_partner_nt_level}N invite requires non-minimum HCP; "
+                                        f"self previously showed {_shown_bid} with HCP floor {_shown_floor_txt} "
+                                        f"and actual HCP {_ntr_self_hcp:.0f}"
+                                    )
+                                    _ntr_nb = None
                             if _ntr_nb is not None:
                                 # Respect regex CSV overlay rules (e.g. 1N-P-3N no 4-card major)
                                 # before injecting NT rescue candidates.
@@ -13539,6 +15397,7 @@ def handle_ai_model_advanced_path(
                                             dealer_rot,
                                             [{"seat": int(seat_bt), "criteria": list(_rr_crits)}],
                                             deal_row_dict=deal_row_dict,
+                                            auction_tokens=list(tokens or []),
                                         )
                                         _overlay_results = _overlay_check.get("results", []) or []
                                         if not _overlay_results or not bool((_overlay_results[0] or {}).get("passes", False)):
@@ -13565,6 +15424,24 @@ def handle_ai_model_advanced_path(
             except Exception:
                 pass
 
+        # --- Bad-NT correction rescue -------------------------------------
+        # If partner's 3NT leaves the only unbid suit unstopped and opener has
+        # a self-sufficient suit (LTC-backed), re-admit the best natural
+        # correction so scoring can choose it over a blind pass.
+        if use_guardrails_v2 and deal_row and _bids_criteria_filtered:
+            try:
+                passed_opts, _bids_criteria_filtered, _bad_nt_gate_reason = _apply_bad_nt_correction_rescue(
+                    passed_opts_now=passed_opts,
+                    filtered_bids_now=_bids_criteria_filtered,
+                    next_bids_now=next_bids,
+                    tokens_now=list(tokens or []),
+                    acting_dir_now=acting_dir_step,
+                )
+                if _bad_nt_gate_reason:
+                    step_rec["hard_gate_reason"] = _bad_nt_gate_reason
+            except Exception:
+                pass
+
         # --- Direct-overcall gap rescue -----------------------------------
         # BT can under-specify strong direct overcalls and leave only Pass
         # after criteria filtering. In that case, re-admit sane natural bids
@@ -13585,22 +15462,32 @@ def handle_ai_model_advanced_path(
             except Exception:
                 pass
 
-        # --- Forcing-to-3NT rescue -----------------------------------------
-        # When BT criteria leave only Pass in a still-forcing auction, restore
-        # the criteria-filtered forcing continuations so scoring can choose
-        # among real actions instead of signing off illegally.
+        # --- Intent continuation fallback -----------------------------------
+        # When BT leaves only pass or semantically broken continuations, infer
+        # partner intent from the live auction and restore only the narrow
+        # continuation family that matches that intent.
         if use_guardrails_v2 and deal_row and _bids_criteria_filtered:
             try:
-                passed_opts, _bids_criteria_filtered, _ft3n_gate_reason = _apply_forcing_to_3n_pass_rescue(
+                (
+                    passed_opts,
+                    _bids_criteria_filtered,
+                    _intent_promoted,
+                    _intent_gate_reason,
+                    _active_intents_for_acting_dir,
+                ) = _apply_intent_continuation_fallback(
                     passed_opts_now=passed_opts,
                     filtered_bids_now=_bids_criteria_filtered,
                     next_bids_now=next_bids,
-                    acting_dir_now=acting_dir_step,
                     tokens_now=list(tokens or []),
+                    acting_dir_now=acting_dir_step,
+                    deal_row_now=deal_row,
+                    dealer_actual_now=dealer_actual,
                     forcing_heart_flags_now=forcing_heart_shown_by_dir,
                 )
-                if _ft3n_gate_reason:
-                    step_rec["hard_gate_reason"] = _ft3n_gate_reason
+                if _intent_gate_reason:
+                    step_rec["hard_gate_reason"] = _intent_gate_reason
+                if _active_intents_for_acting_dir:
+                    step_rec["active_intents"] = [dict(x) for x in _active_intents_for_acting_dir]
             except Exception:
                 pass
 
@@ -13653,12 +15540,17 @@ def handle_ai_model_advanced_path(
         #   - Responder has non-pass bids in OTHER suits (forward-going).
         #   - A fit is already agreed (both sides bid the same suit).
         #   - Responder holds strictly more cards in the second suit.
+        #   - The acting player is the side's opener rather than responder.
+        #   - The auction has already reached 3NT or higher.
         # If a preference bid exists in passed_opts, mark it exempt.
         # If none passed criteria, inject from next_bids.
         try:
             _partner_pref = _partner_dir(acting_dir_step)
+            _auction_now = "-".join([str(t or "").strip().upper() for t in list(tokens or []) if str(t or "").strip()])
+            _below_3nt_now = _is_contract_below_3nt(_auction_now)
             _partner_suits_ordered: list[str] = []
             _self_suits: set[str] = set()
+            _first_side_bidder: str | None = None
             for _i_pref, _tk_pref in enumerate(list(tokens or [])):
                 _tk_str = str(_tk_pref or "").strip().upper()
                 if len(_tk_str) < 2 or not _tk_str[0].isdigit():
@@ -13669,6 +15561,10 @@ def handle_ai_model_advanced_path(
                     _st_pref = "N"
                 if _st_pref not in ("C", "D", "H", "S"):
                     continue
+                _bidder_side = "NS" if _bidder in ("N", "S") else "EW"
+                _acting_side_pref = "NS" if acting_dir_step in ("N", "S") else "EW"
+                if _first_side_bidder is None and _bidder_side == _acting_side_pref:
+                    _first_side_bidder = _bidder
                 if _bidder == _partner_pref:
                     if _st_pref not in _partner_suits_ordered:
                         _partner_suits_ordered.append(_st_pref)
@@ -13676,7 +15572,11 @@ def handle_ai_model_advanced_path(
                     _self_suits.add(_st_pref)
             _fit_overlap = _self_suits & set(_partner_suits_ordered)
             _fit_agreed = bool(_fit_overlap)
-            if len(_partner_suits_ordered) >= 2 and not _fit_agreed:
+            _acting_is_responder = bool(
+                _first_side_bidder
+                and _first_side_bidder != acting_dir_step
+            )
+            if len(_partner_suits_ordered) >= 2 and not _fit_agreed and _acting_is_responder and _below_3nt_now:
                 _first_suit = _partner_suits_ordered[0]
                 _fp_sl_map_check: dict[str, int] = {}
                 _fp_has_real_fit = False
@@ -13695,13 +15595,31 @@ def handle_ai_model_advanced_path(
                     _o for _o in list(passed_opts or [])
                     if str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
                 ]
-                def _bid_strain(b: str) -> str:
+                def _bid_level_and_strain(b: str) -> tuple[int | None, str]:
                     b = b.strip().upper()
-                    return b[1:] if len(b) >= 2 and b[0].isdigit() else ""
-                _non_pref_forward = [
-                    _o for _o in _passed_non_pass_fp
-                    if _bid_strain(str((_o or {}).get("bid", "") or "")) != _first_suit
-                ]
+                    if len(b) >= 2 and b[0].isdigit():
+                        return int(b[0]), b[1:]
+                    return None, ""
+                _current_contract_level: int | None = None
+                for _tk_pref in reversed(list(tokens or [])):
+                    _tk_pref_str = str(_tk_pref or "").strip().upper()
+                    if len(_tk_pref_str) >= 2 and _tk_pref_str[0].isdigit():
+                        _current_contract_level = int(_tk_pref_str[0])
+                        break
+                _non_pref_forward = []
+                for _o in _passed_non_pass_fp:
+                    _bid_lvl_fp, _bid_st_fp = _bid_level_and_strain(str((_o or {}).get("bid", "") or ""))
+                    if _bid_st_fp == _first_suit:
+                        continue
+                    # Ignore remote jump-outs when deciding whether responder still
+                    # has a meaningful forward-going alternative to simple preference.
+                    if (
+                        _bid_lvl_fp is not None
+                        and _current_contract_level is not None
+                        and _bid_lvl_fp > (_current_contract_level + 1)
+                    ):
+                        continue
+                    _non_pref_forward.append(_o)
                 if len(_non_pref_forward) == 0 and not _fp_has_real_fit:
                     _second_suit = _partner_suits_ordered[1]
                     _sl_first: int | None = None
@@ -13777,6 +15695,112 @@ def handle_ai_model_advanced_path(
         except Exception:
             pass
 
+        # Fallback forced-preference rescue: if partner has shown two suits,
+        # responder has no meaningful forward continuation near the current
+        # level, and the cheapest return to partner's first suit exists in BT,
+        # inject it even if criteria-filtered out.
+        try:
+            if not step_rec.get("hard_gate_reason"):
+                _partner_pref_fb = _partner_dir(acting_dir_step)
+                _auction_now_fb = "-".join([str(t or "").strip().upper() for t in list(tokens or []) if str(t or "").strip()])
+                _below_3nt_now_fb = _is_contract_below_3nt(_auction_now_fb)
+                _partner_suits_ordered_fb: list[str] = []
+                _self_suits_fb: set[str] = set()
+                _first_side_bidder_fb: str | None = None
+                for _i_pref_fb, _tk_pref_fb in enumerate(list(tokens or [])):
+                    _tk_str_fb = str(_tk_pref_fb or "").strip().upper()
+                    if len(_tk_str_fb) < 2 or not _tk_str_fb[0].isdigit():
+                        continue
+                    _bidder_fb = _token_bidder_dir_for_dealer(_i_pref_fb, dealer_actual)
+                    _st_pref_fb = _tk_str_fb[1:]
+                    if _st_pref_fb == "NT":
+                        _st_pref_fb = "N"
+                    if _st_pref_fb not in ("C", "D", "H", "S"):
+                        continue
+                    _bidder_side_fb = "NS" if _bidder_fb in ("N", "S") else "EW"
+                    _acting_side_fb = "NS" if acting_dir_step in ("N", "S") else "EW"
+                    if _first_side_bidder_fb is None and _bidder_side_fb == _acting_side_fb:
+                        _first_side_bidder_fb = _bidder_fb
+                    if _bidder_fb == _partner_pref_fb:
+                        if _st_pref_fb not in _partner_suits_ordered_fb:
+                            _partner_suits_ordered_fb.append(_st_pref_fb)
+                    elif _bidder_fb == acting_dir_step:
+                        _self_suits_fb.add(_st_pref_fb)
+                _fit_overlap_fb = _self_suits_fb & set(_partner_suits_ordered_fb)
+                _acting_is_responder_fb = bool(
+                    _first_side_bidder_fb
+                    and _first_side_bidder_fb != acting_dir_step
+                )
+                if len(_partner_suits_ordered_fb) >= 2 and not _fit_overlap_fb and _acting_is_responder_fb and _below_3nt_now_fb:
+                    _first_suit_fb = _partner_suits_ordered_fb[0]
+                    _second_suit_fb = _partner_suits_ordered_fb[1]
+                    _sl_first_fb: int | None = None
+                    _sl_second_fb: int | None = None
+                    if deal_row:
+                        _hand_pbn_fb = str(deal_row.get(f"Hand_{acting_dir_step}", "") or "").strip()
+                        if _hand_pbn_fb and "." in _hand_pbn_fb:
+                            _hp_fb = _hand_pbn_fb.split(".")
+                            if len(_hp_fb) == 4:
+                                _sl_map_fb = {"S": len(_hp_fb[0]), "H": len(_hp_fb[1]), "D": len(_hp_fb[2]), "C": len(_hp_fb[3])}
+                                _sl_first_fb = _sl_map_fb.get(_first_suit_fb)
+                                _sl_second_fb = _sl_map_fb.get(_second_suit_fb)
+                    _current_contract_level_fb: int | None = None
+                    for _tk_pref_fb in reversed(list(tokens or [])):
+                        _tk_pref_str_fb = str(_tk_pref_fb or "").strip().upper()
+                        if len(_tk_pref_str_fb) >= 2 and _tk_pref_str_fb[0].isdigit():
+                            _current_contract_level_fb = int(_tk_pref_str_fb[0])
+                            break
+                    _near_forward_exists_fb = False
+                    for _o_fb in list(passed_opts or []):
+                        _b_fb = str((_o_fb or {}).get("bid", "") or "").strip().upper()
+                        if _b_fb in ("", "P", "PASS") or len(_b_fb) < 2 or not _b_fb[0].isdigit():
+                            continue
+                        _lvl_fb = int(_b_fb[0])
+                        _st_fb = _b_fb[1:]
+                        if _st_fb == "NT":
+                            _st_fb = "N"
+                        if _st_fb == _first_suit_fb:
+                            continue
+                        if _current_contract_level_fb is None or _lvl_fb <= (_current_contract_level_fb + 1):
+                            _near_forward_exists_fb = True
+                            break
+                    if (
+                        not _near_forward_exists_fb
+                        and _sl_first_fb is not None
+                        and _sl_second_fb is not None
+                        and _sl_first_fb >= _sl_second_fb
+                    ):
+                        _pref_bid_fb: Dict[str, Any] | None = None
+                        for _o_fb in list(next_bids or []):
+                            _b_fb = str((_o_fb or {}).get("bid", "") or "").strip().upper()
+                            if len(_b_fb) < 2 or not _b_fb[0].isdigit():
+                                continue
+                            _lvl_fb = int(_b_fb[0])
+                            _st_fb = _b_fb[1:]
+                            if _st_fb == "NT":
+                                _st_fb = "N"
+                            if _st_fb != _first_suit_fb:
+                                continue
+                            if _current_contract_level_fb is not None and _lvl_fb > (_current_contract_level_fb + 1):
+                                continue
+                            _bt_i_fb = (_o_fb or {}).get("bt_index")
+                            _can_complete_fb = bool((_o_fb or {}).get("can_complete", True))
+                            _is_dead_end_fb = bool((_o_fb or {}).get("is_dead_end", False))
+                            if _bt_i_fb is not None and _can_complete_fb and (not _is_dead_end_fb):
+                                _pref_bid_fb = _o_fb
+                                break
+                        if _pref_bid_fb is not None:
+                            _pref_bid_fb["_forced_preference"] = True
+                            _pref_bid_name_fb = str((_pref_bid_fb or {}).get("bid", "") or "").strip().upper()
+                            passed_opts = [_pref_bid_fb]
+                            step_rec["hard_gate_reason"] = (
+                                f"FORCED_PREFERENCE_FALLBACK: partner showed {'/'.join(_partner_suits_ordered_fb)}, "
+                                f"self has {_sl_first_fb}{_first_suit_fb} vs {_sl_second_fb}{_second_suit_fb}, "
+                                f"and no near-level forward action survived; injected {_pref_bid_name_fb}"
+                            )
+        except Exception:
+            pass
+
         # Delayed support raise gate: when the responder previously
         # temporized (e.g. bid a new suit) but actually has 4+ cards in
         # opener's first suit, and the only surviving bid in that suit is
@@ -13800,6 +15824,7 @@ def handle_ai_model_advanced_path(
                 _dsr_partner_last_suit: str | None = None
                 _dsr_partner_suit_token_idx: int = -1
                 _dsr_self_already_bid = False
+                _dsr_self_first_bid_token_idx: int = -1
                 _dsr_self_bid_is_suit_opener = False
                 _dsr_current_auction_level = 0
                 _dsr_suit_rank = {"C": 0, "D": 1, "H": 2, "S": 3}
@@ -13832,6 +15857,7 @@ def handle_ai_model_advanced_path(
                             _dsr_self_suits.append(_tk_u_dsr[1:])
                         if not _dsr_self_already_bid:
                             _dsr_self_already_bid = True
+                            _dsr_self_first_bid_token_idx = _ti_dsr
                             if len(_tk_u_dsr) >= 2 and _tk_u_dsr[0].isdigit() and _tk_u_dsr[1:] in ("C", "D", "H", "S"):
                                 if _dsr_partner_first_suit and _tk_u_dsr[1:] == _dsr_partner_first_suit:
                                     _dsr_self_bid_is_suit_opener = True
@@ -13887,6 +15913,13 @@ def handle_ai_model_advanced_path(
                     _dsr_partner_first_suit
                     and _dsr_partner_last_suit == _dsr_partner_first_suit
                     and _dsr_self_already_bid
+                    # Delayed support only applies when partner introduced the
+                    # suit before our own first non-pass call. This prevents the
+                    # gate from misfiring on opener-support sequences like
+                    # `1C-P-1H-P-4H`, which are not "temporized support".
+                    and _dsr_partner_suit_token_idx >= 0
+                    and _dsr_self_first_bid_token_idx >= 0
+                    and _dsr_partner_suit_token_idx < _dsr_self_first_bid_token_idx
                     and not _dsr_self_bid_is_suit_opener
                     and not _dsr_partner_bid_is_artificial
                     and not _dsr_nt_already_bid
@@ -14156,6 +16189,9 @@ def handle_ai_model_advanced_path(
                 _mfr_1s: list[dict] = []
                 _mfr_2minor: list[dict] = []
                 _mfr_other: list[dict] = []
+                _mfr_tp: float | None = None
+                _mfr_hcp: float | None = None
+                _mfr_sl_map: dict[str, int] = {}
                 for _o in list(passed_opts):
                     _b = str((_o or {}).get("bid", "") or "").strip().upper()
                     if _b == "1H":
@@ -14167,28 +16203,70 @@ def handle_ai_model_advanced_path(
                     else:
                         _mfr_other.append(_o)
 
+                if deal_row:
+                    try:
+                        _mfr_tp_raw = deal_row.get(f"Total_Points_{acting_dir_step}")
+                        if _mfr_tp_raw is not None:
+                            _mfr_tp = float(_mfr_tp_raw)
+                    except Exception:
+                        pass
+                    try:
+                        _mfr_hcp_raw = deal_row.get(f"HCP_{acting_dir_step}")
+                        if _mfr_hcp_raw is not None:
+                            _mfr_hcp = float(_mfr_hcp_raw)
+                    except Exception:
+                        pass
+                    _mfr_pbn = str(deal_row.get(f"Hand_{acting_dir_step}", "") or "").strip()
+                    if _mfr_pbn and "." in _mfr_pbn:
+                        try:
+                            _mfr_hp = _mfr_pbn.split(".")
+                            if len(_mfr_hp) == 4:
+                                _mfr_sl_map = {
+                                    "S": len(_mfr_hp[0]),
+                                    "H": len(_mfr_hp[1]),
+                                    "D": len(_mfr_hp[2]),
+                                    "C": len(_mfr_hp[3]),
+                                }
+                        except Exception:
+                            pass
+
                 _mfr_has_major = bool(_mfr_1h or _mfr_1s)
                 _mfr_removed: list[str] = []
                 _mfr_reason_parts: list[str] = []
 
                 if _mfr_has_major and _mfr_2minor:
-                    _mfr_removed = [str((_o or {}).get("bid", "")) for _o in _mfr_2minor]
-                    _mfr_2minor = []
-                    _mfr_reason_parts.append(f"removed {'/'.join(_mfr_removed)}")
+                    _mfr_keep_2minor: list[dict] = []
+                    _mfr_removed_local: list[str] = []
+                    _mfr_allow_strong_two_over_one = bool(
+                        _mfr_partner_opening_strain in ("H", "S")
+                        and (
+                            (_mfr_tp is not None and _mfr_tp >= 13.0)
+                            or (_mfr_hcp is not None and _mfr_hcp >= 10.0)
+                        )
+                    )
+                    for _o in list(_mfr_2minor):
+                        _mfr_bid = str((_o or {}).get("bid", "") or "").strip().upper()
+                        _mfr_keep_bid = False
+                        if _mfr_allow_strong_two_over_one:
+                            if _mfr_bid == "2C" and int(_mfr_sl_map.get("C", 0) or 0) >= 5:
+                                _mfr_keep_bid = True
+                            elif _mfr_bid == "2D" and int(_mfr_sl_map.get("D", 0) or 0) >= 5:
+                                _mfr_keep_bid = True
+                        if _mfr_keep_bid:
+                            _mfr_keep_2minor.append(_o)
+                        else:
+                            _mfr_removed_local.append(_mfr_bid)
+                    _mfr_2minor = _mfr_keep_2minor
+                    _mfr_removed = list(_mfr_removed_local)
+                    if _mfr_removed:
+                        _mfr_reason_parts.append(f"removed {'/'.join(_mfr_removed)}")
 
                 if _mfr_1h and _mfr_1s:
                     _mfr_sl_h: int | None = None
                     _mfr_sl_s: int | None = None
-                    if deal_row:
-                        _mfr_pbn = str(deal_row.get(f"Hand_{acting_dir_step}", "") or "").strip()
-                        if _mfr_pbn and "." in _mfr_pbn:
-                            try:
-                                _mfr_hp = _mfr_pbn.split(".")
-                                if len(_mfr_hp) == 4:
-                                    _mfr_sl_s = len(_mfr_hp[0])
-                                    _mfr_sl_h = len(_mfr_hp[1])
-                            except Exception:
-                                pass
+                    if _mfr_sl_map:
+                        _mfr_sl_h = int(_mfr_sl_map.get("H", 0) or 0)
+                        _mfr_sl_s = int(_mfr_sl_map.get("S", 0) or 0)
                     if _mfr_sl_h is not None and _mfr_sl_s is not None:
                         if _mfr_sl_h > _mfr_sl_s:
                             _mfr_1s = []
@@ -14387,45 +16465,45 @@ def handle_ai_model_advanced_path(
                 step_rec["v2_single_candidate_diag"] = _single_v2_diag
             _single_hard_gate_reason: str | None = None
             _single_hard_gate_applied = False
-            if use_common_sense:
+            try:
+                _legal_non_pass_candidates = [
+                    _o for _o in list(candidates_sorted or [])
+                    if str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                    and bool((_o or {}).get("can_complete", True))
+                ]
+                _blocked_cannot_complete = [
+                    _r for _r in list(_bids_criteria_filtered or [])
+                    if str((_r or {}).get("filter_reason", "")).strip().lower() == "cannot_complete"
+                ]
+                _blocked_criteria_fail = [
+                    _r for _r in list(_bids_criteria_filtered or [])
+                    if str((_r or {}).get("filter_reason", "")).strip().lower() == "criteria_fail"
+                    and str((_r or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                ]
+                _self_tp_step = None
+                _self_sl_step_single: Dict[str, int] | None = None
                 try:
-                    _legal_non_pass_candidates = [
-                        _o for _o in list(candidates_sorted or [])
-                        if str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
-                        and bool((_o or {}).get("can_complete", True))
-                    ]
-                    _blocked_cannot_complete = [
-                        _r for _r in list(_bids_criteria_filtered or [])
-                        if str((_r or {}).get("filter_reason", "")).strip().lower() == "cannot_complete"
-                    ]
-                    _blocked_criteria_fail = [
-                        _r for _r in list(_bids_criteria_filtered or [])
-                        if str((_r or {}).get("filter_reason", "")).strip().lower() == "criteria_fail"
-                        and str((_r or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
-                    ]
+                    _tp_raw = deal_row.get(f"Total_Points_{acting_dir_step}")
+                    if _tp_raw is not None:
+                        _self_tp_step = float(_tp_raw)
+                except Exception:
                     _self_tp_step = None
-                    _self_sl_step_single: Dict[str, int] | None = None
-                    try:
-                        _tp_raw = deal_row.get(f"Total_Points_{acting_dir_step}")
-                        if _tp_raw is not None:
-                            _self_tp_step = float(_tp_raw)
-                    except Exception:
-                        _self_tp_step = None
-                    try:
-                        _h = str(deal_row.get(f"Hand_{acting_dir_step}", "") or "").strip()
-                        if _h:
-                            _parts = _h.split(".")
-                            if len(_parts) == 4:
-                                _self_sl_step_single = {
-                                    "S": len(str(_parts[0] or "")),
-                                    "H": len(str(_parts[1] or "")),
-                                    "D": len(str(_parts[2] or "")),
-                                    "C": len(str(_parts[3] or "")),
-                                }
-                    except Exception:
-                        _self_sl_step_single = None
-
-                    _cs_hard = compute_common_sense_hard_override(
+                try:
+                    _h = str(deal_row.get(f"Hand_{acting_dir_step}", "") or "").strip()
+                    if _h:
+                        _parts = _h.split(".")
+                        if len(_parts) == 4:
+                            _self_sl_step_single = {
+                                "S": len(str(_parts[0] or "")),
+                                "H": len(str(_parts[1] or "")),
+                                "D": len(str(_parts[2] or "")),
+                                "C": len(str(_parts[3] or "")),
+                            }
+                except Exception:
+                    _self_sl_step_single = None
+                _hard_override_decision: Dict[str, Any] = {}
+                if use_common_sense or use_guardrails_v2:
+                    _hard_override_decision = compute_common_sense_hard_override(
                         auction_tokens=list(tokens or []),
                         acting_direction=acting_dir_step,
                         dealer_actual=dealer_actual,
@@ -14437,27 +16515,54 @@ def handle_ai_model_advanced_path(
                         blocked_candidates=list(_blocked_cannot_complete or []),
                         criteria_failed_candidates=list(_blocked_criteria_fail or []),
                     )
-                    if bool((_cs_hard or {}).get("apply")):
-                        _ov_bid = str((_cs_hard or {}).get("selected_bid") or "").strip().upper()
-                        if _ov_bid:
-                            bid1 = _ov_bid
-                            _single_hard_gate_applied = True
-                            _single_hard_gate_reason = str((_cs_hard or {}).get("reason") or "COMMON_SENSE_HARD_OVERRIDE")
-                            step_rec["common_sense_final_gate_applied"] = True
-                            step_rec["common_sense_gate_reason"] = _single_hard_gate_reason
-                            step_rec["bid_scores"] = [
-                                {
-                                    "bid": bid1,
-                                    "score": None,
-                                    "agg_expr": [],
-                                    "common_sense_hard_override": True,
-                                    "common_sense_reason_codes": list((_cs_hard or {}).get("reason_codes") or []),
-                                    "common_sense_evidence": dict((_cs_hard or {}).get("evidence") or {}),
-                                }
-                            ]
-                except Exception:
-                    _single_hard_gate_applied = False
-                    _single_hard_gate_reason = None
+                if not bool((_hard_override_decision or {}).get("apply")):
+                    _hard_override_decision = _maybe_rescue_blocked_second_suit_rebid(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir_step,
+                        dealer_actual=dealer_actual,
+                        self_suit_lengths=_self_sl_step_single if isinstance(_self_sl_step_single, dict) else None,
+                        current_best_bid=bid1,
+                        blocked_candidates=list(_blocked_cannot_complete or []),
+                    ) or _hard_override_decision
+                if not bool((_hard_override_decision or {}).get("apply")):
+                    _hard_override_decision = _maybe_rescue_blocked_nt_slam_followup(
+                        self_total_points=_self_tp_step if isinstance(_self_tp_step, (int, float)) else None,
+                        current_best_bid=bid1,
+                        blocked_candidates=list(_blocked_cannot_complete or []),
+                        criteria_failed_candidates=list(_blocked_criteria_fail or []),
+                    ) or _hard_override_decision
+                if not bool((_hard_override_decision or {}).get("apply")):
+                    _hard_override_decision = _maybe_rescue_blocked_major_game_followup(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir_step,
+                        dealer_actual=dealer_actual,
+                        self_total_points=_self_tp_step if isinstance(_self_tp_step, (int, float)) else None,
+                        self_suit_lengths=_self_sl_step_single if isinstance(_self_sl_step_single, dict) else None,
+                        current_best_bid=bid1,
+                        blocked_candidates=list(_blocked_cannot_complete or []),
+                        criteria_failed_candidates=list(_blocked_criteria_fail or []),
+                    ) or _hard_override_decision
+                if bool((_hard_override_decision or {}).get("apply")):
+                    _ov_bid = str((_hard_override_decision or {}).get("selected_bid") or "").strip().upper()
+                    if _ov_bid:
+                        bid1 = _ov_bid
+                        _single_hard_gate_applied = True
+                        _single_hard_gate_reason = str((_hard_override_decision or {}).get("reason") or "COMMON_SENSE_HARD_OVERRIDE")
+                        step_rec["common_sense_final_gate_applied"] = True
+                        step_rec["common_sense_gate_reason"] = _single_hard_gate_reason
+                        step_rec["bid_scores"] = [
+                            {
+                                "bid": bid1,
+                                "score": None,
+                                "agg_expr": [],
+                                "common_sense_hard_override": True,
+                                "common_sense_reason_codes": list((_hard_override_decision or {}).get("reason_codes") or []),
+                                "common_sense_evidence": dict((_hard_override_decision or {}).get("evidence") or {}),
+                            }
+                        ]
+            except Exception:
+                _single_hard_gate_applied = False
+                _single_hard_gate_reason = None
             if not bid1:
                 break
             tokens.append(bid1)
@@ -14832,11 +16937,206 @@ def handle_ai_model_advanced_path(
                 if partner_last_bid not in ("3N", "3NT"):
                     return penalty, reason
                 b = str(bid_text or "").strip().upper()
+                _bad_nt_ctx = _bad_nt_correction_context(
+                    auction_tokens=list(auction_tokens or []),
+                    acting_direction=str(acting_direction or "").strip().upper(),
+                )
+                if _bad_nt_ctx and b == str(_bad_nt_ctx.get("best_bid") or "").strip().upper():
+                    reason = (
+                        "PULL_NT_GAME_PENALTY_WAIVED: partner 3NT leaves "
+                        f"{_bad_nt_ctx['danger_suit']} unstopped; self "
+                        f"{_bad_nt_ctx['best_suit']} len={_bad_nt_ctx['best_suit_len']}, "
+                        f"{_bad_nt_ctx['best_suit']} LTC={_bad_nt_ctx['best_suit_ltc']}, "
+                        f"hand LTC={_bad_nt_ctx['hand_ltc']} makes {b} a legitimate correction"
+                    )
+                    return 0.0, reason
                 penalty = 500.0
                 reason = (
                     f"PULL_NT_GAME_PENALTY: partner bid 3NT (game); "
                     f"pulling to {b} is almost never correct without "
                     f"a self-sufficient suit (-{penalty:.0f})"
+                )
+            except Exception:
+                return 0.0, None
+            return penalty, reason
+
+        def _compute_bad_nt_correction_bonus(
+            *,
+            bid_text: str,
+            auction_tokens: List[str],
+            acting_direction: str,
+        ) -> Tuple[float, str | None]:
+            """Reward correcting a dangerous partner 3NT to a self-sufficient suit game."""
+            bonus = 0.0
+            reason: str | None = None
+            try:
+                _ctx = _bad_nt_correction_context(
+                    auction_tokens=list(auction_tokens or []),
+                    acting_direction=str(acting_direction or "").strip().upper(),
+                )
+                if not _ctx:
+                    return bonus, reason
+                b = str(bid_text or "").strip().upper()
+                if b != str(_ctx.get("best_bid") or "").strip().upper():
+                    return bonus, reason
+                bonus = 420.0 if str(_ctx.get("best_suit") or "") in ("H", "S") else 320.0
+                reason = (
+                    "BAD_NT_SELF_SUFFICIENT_CORRECTION: partner 3NT leaves "
+                    f"{_ctx['danger_suit']} unstopped; self {_ctx['best_suit']} len={_ctx['best_suit_len']}, "
+                    f"{_ctx['best_suit']} LTC={_ctx['best_suit_ltc']}, hand LTC={_ctx['hand_ltc']} -> "
+                    f"reward {b} (+{bonus:.0f})"
+                )
+            except Exception:
+                return 0.0, None
+            return bonus, reason
+
+        def _compute_invite_accept_minimum_penalty(
+            *,
+            bid_text: str,
+            bid_level_local: int | None,
+            bid_strain_local: str | None,
+            auction_tokens: List[str],
+            acting_direction: str,
+        ) -> Tuple[float, str | None]:
+            """Penalize accepting game invitations on a minimum shown range."""
+            penalty = 0.0
+            reason: str | None = None
+            try:
+                if bid_level_local is None or bid_strain_local is None:
+                    return penalty, reason
+                toks_u = [str(t or "").strip().upper() for t in list(auction_tokens or [])]
+                if len(toks_u) < 2 or toks_u[-1] not in ("P", "PASS"):
+                    return penalty, reason
+                partner_dir = _partner_dir(acting_direction)
+                last_contract_idx: int | None = None
+                last_contract_bid: str | None = None
+                for idx in range(len(toks_u) - 1, -1, -1):
+                    tk_u = toks_u[idx]
+                    if _parse_contract_bid_text(tk_u) is None:
+                        continue
+                    last_contract_idx = int(idx)
+                    last_contract_bid = tk_u
+                    break
+                if last_contract_idx is None or last_contract_bid is None:
+                    return penalty, reason
+                if len(toks_u) - int(last_contract_idx) - 1 != 1:
+                    return penalty, reason
+                if _token_bidder_dir(last_contract_idx) != partner_dir:
+                    return penalty, reason
+                partner_parsed = _parse_contract_bid_text(last_contract_bid)
+                if partner_parsed is None:
+                    return penalty, reason
+                partner_lvl, partner_strain = int(partner_parsed[0]), str(partner_parsed[1])
+                # Opener's 2NT rebid is often a strong natural description, not a
+                # generic game invitation. Do not treat responder's 3NT as invite
+                # acceptance in those auctions.
+                if partner_strain == "N" and partner_lvl == 2:
+                    partner_prior_contract_idx: int | None = None
+                    for idx in range(int(last_contract_idx) - 1, -1, -1):
+                        tk_u = toks_u[idx]
+                        if _parse_contract_bid_text(tk_u) is None:
+                            continue
+                        if _token_bidder_dir(idx) != partner_dir:
+                            continue
+                        partner_prior_contract_idx = int(idx)
+                        break
+                    if partner_prior_contract_idx is not None:
+                        return penalty, reason
+                game_level = _game_level_for_strain(partner_strain)
+                if partner_strain != str(bid_strain_local).upper():
+                    return penalty, reason
+                if int(partner_lvl) != int(game_level) - 1:
+                    return penalty, reason
+                if int(bid_level_local) != int(game_level):
+                    return penalty, reason
+                non_min_diag = _invite_accept_non_minimum_info(
+                    acting_direction,
+                    metric_preference=("hcp" if partner_strain == "N" else "any"),
+                    auction_tokens=list(auction_tokens or []),
+                    dealer_actual_now=dealer_actual,
+                )
+                if not bool(non_min_diag.get("can_evaluate_non_minimum", False)):
+                    acting_dir_u = str(acting_direction or "").strip().upper()
+                    hand = str(deal_row.get(f"Hand_{acting_dir_u}", "") or "").strip()
+                    support = 0
+                    if hand and "." in hand:
+                        parts = hand.split(".")
+                        if len(parts) == 4:
+                            idx = {"S": 0, "H": 1, "D": 2, "C": 3}.get(partner_strain, -1)
+                            if idx >= 0:
+                                support = len(parts[idx])
+                    aces = 0
+                    helpful_voids = 0
+                    try:
+                        if hand:
+                            aces, helpful_voids = hand_controls(hand)
+                    except Exception:
+                        aces = 0
+                        helpful_voids = 0
+                    actual_tp = non_min_diag.get("actual_tp")
+                    actual_hcp = non_min_diag.get("actual_hcp")
+                    accept_score = 0
+                    if support >= 5:
+                        accept_score += 2
+                    elif support >= 4:
+                        accept_score += 1
+                    if aces >= 1:
+                        accept_score += 2
+                    elif helpful_voids >= 1:
+                        accept_score += 1
+                    if isinstance(actual_tp, (int, float)) and float(actual_tp) >= 10.0:
+                        accept_score += 1
+                    if isinstance(actual_hcp, (int, float)) and float(actual_hcp) >= 8.0:
+                        accept_score += 1
+                    fallback_support_ok, fallback_support_detail = _hand_supports_invite_accept(
+                        strain=partner_strain,
+                        support=int(support),
+                        accept_score=int(accept_score),
+                        tp_val=(float(actual_tp) if isinstance(actual_tp, (int, float)) else None),
+                        hcp_val=(float(actual_hcp) if isinstance(actual_hcp, (int, float)) else None),
+                    )
+                    if fallback_support_ok:
+                        return penalty, reason
+                    penalty = 180.0 if partner_strain == "N" else 160.0
+                    reason = (
+                        "INVITE_ACCEPT_UNSUPPORTED: partner's "
+                        f"{last_contract_bid} invites {bid_text}, but self hand does not support the higher level; "
+                        f"{fallback_support_detail} (-{penalty:.0f})"
+                    )
+                    return penalty, reason
+                if bool(non_min_diag.get("is_non_minimum", False)):
+                    return penalty, reason
+                shown_bid = str(non_min_diag.get("shown_bid") or "?")
+                if partner_strain == "N":
+                    shown_floor = non_min_diag.get("hcp_floor")
+                    shown_floor_txt = (
+                        f"{float(shown_floor):.0f}" if isinstance(shown_floor, (int, float)) else "?"
+                    )
+                    actual_hcp = non_min_diag.get("actual_hcp")
+                    actual_hcp_txt = (
+                        f"{float(actual_hcp):.0f}" if isinstance(actual_hcp, (int, float)) else "?"
+                    )
+                    penalty = 260.0
+                    reason = (
+                        "INVITE_ACCEPT_MINIMUM: partner's "
+                        f"{last_contract_bid} invites {bid_text}, but self is minimum for prior {shown_bid}; "
+                        f"HCP {actual_hcp_txt} is not above shown floor {shown_floor_txt} (-{penalty:.0f})"
+                    )
+                    return penalty, reason
+                shown_tp = non_min_diag.get("tp_floor")
+                shown_hcp = non_min_diag.get("hcp_floor")
+                shown_tp_txt = f"{float(shown_tp):.0f}" if isinstance(shown_tp, (int, float)) else "?"
+                shown_hcp_txt = f"{float(shown_hcp):.0f}" if isinstance(shown_hcp, (int, float)) else "?"
+                actual_tp = non_min_diag.get("actual_tp")
+                actual_hcp = non_min_diag.get("actual_hcp")
+                actual_tp_txt = f"{float(actual_tp):.0f}" if isinstance(actual_tp, (int, float)) else "?"
+                actual_hcp_txt = f"{float(actual_hcp):.0f}" if isinstance(actual_hcp, (int, float)) else "?"
+                penalty = 220.0
+                reason = (
+                    "INVITE_ACCEPT_MINIMUM: partner's "
+                    f"{last_contract_bid} invites {bid_text}, but self is minimum for prior {shown_bid}; "
+                    f"TP {actual_tp_txt} vs floor {shown_tp_txt}, HCP {actual_hcp_txt} vs floor {shown_hcp_txt} "
+                    f"(-{penalty:.0f})"
                 )
             except Exception:
                 return 0.0, None
@@ -15015,6 +17315,57 @@ def handle_ai_model_advanced_path(
                 partner_lvl, partner_strain = partner_last_contract
                 if not (partner_strain == "N" and int(partner_lvl) < 3):
                     return bonus, penalty, reason
+                # Do not apply this fit-exploration heuristic when partner is
+                # opener rebidding 2NT. In these auctions, responder's next call
+                # is not just generic room-preserving exploration.
+                if int(partner_lvl) == 2:
+                    partner_prior_contract_idx: int | None = None
+                    for i, tk in enumerate(list(auction_tokens or [])):
+                        parsed = _parse_contract_bid_text(str(tk or "").strip().upper())
+                        if parsed is None:
+                            continue
+                        tk_dir = _token_bidder_dir_for_dealer(i, dealer_actual)
+                        if tk_dir != partner_dir:
+                            continue
+                        if partner_last_contract == (int(parsed[0]), str(parsed[1])):
+                            continue
+                        partner_prior_contract_idx = i
+                    if partner_prior_contract_idx is not None:
+                        return bonus, penalty, reason
+
+                # Do not reward exploration over a weak, capped 1NT rebid.
+                partner_hcp_cap: float | None = None
+                partner_tp_cap: float | None = None
+                try:
+                    partner_nt_bid = f"{int(partner_lvl)}N"
+                    for prev_step in reversed(list(steps_detail or [])):
+                        prev_view = dict((prev_step or {}).get("bidder_view") or {})
+                        prev_dir = str(prev_view.get("acting_direction") or "").strip().upper()
+                        prev_bid = str(
+                            prev_view.get("chosen_bid")
+                            or (prev_step or {}).get("choice")
+                            or ""
+                        ).strip().upper()
+                        if prev_dir != partner_dir or prev_bid != partner_nt_bid:
+                            continue
+                        for scored_bid in list((prev_step or {}).get("bid_scores") or []):
+                            scored_bid_text = str((scored_bid or {}).get("bid") or "").strip().upper()
+                            if scored_bid_text != partner_nt_bid:
+                                continue
+                            caps = extract_pass_range_caps(list((scored_bid or {}).get("agg_expr") or []))
+                            partner_hcp_cap = caps.get("hcp_cap")
+                            partner_tp_cap = caps.get("tp_cap")
+                            break
+                        break
+                except Exception:
+                    partner_hcp_cap = None
+                    partner_tp_cap = None
+
+                if int(partner_lvl) == 1 and (
+                    (partner_hcp_cap is not None and float(partner_hcp_cap) <= 10.0)
+                    or (partner_tp_cap is not None and float(partner_tp_cap) <= 13.0)
+                ):
+                    return bonus, penalty, reason
 
                 nt_game_available = False
                 lower_room_suit_available = False
@@ -15072,6 +17423,60 @@ def handle_ai_model_advanced_path(
             except Exception:
                 return 0.0, 0.0, None
             return bonus, penalty, reason
+
+        def _opener_rebid_2nt_minor_length_relief(
+            *,
+            bid_text: str,
+            auction_tokens: List[str],
+            acting_direction: str,
+            self_suit_lengths: Dict[str, int] | None,
+            bid_agg_expr: List[str] | None,
+        ) -> float:
+            """Relax 3m length penalty for responder after opener's natural 2NT rebid."""
+            try:
+                parsed_bid = _parse_contract_bid_text(str(bid_text or "").strip().upper())
+                if parsed_bid is None:
+                    return 0.0
+                bid_level_local, bid_strain_local = int(parsed_bid[0]), str(parsed_bid[1]).upper()
+                if bid_level_local != 3 or bid_strain_local not in ("C", "D"):
+                    return 0.0
+                if not isinstance(self_suit_lengths, dict):
+                    return 0.0
+                self_len_raw = self_suit_lengths.get(bid_strain_local)
+                if self_len_raw is None:
+                    return 0.0
+                self_len = int(self_len_raw)
+                if self_len < 4:
+                    return 0.0
+                crit_norm = {
+                    str(c or "").strip().upper().strip("()")
+                    for c in list(bid_agg_expr or [])
+                    if str(c or "").strip()
+                }
+                if not any(("SL_H" in tok) or ("SL_S" in tok) for tok in crit_norm):
+                    return 0.0
+                partner_dir = _partner_dir(acting_direction)
+                if not partner_dir:
+                    return 0.0
+                partner_contracts: List[tuple[int, int, str]] = []
+                for idx, tk in enumerate(list(auction_tokens or [])):
+                    parsed = _parse_contract_bid_text(str(tk or "").strip().upper())
+                    if parsed is None:
+                        continue
+                    if _token_bidder_dir_for_dealer(idx, dealer_actual) != partner_dir:
+                        continue
+                    partner_contracts.append((int(idx), int(parsed[0]), str(parsed[1]).upper()))
+                if len(partner_contracts) < 2:
+                    return 0.0
+                _last_idx, last_lvl, last_strain = partner_contracts[-1]
+                _prev_idx, prev_lvl, prev_strain = partner_contracts[-2]
+                if not (last_lvl == 2 and last_strain == "N"):
+                    return 0.0
+                if prev_lvl < 1 or prev_strain not in ("C", "D", "H", "S", "N"):
+                    return 0.0
+                return float(max(0, 6 - self_len) * 45.0)
+            except Exception:
+                return 0.0
 
         def _compute_takeout_double_game_explore_adjustment(
             *,
@@ -15221,6 +17626,97 @@ def handle_ai_model_advanced_path(
                         f"{self_len}-{self_len} shape across {','.join(sorted(same_level_suits, key=lambda _s: suit_rank.get(_s, -1)))}; "
                         f"penalize lower-ranked suit {b} in favor of {bid_level_local}{preferred} (-{penalty:.0f})"
                     )
+            except Exception:
+                return 0.0, 0.0, None
+            return bonus, penalty, reason
+
+        def _compute_rebiddable_major_over_generic_nt_adjustment(
+            *,
+            bid_text: str,
+            bid_level_local: int | None,
+            bid_strain_local: str | None,
+            options: List[Dict[str, Any]],
+            bt_acting_criteria: List[str] | None,
+            self_suit_lengths: Dict[str, int] | None,
+            score_phase_local: str,
+        ) -> Tuple[float, float, str | None]:
+            """Prefer a real rebiddable major over a generic same-level 2NT call."""
+            bonus = 0.0
+            penalty = 0.0
+            reason: str | None = None
+            try:
+                if score_phase_local not in ("opening", "early_uncontested"):
+                    return bonus, penalty, reason
+                if bid_level_local is None or bid_strain_local is None:
+                    return bonus, penalty, reason
+                if int(bid_level_local) != 2:
+                    return bonus, penalty, reason
+                if not isinstance(self_suit_lengths, dict) or not self_suit_lengths:
+                    return bonus, penalty, reason
+
+                def _crit_u_list(crits: Any) -> list[str]:
+                    return [str(c or "").strip().upper() for c in list(crits or []) if str(c or "").strip()]
+
+                def _is_generic_nt_criteria(crits: Any) -> bool:
+                    crit_list = _crit_u_list(crits)
+                    if not crit_list:
+                        return True
+                    simple_strength_pat = re.compile(
+                        r"^(HCP|TOTAL_POINTS)\s*(>=|<=|>|<|==|!=)\s*\d+(?:\.\d+)?$"
+                    )
+                    return all(simple_strength_pat.match(c) for c in crit_list)
+
+                rebiddable_major_bids: list[str] = []
+                generic_nt_bid: str | None = None
+                for opt in list(options or []):
+                    opt_bid = str((opt or {}).get("bid", "") or "").strip().upper()
+                    parsed = _parse_contract_bid_text(opt_bid)
+                    if parsed is None:
+                        continue
+                    opt_lvl, opt_strain = int(parsed[0]), str(parsed[1]).upper()
+                    if opt_lvl != 2:
+                        continue
+                    crit_u = set(_crit_u_list((opt or {}).get("agg_expr") or []))
+                    if opt_strain == "N" and _is_generic_nt_criteria((opt or {}).get("agg_expr") or []):
+                        generic_nt_bid = opt_bid
+                    if opt_strain in ("H", "S"):
+                        if (
+                            f"REBIDDABLE_{opt_strain}" in crit_u
+                            or f"STRONG_REBIDDABLE_{opt_strain}" in crit_u
+                            or f"TWICE_REBIDDABLE_{opt_strain}" in crit_u
+                        ):
+                            opt_len = self_suit_lengths.get(opt_strain)
+                            if opt_len is not None and int(opt_len) >= 5:
+                                rebiddable_major_bids.append(opt_bid)
+
+                if generic_nt_bid is None or not rebiddable_major_bids:
+                    return bonus, penalty, reason
+
+                bid_u = str(bid_text or "").strip().upper()
+                crit_u_cur = set(_crit_u_list(bt_acting_criteria))
+                current_is_rebiddable_major = (
+                    bid_u in rebiddable_major_bids
+                    and bid_strain_local in ("H", "S")
+                    and (
+                        f"REBIDDABLE_{bid_strain_local}" in crit_u_cur
+                        or f"STRONG_REBIDDABLE_{bid_strain_local}" in crit_u_cur
+                        or f"TWICE_REBIDDABLE_{bid_strain_local}" in crit_u_cur
+                    )
+                )
+                if current_is_rebiddable_major:
+                    bonus = 360.0
+                    reason = (
+                        "REBIDDABLE_MAJOR_OVER_GENERIC_NT: same-level generic 2NT is available, "
+                        f"but {bid_u} shows a real rebiddable major and deserves priority (+{bonus:.0f})"
+                    )
+                    return bonus, penalty, reason
+                if bid_u == generic_nt_bid:
+                    penalty = 220.0
+                    reason = (
+                        "GENERIC_NT_DETOUR_OVER_REBIDDABLE_MAJOR: rebiddable major available at the same level; "
+                        f"penalize generic {bid_u} detour (-{penalty:.0f})"
+                    )
+                    return bonus, penalty, reason
             except Exception:
                 return 0.0, 0.0, None
             return bonus, penalty, reason
@@ -15564,6 +18060,7 @@ def handle_ai_model_advanced_path(
                 "v2_prev_same_side_same_strain_level": None,
                 "v2_game_level_for_strain": None,
                 "v2_jump_detected": False,
+                "v2_point_type": None,
                 "v2_required_tp": None,
                 "v2_self_tp_used": None,
                 "v2_partner_tp_floor": partner_tp_floor_local,
@@ -15672,6 +18169,8 @@ def handle_ai_model_advanced_path(
                     max_level_by_ceiling = int((float(combined_tp_ceiling_local) - 14.0) // 3.0)
                     max_level_by_ceiling = max(0, min(7, max_level_by_ceiling))
                 out["v2_max_level_by_tp_ceiling"] = max_level_by_ceiling
+                if not is_jump_past_game:
+                    return out
 
                 ceiling_qualified = bool(
                     combined_tp_ceiling_local is not None and combined_tp_ceiling_local >= required_tp
@@ -15716,6 +18215,112 @@ def handle_ai_model_advanced_path(
             except Exception:
                 return out
 
+        def _v2_intent_continuation_rescue(
+            *,
+            opt_local: Dict[str, Any],
+            bid_text: str,
+            bid_level_local: int | None,
+            bid_strain_local: str | None,
+            acting_direction: str,
+            acting_sign_local: float,
+            auction_tokens: List[str],
+            deal_row_local: Dict[str, Any],
+            opt_avg_par: Any,
+            base_phase_mult_local: float,
+        ) -> Tuple[float, Dict[str, Any]] | None:
+            """Synthetic score/floor for rescued intent-based continuations."""
+            if not bool((opt_local or {}).get("_intent_continuation_rescue", False)):
+                return None
+            ctx = dict((opt_local or {}).get("_intent_continuation_context") or {})
+            intent_type = str(ctx.get("intent_type") or "").strip()
+            source = "intent_continuation_heuristic"
+            synth_base = 0.0
+            base_acting = 0.0
+            if intent_type == INTENT_TYPE_HIGHER_LEVEL_PREFERENCE_REQUEST:
+                if bid_level_local != 5 or bid_strain_local not in ("C", "D"):
+                    return None
+                if str(ctx.get("accept_bid") or ctx.get("target_bid") or "").strip().upper() != str(bid_text or "").strip().upper():
+                    return None
+                if not bool(ctx.get("accept")):
+                    return None
+                if opt_avg_par is not None:
+                    try:
+                        synth_base = float(opt_avg_par)
+                        source = "intent_continuation_avg_par"
+                    except Exception:
+                        synth_base = 0.0
+                if synth_base == 0.0:
+                    support = int(ctx.get("support") or 0)
+                    aces = int(ctx.get("aces") or 0)
+                    helpful_voids = int(ctx.get("helpful_voids") or 0)
+                    synth_base = 390.0
+                    synth_base += 20.0 * float(max(0, support - 4))
+                    synth_base += 25.0 * float(min(2, aces))
+                    synth_base += 10.0 * float(min(1, helpful_voids))
+                    tp_val = ctx.get("tp")
+                    if isinstance(tp_val, (int, float)):
+                        synth_base += min(20.0, 5.0 * max(0.0, float(tp_val) - 10.0))
+                    synth_base = min(520.0, synth_base)
+                base_acting = float(acting_sign_local) * float(synth_base)
+            elif intent_type == INTENT_TYPE_OPENER_2NT_CLARIFICATION_REQUEST:
+                rescue_bids = {
+                    str(b or "").strip().upper()
+                    for b in list(ctx.get("rescue_bids") or [])
+                    if str(b or "").strip()
+                }
+                if str(bid_text or "").strip().upper() not in rescue_bids:
+                    return None
+                if opt_avg_par is not None:
+                    try:
+                        base_acting = float(opt_avg_par)
+                        synth_base = abs(float(base_acting))
+                        source = "intent_continuation_avg_par"
+                    except Exception:
+                        base_acting = 0.0
+                        synth_base = 0.0
+                if base_acting == 0.0:
+                    support = int(ctx.get("support") or 0)
+                    tp_val = ctx.get("tp")
+                    hcp_val = ctx.get("hcp")
+                    base_acting = 180.0
+                    if bid_strain_local == "N":
+                        base_acting = 260.0
+                    elif bid_strain_local == str(ctx.get("strain") or "").upper() and bid_level_local == 4:
+                        base_acting = 300.0 + 25.0 * float(max(0, support - 2))
+                    elif bid_strain_local == str(ctx.get("strain") or "").upper() and bid_level_local == 3:
+                        base_acting = 210.0 + 20.0 * float(max(0, support - 2))
+                    if isinstance(tp_val, (int, float)):
+                        base_acting += min(40.0, 5.0 * max(0.0, float(tp_val) - 14.0))
+                    if isinstance(hcp_val, (int, float)) and bid_strain_local == "N":
+                        base_acting += min(30.0, 5.0 * max(0.0, float(hcp_val) - 15.0))
+                    synth_base = abs(float(base_acting))
+            else:
+                return None
+
+            final = base_acting * float(base_phase_mult_local)
+            tp_txt = f"{float(ctx['tp']):.0f}" if isinstance(ctx.get("tp"), (int, float)) else "?"
+            hcp_txt = f"{float(ctx['hcp']):.0f}" if isinstance(ctx.get("hcp"), (int, float)) else "?"
+            reason = (
+                f"INTENT_CONTINUATION_RESCUE: partner's {ctx['partner_bid']} shows "
+                f"{ctx['intent_type']} in {ctx['strain']}; self has {ctx['support']} card support, "
+                f"TP={tp_txt}, HCP={hcp_txt}; source={source}"
+            )
+            breakdown: Dict[str, Any] = {
+                "cache_mode": "v2_intent_continuation_rescue",
+                "base": round(base_acting, 2),
+                "base_shrunk": round(final, 2),
+                "base_phase_mult": round(float(base_phase_mult_local), 4),
+                "matched_n": None,
+                "mean_par": round(float(synth_base), 2) if source == "intent_continuation_avg_par" else None,
+                "final_score": round(final, 2),
+                "acting_sign": float(acting_sign_local),
+                "intent_type": intent_type,
+                "intent_continuation_reason": reason,
+                "minor_game_invite_accept_reason": reason,
+            }
+            breakdown["special_case_notes"] = [reason]
+            return final, breakdown
+
         def _v2_simple_raise_rescue(
             *,
             bid_text: str,
@@ -15738,7 +18343,10 @@ def handle_ai_model_advanced_path(
             1. Partner (same side) previously bid this strain.
             2. Self has 3+ cards in that strain.
             3. Self TP falls inside the appropriate range for the bid level
-               (2-level: 6-9, 3-level game-try: 10-12, 4-level game: 13+).
+               (2-level: 6-9, 3-level game-try: 10-12, exact game: 13+).
+            4. Game+ raises are only rescued after partner has repeated the
+               strain; direct jump raises often represent conventional explore
+               space rather than a natural signoff.
             """
             if bid_level_local is None or bid_strain_local is None:
                 return None
@@ -15762,7 +18370,7 @@ def handle_ai_model_advanced_path(
                 if _last_st == "N" and _last_lvl >= 3:
                     return None
 
-            partner_bid_this_strain = False
+            partner_strain_bid_count = 0
             for i, tk in enumerate(list(auction_tokens or [])):
                 c = _parse_contract_bid_text(str(tk or "").strip().upper())
                 if c is None:
@@ -15773,10 +18381,14 @@ def handle_ai_model_advanced_path(
                 if tk_dir == acting_direction:
                     continue
                 if str(c[1]) == str(bid_strain_local):
-                    partner_bid_this_strain = True
-                    break
+                    partner_strain_bid_count += 1
 
-            if not partner_bid_this_strain:
+            if partner_strain_bid_count <= 0:
+                return None
+            if int(bid_level_local) >= 4 and partner_strain_bid_count < 2:
+                return None
+            game_level_local = _game_level_for_strain(str(bid_strain_local))
+            if int(bid_level_local) > int(game_level_local):
                 return None
 
             _srr_suit_rank = {"C": 0, "D": 1, "H": 2, "S": 3}
@@ -16011,8 +18623,11 @@ def handle_ai_model_advanced_path(
                 special_notes: list[str] = []
                 out: Dict[str, Any] = {}
                 for src_key, dst_key in (
+                    ("_opening_gap_rescue_reason", "opening_gap_rescue_reason"),
                     ("_early_constructive_gap_rescue_reason", "early_constructive_gap_rescue_reason"),
                     ("_simple_raise_pre_rescue_reason", "simple_raise_pre_rescue_reason"),
+                    ("_intent_continuation_rescue_reason", "intent_continuation_rescue_reason"),
+                    ("_minor_game_invite_accept_rescue_reason", "minor_game_invite_accept_rescue_reason"),
                     ("_nt_raise_rescue_reason", "nt_raise_rescue_reason"),
                     ("_opener_rebid_gap_rescue_reason", "opener_rebid_gap_rescue_reason"),
                     ("_direct_overcall_gap_rescue_reason", "direct_overcall_gap_rescue_reason"),
@@ -16050,6 +18665,7 @@ def handle_ai_model_advanced_path(
                 acting_direction=acting_dir,
                 next_seat=int(seat_display),
                 deal_row=deal_row if isinstance(deal_row, dict) else {},
+                convention_state=convention_state_step,
             )
             _self_tp_actual = acting_view.visible_hand.total_points
             _self_hcp_actual = acting_view.visible_hand.hcp
@@ -16127,6 +18743,30 @@ def handle_ai_model_advanced_path(
                         _tag = (
                             "FORCING_HEART_PASS_PENALTY: partner showed forcing-heart/Smolen intent; "
                             "penalize pass while constructive continuations exist"
+                        )
+                        pass_penalty_reason = (
+                            _tag if not pass_penalty_reason else f"{pass_penalty_reason}; {_tag}"
+                        )
+                except Exception:
+                    pass
+                try:
+                    _bad_nt_ctx = _bad_nt_correction_context(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir,
+                    )
+                    _has_non_pass = any(
+                        str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                        for _o in list(passed_opts or [])
+                    )
+                    if _bad_nt_ctx and _has_non_pass:
+                        _extra = 320.0
+                        pass_penalty += _extra
+                        _tag = (
+                            "BAD_NT_PASS_PENALTY: partner 3NT leaves "
+                            f"{_bad_nt_ctx['danger_suit']} unstopped; self "
+                            f"{_bad_nt_ctx['best_suit']} len={_bad_nt_ctx['best_suit_len']}, "
+                            f"{_bad_nt_ctx['best_suit']} LTC={_bad_nt_ctx['best_suit_ltc']}, "
+                            f"hand LTC={_bad_nt_ctx['hand_ltc']} so pass is unsafe (-{_extra:.0f})"
                         )
                         pass_penalty_reason = (
                             _tag if not pass_penalty_reason else f"{pass_penalty_reason}; {_tag}"
@@ -16386,11 +19026,17 @@ def handle_ai_model_advanced_path(
                 seed=int(seed or 0),
                 vul_filter=str(board_vul or "") if board_vul is not None else None,
                 deal_index=deal_index_i,
+                deal_row_dict=(dict(deal_row) if isinstance(deal_row, dict) and int(deal_row_idx) < 0 else None),
                 topk=10,
                 include_phase2a=True,
                 include_timing=True,
             )
             live_details = get_live_policy_details(details)
+            details_debug_annotations = details.get("debug_annotations") or {}
+            range_percentiles = (
+                live_details.get("range_percentiles")
+                or (details_debug_annotations.get("range_percentiles") if isinstance(details_debug_annotations, dict) else None)
+            )
             d_ms = 0.0
             p2_ms = 0.0
             hit = bool((details.get("cache") or {}).get("hit", False))
@@ -16410,6 +19056,21 @@ def handle_ai_model_advanced_path(
                 # In v2 mode, rescue the bid with a synthetic score when it is a
                 # *simple raise* of partner's suit at the level justified by TP.
                 if use_guardrails_v2 and bid_contract is not None:
+                    if bool(opt.get("_intent_continuation_rescue", False)):
+                        _mgia = _v2_intent_continuation_rescue(
+                            opt_local=opt,
+                            bid_text=bid1,
+                            bid_level_local=bid_level,
+                            bid_strain_local=bid_strain,
+                            acting_direction=acting_dir,
+                            acting_sign_local=acting_sign,
+                            auction_tokens=tokens,
+                            deal_row_local=deal_row,
+                            opt_avg_par=opt.get("avg_par"),
+                            base_phase_mult_local=base_phase_mult,
+                        )
+                        if _mgia is not None:
+                            return _mgia[0], bid1, d_ms, p2_ms, hit, _mgia[1]
                     _sr = _v2_simple_raise_rescue(
                         bid_text=bid1,
                         bid_level_local=bid_level,
@@ -16471,7 +19132,7 @@ def handle_ai_model_advanced_path(
 
             desc_score = None
             try:
-                rp = live_details.get("range_percentiles")
+                rp = range_percentiles
                 if isinstance(rp, dict) and rp.get("role") == "self":
                     pcts = []
                     h = (rp.get("hcp") or {}).get("percentile")
@@ -16570,6 +19231,7 @@ def handle_ai_model_advanced_path(
             partner_hcp_max: float | None = None
             partner_hcp_shown_floor: float | None = None
             par_topk: list[dict[str, Any]] = []
+            range_support_diag: Dict[str, Any] = {}
             non_rebiddable_rebid_penalty = 0.0
             non_rebiddable_rebid_reason: str | None = None
             rebiddable_major_game_bonus = 0.0
@@ -16591,7 +19253,7 @@ def handle_ai_model_advanced_path(
                     guard_enable_tp_shortfall_check = (not guard_uncontested_early) or is_high_level_contract
                     guard_enable_tricks_shortfall_check = (not guard_uncontested_early) or is_high_level_contract
                     try:
-                        rp2 = live_details.get("range_percentiles")
+                        rp2 = range_percentiles
                         if isinstance(rp2, dict):
                             self_tp_val = (rp2.get("total_points") or {}).get("value")
                             if self_tp_val is not None:
@@ -16633,6 +19295,21 @@ def handle_ai_model_advanced_path(
                         partner_hcp_shown_floor = None
 
                     par_topk = (live_details.get("par_contracts") or {}).get("topk") or []
+                    if use_guardrails_v2:
+                        range_support_diag = _guardrails_v2_jump_past_game_diagnostics(
+                            auction_tokens=list(tokens or []),
+                            acting_direction=acting_dir,
+                            bid_level_local=bid_level,
+                            bid_strain_local=bid_strain,
+                            self_tp_est=(float(self_tp_val) if isinstance(self_tp_val, (int, float)) else None),
+                            self_tp_act=(float(self_tp_actual) if isinstance(self_tp_actual, (int, float)) else None),
+                            partner_tp_floor_local=(float(partner_tp_min) if isinstance(partner_tp_min, (int, float)) else None),
+                            partner_tp_ceiling_local=(float(partner_tp_max) if isinstance(partner_tp_max, (int, float)) else None),
+                            self_hcp_est_local=(float(self_hcp_est) if isinstance(self_hcp_est, (int, float)) else None),
+                            self_hcp_act_local=(float(self_hcp_actual) if isinstance(self_hcp_actual, (int, float)) else None),
+                            partner_hcp_floor_local=(float(partner_hcp_min) if isinstance(partner_hcp_min, (int, float)) else None),
+                            partner_hcp_ceiling_local=(float(partner_hcp_max) if isinstance(partner_hcp_max, (int, float)) else None),
+                        )
 
                     gp, guard_reasons = compute_guardrail_penalty(
                         bid=bid1,
@@ -16668,7 +19345,24 @@ def handle_ai_model_advanced_path(
                         ),
                         opp_shown_strains=_opp_shown_strains,
                         debug_equivalence_bypass=True,
+                        same_strain_prev_level=range_support_diag.get("v2_prev_same_side_same_strain_level"),
+                        same_strain_support_level_floor=range_support_diag.get("v2_max_level_by_tp_floor"),
+                        same_strain_support_level_ceiling=range_support_diag.get("v2_max_level_by_tp_ceiling"),
+                        same_strain_point_type=range_support_diag.get("v2_point_type"),
                     )
+                    _minor_len_relief = _opener_rebid_2nt_minor_length_relief(
+                        bid_text=bid1,
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir,
+                        self_suit_lengths=_self_suit_lengths if isinstance(_self_suit_lengths, dict) else None,
+                        bid_agg_expr=bt_acting_criteria,
+                    )
+                    if _minor_len_relief > 0:
+                        gp = max(0.0, float(gp) - float(_minor_len_relief))
+                        guard_reasons = [
+                            gr for gr in list(guard_reasons or [])
+                            if "NATURAL_SUIT_LENGTH_SHORTFALL" not in str(gr)
+                        ]
                     guard_penalty_raw = float(gp)
                     guard_penalty = float(gp) * float(w_guard)
             except Exception:
@@ -16678,20 +19372,27 @@ def handle_ai_model_advanced_path(
 
             # Additional bridge-texture guardrail:
             # Penalize same-player suit rebids that are not rebiddable by hand.
+            rebid_hard_blocked = False
+            rebid_hard_block_reason: str | None = None
             try:
                 if float(w_guard) > 0:
-                    _nr_p, _nr_reason = compute_non_rebiddable_suit_rebid_penalty(
+                    _nr_p, _nr_reason, _nr_hard = compute_non_rebiddable_suit_rebid_penalty(
                         bid_text=bid1,
                         auction_tokens=tokens,
                         acting_direction=acting_dir,
                         dealer_actual=dealer_actual,
                         bt_acting_criteria=bt_acting_criteria,
+                        self_suit_lengths=_self_suit_lengths if isinstance(_self_suit_lengths, dict) else None,
                     )
                     non_rebiddable_rebid_penalty = float(_nr_p) * float(w_guard)
                     non_rebiddable_rebid_reason = _nr_reason
+                    rebid_hard_blocked = bool(_nr_hard)
+                    rebid_hard_block_reason = _nr_reason if bool(_nr_hard) else None
             except Exception:
                 non_rebiddable_rebid_penalty = 0.0
                 non_rebiddable_rebid_reason = None
+                rebid_hard_blocked = False
+                rebid_hard_block_reason = None
 
             # Bonus for directly committing to game in a strongly rebiddable
             # major already shown by acting player.
@@ -16758,6 +19459,33 @@ def handle_ai_model_advanced_path(
             except Exception:
                 pull_nt_game_penalty = 0.0
                 pull_nt_game_reason = None
+            bad_nt_correction_bonus, bad_nt_correction_reason = 0.0, None
+            try:
+                bad_nt_correction_bonus, bad_nt_correction_reason = _compute_bad_nt_correction_bonus(
+                    bid_text=bid1,
+                    auction_tokens=list(tokens or []),
+                    acting_direction=acting_dir,
+                )
+            except Exception:
+                bad_nt_correction_bonus = 0.0
+                bad_nt_correction_reason = None
+            if float(bad_nt_correction_bonus or 0.0) > 0.0:
+                guard_penalty = 0.0
+                guard_reasons = [
+                    "BAD_NT_GUARDRAIL_WAIVER: waive generic overbid/tricks guards for vetted correction over dangerous partner 3NT"
+                ]
+            invite_accept_minimum_penalty, invite_accept_minimum_reason = 0.0, None
+            try:
+                invite_accept_minimum_penalty, invite_accept_minimum_reason = _compute_invite_accept_minimum_penalty(
+                    bid_text=bid1,
+                    bid_level_local=bid_level,
+                    bid_strain_local=bid_strain,
+                    auction_tokens=list(tokens or []),
+                    acting_direction=acting_dir,
+                )
+            except Exception:
+                invite_accept_minimum_penalty = 0.0
+                invite_accept_minimum_reason = None
             forcing_heart_fit_bonus, forcing_heart_detour_penalty, forcing_heart_reason = _compute_forcing_heart_state_adjustment(
                 bid_text=bid1,
                 bid_level_local=bid_level,
@@ -16780,6 +19508,11 @@ def handle_ai_model_advanced_path(
                 auction_tokens=list(tokens or []),
                 acting_direction=acting_dir,
             )
+            if rebid_hard_blocked and float(major_fit_explore_bonus or 0.0) > 0.0:
+                major_fit_explore_bonus = 0.0
+                major_fit_explore_reason = (
+                    f"MAJOR_FIT_EXPLORE_SUPPRESSED: impossible rebid {bid1} cannot receive fit-exploration bonus"
+                )
             takeout_double_explore_bonus, takeout_double_explore_penalty, takeout_double_explore_reason = _compute_takeout_double_game_explore_adjustment(
                 bid_text=bid1,
                 bid_level_local=bid_level,
@@ -16806,6 +19539,15 @@ def handle_ai_model_advanced_path(
                 bid_strain_local=bid_strain,
                 options=list(passed_opts or []),
                 self_suit_lengths=_self_suit_lengths if isinstance(_self_suit_lengths, dict) else None,
+            )
+            rebiddable_major_nt_bonus, rebiddable_major_nt_penalty, rebiddable_major_nt_reason = _compute_rebiddable_major_over_generic_nt_adjustment(
+                bid_text=bid1,
+                bid_level_local=bid_level,
+                bid_strain_local=bid_strain,
+                options=list(passed_opts or []),
+                bt_acting_criteria=list(opt.get("agg_expr") or []),
+                self_suit_lengths=_self_suit_lengths if isinstance(_self_suit_lengths, dict) else None,
+                score_phase_local=score_phase,
             )
             competitive_new_suit_bonus, competitive_new_suit_penalty, competitive_new_suit_reason = _compute_competitive_new_suit_response_adjustment(
                 bid_text=bid1,
@@ -17074,6 +19816,21 @@ def handle_ai_model_advanced_path(
                 )
                 v2_jump_past_game_hard_block = bool(v2_diag.get("v2_blocked", False))
                 v2_jump_past_game_reason = v2_diag.get("v2_block_reason")
+                if (
+                    slam_hard_block
+                    and slam_hard_block_reason == "SLAM_GATE_WITHOUT_EV_MAKE_EVIDENCE"
+                    and bool(v2_diag.get("v2_jump_detected", False))
+                    and bool(v2_diag.get("v2_slam_qualified", False))
+                ):
+                    slam_hard_block = False
+                    slam_hard_block_reason = None
+                    slam_likely_make = True
+                    slam_likely_make_reason = "V2_SAME_STRAIN_RANGE_SUPPORT"
+                    post_game_slam_gate_penalty = 0.0
+                    post_game_slam_gate_reason = (
+                        "V2_SAME_STRAIN_RANGE_BYPASS: same-strain range floor/ceiling "
+                        "already qualify the slam level"
+                    )
 
             _pref_exempt = bool(opt.get("_forced_preference", False))
 
@@ -17101,7 +19858,11 @@ def handle_ai_model_advanced_path(
                         _self_pts_cap = float(self_tp_actual) if isinstance(self_tp_actual, (int, float)) else None
                         _partner_pts_cap = float(partner_tp_expected) if isinstance(partner_tp_expected, (int, float)) else None
                         _pt_label = "TP"
-                    if _self_pts_cap is not None and _partner_pts_cap is not None:
+                    if (
+                        _self_pts_cap is not None
+                        and _partner_pts_cap is not None
+                        and (not bool(opt.get("_intent_continuation_allow_level_cap_bypass", False)))
+                    ):
                         _combined_pts_cap = _self_pts_cap + _partner_pts_cap
                         _required_pts_cap = 14.0 + 3.0 * float(int(bid_level))
                         _max_level_cap = max(0, min(7, int((_combined_pts_cap - 14.0) // 3.0)))
@@ -17315,6 +20076,8 @@ def handle_ai_model_advanced_path(
                     },
                     "non_rebiddable_rebid_penalty": round(float(non_rebiddable_rebid_penalty), 2),
                     "non_rebiddable_rebid_reason": non_rebiddable_rebid_reason,
+                    "rebid_hard_blocked": bool(rebid_hard_blocked),
+                    "rebid_hard_block_reason": rebid_hard_block_reason,
                     "post_game_slam_gate_penalty": round(float(post_game_slam_gate_penalty), 2),
                     "post_game_slam_gate_reason": post_game_slam_gate_reason,
                     "rebiddable_major_game_bonus": round(float(rebiddable_major_game_bonus), 2),
@@ -17383,6 +20146,41 @@ def handle_ai_model_advanced_path(
                 v2_current_ev_acting = (
                     float(acting_sign) * float(v2_current_ev_ns) if v2_current_ev_ns is not None else None
                 )
+                semantic_positive_total = float(
+                    rebiddable_major_game_bonus
+                    + partner_major_game_bonus
+                    + forcing_heart_fit_bonus
+                    + forced_major_game_commit_bonus
+                    + major_fit_explore_bonus
+                    + takeout_double_trigger_bonus
+                    + takeout_double_explore_bonus
+                    + nt_preference_bonus
+                    + nt_over_minor_bonus
+                    + higher_suit_pref_bonus
+                    + rebiddable_major_nt_bonus
+                    + competitive_new_suit_bonus
+                    + bad_nt_correction_bonus
+                    + policy_bonus
+                )
+                semantic_negative_total = float(
+                    guard_penalty
+                    + non_rebiddable_rebid_penalty
+                    + post_game_slam_gate_penalty
+                    + room_consumption_penalty
+                    + partner_major_detour_penalty
+                    + forcing_heart_detour_penalty
+                    + forced_major_game_commit_penalty
+                    + major_fit_explore_penalty
+                    + takeout_double_trigger_penalty
+                    + takeout_double_explore_penalty
+                    + minor_nt_detour_penalty
+                    + nt_over_minor_penalty
+                    + higher_suit_pref_penalty
+                    + rebiddable_major_nt_penalty
+                    + competitive_new_suit_penalty
+                    + pull_nt_game_penalty
+                    + invite_accept_minimum_penalty
+                )
 
                 if use_bt_only_scoring:
                     bt_only_terms = [
@@ -17399,17 +20197,41 @@ def handle_ai_model_advanced_path(
                         ]
                     bt_only_terms.extend(
                         [
+                            ScoreTerm("guard_penalty", -float(guard_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("non_rebiddable_rebid_penalty", -float(non_rebiddable_rebid_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("post_game_slam_gate_penalty", -float(post_game_slam_gate_penalty), InformationClass.POSTERIOR),
+                            ScoreTerm("room_consumption_penalty", -float(room_consumption_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("rebiddable_major_game_bonus", float(rebiddable_major_game_bonus), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("partner_major_game_bonus", float(partner_major_game_bonus), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("partner_major_detour_penalty", -float(partner_major_detour_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("forcing_heart_fit_bonus", float(forcing_heart_fit_bonus), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("forcing_heart_detour_penalty", -float(forcing_heart_detour_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("forced_major_game_commit_bonus", float(forced_major_game_commit_bonus), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("forced_major_game_commit_penalty", -float(forced_major_game_commit_penalty), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("major_fit_explore_bonus", float(major_fit_explore_bonus), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("major_fit_explore_penalty", -float(major_fit_explore_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("takeout_double_trigger_bonus", float(takeout_double_trigger_bonus), InformationClass.SELF_HAND),
+                            ScoreTerm("takeout_double_trigger_penalty", -float(takeout_double_trigger_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("takeout_double_explore_bonus", float(takeout_double_explore_bonus), InformationClass.SELF_HAND),
+                            ScoreTerm("takeout_double_explore_penalty", -float(takeout_double_explore_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("nt_preference_bonus", float(nt_preference_bonus), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("minor_nt_detour_penalty", -float(minor_nt_detour_penalty), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("nt_over_minor_bonus", float(nt_over_minor_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("nt_over_minor_penalty", -float(nt_over_minor_penalty), InformationClass.SELF_HAND),
                             ScoreTerm("higher_suit_pref_bonus", float(higher_suit_pref_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("higher_suit_pref_penalty", -float(higher_suit_pref_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("rebiddable_major_over_generic_nt_bonus", float(rebiddable_major_nt_bonus), InformationClass.SELF_HAND),
+                            ScoreTerm("rebiddable_major_over_generic_nt_penalty", -float(rebiddable_major_nt_penalty), InformationClass.SELF_HAND),
                             ScoreTerm("competitive_new_suit_bonus", float(competitive_new_suit_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("competitive_new_suit_penalty", -float(competitive_new_suit_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("bad_nt_correction_bonus", float(bad_nt_correction_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("pull_nt_game_penalty", -float(pull_nt_game_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("invite_accept_minimum_penalty", -float(invite_accept_minimum_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("policy_bonus", float(policy_bonus), InformationClass.PUBLIC_AUCTION),
                         ]
                     )
+                    if rebid_hard_blocked:
+                        bt_only_terms.append(ScoreTerm("rebid_hard_block", -1.0e9, InformationClass.PUBLIC_AUCTION))
                     score_val = combine_live_score_terms(bt_only_terms)
                 else:
                     # Use full scoring stack (optionally with common-sense stage disabled later).
@@ -17441,10 +20263,15 @@ def handle_ai_model_advanced_path(
                             ScoreTerm("nt_over_minor_penalty", -float(nt_over_minor_penalty), InformationClass.SELF_HAND),
                             ScoreTerm("higher_suit_pref_bonus", float(higher_suit_pref_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("higher_suit_pref_penalty", -float(higher_suit_pref_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("rebiddable_major_over_generic_nt_bonus", float(rebiddable_major_nt_bonus), InformationClass.SELF_HAND),
+                            ScoreTerm("rebiddable_major_over_generic_nt_penalty", -float(rebiddable_major_nt_penalty), InformationClass.SELF_HAND),
                             ScoreTerm("competitive_new_suit_bonus", float(competitive_new_suit_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("competitive_new_suit_penalty", -float(competitive_new_suit_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("bad_nt_correction_bonus", float(bad_nt_correction_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("pull_nt_game_penalty", -float(pull_nt_game_penalty), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("invite_accept_minimum_penalty", -float(invite_accept_minimum_penalty), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("policy_bonus", float(policy_bonus), InformationClass.PUBLIC_AUCTION),
+                            ScoreTerm("rebid_hard_block", -1.0e9 if rebid_hard_blocked else 0.0, InformationClass.PUBLIC_AUCTION),
                         ]
                     )
                 simple_raise_floor_bonus = 0.0
@@ -17474,6 +20301,34 @@ def handle_ai_model_advanced_path(
                 except Exception:
                     simple_raise_floor_bonus = 0.0
                     simple_raise_floor_reason = None
+                minor_game_invite_accept_bonus = 0.0
+                minor_game_invite_accept_reason: str | None = None
+                try:
+                    if use_guardrails_v2 and bool(opt.get("_intent_continuation_rescue", False)):
+                        _mgia_floor = _v2_intent_continuation_rescue(
+                            opt_local=opt,
+                            bid_text=bid1,
+                            bid_level_local=bid_level,
+                            bid_strain_local=bid_strain,
+                            acting_direction=acting_dir,
+                            acting_sign_local=acting_sign,
+                            auction_tokens=list(tokens or []),
+                            deal_row_local=deal_row,
+                            opt_avg_par=opt.get("avg_par"),
+                            base_phase_mult_local=base_phase_mult,
+                        )
+                        if _mgia_floor is not None:
+                            _mgia_floor_score, _mgia_floor_breakdown = _mgia_floor
+                            if float(score_val) < float(_mgia_floor_score):
+                                minor_game_invite_accept_bonus = float(_mgia_floor_score) - float(score_val)
+                                minor_game_invite_accept_reason = str(
+                                    (_mgia_floor_breakdown or {}).get("minor_game_invite_accept_reason")
+                                    or "MINOR_GAME_INVITE_ACCEPT_RESCUE_FLOOR"
+                                )
+                                score_val = float(_mgia_floor_score)
+                except Exception:
+                    minor_game_invite_accept_bonus = 0.0
+                    minor_game_invite_accept_reason = None
                 breakdown = {
                     "base": round(base, 2),
                     "base_shrunk": round(base_shrunk, 2),
@@ -17509,6 +20364,8 @@ def handle_ai_model_advanced_path(
                     },
                     "non_rebiddable_rebid_penalty": round(float(non_rebiddable_rebid_penalty), 2),
                     "non_rebiddable_rebid_reason": non_rebiddable_rebid_reason,
+                    "rebid_hard_blocked": bool(rebid_hard_blocked),
+                    "rebid_hard_block_reason": rebid_hard_block_reason,
                     "post_game_slam_gate_penalty": round(float(post_game_slam_gate_penalty), 2),
                     "post_game_slam_gate_reason": post_game_slam_gate_reason,
                     "rebiddable_major_game_bonus": round(float(rebiddable_major_game_bonus), 2),
@@ -17537,8 +20394,14 @@ def handle_ai_model_advanced_path(
                     "competitive_new_suit_bonus": round(float(competitive_new_suit_bonus), 2),
                     "competitive_new_suit_penalty": round(float(competitive_new_suit_penalty), 2),
                     "competitive_new_suit_reason": competitive_new_suit_reason,
+                    "bad_nt_correction_bonus": round(float(bad_nt_correction_bonus), 2),
+                    "bad_nt_correction_reason": bad_nt_correction_reason,
                     "simple_raise_floor_bonus": round(float(simple_raise_floor_bonus), 2),
                     "simple_raise_floor_reason": simple_raise_floor_reason,
+                    "minor_game_invite_accept_bonus": round(float(minor_game_invite_accept_bonus), 2),
+                    "minor_game_invite_accept_reason": minor_game_invite_accept_reason,
+                    "semantic_positive_total": round(float(semantic_positive_total), 2),
+                    "semantic_negative_total": round(float(semantic_negative_total), 2),
                     "common_sense_bonus": round(float(common_sense_bonus), 2),
                     "common_sense_penalty": round(float(common_sense_penalty), 2),
                     "common_sense_reason_codes": list(common_sense_reason_codes or []),
@@ -17550,8 +20413,13 @@ def handle_ai_model_advanced_path(
                     "nt_over_minor_bonus": round(float(nt_over_minor_bonus), 2),
                     "nt_over_minor_penalty": round(float(nt_over_minor_penalty), 2),
                     "nt_over_minor_reason": nt_over_minor_reason,
+                    "rebiddable_major_over_generic_nt_bonus": round(float(rebiddable_major_nt_bonus), 2),
+                    "rebiddable_major_over_generic_nt_penalty": round(float(rebiddable_major_nt_penalty), 2),
+                    "rebiddable_major_over_generic_nt_reason": rebiddable_major_nt_reason,
                     "pull_nt_game_penalty": round(float(pull_nt_game_penalty), 2),
                     "pull_nt_game_reason": pull_nt_game_reason,
+                    "invite_accept_minimum_penalty": round(float(invite_accept_minimum_penalty), 2),
+                    "invite_accept_minimum_reason": invite_accept_minimum_reason,
                     "room_consumption_penalty": round(float(room_consumption_penalty), 2),
                     "room_consumption_reason": room_consumption_reason,
                     "is_level5_strain_change_jump": bool(is_level5_strain_change_jump),
@@ -17597,6 +20465,29 @@ def handle_ai_model_advanced_path(
                             breakdown["likely_par_score_from_top_contract_acting"] = round(_aps_f, 2)
                 except Exception:
                     pass
+                semantic_veto_blocked = bool(
+                    use_guardrails_v2
+                    and (not _pref_exempt)
+                    and float(bad_nt_correction_bonus or 0.0) <= 0.0
+                    and float(semantic_negative_total) >= 150.0
+                    and float(semantic_negative_total) >= float(base_shrunk_weighted) + float(semantic_positive_total)
+                )
+                if semantic_veto_blocked:
+                    veto_reasons: list[str] = []
+                    if forcing_heart_detour_penalty > 0 and forcing_heart_reason:
+                        veto_reasons.append(str(forcing_heart_reason))
+                    if partner_major_detour_penalty > 0 and partner_major_reason:
+                        veto_reasons.append(str(partner_major_reason))
+                    if guard_reasons:
+                        veto_reasons.extend([str(x) for x in list(guard_reasons or [])[:2]])
+                    veto_suffix = f"; {' | '.join(veto_reasons[:2])}" if veto_reasons else ""
+                    breakdown["hard_blocked"] = True
+                    breakdown["hard_block_reason"] = (
+                        f"SEMANTIC_VETO_BLOCK: semantic negatives {semantic_negative_total:.0f} "
+                        f"overwhelm posterior {base_shrunk_weighted:.0f} for {bid1}{veto_suffix}"
+                    )
+                    breakdown["final_score"] = None
+                    return float("-inf"), bid1, d_ms, p2_ms, hit, breakdown
                 return float(score_val), bid1, d_ms, p2_ms, hit, breakdown
             except Exception:
                 return float("-inf"), bid1, d_ms, p2_ms, hit, {}
@@ -17697,11 +20588,72 @@ def handle_ai_model_advanced_path(
                     _new_scored_rows.append((_sc, _b_s, _bk))
                 scored_rows = _new_scored_rows
 
+        def _partner_major_rebid_tie_break_category(
+            bid_text: str,
+        ) -> tuple[str | None, str | None]:
+            """Classify equal-score continuations after partner's major rebid.
+
+            Narrow bridge-aware rule: if partner's latest natural call is a major,
+            let a supported raise of that major outrank an equal-score minor preference.
+            """
+            try:
+                if not isinstance(_self_suit_lengths, dict) or not _self_suit_lengths:
+                    return None, None
+                partner_dir_now = _partner_dir(acting_dir)
+                if not partner_dir_now:
+                    return None, None
+                toks_u = [str(t or "").strip().upper() for t in list(tokens or [])]
+                if not toks_u:
+                    return None, None
+
+                last_non_pass_idx: int | None = None
+                for _idx in range(len(toks_u) - 1, -1, -1):
+                    if toks_u[_idx] not in ("", "P", "PASS", "X", "XX"):
+                        last_non_pass_idx = int(_idx)
+                        break
+                if last_non_pass_idx is None:
+                    return None, None
+                if _token_bidder_dir_for_dealer(last_non_pass_idx, dealer_actual) != partner_dir_now:
+                    return None, None
+
+                partner_last_parsed = _parse_contract_bid_text(toks_u[last_non_pass_idx])
+                if partner_last_parsed is None:
+                    return None, None
+                partner_lvl, partner_strain = int(partner_last_parsed[0]), str(partner_last_parsed[1]).upper()
+                if partner_strain not in ("H", "S"):
+                    return None, None
+
+                bid_u = str(bid_text or "").strip().upper()
+                bid_parsed = _parse_contract_bid_text(bid_u)
+                if bid_parsed is None:
+                    return None, None
+                bid_lvl, bid_strain = int(bid_parsed[0]), str(bid_parsed[1]).upper()
+                support = int(_self_suit_lengths.get(partner_strain, 0) or 0)
+
+                if bid_strain == partner_strain and bid_lvl > partner_lvl and support >= 3:
+                    return (
+                        "supported_major_raise",
+                        "MAJOR_RAISE_OVER_MINOR_PREFERENCE_TIEBREAK: "
+                        f"partner's latest call is {partner_lvl}{partner_strain} and self has "
+                        f"{support}-card support; prefer raise {bid_u} on an equal score",
+                    )
+                if bid_strain in ("C", "D") and bid_lvl >= partner_lvl:
+                    return (
+                        "minor_preference",
+                        "MAJOR_RAISE_OVER_MINOR_PREFERENCE_TIEBREAK: "
+                        f"equal-score minor preference {bid_u} yields to supported raise of partner's "
+                        f"latest major {partner_lvl}{partner_strain}",
+                    )
+            except Exception:
+                return None, None
+            return None, None
+
         common_sense_gate_reason: str | None = None
         common_sense_final_gate_applied = False
         # Common-sense adjudication stage (post-score).
         if scored_rows:
-            _scored_rows_adj: List[Tuple[float, str, Dict[str, Any]]] = []
+            _scored_rows_adj: List[Tuple[float, str, Dict[str, Any], int]] = []
+            _scored_rows_pre: List[Tuple[float, str, Dict[str, Any], str | None, str | None]] = []
             for _sc, _b, _bk in list(scored_rows or []):
                 if use_common_sense:
                     _cs_bonus = float((_bk or {}).get("common_sense_bonus") or 0.0)
@@ -17709,15 +20661,36 @@ def handle_ai_model_advanced_path(
                     _adj = float(_sc) + _cs_bonus - _cs_pen
                 else:
                     _adj = float(_sc)
-                _scored_rows_adj.append((float(_adj), str(_b), dict(_bk or {})))
-            _scored_rows_adj.sort(key=lambda t: (-float(t[0]), str(t[1])))
+                _tb_cat, _tb_reason = _partner_major_rebid_tie_break_category(str(_b))
+                _scored_rows_pre.append((float(_adj), str(_b), dict(_bk or {}), _tb_cat, _tb_reason))
+            _top_adj = max(float(_row[0]) for _row in list(_scored_rows_pre or []))
+            _top_tied = [
+                _row for _row in list(_scored_rows_pre or [])
+                if abs(float(_row[0]) - float(_top_adj)) <= 1.0e-9
+            ]
+            _tie_pref_active = bool(
+                any(str(_row[3] or "") == "supported_major_raise" for _row in _top_tied)
+                and any(str(_row[3] or "") == "minor_preference" for _row in _top_tied)
+            )
+            for _adj, _b, _bk, _tb_cat, _tb_reason in list(_scored_rows_pre or []):
+                _tb_priority = 1 if (_tie_pref_active and str(_tb_cat or "") == "supported_major_raise") else 0
+                if _tie_pref_active:
+                    _bk["tie_break_priority"] = int(_tb_priority)
+                    _bk["tie_break_category"] = _tb_cat
+                    _bk["tie_break_reason"] = _tb_reason
+                    for _row in bid_scores:
+                        if str((_row or {}).get("bid", "")).strip().upper() == str(_b).strip().upper():
+                            _row["tie_break_priority"] = int(_tb_priority)
+                            _row["tie_break_category"] = _tb_cat
+                            _row["tie_break_reason"] = _tb_reason
+                            break
+                _scored_rows_adj.append((float(_adj), str(_b), _bk, int(_tb_priority)))
+            _scored_rows_adj.sort(key=lambda t: (-float(t[0]), -int(t[3]), str(t[1])))
             best_score = float(_scored_rows_adj[0][0])
             best_bid = str(_scored_rows_adj[0][1])
 
             # Optional hard override for whitelisted high-confidence actions.
             try:
-                if not use_common_sense:
-                    raise RuntimeError("common-sense hard override disabled by logic_mode")
                 _legal_non_pass_candidates = [
                     _o for _o in list(candidates_sorted or [])
                     if str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
@@ -17753,24 +20726,81 @@ def handle_ai_model_advanced_path(
                             }
                 except Exception:
                     _self_sl_step = None
-                _cs_hard = compute_common_sense_hard_override(
-                    auction_tokens=list(tokens or []),
-                    acting_direction=acting_dir,
-                    dealer_actual=dealer_actual,
-                    self_total_points=_self_tp_step if isinstance(_self_tp_step, (int, float)) else None,
-                    partner_total_points_expected=None,
-                    self_suit_lengths=_self_sl_step if isinstance(_self_sl_step, dict) else None,
-                    current_best_bid=best_bid,
-                    legal_non_pass_candidates=list(_legal_non_pass_candidates or []),
-                    blocked_candidates=list(_blocked_cannot_complete or []),
-                    criteria_failed_candidates=list(_blocked_criteria_fail or []),
-                )
+                _cs_hard: Dict[str, Any] = {}
+                if use_common_sense or use_guardrails_v2:
+                    _cs_hard_candidate = compute_common_sense_hard_override(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir,
+                        dealer_actual=dealer_actual,
+                        self_total_points=_self_tp_step if isinstance(_self_tp_step, (int, float)) else None,
+                        partner_total_points_expected=None,
+                        self_suit_lengths=_self_sl_step if isinstance(_self_sl_step, dict) else None,
+                        current_best_bid=best_bid,
+                        legal_non_pass_candidates=list(_legal_non_pass_candidates or []),
+                        blocked_candidates=list(_blocked_cannot_complete or []),
+                        criteria_failed_candidates=list(_blocked_criteria_fail or []),
+                    )
+                    if use_common_sense:
+                        _cs_hard = _cs_hard_candidate
+                    else:
+                        # Under guardrails_v2, keep the existing common-sense stage off by
+                        # default, but still honor the high-confidence major-fit raise override.
+                        _reason_codes = {
+                            str(_code or "").strip()
+                            for _code in list((_cs_hard_candidate or {}).get("reason_codes") or [])
+                            if str(_code or "").strip()
+                        }
+                        if (
+                            "major_fit_raise_after_partner_shows_heart_or_spade_fit" in _reason_codes
+                            or "major_over_minor_response_after_minor_opening" in _reason_codes
+                        ):
+                            _cs_hard = _cs_hard_candidate
+                if not bool((_cs_hard or {}).get("apply")):
+                    _cs_hard = _maybe_rescue_blocked_second_suit_rebid(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir,
+                        dealer_actual=dealer_actual,
+                        self_suit_lengths=_self_sl_step if isinstance(_self_sl_step, dict) else None,
+                        current_best_bid=best_bid,
+                        blocked_candidates=list(_blocked_cannot_complete or []),
+                    ) or _cs_hard
+                if not bool((_cs_hard or {}).get("apply")):
+                    _cs_hard = _maybe_rescue_blocked_preference_return(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir,
+                        dealer_actual=dealer_actual,
+                        self_suit_lengths=_self_sl_step if isinstance(_self_sl_step, dict) else None,
+                        current_best_bid=best_bid,
+                        surviving_non_pass_candidates=[
+                            _o for _o in list(passed_sorted or [])
+                            if str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                        ],
+                        criteria_failed_candidates=list(_blocked_criteria_fail or []),
+                    ) or _cs_hard
+                if not bool((_cs_hard or {}).get("apply")):
+                    _cs_hard = _maybe_rescue_blocked_nt_slam_followup(
+                        self_total_points=_self_tp_step if isinstance(_self_tp_step, (int, float)) else None,
+                        current_best_bid=best_bid,
+                        blocked_candidates=list(_blocked_cannot_complete or []),
+                        criteria_failed_candidates=list(_blocked_criteria_fail or []),
+                    ) or _cs_hard
+                if not bool((_cs_hard or {}).get("apply")):
+                    _cs_hard = _maybe_rescue_blocked_major_game_followup(
+                        auction_tokens=list(tokens or []),
+                        acting_direction=acting_dir,
+                        dealer_actual=dealer_actual,
+                        self_total_points=_self_tp_step if isinstance(_self_tp_step, (int, float)) else None,
+                        self_suit_lengths=_self_sl_step if isinstance(_self_sl_step, dict) else None,
+                        current_best_bid=best_bid,
+                        blocked_candidates=list(_blocked_cannot_complete or []),
+                        criteria_failed_candidates=list(_blocked_criteria_fail or []),
+                    ) or _cs_hard
                 if bool((_cs_hard or {}).get("apply")):
                     _ov_bid = str((_cs_hard or {}).get("selected_bid") or "").strip().upper()
                     if _ov_bid:
                         _ov_score = None
                         _ov_row = None
-                        for _adj_sc, _adj_b, _adj_bk in list(_scored_rows_adj or []):
+                        for _adj_sc, _adj_b, _adj_bk, _adj_tb in list(_scored_rows_adj or []):
                             if str(_adj_b).strip().upper() == _ov_bid:
                                 _ov_score = float(_adj_sc)
                                 _ov_row = _adj_bk
@@ -17808,6 +20838,127 @@ def handle_ai_model_advanced_path(
                             )
             except Exception:
                 pass
+        try:
+            if str(best_bid).strip().upper() in ("P", "PASS"):
+                _partner_pref_ps = _partner_dir(acting_dir)
+                _auction_now_ps = "-".join([str(t or "").strip().upper() for t in list(tokens or []) if str(t or "").strip()])
+                _below_3nt_now_ps = _is_contract_below_3nt(_auction_now_ps)
+                _partner_suits_ordered_ps: list[str] = []
+                _self_suits_ps: set[str] = set()
+                _first_side_bidder_ps: str | None = None
+                for _i_ps, _tk_ps in enumerate(list(tokens or [])):
+                    _tk_ps_u = str(_tk_ps or "").strip().upper()
+                    if len(_tk_ps_u) < 2 or not _tk_ps_u[0].isdigit():
+                        continue
+                    _bidder_ps = _token_bidder_dir_for_dealer(_i_ps, dealer_actual)
+                    _st_ps = _tk_ps_u[1:]
+                    if _st_ps == "NT":
+                        _st_ps = "N"
+                    if _st_ps not in ("C", "D", "H", "S"):
+                        continue
+                    _bidder_side_ps = "NS" if _bidder_ps in ("N", "S") else "EW"
+                    _acting_side_ps = "NS" if acting_dir in ("N", "S") else "EW"
+                    if _first_side_bidder_ps is None and _bidder_side_ps == _acting_side_ps:
+                        _first_side_bidder_ps = _bidder_ps
+                    if _bidder_ps == _partner_pref_ps:
+                        if _st_ps not in _partner_suits_ordered_ps:
+                            _partner_suits_ordered_ps.append(_st_ps)
+                    elif _bidder_ps == acting_dir:
+                        _self_suits_ps.add(_st_ps)
+                _fit_overlap_ps = _self_suits_ps & set(_partner_suits_ordered_ps)
+                _acting_is_responder_ps = bool(_first_side_bidder_ps and _first_side_bidder_ps != acting_dir)
+                if len(_partner_suits_ordered_ps) >= 2 and not _fit_overlap_ps and _acting_is_responder_ps and _below_3nt_now_ps:
+                    _first_suit_ps = _partner_suits_ordered_ps[0]
+                    _second_suit_ps = _partner_suits_ordered_ps[1]
+                    _sl_first_ps: int | None = None
+                    _sl_second_ps: int | None = None
+                    _hand_ps = str(deal_row.get(f"Hand_{acting_dir}", "") or "").strip()
+                    if _hand_ps and "." in _hand_ps:
+                        _parts_ps = _hand_ps.split(".")
+                        if len(_parts_ps) == 4:
+                            _sl_map_ps = {"S": len(_parts_ps[0]), "H": len(_parts_ps[1]), "D": len(_parts_ps[2]), "C": len(_parts_ps[3])}
+                            _sl_first_ps = _sl_map_ps.get(_first_suit_ps)
+                            _sl_second_ps = _sl_map_ps.get(_second_suit_ps)
+                    _current_contract_level_ps: int | None = None
+                    for _tk_ps in reversed(list(tokens or [])):
+                        _tk_ps_u = str(_tk_ps or "").strip().upper()
+                        if len(_tk_ps_u) >= 2 and _tk_ps_u[0].isdigit():
+                            _current_contract_level_ps = int(_tk_ps_u[0])
+                            break
+                    _near_non_pass_ps = False
+                    for _o_ps in list(passed_sorted or []):
+                        _b_ps = str((_o_ps or {}).get("bid", "") or "").strip().upper()
+                        if _b_ps in ("", "P", "PASS") or len(_b_ps) < 2 or not _b_ps[0].isdigit():
+                            continue
+                        _lvl_ps = int(_b_ps[0])
+                        _st_ps = _b_ps[1:]
+                        if _st_ps == "NT":
+                            _st_ps = "N"
+                        if _st_ps == _first_suit_ps:
+                            continue
+                        if _current_contract_level_ps is None or _lvl_ps <= (_current_contract_level_ps + 1):
+                            _near_non_pass_ps = True
+                            break
+                    if (
+                        not _near_non_pass_ps
+                        and _sl_first_ps is not None
+                        and _sl_second_ps is not None
+                        and _sl_first_ps >= _sl_second_ps
+                    ):
+                        _pref_opt_ps: Dict[str, Any] | None = None
+                        for _o_ps in list(next_bids or []):
+                            _b_ps = str((_o_ps or {}).get("bid", "") or "").strip().upper()
+                            if len(_b_ps) < 2 or not _b_ps[0].isdigit():
+                                continue
+                            _lvl_ps = int(_b_ps[0])
+                            _st_ps = _b_ps[1:]
+                            if _st_ps == "NT":
+                                _st_ps = "N"
+                            if _st_ps != _first_suit_ps:
+                                continue
+                            if _current_contract_level_ps is not None and _lvl_ps > (_current_contract_level_ps + 1):
+                                continue
+                            if bool((_o_ps or {}).get("is_dead_end", False)):
+                                continue
+                            if not bool((_o_ps or {}).get("can_complete", True)):
+                                continue
+                            if (_o_ps or {}).get("bt_index") is None:
+                                continue
+                            _pref_opt_ps = _o_ps
+                            break
+                        if _pref_opt_ps is not None:
+                            _pref_bid_ps = str((_pref_opt_ps or {}).get("bid", "") or "").strip().upper()
+                            _override_score_ps = (
+                                float(best_score) + 1.0
+                                if isinstance(best_score, (int, float)) and best_score != float("-inf")
+                                else 1.0
+                            )
+                            best_bid = _pref_bid_ps
+                            best_score = float(_override_score_ps)
+                            step_rec["hard_gate_reason"] = (
+                                f"FORCED_PREFERENCE_POST_SCORE: partner showed {'/'.join(_partner_suits_ordered_ps)}, "
+                                f"self has {_sl_first_ps}{_first_suit_ps} vs {_sl_second_ps}{_second_suit_ps}, "
+                                f"and pass only beat remote jumps; overriding to {_pref_bid_ps}"
+                            )
+                            _found_ps = False
+                            for _row_ps in bid_scores:
+                                if str((_row_ps or {}).get("bid", "")).strip().upper() == _pref_bid_ps:
+                                    _row_ps["score"] = round(float(best_score), 2)
+                                    _row_ps["forced_preference_post_score"] = True
+                                    _found_ps = True
+                                    break
+                            if not _found_ps:
+                                bid_scores.append(
+                                    {
+                                        "bid": _pref_bid_ps,
+                                        "score": round(float(best_score), 2),
+                                        "agg_expr": _agg_expr_by_bid.get(_pref_bid_ps, []),
+                                        "forced_preference_post_score": True,
+                                        "hard_override_without_bid_details": True,
+                                    }
+                                )
+        except Exception:
+            pass
         # Sort bid_scores by score descending for readability
         bid_scores.sort(key=lambda x: float(x.get("score") or float("-inf")), reverse=True)
 
@@ -17875,10 +21026,13 @@ def handle_ai_model_advanced_path(
                     forcing_heart_shown_by_dir[str(acting_dir)] = True
                 if str(best_bid).strip().upper() in ("D", "X", "DOUBLE"):
                     takeout_double_shown_by_dir[str(acting_dir)] = True
-                step_rec["convention_state"] = {
-                    "forcing_heart_shown_by_dir": dict(forcing_heart_shown_by_dir),
-                    "takeout_double_shown_by_dir": dict(takeout_double_shown_by_dir),
-                }
+                step_rec["convention_state"] = _build_convention_state_snapshot(
+                    auction_tokens=list(tokens or []),
+                    dealer_actual_now=dealer_actual,
+                    deal_row_local=deal_row if isinstance(deal_row, dict) else {},
+                    forcing_heart_flags_now=forcing_heart_shown_by_dir,
+                    takeout_double_flags_now=takeout_double_shown_by_dir,
+                )
             except Exception:
                 pass
         except Exception:

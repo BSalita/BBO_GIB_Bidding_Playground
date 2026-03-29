@@ -8,16 +8,43 @@ Playground for experimenting with BBO GIB Bidding data analysis and rule learnin
 # Install dependencies
 pip install -r requirements.txt
 
-# Start API server (loads ~40GB of data, takes ~2 min)
+# Start the main API server that Streamlit talks to
+# Loads the in-process core state and hot-reloadable plugins.
 python bbo_bidding_queries_api.py
 
 # Start Streamlit UI (in a separate terminal)
 streamlit run bbo_bidding_queries_streamlit.py
 ```
 
+Streamlit currently calls `http://127.0.0.1:8000` directly, so `bbo_bidding_queries_api.py`
+must be running before the UI is usable.
+
+## API Surfaces
+
+The repo now has two API layers:
+
+- `bbo_bidding_queries_api.py`: the main FastAPI app and current Streamlit backend
+- Split surface wrappers for narrower use cases:
+  - `bbo_bidding_queries_api_live.py`
+  - `bbo_bidding_queries_api_oracle.py`
+  - `bbo_bidding_queries_api_shared.py`
+
+These split servers reuse the same underlying startup/init path and model registry,
+so their startup logs look very similar. That is expected. They differ primarily in
+which routes they expose.
+
+### Which server should I run?
+
+- For the current Streamlit app: run `python bbo_bidding_queries_api.py`
+- For live-safe bidding path endpoints only: run `python bbo_bidding_queries_api_live.py`
+- For analysis/oracle endpoints only: run `python bbo_bidding_queries_api_oracle.py`
+- For shared data/query endpoints only: run `python bbo_bidding_queries_api_shared.py`
+
+The split surfaces do not replace the main app for Streamlit yet.
+
 ## Swagger / OpenAPI
 
-- Live docs (when server is running): `http://127.0.0.1:8000/docs`
+- Main app docs: `http://127.0.0.1:8000/docs`
 - Static export: see `docs/OPENAPI.md` (generates `docs/openapi.json` and `docs/openapi.summary.md`)
 
 ## Architecture
@@ -29,14 +56,17 @@ streamlit run bbo_bidding_queries_streamlit.py
 └─────────────────────┬───────────────────────────────────────┘
                       │ HTTP/REST
 ┌─────────────────────▼───────────────────────────────────────┐
-│                   FastAPI Server                            │
-│  (bbo_bidding_queries_api.py)                               │
+│              Main FastAPI Server (today)                    │
+│  (bbo_bidding_queries_api.py on :8000)                      │
 │  ├── G3Index (CSR traversal, sub-ms lookups)                │
 │  ├── bt_seat1_df (461M rows, lightweight cols)              │
 │  ├── deal_df (deals with criteria bitmaps)                  │
 │  └── Hot-reloadable plugins (plugins/*.py)                  │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+Optional split surfaces sit beside the main app and expose narrower route sets for
+live-safe flows, oracle/analysis workflows, and shared query/data access.
 
 ## Key Features
 

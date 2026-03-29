@@ -765,20 +765,28 @@ def safe_float(x: Any) -> float | None:
 def bid_value_to_str(bid_val: Any) -> str:
     """Stringize deal_df['bid'] consistently across endpoints.
 
-    - If it's a list of bids, join with '-' (e.g., ['1N','p','3N'] -> '1N-p-3N')
-    - If it's already a string, return as-is
+    - If it's a list of bids, join with '-'
+    - If it's already a string, use it directly
+    - Canonicalize via `normalize_auction_input()` so display matches AI auctions
+      (e.g. `pass` -> `P`, `1NT` -> `1N`)
     - Else, best-effort str(...)
     """
     if bid_val is None:
         return ""
+    raw_s = ""
     if isinstance(bid_val, list):
         try:
-            return "-".join(map(str, bid_val))
+            raw_s = "-".join(map(str, bid_val))
         except Exception:
-            return "-".join([str(x) for x in bid_val])
-    if isinstance(bid_val, str):
-        return bid_val
-    return str(bid_val)
+            raw_s = "-".join([str(x) for x in bid_val])
+    elif isinstance(bid_val, str):
+        raw_s = bid_val
+    else:
+        raw_s = str(bid_val)
+    try:
+        return normalize_auction_input(raw_s)
+    except Exception:
+        return raw_s
 
 
 def count_leading_passes(auction: Any) -> int:
@@ -1849,8 +1857,17 @@ def annotate_criterion_with_value(
         lv_str = f"({lv})" if lv is not None else "(?)"
         return f"SL_{suit}{lv_str} {op} {num_val}"
     
-    # Try general variable comparison: VAR op NUMBER (e.g., HCP <= 11, Total_Points >= 20)
-    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|>|<|==|!=)\s*(\d+)$", crit_s)
+    def _fmt_numeric(val: Any) -> str:
+        try:
+            val_f = float(val)
+        except (ValueError, TypeError):
+            return str(val)
+        if float(val_f).is_integer():
+            return str(int(val_f))
+        return f"{val_f:.1f}".rstrip("0").rstrip(".")
+
+    # Try general variable comparison: VAR op NUMBER (e.g., HCP <= 11, QT >= 1, Total_Points >= 20)
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|>|<|==|!=)\s*(\d+(?:\.\d+)?)$", crit_s)
     if m:
         var_name = m.group(1)
         op = m.group(2)
@@ -1872,8 +1889,8 @@ def annotate_criterion_with_value(
         
         if actual_val is not None:
             try:
-                actual_val = int(actual_val)
-                return f"{var_name}({actual_val}) {op} {num_val}"
+                actual_val_f = float(actual_val)
+                return f"{var_name}({_fmt_numeric(actual_val_f)}) {op} {num_val}"
             except (ValueError, TypeError):
                 pass
     
@@ -2141,7 +2158,7 @@ def evaluate_complex_expression(
     missing_vars: List[str] = []
     
     for token in postfix:
-        if token in evaluator.ops or token.isnumeric() or token in ('(', ')'):
+        if token in evaluator.ops or re.fullmatch(r"\d+(?:\.\d+)?", token) or token in ('(', ')'):
             continue
         if not re.match(r'^[a-zA-Z_]\w*$', token):
             continue
@@ -2170,12 +2187,13 @@ def _resolve_variable_value(
     var_name: str,
     direction: str,
     deal_row: Dict[str, Any],
-) -> Optional[int]:
+) -> Optional[float]:
     """Resolve a variable name to its value for a given direction.
     
     Handles:
     - SL_S, SL_H, SL_D, SL_C -> suit length from hand
     - HCP -> high card points (from HCP_{direction} column)
+    - QT -> quick tricks (from QT_{direction} column)
     - Total_Points -> total points (from Total_Points_{direction} column)
     """
     var_upper = var_name.upper()
@@ -2192,7 +2210,18 @@ def _resolve_variable_value(
         val = deal_row.get(hcp_col)
         if val is not None:
             try:
-                return int(val)
+                return float(val)
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    # Quick tricks variable
+    if var_upper == "QT":
+        qt_col = f"QT_{direction}"
+        val = deal_row.get(qt_col)
+        if val is not None:
+            try:
+                return float(val)
             except (ValueError, TypeError):
                 pass
         return None
@@ -2203,7 +2232,7 @@ def _resolve_variable_value(
         val = deal_row.get(tp_col)
         if val is not None:
             try:
-                return int(val)
+                return float(val)
             except (ValueError, TypeError):
                 pass
         return None
@@ -2214,7 +2243,7 @@ def _resolve_variable_value(
         val = deal_row.get(col)
         if val is not None:
             try:
-                return int(val)
+                return float(val)
             except (ValueError, TypeError):
                 pass
     
@@ -2263,8 +2292,8 @@ def _evaluate_postfix_single(
     stack: List[Any] = []
     
     for token in postfix:
-        if token.isnumeric():
-            stack.append(int(token))
+        if re.fullmatch(r"\d+(?:\.\d+)?", token):
+            stack.append(float(token))
         elif token in scalar_ops:
             if token == 'not':
                 if not stack:

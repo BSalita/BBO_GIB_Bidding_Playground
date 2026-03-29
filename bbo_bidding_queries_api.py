@@ -1,7 +1,9 @@
 """
-FastAPI server for BBO bidding queries.
+Main FastAPI server for BBO bidding queries.
 
-This service loads bidding data (bt_seat1_df and deal_df), exposes HTTP endpoints that Streamlit (or other clients) can call.
+This service loads bidding data (bt_seat1_df and deal_df), exposes HTTP
+endpoints that Streamlit currently calls on `http://127.0.0.1:8000`, and hosts
+the shared initialization path used by the split API surface wrappers.
 
 Heavy initialization (loading Parquet files, building criteria bitmaps,
 computing opening-bid candidates) is performed once in the background and the
@@ -115,6 +117,7 @@ _CODE_SYNC_BASELINE_MTIME: Dict[str, float] = {}
 _CODE_SYNC_NOTIFIED: set[str] = set()
 _CODE_SYNC_LAST_CHECK_T: float = 0.0
 _CODE_SYNC_CHECK_INTERVAL_S: float = 2.0  # keep overhead low (reload is called per-request)
+_HOT_RELOADABLE_LOCAL_PATHS: set[pathlib.Path] = set()
 
 
 def _iter_local_import_files() -> list[pathlib.Path]:
@@ -145,6 +148,10 @@ def _iter_local_import_files() -> list[pathlib.Path]:
                 continue
             except Exception:
                 pass
+            # Shared helper modules in the core hot-reload allowlist are also
+            # safe to edit without restarting the API process.
+            if p in _HOT_RELOADABLE_LOCAL_PATHS:
+                continue
             out.append(p)
     except Exception:
         return []
@@ -229,6 +236,10 @@ def _notify_if_api_out_of_sync() -> None:
 
 # Global, long-lived core instance for this process.
 CORE = CoreService(plugins_dir=_PLUGINS_DIR)
+try:
+    _HOT_RELOADABLE_LOCAL_PATHS = set(CORE.hot_reloadable_source_paths())
+except Exception:
+    _HOT_RELOADABLE_LOCAL_PATHS = set()
 
 # Global registry of loaded plugins (hot-reloaded). Kept for compatibility with handler usage.
 PLUGINS: Dict[str, Any] = CORE.plugins
@@ -296,6 +307,18 @@ def _attach_hot_reload_info(resp: Dict[str, Any], reload_info: dict[str, object]
     if resp["hot_reload"]:
         resp["hot_reload_mtime"] = reload_info.get("mtime")
         resp["hot_reload_at"] = reload_info.get("reloaded_at")
+    return resp
+
+
+def _attach_code_sync_info(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach API code-sync status so UIs can warn when restart is required."""
+    try:
+        status = _get_code_sync_status()
+    except Exception:
+        status = {"out_of_sync": False, "changed_files": [], "files_monitored": 0}
+    resp["code_out_of_sync"] = bool(status.get("out_of_sync", False))
+    resp["code_changed_files"] = list(status.get("changed_files") or [])
+    resp["code_files_monitored"] = int(status.get("files_monitored") or 0)
     return resp
 
 
@@ -530,7 +553,7 @@ cheater_terminal_cache_manifest_file = dataPath.joinpath("bbo_cheater_terminal_c
 
 # Valid column names for hand criteria expressions (base names; direction suffix appended where applicable)
 # NOTE: Keep this list aligned with what actually exists in the precomputed deal_df.
-HAND_CRITERIA_COLUMNS = frozenset(['HCP', 'SL_S', 'SL_H', 'SL_D', 'SL_C', 'Total_Points'])
+HAND_CRITERIA_COLUMNS = frozenset(['HCP', 'QT', 'SL_S', 'SL_H', 'SL_D', 'SL_C', 'Total_Points'])
 
 # Bridge directions
 DIRECTIONS_LIST = ['N', 'E', 'S', 'W']
@@ -3371,48 +3394,68 @@ def save_custom_criteria_rules(req: CustomCriteriaSaveRequest) -> Dict[str, Any]
 def validate_custom_criteria(req: CustomCriteriaValidateRequest) -> Dict[str, Any]:
     """Validate a criteria expression syntax."""
     expression = req.expression.strip()
-    
-    # Check basic format: COL OP VALUE or COL OP COL
+
+    # Fast path for simple comparisons: COL OP VALUE or COL OP COL
     pattern = r'^(\w+)\s*(>=|<=|>|<|==|!=)\s*(\w+|\d+\.?\d*)$'
     match = re.match(pattern, expression)
-    
-    if not match:
+    if match:
+        left, op, right = match.groups()
+
+        if left not in HAND_CRITERIA_COLUMNS:
+            return {
+                "valid": False,
+                "expression": expression,
+                "error": f"Unknown column '{left}'. Valid columns: {sorted(HAND_CRITERIA_COLUMNS)}",
+                "warning": True,
+            }
+
+        try:
+            float(right)
+            is_number = True
+        except ValueError:
+            is_number = False
+
+        if not is_number and right not in HAND_CRITERIA_COLUMNS:
+            return {
+                "valid": False,
+                "expression": expression,
+                "error": f"Right side '{right}' is neither a number nor a known column",
+                "warning": True,
+            }
+
         return {
-            "valid": False,
+            "valid": True,
             "expression": expression,
-            "error": "Invalid format. Expected: COLUMN OPERATOR VALUE (e.g., 'HCP >= 12', 'SL_S > SL_H')",
+            "parsed": {"left": left, "operator": op, "right": right},
         }
-    
-    left, op, right = match.groups()
-    
-    # Check if left is a known column
-    if left not in HAND_CRITERIA_COLUMNS:
+
+    # Broader support for arithmetic/logical expressions like:
+    #   Total_Points + QT >= 14
+    #   QT >= 1 & HCP >= 11
+    ident_tokens = {
+        tok for tok in re.findall(r"\b[a-zA-Z_]\w*\b", expression)
+        if tok.lower() not in {"and", "or", "not", "true", "false"}
+    }
+    unknown_vars = sorted(tok for tok in ident_tokens if tok not in HAND_CRITERIA_COLUMNS)
+    if unknown_vars:
         return {
             "valid": False,
             "expression": expression,
-            "error": f"Unknown column '{left}'. Valid columns: {sorted(HAND_CRITERIA_COLUMNS)}",
-            "warning": True,  # Warning, not error - might be valid for advanced use
-        }
-    
-    # Check if right is a number or valid column
-    try:
-        float(right)
-        is_number = True
-    except ValueError:
-        is_number = False
-    
-    if not is_number and right not in HAND_CRITERIA_COLUMNS:
-        return {
-            "valid": False,
-            "expression": expression,
-            "error": f"Right side '{right}' is neither a number nor a known column",
+            "error": f"Unknown column(s): {unknown_vars}. Valid columns: {sorted(HAND_CRITERIA_COLUMNS)}",
             "warning": True,
         }
-    
+
+    if not ident_tokens or not re.search(r"(>=|<=|==|!=|>|<|[+*/%()&|-])", expression):
+        return {
+            "valid": False,
+            "expression": expression,
+            "error": "Invalid format. Expected a criteria expression such as 'HCP >= 12' or 'Total_Points + QT >= 14'.",
+        }
+
     return {
         "valid": True,
         "expression": expression,
-        "parsed": {"left": left, "operator": op, "right": right},
+        "parsed": {"variables": sorted(ident_tokens)},
     }
 
 
@@ -3450,16 +3493,23 @@ def preview_custom_criteria(req: CustomCriteriaPreviewRequest) -> Dict[str, Any]
 
 @app.post("/custom-criteria-reload")
 def reload_custom_criteria() -> Dict[str, Any]:
-    """Hot-reload custom criteria overlay from CSV (no bt/deal reload)."""
+    """Hot-reload plugin code and custom criteria overlay from CSV."""
     _ensure_ready()
     try:
+        reload_info = _reload_plugins()
         with _STATE_LOCK:
             available_criteria_names = STATE.get("available_criteria_names")
         overlay, stats = _build_custom_criteria_overlay(available_criteria_names)
         with _STATE_LOCK:
             STATE["custom_criteria_overlay"] = overlay
             STATE["custom_criteria_stats"] = stats
-        return {"success": True, "message": "Custom criteria overlay reloaded successfully", "stats": stats}
+        resp = {
+            "success": True,
+            "message": "Plugin code and custom criteria overlay reloaded successfully",
+            "stats": stats,
+        }
+        resp = _attach_hot_reload_info(resp, reload_info)
+        return _attach_code_sync_info(resp)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
 

@@ -17,7 +17,9 @@ xlsxwriter
 
 # API server
 fastapi
-uvicorn[standard]
+uvicorn  # Required ASGI server for bbo_bidding_queries_api.py
+# Optional local-dev extras:
+# uvicorn[standard]
 pydantic
 psutil
 

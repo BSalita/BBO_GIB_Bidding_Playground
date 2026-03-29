@@ -60,7 +60,7 @@ class CriteriaEvaluator:
         }
         
         # Regex pattern for tokenizing expressions
-        self.token_pattern = r'\d+|<=|>=|==|!=|\b[a-zA-Z_]\w*\b|[&|<>+*/%()-]|\bnot\b|\band\b|\bor\b|//|\*\*'
+        self.token_pattern = r'\d+(?:\.\d+)?|<=|>=|==|!=|\b[a-zA-Z_]\w*\b|[&|<>+*/%()-]|\bnot\b|\band\b|\bor\b|//|\*\*'
 
         self.next_bidding_seat_d = {'N': 'E', 'E': 'S', 'S': 'W', 'W': 'N'}
 
@@ -240,8 +240,8 @@ class CriteriaEvaluator:
         """Evaluate a postfix expression using vectorized operations."""
         stack = []
         for token in postfix_expr:
-            if token.isnumeric():
-                stack.append(np.full(len(df), int(token)))
+            if re.fullmatch(r'\d+(?:\.\d+)?', str(token)):
+                stack.append(np.full(len(df), float(token)))
             elif token in self.ops:
                 if token == 'not':
                     if not stack:  # Check for empty stack
@@ -1024,6 +1024,27 @@ def load_deal_df(
     )
     print(f"Loaded deal_df: shape={deal_df.shape} in {time.time() - t0:.2f}s")
 
+    qt_missing_dirs = [d for d in "NESW" if f"QT_{d}" not in deal_df.columns and f"Hand_{d}" in deal_df.columns]
+    if qt_missing_dirs:
+        from bbo_hand_eval_lib import count_quick_tricks, parse_hand_cards
+
+        def _hand_qt(hand_str: Any) -> float:
+            try:
+                hand_txt = str(hand_str or "").strip()
+                if not hand_txt:
+                    return np.float32(0.0)
+                qt_total, _qt_breakdown = count_quick_tricks(parse_hand_cards(hand_txt))
+                return np.float32(qt_total)
+            except Exception:
+                return np.float32(0.0)
+
+        qt_exprs = [
+            pl.col(f"Hand_{direction}").map_elements(_hand_qt, return_dtype=pl.Float64).alias(f"QT_{direction}")
+            for direction in qt_missing_dirs
+        ]
+        deal_df = deal_df.with_columns(qt_exprs)
+        print(f"Computed quick-trick columns: {', '.join(f'QT_{d}' for d in qt_missing_dirs)}")
+
     # Memory note:
     # - Dealer has only 4 values → categorical is a clear win.
     # - Hand_* columns are (nearly) unique per row → categorical usually *increases* memory
@@ -1047,6 +1068,8 @@ def load_deal_df(
             if any(x in c for x in ["HCP", "SL_", "Total_Points", "Tricks", "Result"]):
                 # These are always small (0-100ish)
                 cast_ops.append(col_expr.fill_null(0).cast(pl.UInt8 if "UInt" in str(dtype) or "Float" in str(dtype) else pl.Int8))
+            elif c.startswith("QT_"):
+                cast_ops.append(col_expr.fill_null(0).cast(pl.Float32))
             elif any(x in c for x in ["Score", "ParScore", "DD_Score", "EV_"]):
                 # These can be larger or have decimals (EV)
                 if "EV_" in c or dtype in (pl.Float64, pl.Float32):

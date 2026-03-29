@@ -110,6 +110,16 @@ class CoreService:
             ("plugins.bbo_bt_custom_criteria_overlay", self.plugins_dir / "bbo_bt_custom_criteria_overlay.py"),
         ]
 
+    def hot_reloadable_source_paths(self) -> set[pathlib.Path]:
+        """Return repo source files reloaded automatically at request boundaries."""
+        out: set[pathlib.Path] = set()
+        for _, p in self._shared_reload_targets:
+            try:
+                out.add(pathlib.Path(p).resolve())
+            except Exception:
+                continue
+        return out
+
     @property
     def store(self) -> "DataStore":
         return DataStore(self)

@@ -13,6 +13,7 @@ from itertools import permutations
 from typing import Dict, Any
 
 import polars as pl
+from bbo_hand_eval_lib import count_quick_tricks, parse_hand_cards
 
 # Optional imports for par score calculation
 try:
@@ -1014,7 +1015,7 @@ def compute_hand_features(hand_str: str) -> dict:
         hand_str: Hand in dot notation like "AKQ2.J98.T75.643"
         
     Returns:
-        Dictionary with keys: HCP, SL_S, SL_H, SL_D, SL_C, Total_Points
+        Dictionary with keys: HCP, QT, SL_S, SL_H, SL_D, SL_C, Total_Points
     """
     hcp_values = {'A': 4, 'K': 3, 'Q': 2, 'J': 1}
     
@@ -1044,6 +1045,11 @@ def compute_hand_features(hand_str: str) -> dict:
     
     result['HCP'] = total_hcp
     result['Total_Points'] = total_hcp + dp
+    try:
+        qt_total, _qt_breakdown = count_quick_tricks(parse_hand_cards(hand_str))
+        result['QT'] = float(qt_total)
+    except Exception:
+        result['QT'] = 0.0
     
     return result
 
@@ -1402,7 +1408,7 @@ def add_suit_length_columns(df: pl.DataFrame, direction: str) -> pl.DataFrame:
 # Criteria Evaluation (supports complex and suit-relational via shared helpers)
 # ---------------------------------------------------------------------------
 
-def evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, int]) -> bool:
+def evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, Any]) -> bool:
     """
     Evaluate a criterion string (including complex/suit relational) against specific hand values.
     
@@ -1422,6 +1428,7 @@ def evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, int]) -> 
     # Build a minimal deal_row for direction 'N' using provided hand values.
     deal_row = {
         "HCP_N": hand_values.get("HCP"),
+        "QT_N": hand_values.get("QT"),
         "Total_Points_N": hand_values.get("Total_Points"),
         "SL_N_S": hand_values.get("SL_S"),
         "SL_N_H": hand_values.get("SL_H"),
@@ -1445,10 +1452,11 @@ def evaluate_criterion_for_hand(criterion: str, hand_values: Dict[str, int]) -> 
 # ---------------------------------------------------------------------------
 
 DIRECTIONS_LIST = ["N", "E", "S", "W"]
-RANGE_METRICS = ["HCP", "SL_C", "SL_D", "SL_H", "SL_S", "Total_Points"]
+RANGE_METRICS = ["HCP", "QT", "SL_C", "SL_D", "SL_H", "SL_S", "Total_Points"]
 
 DEFAULT_METRIC_RANGES = {
     "HCP": (0, 40),
+    "QT": (0, 8),
     "SL_C": (0, 13),
     "SL_D": (0, 13),
     "SL_H": (0, 13),
@@ -1457,11 +1465,11 @@ DEFAULT_METRIC_RANGES = {
 }
 
 # Regex patterns for parsing criteria
-_PATTERN_LE = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*<=\s*(\d+)$")
-_PATTERN_GE = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*>=\s*(\d+)$")
-_PATTERN_EQ = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*==\s*(\d+)$")
-_PATTERN_LT = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*<\s*(\d+)$")
-_PATTERN_GT = re.compile(r"^(HCP|SL_[CDHS]|Total_Points)\s*>\s*(\d+)$")
+_PATTERN_LE = re.compile(r"^(HCP|QT|SL_[CDHS]|Total_Points)\s*<=\s*(\d+(?:\.\d+)?)$")
+_PATTERN_GE = re.compile(r"^(HCP|QT|SL_[CDHS]|Total_Points)\s*>=\s*(\d+(?:\.\d+)?)$")
+_PATTERN_EQ = re.compile(r"^(HCP|QT|SL_[CDHS]|Total_Points)\s*==\s*(\d+(?:\.\d+)?)$")
+_PATTERN_LT = re.compile(r"^(HCP|QT|SL_[CDHS]|Total_Points)\s*<\s*(\d+(?:\.\d+)?)$")
+_PATTERN_GT = re.compile(r"^(HCP|QT|SL_[CDHS]|Total_Points)\s*>\s*(\d+(?:\.\d+)?)$")
 
 
 def _parse_criteria_to_ranges(criteria_list: list | None) -> Dict[str, tuple]:
@@ -1484,17 +1492,19 @@ def _parse_criteria_to_ranges(criteria_list: list | None) -> Dict[str, tuple]:
             m = pattern.match(expr)
             if m:
                 metric, val = m.groups()
+                val_num = float(val)
                 if is_min:
-                    mins[metric].append(int(val) + offset)
+                    mins[metric].append(val_num + offset)
                 else:
-                    maxs[metric].append(int(val) + offset)
+                    maxs[metric].append(val_num + offset)
                 break
         else:
             m = _PATTERN_EQ.match(expr)
             if m:
                 metric, val = m.groups()
-                mins[metric].append(int(val))
-                maxs[metric].append(int(val))
+                val_num = float(val)
+                mins[metric].append(val_num)
+                maxs[metric].append(val_num)
     
     result = {}
     for metric in RANGE_METRICS:
@@ -1513,7 +1523,7 @@ def _get_seat_direction(dealer: str, seat: int) -> str:
 
 
 def _hand_matches_ranges(
-    hand_features: Dict[str, int],
+    hand_features: Dict[str, Any],
     ranges: Dict[str, tuple],
 ) -> bool:
     """Check if a hand's features fall within the specified ranges."""
