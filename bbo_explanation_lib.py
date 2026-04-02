@@ -733,10 +733,10 @@ def compute_non_rebiddable_suit_rebid_penalty(
                 partner_supported_strain = True
                 break
 
-    # Once partner has explicitly supported the same major, a direct jump to game
-    # is a fit-based game commitment, not a pure "long-suit rebid" that should
-    # require REBIDDABLE/TWICE_REBIDDABLE evidence.
-    if bid_strain in ("H", "S") and bid_level == 4 and partner_supported_strain:
+    # Once partner has explicitly supported the same strain (bid it or raised it),
+    # further bids in that strain are *raises* of an agreed suit — not natural
+    # rebids requiring 5+ cards.  Applies to all levels & all suits.
+    if partner_supported_strain:
         return 0.0, None, False
 
     # After partner answers Blackwood, same-strain continuations above an
@@ -1215,6 +1215,136 @@ def compute_constructive_pass_penalty(
     return penalty, "; ".join(reasons) if reasons else None
 
 
+# ---------------------------------------------------------------------------
+# Game-try response logic
+# ---------------------------------------------------------------------------
+
+_SUIT_ORDER = ["C", "D", "H", "S"]
+_GAME_LEVEL = {"C": 5, "D": 5, "H": 4, "S": 4, "N": 3}
+
+
+def _parse_bid_text(bid: str) -> tuple[int, str] | None:
+    m = re.match(r"^([1-7])\s*(NT|N|[CDHS])$", str(bid or "").strip().upper())
+    if not m:
+        return None
+    strain = "N" if m.group(2) in ("N", "NT") else m.group(2)
+    return int(m.group(1)), strain
+
+
+def _suit_has_help(hand_pbn: str, suit: str) -> bool:
+    """Return True if the hand has help in *suit*: A, K, singleton, or void."""
+    parts = hand_pbn.split(".")
+    if len(parts) != 4:
+        return False
+    idx = {"S": 0, "H": 1, "D": 2, "C": 3}.get(suit)
+    if idx is None:
+        return False
+    cards = parts[idx]
+    if len(cards) <= 1:
+        return True
+    return "A" in cards or "K" in cards
+
+
+def _suits_between(game_try_suit: str, agreed_suit: str) -> list[str]:
+    """Return suits strictly between *game_try_suit* and *agreed_suit* in
+    bidding order, wrapping around if needed.  Both args are single-char
+    suit letters (C/D/H/S).  Returns suits that can be bid as features
+    below the agreed suit at the forcing level."""
+    if game_try_suit not in _SUIT_ORDER or agreed_suit not in _SUIT_ORDER:
+        return []
+    gt_idx = _SUIT_ORDER.index(game_try_suit)
+    ag_idx = _SUIT_ORDER.index(agreed_suit)
+    if ag_idx <= gt_idx:
+        return []
+    return _SUIT_ORDER[gt_idx + 1: ag_idx]
+
+
+def compute_game_try_response(
+    *,
+    hand_pbn: str,
+    hcp: float | None,
+    total_points: float | None,
+    game_try_suit: str,
+    agreed_suit: str,
+    forcing_level: int,
+    raise_tp_cap: float | None = None,
+) -> dict[str, Any]:
+    """Decide how to respond to a help-suit game try.
+
+    Parameters
+    ----------
+    hand_pbn : str
+        PBN hand string, e.g. ``"Q.QJ93.AQ7.AQ975"``.
+    hcp, total_points : float | None
+        Acting player's point counts.
+    game_try_suit : str
+        Single-char suit of the game-try bid (e.g. ``"S"`` for a 2S game try).
+    agreed_suit : str
+        Single-char suit the partnership has agreed (e.g. ``"H"``).
+    forcing_level : int
+        The minimum level we are forced to (e.g. ``3`` from ``Forcing_To_3H``).
+    raise_tp_cap : float | None
+        Upper TP bound of the original raise; above this the hand is "max".
+
+    Returns
+    -------
+    dict with keys:
+        ``"action"`` – one of ``"accept_game"``, ``"show_feature"``, ``"signoff"``
+        ``"bid"`` – the recommended bid text (e.g. ``"4H"``, ``"3D"``, ``"3H"``)
+        ``"reason"`` – human-readable explanation
+    """
+    game_level = _GAME_LEVEL.get(agreed_suit, 4)
+    game_bid = f"{game_level}{agreed_suit}"
+    signoff_bid = f"{forcing_level}{agreed_suit}"
+
+    tp = total_points if total_points is not None else (hcp if hcp is not None else 0.0)
+
+    is_max = False
+    if raise_tp_cap is not None and tp > raise_tp_cap:
+        is_max = True
+
+    has_help = _suit_has_help(hand_pbn, game_try_suit) if hand_pbn else False
+
+    if is_max or has_help:
+        reasons = []
+        if is_max:
+            reasons.append(f"max hand ({tp:.0f} TP > {raise_tp_cap:.0f} cap)")
+        if has_help:
+            parts = hand_pbn.split(".") if hand_pbn else []
+            idx = {"S": 0, "H": 1, "D": 2, "C": 3}.get(game_try_suit, -1)
+            suit_cards = parts[idx] if 0 <= idx < len(parts) else "?"
+            reasons.append(f"help in game-try suit {game_try_suit} ({suit_cards})")
+        return {
+            "action": "accept_game",
+            "bid": game_bid,
+            "reason": f"GAME_TRY_ACCEPT: {'; '.join(reasons)}",
+        }
+
+    feature_suits = _suits_between(game_try_suit, agreed_suit)
+    for suit in feature_suits:
+        if _suit_has_help(hand_pbn, suit):
+            feature_bid = f"{forcing_level}{suit}"
+            parsed = _parse_bid_text(feature_bid)
+            if parsed and parsed[0] <= game_level:
+                parts = hand_pbn.split(".") if hand_pbn else []
+                idx = {"S": 0, "H": 1, "D": 2, "C": 3}.get(suit, -1)
+                suit_cards = parts[idx] if 0 <= idx < len(parts) else "?"
+                return {
+                    "action": "show_feature",
+                    "bid": feature_bid,
+                    "reason": (
+                        f"GAME_TRY_FEATURE: showing feature in {suit} ({suit_cards}) "
+                        f"below {agreed_suit}"
+                    ),
+                }
+
+    return {
+        "action": "signoff",
+        "bid": signoff_bid,
+        "reason": f"GAME_TRY_SIGNOFF: no help in {game_try_suit}, no feature to show; minimum",
+    }
+
+
 def compute_forced_non_pass_policy(
     *,
     auction_tokens: list[str],
@@ -1225,6 +1355,7 @@ def compute_forced_non_pass_policy(
     self_hcp: float | None,
     self_hand: str | None = None,
     pass_agg_expr: list[str] | None = None,
+    partner_last_bid_agg_expr: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return hard-block policy for impossible early signoffs.
 
@@ -1304,6 +1435,32 @@ def compute_forced_non_pass_policy(
                 "pass_agg_expr": [str(tok) for tok in list(pass_agg_expr or []) if str(tok).strip()],
             }
             return out
+
+        # Partner's last bid may carry a Forcing_To_* flag (e.g. a help-suit
+        # game try like 2S with Forcing_To_3H).  When it does, the current
+        # player is obligated to bid at least the target level/strain and
+        # must not pass.
+        if partner_last_bid_agg_expr:
+            _partner_forcing_targets = [
+                str(expr).strip()
+                for expr in partner_last_bid_agg_expr
+                if re.match(r"(?i)^Forcing_To_", str(expr or "").strip())
+            ]
+            if _partner_forcing_targets:
+                out["hard_block"] = True
+                out["reason"] = (
+                    "FORCED_NON_PASS_PARTNER_FORCING_TO: partner's last bid carries "
+                    f"{', '.join(_partner_forcing_targets)}, so pass is not legal "
+                    "while non-pass continuations exist"
+                )
+                out["context"] = {
+                    "metric": "partner_forcing_to",
+                    "partner_forcing_flags": _partner_forcing_targets,
+                    "partner_last_bid_agg_expr": [
+                        str(tok) for tok in list(partner_last_bid_agg_expr or []) if str(tok).strip()
+                    ],
+                }
+                return out
 
         opener_minor_clarification_ctx = extract_opener_minor_clarification_pass_context(
             auction_tokens=list(auction_tokens or []),

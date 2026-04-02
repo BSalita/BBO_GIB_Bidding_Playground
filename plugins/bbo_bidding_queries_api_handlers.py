@@ -82,6 +82,7 @@ from bbo_explanation_lib import (
     compute_common_sense_adjustments,
     compute_common_sense_hard_override,
     compute_forced_non_pass_policy,
+    compute_game_try_response,
     compute_partner_major_game_commit_adjustment,
     compute_pass_signoff_bonus,
     compute_post_game_slam_gate_adjustment,
@@ -16953,6 +16954,143 @@ def handle_ai_model_advanced_path(
         except Exception:
             pass
 
+        # --- Partner Forcing_To_* gate ----------------------------------------
+        # When partner's most recent non-pass bid carried a Forcing_To_XY flag
+        # (e.g. Forcing_To_3H for a help-suit game try), this player MUST bid
+        # at least the target — pass is not allowed.
+        try:
+            _ft_partner_dir = _partner_dir(acting_dir_step)
+            _ft_target_bid: str | None = None
+            if _ft_partner_dir and steps_detail:
+                for _ft_prev in reversed(steps_detail):
+                    _ft_ch = str((_ft_prev or {}).get("choice", "") or "").strip().upper()
+                    if _ft_ch in ("", "P", "PASS"):
+                        continue
+                    _ft_prev_dir = None
+                    try:
+                        _ft_seat = int((_ft_prev or {}).get("seat", 0))
+                        _ft_dirs = ["N", "E", "S", "W"]
+                        _ft_di = _ft_dirs.index(dealer_actual) if dealer_actual in _ft_dirs else 0
+                        _ft_prev_dir = _ft_dirs[(_ft_di + _ft_seat - 1) % 4]
+                    except Exception:
+                        pass
+                    if _ft_prev_dir != _ft_partner_dir:
+                        break
+                    for _ft_bs in list((_ft_prev or {}).get("bid_scores") or []):
+                        if str((_ft_bs or {}).get("bid", "")).strip().upper() != _ft_ch:
+                            continue
+                        for _ft_expr in list((_ft_bs or {}).get("agg_expr") or []):
+                            _ft_m = re.match(r"(?i)^Forcing_To_(\d[A-Z]+)$", str(_ft_expr or "").strip())
+                            if _ft_m:
+                                _ft_target_bid = _ft_m.group(1).upper()
+                                break
+                        break
+                    break
+            if _ft_target_bid:
+                _ft_parsed_target = re.match(r"^(\d)([CDHSN])$", _ft_target_bid)
+                _ft_forcing_level = int(_ft_parsed_target.group(1)) if _ft_parsed_target else 3
+                _ft_agreed_suit = (_ft_parsed_target.group(2) if _ft_parsed_target else "H")
+                _ft_parsed_partner = re.match(r"^(\d)([CDHS])$", _ft_ch) if _ft_ch else None
+                _ft_game_try_suit = _ft_parsed_partner.group(2) if _ft_parsed_partner else None
+
+                _ft_hand = str(deal_row.get(f"Hand_{acting_dir_step}", "") or "").strip() if isinstance(deal_row, dict) else ""
+                _ft_hcp: float | None = None
+                _ft_tp: float | None = None
+                try:
+                    _ft_hcp = float(deal_row.get(f"HCP_{acting_dir_step}"))
+                except Exception:
+                    pass
+                try:
+                    _ft_tp = float(deal_row.get(f"Total_Points_{acting_dir_step}"))
+                except Exception:
+                    pass
+
+                _ft_raise_tp_cap: float | None = None
+                try:
+                    for _ft_prev2 in reversed(steps_detail):
+                        _ft_ch2 = str((_ft_prev2 or {}).get("choice", "") or "").strip().upper()
+                        if _ft_ch2 in ("", "P", "PASS"):
+                            continue
+                        _ft_prev2_dir = None
+                        try:
+                            _ft_s2 = int((_ft_prev2 or {}).get("seat", 0))
+                            _ft_d2 = ["N", "E", "S", "W"]
+                            _ft_di2 = _ft_d2.index(dealer_actual) if dealer_actual in _ft_d2 else 0
+                            _ft_prev2_dir = _ft_d2[(_ft_di2 + _ft_s2 - 1) % 4]
+                        except Exception:
+                            pass
+                        if _ft_prev2_dir != acting_dir_step:
+                            continue
+                        for _ft_bs2 in list((_ft_prev2 or {}).get("bid_scores") or []):
+                            if str((_ft_bs2 or {}).get("bid", "")).strip().upper() != _ft_ch2:
+                                continue
+                            for _ft_crit in list((_ft_bs2 or {}).get("agg_expr") or []):
+                                _ft_tc = re.match(r"(?i)^Total_Points\s*<=\s*(\d+)", str(_ft_crit or "").strip())
+                                if _ft_tc:
+                                    _ft_raise_tp_cap = float(_ft_tc.group(1))
+                            break
+                        break
+                except Exception:
+                    pass
+
+                _ft_response = compute_game_try_response(
+                    hand_pbn=_ft_hand,
+                    hcp=_ft_hcp,
+                    total_points=_ft_tp,
+                    game_try_suit=_ft_game_try_suit or "",
+                    agreed_suit=_ft_agreed_suit,
+                    forcing_level=_ft_forcing_level,
+                    raise_tp_cap=_ft_raise_tp_cap,
+                )
+                _ft_chosen_bid = str(_ft_response.get("bid", _ft_target_bid) or _ft_target_bid).strip().upper()
+                _ft_reason = str(_ft_response.get("reason", "") or "")
+
+                def _ft_find_in_bids(bid_text: str, bids_list: list) -> dict | None:
+                    for _o in list(bids_list or []):
+                        if str((_o or {}).get("bid", "") or "").strip().upper() == bid_text:
+                            _bt_i = (_o or {}).get("bt_index")
+                            _cc = bool((_o or {}).get("can_complete", True))
+                            _de = bool((_o or {}).get("is_dead_end", False))
+                            if _bt_i is not None and _cc and (not _de):
+                                return _o
+                    for _o in list(bids_list or []):
+                        if str((_o or {}).get("bid", "") or "").strip().upper() == bid_text:
+                            return _o
+                    return None
+
+                _ft_chosen_opt = (
+                    _ft_find_in_bids(_ft_chosen_bid, passed_opts)
+                    or _ft_find_in_bids(_ft_chosen_bid, next_bids)
+                )
+                if _ft_chosen_opt is None and _ft_chosen_bid != _ft_target_bid:
+                    _ft_chosen_opt = (
+                        _ft_find_in_bids(_ft_target_bid, passed_opts)
+                        or _ft_find_in_bids(_ft_target_bid, next_bids)
+                    )
+                    if _ft_chosen_opt:
+                        _ft_chosen_bid = _ft_target_bid
+                        _ft_reason += f" (fell back to {_ft_target_bid}; chosen bid not in BT)"
+
+                if _ft_chosen_opt is not None:
+                    passed_opts = [_ft_chosen_opt]
+                    step_rec["hard_gate_reason"] = (
+                        f"PARTNER_FORCING_TO_GATE: {_ft_reason}; "
+                        f"bid {_ft_chosen_bid} (partner forced to {_ft_target_bid})"
+                    )
+                else:
+                    _ft_non_pass = [
+                        _o for _o in list(passed_opts or [])
+                        if str((_o or {}).get("bid", "") or "").strip().upper() not in ("", "P", "PASS")
+                    ]
+                    if _ft_non_pass:
+                        passed_opts = _ft_non_pass
+                    step_rec["hard_gate_reason"] = (
+                        f"PARTNER_FORCING_TO_GATE: pass blocked; partner's bid is forcing to {_ft_target_bid}; "
+                        f"{_ft_reason}"
+                    )
+        except Exception:
+            pass
+
         # --- Simple-raise pre-rescue for criteria-filtered bids ----------
         # Bids that failed criteria but qualify as a simple raise of
         # partner's suit at the TP-justified level are promoted into
@@ -21012,6 +21150,31 @@ def handle_ai_model_advanced_path(
                         "pass cannot override an opening bid"
                     )
                 else:
+                    _partner_last_agg: list[str] | None = None
+                    try:
+                        _partner_dir_fnp = _partner_dir(acting_dir)
+                        if _partner_dir_fnp and steps_detail:
+                            for _prev in reversed(steps_detail):
+                                _prev_choice = str((_prev or {}).get("choice", "") or "").strip().upper()
+                                if _prev_choice in ("", "P", "PASS"):
+                                    continue
+                                _prev_dir = None
+                                try:
+                                    _prev_seat = int((_prev or {}).get("seat", 0))
+                                    _dirs_fnp = ["N", "E", "S", "W"]
+                                    _di_fnp = _dirs_fnp.index(dealer_actual) if dealer_actual in _dirs_fnp else 0
+                                    _prev_dir = _dirs_fnp[(_di_fnp + _prev_seat - 1) % 4]
+                                except Exception:
+                                    pass
+                                if _prev_dir != _partner_dir_fnp:
+                                    continue
+                                for _bs in list((_prev or {}).get("bid_scores") or []):
+                                    if str((_bs or {}).get("bid", "")).strip().upper() == _prev_choice:
+                                        _partner_last_agg = [str(x) for x in list((_bs or {}).get("agg_expr") or []) if str(x).strip()]
+                                        break
+                                break
+                    except Exception:
+                        _partner_last_agg = None
                     try:
                         _forced_non_pass = compute_forced_non_pass_policy(
                             auction_tokens=list(tokens or []),
@@ -21022,6 +21185,7 @@ def handle_ai_model_advanced_path(
                             self_hcp=_self_hcp_actual,
                             self_hand=_self_hand_actual,
                             pass_agg_expr=[str(_x) for _x in list(opt.get("agg_expr") or []) if str(_x).strip()],
+                            partner_last_bid_agg_expr=_partner_last_agg,
                         )
                     except Exception:
                         _forced_non_pass = {"hard_block": False, "reason": None}
