@@ -19,4 +19,10 @@ def select_top_candidate_pool(
     for opt in list(passed_opts or [])[:limit]:
         bid = str((opt or {}).get("bid", "") or "").strip().upper()
         pool.append(CandidateOption(bid=bid, raw=dict(opt or {})))
+    if not any(opt.bid in ("P", "PASS") for opt in pool):
+        for opt in list(passed_opts or [])[limit:]:
+            bid = str((opt or {}).get("bid", "") or "").strip().upper()
+            if bid in ("P", "PASS"):
+                pool.append(CandidateOption(bid=bid, raw=dict(opt or {})))
+                break
     return pool

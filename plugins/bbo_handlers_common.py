@@ -16,7 +16,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import polars as pl
 
-from bbo_bidding_queries_lib import normalize_auction_pattern, normalize_auction_input, normalize_auction_user_text, pattern_matches
+from bbo_bidding_queries_lib import (
+    get_cached_regex,
+    is_regex_pattern,
+    normalize_auction_pattern,
+    normalize_auction_input,
+    normalize_auction_user_text,
+    pattern_matches,
+)
 from mlBridge.mlBridgeBiddingLib import DIRECTIONS
 
 
@@ -442,6 +449,34 @@ def normalize_auction_for_overlay(auction: str) -> str:
     return a
 
 
+def _overlay_rule_matches(
+    partial: str,
+    auction_norm: str,
+    auction_with_candidate: str,
+    *,
+    exact: bool = False,
+) -> bool:
+    """Match an overlay rule against a prefix/child auction.
+
+    Most overlay rules are prefix-style and should continue to match descendants.
+    `replace_criteria` is different: it is intended to replace the criteria of an
+    exact BT node, not every descendant that happens to share the same prefix.
+    """
+    targets = [str(auction_norm or "").upper(), str(auction_with_candidate or "").upper()]
+    partial_u = str(partial or "").upper()
+    if not partial_u:
+        return False
+    if not exact:
+        return any(pattern_matches(partial_u, tgt) for tgt in targets if tgt)
+    if is_regex_pattern(partial_u):
+        try:
+            rx = get_cached_regex(partial_u)
+            return any(bool(rx.fullmatch(tgt)) for tgt in targets if tgt)
+        except Exception:
+            return False
+    return any(tgt == partial_u for tgt in targets if tgt)
+
+
 def _ensure_list_criteria(val: Any) -> list[str]:
     """Ensure criteria is a list of strings. 
     Handles both pl.List(pl.Utf8) and pipe-separated strings (memory optimization).
@@ -523,13 +558,19 @@ def apply_custom_criteria_overlay_to_bt_row(
             bt_row[col] = _ensure_list_criteria(bt_row[col])
 
     for rule in overlay:
+        flags = set(str(f).strip().lower() for f in (rule.get("flags") or set()) if f is not None)
         partial = str(rule.get("partial") or "")
         if not partial:
             continue
         # Match against either:
         # - row prefix auction (Auction), for prefix-level rules
         # - concrete child auction (Auction-candidate_bid), for bid-specific rules
-        if not (pattern_matches(partial, auction_norm) or pattern_matches(partial, auction_with_candidate)):
+        if not _overlay_rule_matches(
+            partial,
+            auction_norm,
+            auction_with_candidate,
+            exact=("replace_criteria" in flags),
+        ):
             continue
 
         try:
@@ -541,7 +582,6 @@ def apply_custom_criteria_overlay_to_bt_row(
 
         col = f"Agg_Expr_Seat_{seat}"
         crit_to_add = [str(c) for c in (rule.get("criteria") or []) if c is not None]
-        flags = set(str(f).strip().lower() for f in (rule.get("flags") or set()) if f is not None)
         if "replace_criteria" in flags:
             bt_row[col] = crit_to_add
             continue

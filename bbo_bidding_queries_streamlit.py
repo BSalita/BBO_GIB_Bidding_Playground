@@ -2651,12 +2651,25 @@ def _auto_reload_criteria_overlay():
             st.session_state["_criteria_overlay_rules"] = rules_count
             hot_reload = bool(data.get("hot_reload", False))
             hot_reload_at = data.get("hot_reload_at")
+            backend_instance_id = str(data.get("backend_instance_id") or "").strip()
             prev_hot_reload_at = st.session_state.get("_backend_hot_reload_at")
+            prev_backend_instance_id = str(st.session_state.get("_backend_instance_id") or "").strip()
             st.session_state["_backend_hot_reload"] = hot_reload
             st.session_state["_backend_hot_reload_at"] = hot_reload_at
+            st.session_state["_backend_instance_id"] = backend_instance_id or None
+            st.session_state["_backend_started_at"] = data.get("backend_started_at")
+            st.session_state["_backend_pid"] = data.get("backend_pid")
             st.session_state["_backend_code_out_of_sync"] = bool(data.get("code_out_of_sync", False))
             st.session_state["_backend_code_changed_files"] = list(data.get("code_changed_files") or [])
-            if hot_reload and hot_reload_at and hot_reload_at != prev_hot_reload_at:
+            backend_changed = bool(
+                backend_instance_id
+                and prev_backend_instance_id
+                and backend_instance_id != prev_backend_instance_id
+            )
+            if (
+                (hot_reload and hot_reload_at and hot_reload_at != prev_hot_reload_at)
+                or backend_changed
+            ):
                 # Backend plugin code changed; invalidate UI-held auction/batch results
                 # so a page refresh doesn't keep showing stale pre-reload auctions.
                 for _key in (
@@ -2666,8 +2679,20 @@ def _auto_reload_criteria_overlay():
                     "_batch_selected_result",
                     "_arena_cache_key",
                     "_arena_cache_data",
+                    "_ai_model_debug_refresh_cache",
                 ):
                     st.session_state.pop(_key, None)
+                # Clear cached Auction Builder advanced AI results as well.
+                try:
+                    _dynamic_keys = [
+                        _k for _k in list(st.session_state.keys())
+                        if str(_k).startswith("_auction_builder_ai_model_advanced_")
+                        or str(_k).startswith("_ai_model_adv_job_params")
+                    ]
+                    for _k in _dynamic_keys:
+                        st.session_state.pop(_k, None)
+                except Exception:
+                    pass
                 st.session_state["_backend_results_invalidated"] = True
     except Exception:
         pass  # Silently ignore - the UI will use the last loaded backend state
@@ -4692,7 +4717,13 @@ def render_bidding_arena():
                 "include_model_auction": bool(include_model_auction),
             }
             # Cache the expensive arena response across Streamlit reruns (e.g., AgGrid selection changes).
-            cache_key = ("bidding-arena", tuple(sorted(payload.items())))
+            cache_key = (
+                "bidding-arena",
+                tuple(sorted(payload.items())),
+                str(st.session_state.get("_backend_instance_id") or ""),
+                str(st.session_state.get("_backend_hot_reload_at") or ""),
+                bool(st.session_state.get("_backend_code_out_of_sync", False)),
+            )
             if st.session_state.get("_arena_cache_key") == cache_key and st.session_state.get("_arena_cache_data") is not None:
                 data = st.session_state["_arena_cache_data"]
             else:
@@ -8138,6 +8169,26 @@ def render_ai_model_batch_arena():
             else:
                 st.info("Deal diagram unavailable — re-run the batch to load hand data.")
 
+            # 2. Single-row detail — same colour as the clicked row.
+            # Render this from cached batch data before any live refresh so row-clicks feel immediate.
+            _display_result = {k: v for k, v in _sel_result.items() if not k.startswith("_")}
+            _imp_val = _batch_dd_color_metric(_display_result)
+            if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):
+                _imp_int = int(_imp_val)
+                _imp_color = "Invalid" if _imp_int < 0 else ("Valid" if _imp_int > 0 else "Neutral")
+            else:
+                _imp_color = "Neutral"  # no class → white
+            _display_result["_IMP_Color"] = _imp_color
+            render_aggrid(
+                [_display_result],
+                key=f"_batch_selected_detail_{_sel_deal_idx}",
+                table_name=None,
+                show_sql_expander=False,
+                row_bucket_col="_IMP_Color",
+                hide_cols=["_IMP_Color"],
+                height=calc_grid_height(1),
+            )
+
             # ── Debug dump: write ai_model_debug.json so agent has visibility ──
             try:
                 import json as _ba_dbg_json
@@ -8157,10 +8208,9 @@ def render_ai_model_batch_arena():
                             _ba_dbg_deal[_dk] = _dv
                 _ba_dbg_steps = _ai_steps_map_ss.get(_sel_row_key) if _sel_row_key else []
                 _ba_live_res: dict[str, Any] | None = None
-                # Do not block Batch Arena row-click rendering on a fresh live solve.
-                # The stored per-deal batch steps are enough for the detail pane and
-                # debug dump; if a live refresh has already been cached this session,
-                # reuse it opportunistically.
+                # Prefer a fresh live solve for the selected row so row-click detail
+                # and ai_model_debug.json cannot silently drift from the current backend.
+                # Session caching keeps repeated clicks cheap for the same backend + params.
                 _ba_live_refresh_error: str | None = None
                 try:
                     _ba_cache_key = "|".join(
@@ -8169,10 +8219,29 @@ def render_ai_model_batch_arena():
                             str(ai_logic_mode),
                             str(int(bool(use_guardrails_v2))),
                             str(int(seed)),
+                            str(st.session_state.get("_backend_instance_id") or ""),
+                            str(st.session_state.get("_backend_hot_reload_at") or ""),
                         ]
                     )
                     _ba_live_cache = st.session_state.get("_ai_model_debug_refresh_cache") or {}
                     _ba_live_res = _ba_live_cache.get(_ba_cache_key) if isinstance(_ba_live_cache, dict) else None
+                    if not isinstance(_ba_live_res, dict):
+                        _ba_row_idx = None
+                        _ba_row_idx_raw = _deal_row.get("_row_idx") if _deal_row else None
+                        if _ba_row_idx_raw is not None:
+                            _ba_row_idx = int(_ba_row_idx_raw)
+                        _ba_deal_row_dict = None
+                        if _deal_row and _ba_row_idx is None:
+                            _ba_deal_row_dict = _json_safe_deal_row(_deal_row)
+                        _ba_live_res = _fetch_live_ai_model_debug_refresh(
+                            cache_key=_ba_cache_key,
+                            deal_row_idx=_ba_row_idx,
+                            deal_row_dict=_ba_deal_row_dict,
+                            seed=int(seed),
+                            logic_mode=str(ai_logic_mode),
+                            use_guardrails_v2=bool(use_guardrails_v2),
+                            permissive_pass=bool(st.session_state.get("always_valid_pass", True)),
+                        )
                 except Exception as _live_exc:
                     _ba_live_refresh_error = str(_live_exc)
                 if isinstance(_ba_live_res, dict):
@@ -8223,6 +8292,17 @@ def render_ai_model_batch_arena():
                     "current_path_bids": [t for t in _ba_ai_auction.split("-") if t],
                     "live_refresh_applied": bool(_ba_live_res),
                     "live_refresh_error": _ba_live_refresh_error,
+                    "ai_model_result_source": "live_refresh_cache" if _ba_live_res else "batch_result_cache",
+                    "ai_model_request_params": {
+                        "seed": int(seed),
+                        "logic_mode": str(ai_logic_mode),
+                        "use_guardrails_v2": bool(use_guardrails_v2),
+                        "backend_instance_id": st.session_state.get("_backend_instance_id"),
+                        "backend_hot_reload_at": st.session_state.get("_backend_hot_reload_at"),
+                        "backend_code_out_of_sync": bool(
+                            st.session_state.get("_backend_code_out_of_sync", False)
+                        ),
+                    },
                     "auction_error_taxonomy": _sel_result.get("auction_error_taxonomy"),
                 }
                 _ba_dbg_path.write_text(
@@ -8231,25 +8311,6 @@ def render_ai_model_batch_arena():
                 )
             except Exception:
                 pass
-
-            # 2. Single-row detail — same colour as the clicked row
-            _display_result = {k: v for k, v in _sel_result.items() if not k.startswith("_")}
-            _imp_val = _batch_dd_color_metric(_display_result)
-            if _imp_val is not None and not (isinstance(_imp_val, float) and pd.isna(_imp_val)):
-                _imp_int = int(_imp_val)
-                _imp_color = "Invalid" if _imp_int < 0 else ("Valid" if _imp_int > 0 else "Neutral")
-            else:
-                _imp_color = "Neutral"  # no class → white
-            _display_result["_IMP_Color"] = _imp_color
-            render_aggrid(
-                [_display_result],
-                key=f"_batch_selected_detail_{_sel_deal_idx}",
-                table_name=None,
-                show_sql_expander=False,
-                row_bucket_col="_IMP_Color",
-                hide_cols=["_IMP_Color"],
-                height=calc_grid_height(1),
-            )
 
             # 2b. Radar chart — Actual vs AI comparison
             _render_batch_deal_radar(
@@ -13469,15 +13530,6 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     )
                     pass_bonus = 0.0
                     pass_bonus_reason = None
-                    try:
-                        pass_bonus, pass_bonus_reason = compute_pass_signoff_bonus(
-                            auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
-                            acting_direction=acting_dir_adv,
-                            dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
-                        )
-                    except Exception:
-                        pass_bonus = 0.0
-                        pass_bonus_reason = None
                     pass_penalty = 0.0
                     pass_penalty_reason = None
                     try:
@@ -13503,6 +13555,14 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                 if isinstance(_v, list):
                                     _pass_agg_expr = _v
                                     break
+                        pass_bonus, pass_bonus_reason = compute_pass_signoff_bonus(
+                            auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
+                            acting_direction=acting_dir_adv,
+                            dealer_actual=dealer_actual if "dealer_actual" in locals() else "N",
+                            self_total_points=_self_tp_actual,
+                            self_hcp=_self_hcp_actual,
+                            pass_agg_expr=_pass_agg_expr,
+                        )
                         pass_penalty, pass_penalty_reason = compute_constructive_pass_penalty(
                             auction_tokens=[t.strip().upper() for t in str(current_auction or "").split("-") if t.strip()],
                             acting_direction=acting_dir_adv,
@@ -16195,6 +16255,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                 # "Best Next Bids (Advanced)" starting from opening.
                 ai_model_auction_text: str | None = None
                 ai_model_steps: list[dict[str, Any]] = []
+                ai_model_result_source = "unresolved"
                 ai_job_params_key = f"_ai_model_adv_job_params__{best_auc_deal_key}" if best_auc_deal_key else "_ai_model_adv_job_params"
 
                 # Parameters: tie to Advanced controls when present.
@@ -16218,10 +16279,24 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     ai_w_guard_underbid, ai_w_guard_tp_surplus, ai_w_guard_strain, ai_w_guard_sacrifice = 40.0, 8.0, 60.0, 0.7
                     ai_w_guard_tricks = 30.0
 
+                ai_logic_mode_label_effective = str(
+                    st.session_state.get("_batch_ai_logic_mode") or "Use guardrails v2"
+                ).strip()
+                _ai_logic_mode_map = {
+                    "All logic": "all_logic",
+                    "AI BT only": "ai_bt_only",
+                    "Guardrails only": "guardrails_only",
+                    "Use guardrails v2": "ai_bt_only",
+                }
+                ai_logic_mode_effective = _ai_logic_mode_map.get(ai_logic_mode_label_effective, "all_logic")
+                ai_use_guardrails_v2_effective = ai_logic_mode_label_effective == "Use guardrails v2"
+
                 # If params changed, clear cached result + job id.
                 ai_params = {
                     "deal_row_idx": int(pinned_deal.get("_row_idx")) if pinned_deal.get("_row_idx") is not None else None,
                     "seed": int(seed) if isinstance(seed, (int, float)) else 0,
+                    "logic_mode": str(ai_logic_mode_effective),
+                    "use_guardrails_v2": bool(ai_use_guardrails_v2_effective),
                     "max_steps": 40,
                     "top_n": int(ai_top_n),
                     "max_deals": int(ai_max_deals),
@@ -16238,10 +16313,16 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     "w_guard_tricks": float(ai_w_guard_tricks),
                     "permissive_pass": bool(st.session_state.get("always_valid_pass", True)),
                 }
+                ai_cache_params = dict(ai_params)
+                ai_cache_params["backend_instance_id"] = st.session_state.get("_backend_instance_id")
+                ai_cache_params["backend_hot_reload_at"] = st.session_state.get("_backend_hot_reload_at")
+                ai_cache_params["backend_code_out_of_sync"] = bool(
+                    st.session_state.get("_backend_code_out_of_sync", False)
+                )
                 try:
                     prev_params = st.session_state.get(ai_job_params_key)
-                    if prev_params != ai_params:
-                        st.session_state[ai_job_params_key] = dict(ai_params)
+                    if prev_params != ai_cache_params:
+                        st.session_state[ai_job_params_key] = dict(ai_cache_params)
                         # Clear cached results for these display keys
                         if ai_model_auc_ss_key in st.session_state:
                             del st.session_state[ai_model_auc_ss_key]
@@ -16251,6 +16332,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                             del st.session_state[ai_model_job_ss_key]
                         if ai_model_err_ss_key in st.session_state:
                             del st.session_state[ai_model_err_ss_key]
+                        if ai_model_perf_ss_key in st.session_state:
+                            del st.session_state[ai_model_perf_ss_key]
                 except Exception:
                     pass
 
@@ -16260,6 +16343,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                     cached_ai_times = st.session_state.get(ai_model_times_ss_key)
                     if isinstance(cached_ai_auc, str) and cached_ai_auc.strip():
                         ai_model_auction_text = cached_ai_auc.strip()
+                        ai_model_result_source = "session_cache"
                     if isinstance(cached_ai_times, list):
                         ai_model_steps = list(cached_ai_times)
                 except Exception:
@@ -16328,6 +16412,7 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                                     steps_detail = res.get("steps_detail") or []
                                     if auc_s:
                                         ai_model_auction_text = auc_s
+                                        ai_model_result_source = "server_job_completed"
                                         st.session_state[ai_model_auc_ss_key] = auc_s
                                         if isinstance(steps_detail, list):
                                             st.session_state[ai_model_times_ss_key] = steps_detail
@@ -16608,6 +16693,8 @@ def render_auction_builder():  # pyright: ignore[reportGeneralTypeIssues]
                         "dealer": dealer if 'dealer' in dir() else None,
                         "built_auction": auction_text,
                         "ai_model_auction": ai_model_auction_text,
+                        "ai_model_result_source": ai_model_result_source,
+                        "ai_model_request_params": ai_params,
                         "best_auction": best_auction_text if 'best_auction_text' in dir() else None,
                         "actual_auction": actual_auction if 'actual_auction' in dir() else None,
                         "completion_rows": _dbg_completion,

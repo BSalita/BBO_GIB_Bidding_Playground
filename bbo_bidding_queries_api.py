@@ -118,6 +118,9 @@ _CODE_SYNC_NOTIFIED: set[str] = set()
 _CODE_SYNC_LAST_CHECK_T: float = 0.0
 _CODE_SYNC_CHECK_INTERVAL_S: float = 2.0  # keep overhead low (reload is called per-request)
 _HOT_RELOADABLE_LOCAL_PATHS: set[pathlib.Path] = set()
+_API_SERVER_INSTANCE_ID: str = str(uuid.uuid4())
+_API_SERVER_STARTED_AT: str = datetime.now(timezone.utc).isoformat()
+_API_SERVER_PID: int = int(os.getpid())
 
 
 def _iter_local_import_files() -> list[pathlib.Path]:
@@ -303,6 +306,9 @@ def _attach_hot_reload_info(resp: Dict[str, Any], reload_info: dict[str, object]
     # Apply sorting normalization before attaching metadata.
     resp = _sort_lists_by_index(resp)
     # Always include the boolean so callers can cheaply display a message.
+    resp["backend_instance_id"] = _API_SERVER_INSTANCE_ID
+    resp["backend_started_at"] = _API_SERVER_STARTED_AT
+    resp["backend_pid"] = _API_SERVER_PID
     resp["hot_reload"] = bool(reload_info.get("reloaded", False))
     if resp["hot_reload"]:
         resp["hot_reload_mtime"] = reload_info.get("mtime")
