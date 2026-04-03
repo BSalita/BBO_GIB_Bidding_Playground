@@ -16,7 +16,7 @@ import argparse
 import math
 import re
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from tqdm import tqdm
 
 DEFAULT_BASE_DIR = pathlib.Path(r"e:\bridge\data\bbo\bidding")
@@ -142,6 +142,78 @@ def _sanitize_same_metric_numeric_contradictions(criteria: List[str] | None) -> 
         if var_name not in contradictory_vars
     ) + other
 
+
+def _drop_shadowed_merged_numeric_constraints(
+    merged_criteria: List[str] | None,
+    base_criteria: List[str] | None,
+) -> List[str]:
+    """Drop merged numeric rules that contradict or weaken existing base metrics.
+
+    The compiled BT should let learned prefix rules supplement the base BT row,
+    not relax or contradict the base row's own seat-specific criteria. This is
+    especially important for later descendant bids, where inherited learned
+    rules (for example a responder's earlier major denial) can become stale.
+    """
+    merged = [str(c).strip() for c in list(merged_criteria or []) if str(c).strip()]
+    base = [str(c).strip() for c in list(base_criteria or []) if str(c).strip()]
+    if not merged or not base:
+        return merged
+
+    base_ranges: Dict[str, Dict[str, float]] = {}
+    for crit in base:
+        match = _INEQ_PATTERN.match(crit)
+        if not match:
+            continue
+        var_name, op, value_str = match.groups()
+        value = float(int(value_str))
+        info = base_ranges.setdefault(var_name, {"lo": -math.inf, "hi": math.inf})
+        if op == "==":
+            info["lo"] = max(info["lo"], value)
+            info["hi"] = min(info["hi"], value)
+        elif op == ">=":
+            info["lo"] = max(info["lo"], value)
+        elif op == ">":
+            info["lo"] = max(info["lo"], value + 1.0)
+        elif op == "<=":
+            info["hi"] = min(info["hi"], value)
+        elif op == "<":
+            info["hi"] = min(info["hi"], value - 1.0)
+
+    cleaned: List[str] = []
+    for crit in merged:
+        match = _INEQ_PATTERN.match(crit)
+        if not match:
+            if crit not in cleaned:
+                cleaned.append(crit)
+            continue
+
+        var_name, op, value_str = match.groups()
+        info = base_ranges.get(var_name)
+        if info is None:
+            if crit not in cleaned:
+                cleaned.append(crit)
+            continue
+
+        value = float(int(value_str))
+        lo = float(info["lo"])
+        hi = float(info["hi"])
+        keep = True
+        if op == "==":
+            keep = lo <= value <= hi and not (lo == hi == value)
+        elif op == ">=":
+            keep = value > lo and value <= hi
+        elif op == ">":
+            keep = (value + 1.0) > lo and (value + 1.0) <= hi
+        elif op == "<=":
+            keep = value < hi and value >= lo
+        elif op == "<":
+            keep = (value - 1.0) < hi and (value - 1.0) >= lo
+
+        if keep and crit not in cleaned:
+            cleaned.append(crit)
+
+    return cleaned
+
 def process_chunk(chunk: pl.DataFrame, prefix_dfs_by_len: Dict[int, pl.DataFrame], chunk_num: int = 0, show_progress: bool = True) -> pl.DataFrame:
     """Process a single chunk: apply all prefix-length joins and combine rules."""
     
@@ -243,15 +315,25 @@ def process_chunk(chunk: pl.DataFrame, prefix_dfs_by_len: Dict[int, pl.DataFrame
     for seat in range(1, 5):
         base_col = f"Agg_Expr_Seat_{seat}"
         mcol = f"_m{seat}"
+        merged_col = f"_merged_clean_{seat}"
         combined_col = f"_combined_{seat}"
         chunk = chunk.with_columns(
-            pl.concat_list([pl.col(base_col), pl.col(mcol)])
+            pl.struct([pl.col(mcol), pl.col(base_col)]).map_elements(
+                lambda row: _drop_shadowed_merged_numeric_constraints(
+                    row.get(mcol),
+                    row.get(base_col),
+                ),
+                return_dtype=pl.List(pl.Utf8),
+            ).alias(merged_col)
+        )
+        chunk = chunk.with_columns(
+            pl.concat_list([pl.col(base_col), pl.col(merged_col)])
             .list.eval(pl.element().filter(pl.element().is_not_null()))
             .list.unique()
             .alias(combined_col)
         )
         chunk = chunk.with_columns(
-            pl.when(pl.col(mcol).list.len() > 0)
+            pl.when(pl.col(merged_col).list.len() > 0)
             .then(
                 pl.col(combined_col).map_elements(
                     _sanitize_same_metric_numeric_contradictions,
@@ -261,7 +343,7 @@ def process_chunk(chunk: pl.DataFrame, prefix_dfs_by_len: Dict[int, pl.DataFrame
             .otherwise(pl.col(combined_col))
             .alias(base_col)
         )
-        chunk = chunk.drop(combined_col)
+        chunk = chunk.drop([combined_col, merged_col])
     
     # Drop temp columns
     drop_cols = ["_idx", "_norm", "_tokens", "_len"] + [f"_m{s}" for s in range(1, 5)]

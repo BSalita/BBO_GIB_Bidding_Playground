@@ -1903,6 +1903,7 @@ def compute_guardrail_penalty(
     self_suit_lengths: dict[str, int] | None = None,
     fit_us_hist: dict[str, Any] | None = None,
     bt_acting_criteria: list[str] | None = None,
+    bt_expr: list[str] | None = None,
     is_reopening: bool = False,
     w_first_round_control: float = 75.0,
     w_weak_hand: float = 40.0,
@@ -2182,6 +2183,61 @@ def compute_guardrail_penalty(
         except Exception:
             return False
 
+    def _criteria_total_points_bounds(criteria: list[str] | None) -> tuple[float | None, float | None]:
+        if not criteria:
+            return None, None
+        lo: float | None = None
+        hi: float | None = None
+        try:
+            for c in criteria:
+                crit = str(c or "").strip().upper().strip("()")
+                m = re.match(r"^TOTAL_POINTS\s*(>=|>|<=|<|==)\s*([0-9]+(?:\.[0-9]+)?)$", crit)
+                if m is None:
+                    continue
+                op = str(m.group(1))
+                val = float(m.group(2))
+                if op == ">=":
+                    lo = val if lo is None else max(lo, val)
+                elif op == ">":
+                    lo = (val + 1.0e-6) if lo is None else max(lo, val + 1.0e-6)
+                elif op == "<=":
+                    hi = val if hi is None else min(hi, val)
+                elif op == "<":
+                    hi = (val - 1.0e-6) if hi is None else min(hi, val - 1.0e-6)
+                elif op == "==":
+                    lo = val if lo is None else max(lo, val)
+                    hi = val if hi is None else min(hi, val)
+        except Exception:
+            return None, None
+        return lo, hi
+
+    def _is_constructive_partner_raise_below_game() -> bool:
+        if not is_raise_of_partner_suit:
+            return False
+        if bid_level is None or bid_strain is None or top_level is None or top_strain is None:
+            return False
+        try:
+            bid_st = str(bid_strain).upper()
+            top_st = str(top_strain).upper()
+            if bid_st not in ("C", "D", "H", "S"):
+                return False
+            if bid_st != top_st:
+                return False
+            if int(bid_level) <= int(top_level):
+                return False
+            game_level = 5 if bid_st in ("C", "D") else 4
+            if int(bid_level) >= int(game_level):
+                return False
+            if not _has_strain_length_criterion(bt_acting_criteria, bid_st):
+                return False
+            _tp_lo, _tp_hi = _criteria_total_points_bounds(bt_acting_criteria)
+            if _tp_hi is None:
+                return False
+            # Keep this bypass narrowly targeted to constructive, non-game raises.
+            return float(_tp_hi) <= 15.0
+        except Exception:
+            return False
+
     def _is_artificial_major_probe(criteria: list[str] | None, bid_text: str) -> bool:
         """Detect artificial minor bids that should not inherit natural-suit heuristics.
 
@@ -2314,6 +2370,9 @@ def compute_guardrail_penalty(
         and bid_strain == top_strain
         and not par_is_opponents
     )
+    constructive_partner_raise_bypass = bool(
+        _is_constructive_partner_raise_below_game() and not par_is_opponents
+    )
     blackwood_same_strain_supported_overbid = bool(
         same_strain_blackwood_slam_bypass
         and top_strain is not None
@@ -2341,6 +2400,11 @@ def compute_guardrail_penalty(
             reasons.append(
                 "NO_NON_SAC_OVERBID_BYPASS: partner-major support context treats 3NT and 4M "
                 "as equivalent game targets"
+            )
+        elif constructive_partner_raise_bypass:
+            reasons.append(
+                f"CONSTRUCTIVE_PARTNER_RAISE_BYPASS: supported below-game raise {bid} "
+                f"continues partner's {top_contract} constructively; skipping generic hard overbid veto"
             )
         elif blackwood_same_strain_supported_overbid:
             reasons.append(
@@ -2380,7 +2444,7 @@ def compute_guardrail_penalty(
     # ------------------------------------------------------------------
     if top_rank is not None and bid_rank is not None and bid_rank > top_rank and not (
         nt_major_game_equiv and not par_is_opponents
-    ) and not same_strain_supported_overbid and not blackwood_same_strain_supported_overbid:
+    ) and not same_strain_supported_overbid and not blackwood_same_strain_supported_overbid and not constructive_partner_raise_bypass:
         top_level_i = int(top_level) if top_level is not None else None
         if top_level_i is None:
             overbid_levels = 0
@@ -2406,9 +2470,14 @@ def compute_guardrail_penalty(
             f"(-{p:.0f}){sac_note}"
         )
     elif top_rank is not None and bid_rank is not None and bid_rank > top_rank and (
-        same_strain_supported_overbid or blackwood_same_strain_supported_overbid
+        same_strain_supported_overbid or blackwood_same_strain_supported_overbid or constructive_partner_raise_bypass
     ):
-        if blackwood_same_strain_supported_overbid:
+        if constructive_partner_raise_bypass:
+            reasons.append(
+                f"CONSTRUCTIVE_PARTNER_RAISE_LEVEL_BYPASS: supported below-game raise {bid} "
+                f"continues partner's {top_contract}; skipping generic par-level overbid penalty"
+            )
+        elif blackwood_same_strain_supported_overbid:
             reasons.append(
                 f"BLACKWOOD_SAME_STRAIN_OVERBID_BYPASS: {same_strain_blackwood_slam_reason or 'explicit Blackwood same-strain slam evidence'}"
             )
@@ -2744,11 +2813,19 @@ def compute_guardrail_penalty(
         #    Backstop: if the bid's acting criteria don't constrain the bid strain
         #    length at all, demote as underspecified (especially problematic in
         #    reopening where partner can infer a lead/suit preference).
+        #
+        #    Safety valve: compiled seat-level aggregates can occasionally lose a
+        #    strain marker when contradictory prefix rules are merged and then
+        #    sanitized. In that case the raw BT row (`bt_expr`) still reflects the
+        #    concrete candidate bid, so let it rescue the strain-specific check.
+        has_strain_length = _has_strain_length_criterion(bt_acting_criteria, bid_strain) or _has_strain_length_criterion(
+            bt_expr, bid_strain
+        )
         if (
             (not is_artificial_probe)
             and (not is_new_minor_forcing_like)
             and (not is_transfer_response)
-            and not _has_strain_length_criterion(bt_acting_criteria, bid_strain)
+            and not has_strain_length
         ):
             p = float(w_underspecified_strain) * (1.5 if is_reopening else 1.0)
             penalty += p
