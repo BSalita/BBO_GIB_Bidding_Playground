@@ -1047,6 +1047,13 @@ def compute_pass_signoff_bonus(
     """Bonus for Pass when partner committed to game or invited and self is minimum."""
     if not acting_direction:
         return 0.0, None
+    jacoby_2nt_ctx = extract_jacoby_2nt_opener_pass_context(
+        auction_tokens=list(auction_tokens or []),
+        acting_direction=acting_direction,
+        dealer_actual=dealer_actual,
+    )
+    if jacoby_2nt_ctx is not None:
+        return 0.0, None
     directions = ["N", "E", "S", "W"]
     d = str(dealer_actual or "N").upper()
     dealer_idx = directions.index(d) if d in directions else 0
@@ -1433,6 +1440,27 @@ def compute_forced_non_pass_policy(
                 "metric": "forcing_flag",
                 "forcing_flag": "Forcing_One_Round",
                 "pass_agg_expr": [str(tok) for tok in list(pass_agg_expr or []) if str(tok).strip()],
+            }
+            return out
+
+        jacoby_2nt_ctx = extract_jacoby_2nt_opener_pass_context(
+            auction_tokens=list(auction_tokens or []),
+            acting_direction=acting_direction,
+            dealer_actual=dealer_actual,
+        )
+        if jacoby_2nt_ctx is not None:
+            out["hard_block"] = True
+            out["reason"] = (
+                "FORCED_NON_PASS_JACOBY_2NT: opener cannot pass after "
+                f"{jacoby_2nt_ctx['opening_bid']}-P-{jacoby_2nt_ctx['response_bid']}-P "
+                "while legal non-pass continuations exist"
+            )
+            out["context"] = {
+                "metric": "jacoby_2nt",
+                "opening_bid": str(jacoby_2nt_ctx.get("opening_bid") or ""),
+                "response_bid": str(jacoby_2nt_ctx.get("response_bid") or ""),
+                "opening_strain": str(jacoby_2nt_ctx.get("opening_strain") or ""),
+                "acting_direction": str(jacoby_2nt_ctx.get("acting_direction") or ""),
             }
             return out
 
@@ -2212,8 +2240,6 @@ def compute_guardrail_penalty(
         return lo, hi
 
     def _is_constructive_partner_raise_below_game() -> bool:
-        if not is_raise_of_partner_suit:
-            return False
         if bid_level is None or bid_strain is None or top_level is None or top_strain is None:
             return False
         try:
@@ -2234,7 +2260,13 @@ def compute_guardrail_penalty(
             if _tp_hi is None:
                 return False
             # Keep this bypass narrowly targeted to constructive, non-game raises.
-            return float(_tp_hi) <= 15.0
+            if float(_tp_hi) > 15.0:
+                return False
+            if top_pair is None or str(top_pair).upper() in {"OPP", "OPPONENT", "THEM"}:
+                return False
+            # Allow same-strain criteria and par evidence to recover false
+            # negatives from the explicit raise detector in opener-support cases.
+            return True
         except Exception:
             return False
 
@@ -3164,6 +3196,74 @@ def extract_opener_rebid_pass_context(
     }
 
 
+def extract_jacoby_2nt_opener_pass_context(
+    *,
+    auction_tokens: list[str],
+    acting_direction: str | None,
+    dealer_actual: str | None,
+) -> dict[str, Any] | None:
+    """Normalize uncontested opener turns after an immediate Jacoby 2NT raise."""
+    act = str(acting_direction or "").strip().upper()
+    if act not in ("N", "E", "S", "W"):
+        return None
+
+    toks = [str(t or "").strip().upper() for t in list(auction_tokens or []) if str(t or "").strip()]
+    if len(toks) < 4:
+        return None
+
+    opening_idx: int | None = None
+    opening_bid = ""
+    opening_level: int | None = None
+    opening_strain: str | None = None
+    for i, tk in enumerate(toks):
+        lvl = _parse_bid_level(tk)
+        st = _parse_bid_strain(tk)
+        if lvl is None or st is None:
+            continue
+        opening_idx = i
+        opening_bid = tk
+        opening_level = lvl
+        opening_strain = st
+        break
+
+    if (
+        opening_idx is None
+        or opening_level != 1
+        or opening_strain not in ("H", "S")
+        or len(toks) != (opening_idx + 4)
+    ):
+        return None
+    if toks[opening_idx + 1] not in ("P", "PASS") or toks[opening_idx + 3] not in ("P", "PASS"):
+        return None
+
+    response_bid = toks[opening_idx + 2]
+    if response_bid not in ("2N", "2NT"):
+        return None
+
+    opener_direction = _token_bidder_dir(int(opening_idx), dealer_actual)
+    if opener_direction != act:
+        return None
+    responder_direction = _token_bidder_dir(int(opening_idx + 2), dealer_actual)
+    if responder_direction != _partner_dir(act):
+        return None
+
+    next_to_act = _token_bidder_dir(len(toks), dealer_actual)
+    if next_to_act != act:
+        return None
+
+    return {
+        "tokens": toks,
+        "opening_idx": int(opening_idx),
+        "leading_passes": int(opening_idx),
+        "opening_bid": opening_bid,
+        "opening_strain": str(opening_strain),
+        "response_bid": response_bid,
+        "opener_direction": opener_direction,
+        "responder_direction": responder_direction,
+        "acting_direction": act,
+    }
+
+
 def extract_opener_minor_clarification_pass_context(
     *,
     auction_tokens: list[str],
@@ -3995,6 +4095,22 @@ def compute_common_sense_hard_override(
         "current_best_bid": best_bid,
     }
 
+    def _has_opponent_non_pass_auction_pressure(tokens_now: list[str]) -> bool:
+        act = str(acting_direction or "").strip().upper()
+        if act not in ("N", "E", "S", "W"):
+            return False
+        try:
+            return (
+                _last_opponent_contract(
+                    list(tokens_now or []),
+                    acting_direction=acting_direction,
+                    dealer_actual=dealer_actual,
+                )
+                is not None
+            )
+        except Exception:
+            return False
+
     def _forced_stayman_reply_bid_here(tokens_now: list[str]) -> str | None:
         try:
             toks = [str(t or "").strip().upper() for t in list(tokens_now or []) if str(t or "").strip()]
@@ -4239,7 +4355,7 @@ def compute_common_sense_hard_override(
         second_len = sl.get(bid_suit)
         if first_len is None or second_len is None:
             return False, {"shown_suits": shown}
-        ok = bool(int(second_len) >= 5 and int(first_len) >= int(second_len))
+        ok = bool(int(first_len) >= 5 and int(second_len) >= 5)
         return ok, {
             "shown_suits": shown,
             "first_suit": first_suit,
@@ -4652,6 +4768,52 @@ def compute_common_sense_hard_override(
     except Exception:
         pass
 
+    # Whitelist -0.375: when the actor has already shown two suits and the
+    # current best action simply repeats the first suit, prefer rebidding the
+    # shown second suit at the same level. That rebid is the natural 5-5+
+    # clarification and should beat a generic higher-suit tie-break.
+    try:
+        best_contract = _parse_contract_bid_text(best_bid)
+        if best_contract is not None and isinstance(sl, dict) and sl:
+            best_level, best_strain = int(best_contract[0]), str(best_contract[1]).upper()
+            shown = _actor_shown_suits()
+            if len(shown) >= 2:
+                first_suit = str(shown[0]).upper()
+                second_suit = str(shown[1]).upper()
+                first_len = sl.get(first_suit)
+                second_len = sl.get(second_suit)
+                if (
+                    best_strain == first_suit
+                    and first_len is not None
+                    and second_len is not None
+                    and int(first_len) >= 5
+                    and int(second_len) >= 5
+                ):
+                    target_bid = f"{best_level}{second_suit}"
+                    if target_bid != best_bid:
+                        target_row, target_source = _bid_row_with_source(target_bid)
+                        if target_row is not None:
+                            ok, detail = _qualifies_second_suit_rebid_semantics(target_bid)
+                            if ok:
+                                return {
+                                    "apply": True,
+                                    "selected_bid": target_bid,
+                                    "reason_codes": ["shown_second_suit_rebid_preference"],
+                                    "reason": (
+                                        "COMMON_SENSE_HARD_OVERRIDE: prefer rebidding shown second suit "
+                                        f"{target_bid} over same-level first-suit repeat {best_bid}; "
+                                        "rebidding the second suit shows 5+ in both suits"
+                                    ),
+                                    "evidence": {
+                                        **evidence,
+                                        "selected_source": target_source,
+                                        "second_suit_rebid_detail": detail,
+                                        "replaced_same_level_first_suit_repeat": best_bid,
+                                    },
+                                }
+    except Exception:
+        pass
+
     # Whitelist -0.25: after landing on 3NT with clear slam values, prefer the
     # cheapest blocked NT continuation over an artificial signoff.
     try:
@@ -4984,7 +5146,7 @@ def compute_common_sense_hard_override(
 
     # Whitelist B.5: self-sufficient long major progression / game commitment.
     try:
-        if isinstance(sl, dict) and sl:
+        if isinstance(sl, dict) and sl and _has_opponent_non_pass_auction_pressure(auction_tokens):
             best_bid_parsed = _parse_contract_bid_text(best_bid)
             best_bid_row = _pick_bid(scored, best_bid)
             for target_major in ("H", "S"):

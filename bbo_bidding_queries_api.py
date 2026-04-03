@@ -1105,7 +1105,7 @@ def _format_file_info(
     """Format file loading info showing shape, file size, memory size, and load time.
     
     Examples:
-        "16,234,567 rows × 45 cols | disk: 1.2 GB | mem(est): 5.3 GB | rssΔ: 5.1 GB | 5.3s"
+        "16,234,567 rows x 45 cols | disk: 1.2 GB | mem(est): 5.3 GB | rss_delta: 5.1 GB | 5.3s"
         "123,456 entries | disk: 50.3 MB | mem: 200.1 MB | 1.2s"
     """
     parts = []
@@ -1114,7 +1114,7 @@ def _format_file_info(
     if df is not None:
         rows = f"{df.height:,}"
         cols = df.width
-        parts.append(f"{rows} rows × {cols} cols")
+        parts.append(f"{rows} rows x {cols} cols")
     elif row_count is not None:
         if isinstance(row_count, int):
             parts.append(f"{row_count:,} entries")
@@ -1134,7 +1134,7 @@ def _format_file_info(
     # Include actual process RSS delta if available (ground truth-ish on Windows)
     if rss_delta_bytes is not None:
         try:
-            parts.append(f"rssΔ: {_format_bytes(rss_delta_bytes)}")
+            parts.append(f"rss_delta: {_format_bytes(rss_delta_bytes)}")
         except Exception:
             pass
     
