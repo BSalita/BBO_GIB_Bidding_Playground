@@ -6658,11 +6658,17 @@ def _render_batch_input_from_deals_df() -> dict[str, Any]:
 def _render_batch_input_from_pbn() -> dict[str, Any]:
     """Render local/URL PBN input controls and return normalized config."""
     url_col, dl_col = st.columns([5, 1], vertical_alignment="bottom")
+    pbn_url_options = [
+        "https://github.com/BSalita/pbns/tree/master/cavend01",
+        "https://raw.githubusercontent.com/BSalita/Calculate_PBN_Results/refs/heads/master/DDS_Camrose24_2-%20BENCAM22%20v%20WBridge5.pbn",
+    ]
     with url_col:
-        pbn_url = st.text_input(
+        pbn_url = st.selectbox(
             "PBN URL",
+            options=pbn_url_options,
             key="_batch_pbn_url",
-            value="https://raw.githubusercontent.com/BSalita/Calculate_PBN_Results/refs/heads/master/DDS_Camrose24_1-%20BENCAM22%20v%20WBridge5.pbn",
+            index=0,
+            accept_new_options=True,
             on_change=lambda: st.session_state.__setitem__("_batch_pbn_download_on_enter", True),
         )
     with dl_col:
