@@ -988,7 +988,7 @@ def _build_batch_debug_payload(
         "seed": int(seed),
         "deals_processed": len(results),
         "imp_running_total": imp_running_total,
-        "auction_error_summary": taxonomy_summary_df.to_dict("records"),
+        "auction_error_summary": taxonomy_summary_df.to_dicts(),
         "worst_deals": worst_deals_summary,
         "deals": batch_debug_entries,
     }

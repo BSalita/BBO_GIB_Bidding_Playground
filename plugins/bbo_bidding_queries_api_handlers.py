@@ -673,6 +673,118 @@ def _major_opening_raise_over_1n_adjustment(
     return bonus, penalty, reason
 
 
+def _major_opening_competitive_raise_overcall_adjustment(
+    *,
+    bid_text: str,
+    bid_level: int | None,
+    bid_strain: str | None,
+    options: List[Dict[str, Any]] | None,
+    auction_tokens: List[str] | None,
+    acting_direction: str,
+    dealer_actual: str,
+    self_suit_lengths: Dict[str, int] | None,
+    self_total_points: float | None,
+) -> Tuple[float, float, str | None]:
+    """With a minimum and support, prefer raising partner's major over doubling.
+
+    Narrow target:
+    - partner opened 1H/1S
+    - RHO made a natural two-level overcall
+    - responder is acting for the first time
+    - responder has 3+ trump support and only minimum constructive values
+
+    Bridge rationale: on a minimum, confirming the fit is more valuable than an
+    exploratory double that leaves opener guessing about trump support.
+    """
+    bonus = 0.0
+    penalty = 0.0
+    reason: str | None = None
+    try:
+        bid_u = str(bid_text or "").strip().upper()
+        if bid_u not in ("D", "X", "DOUBLE", "2H", "2S"):
+            return bonus, penalty, reason
+        if not isinstance(self_suit_lengths, dict) or not self_suit_lengths:
+            return bonus, penalty, reason
+        if not isinstance(self_total_points, (int, float)):
+            return bonus, penalty, reason
+
+        toks = [str(t or "").strip().upper() for t in list(auction_tokens or []) if str(t or "").strip()]
+        if len(toks) != 2:
+            return bonus, penalty, reason
+
+        opening_m = re.match(r"^([1-7])\s*(N|NT|[CDHS])$", toks[0])
+        overcall_m = re.match(r"^([1-7])\s*(N|NT|[CDHS])$", toks[1])
+        if opening_m is None or overcall_m is None:
+            return bonus, penalty, reason
+
+        opening_level = int(opening_m.group(1))
+        opening_strain = "N" if opening_m.group(2).upper() in ("N", "NT") else opening_m.group(2).upper()
+        overcall_level = int(overcall_m.group(1))
+        overcall_strain = "N" if overcall_m.group(2).upper() in ("N", "NT") else overcall_m.group(2).upper()
+        if opening_level != 1 or opening_strain not in ("H", "S"):
+            return bonus, penalty, reason
+        if overcall_level != 2 or overcall_strain not in ("C", "D", "H", "S"):
+            return bonus, penalty, reason
+
+        directions = ["N", "E", "S", "W"]
+        dealer_u = str(dealer_actual or "N").strip().upper()
+        acting_u = str(acting_direction or "").strip().upper()
+        if acting_u not in directions:
+            return bonus, penalty, reason
+        dealer_idx = directions.index(dealer_u) if dealer_u in directions else 0
+        partner_direction = {"N": "S", "S": "N", "E": "W", "W": "E"}.get(acting_u, "")
+        if not partner_direction:
+            return bonus, penalty, reason
+        opener_direction = directions[(dealer_idx + 0) % 4]
+        overcaller_direction = directions[(dealer_idx + 1) % 4]
+        acting_side = "NS" if acting_u in ("N", "S") else "EW"
+        overcaller_side = "NS" if overcaller_direction in ("N", "S") else "EW"
+        if opener_direction != partner_direction:
+            return bonus, penalty, reason
+        if overcaller_side == acting_side:
+            return bonus, penalty, reason
+
+        support_len = int(self_suit_lengths.get(opening_strain, 0) or 0)
+        if support_len < 3:
+            return bonus, penalty, reason
+
+        total_points = float(self_total_points)
+        if total_points > 10.0:
+            return bonus, penalty, reason
+
+        raise_bid = f"2{opening_strain}"
+        if bid_u not in (raise_bid, "D", "X", "DOUBLE"):
+            return bonus, penalty, reason
+
+        option_bids = {
+            str((opt or {}).get("bid", "") or "").strip().upper()
+            for opt in list(options or [])
+            if str((opt or {}).get("bid", "") or "").strip()
+        }
+        if raise_bid not in option_bids or not ({"D", "X", "DOUBLE"} & option_bids):
+            return bonus, penalty, reason
+
+        if bid_u == raise_bid:
+            bonus = 260.0 if support_len >= 4 else 220.0
+            reason = (
+                "MAJOR_OPENING_COMPETITIVE_RAISE_PREFERENCE: after partner opens "
+                f"{toks[0]} and RHO overcalls {toks[1]}, prefer minimum support raise "
+                f"{raise_bid} with {support_len}-card support and {total_points:.0f} TP "
+                f"over exploratory double (+{bonus:.0f})"
+            )
+        elif bid_u in ("D", "X", "DOUBLE"):
+            penalty = 220.0
+            reason = (
+                "MAJOR_OPENING_COMPETITIVE_RAISE_PREFERENCE: after partner opens "
+                f"{toks[0]} and RHO overcalls {toks[1]}, penalize exploratory double on "
+                f"{total_points:.0f} TP when {raise_bid} shows the {support_len}-card fit "
+                f"(-{penalty:.0f})"
+            )
+    except Exception:
+        return 0.0, 0.0, None
+    return bonus, penalty, reason
+
+
 def _minor_opening_balanced_invite_rebid_adjustment(
     *,
     bid_text: str,
@@ -14398,6 +14510,30 @@ def handle_ai_model_advanced_path(
     # v2 mode intentionally disables common-sense adjustments and hard overrides.
     use_common_sense = (logic_mode_norm == "all_logic") and (not use_guardrails_v2)
 
+    # --- Auto-fix override layer: hot-reload weight/threshold overrides ---
+    _fix_ov: dict = {}
+    try:
+        from issue_mining.config import load_fix_overrides as _load_fix_overrides
+        _fix_ov = _load_fix_overrides()
+        if _fix_ov:
+            if "w_desc" in _fix_ov: w_desc = float(_fix_ov["w_desc"])
+            if "w_threat" in _fix_ov: w_threat = float(_fix_ov["w_threat"])
+            if "w_guard" in _fix_ov: w_guard = float(_fix_ov["w_guard"])
+            if "w_guard_overbid" in _fix_ov: w_guard_overbid = float(_fix_ov["w_guard_overbid"])
+            if "w_guard_tp" in _fix_ov: w_guard_tp = float(_fix_ov["w_guard_tp"])
+            if "w_guard_neg" in _fix_ov: w_guard_neg = float(_fix_ov["w_guard_neg"])
+            if "w_guard_underbid" in _fix_ov: w_guard_underbid = float(_fix_ov["w_guard_underbid"])
+            if "w_guard_tp_surplus" in _fix_ov: w_guard_tp_surplus = float(_fix_ov["w_guard_tp_surplus"])
+            if "w_guard_strain" in _fix_ov: w_guard_strain = float(_fix_ov["w_guard_strain"])
+            if "w_guard_sacrifice" in _fix_ov: w_guard_sacrifice = float(_fix_ov["w_guard_sacrifice"])
+            if "w_guard_tricks" in _fix_ov: w_guard_tricks = float(_fix_ov["w_guard_tricks"])
+            if "opening_base_mult" in _fix_ov: opening_base_mult = float(_fix_ov["opening_base_mult"])
+            if "early_uncontested_base_mult" in _fix_ov: early_uncontested_base_mult = float(_fix_ov["early_uncontested_base_mult"])
+            if "opening_pass_penalty" in _fix_ov: opening_pass_penalty = float(_fix_ov["opening_pass_penalty"])
+            if "opening_policy_bonus" in _fix_ov: opening_policy_bonus = float(_fix_ov["opening_policy_bonus"])
+    except Exception:
+        pass
+
     def _min_from_hist(hist: dict[str, Any] | None) -> float | None:
         """Return minimum observed bucket key from histogram-like dict."""
         if not isinstance(hist, dict) or not hist:
@@ -21909,7 +22045,7 @@ def handle_ai_model_advanced_path(
                 if mean_par is not None and matched_n is not None and float(matched_n) > 0:
                     mean_par_val = float(mean_par)
                     n_val = float(matched_n)
-                    shrinkage_k = 5.0
+                    shrinkage_k = float(_fix_ov.get("shrinkage_k", 5.0)) if _fix_ov else 5.0
                     # Avg_Par is seat-relative since GPU pipeline v3.1.
                     base = mean_par_val
                     base_shrunk = (base * n_val) / (n_val + shrinkage_k)
@@ -22699,6 +22835,17 @@ def handle_ai_model_advanced_path(
                 dealer_actual=dealer_actual,
                 self_suit_lengths=_self_suit_lengths if isinstance(_self_suit_lengths, dict) else None,
             )
+            competitive_major_raise_bonus, competitive_major_raise_penalty, competitive_major_raise_reason = _major_opening_competitive_raise_overcall_adjustment(
+                bid_text=bid1,
+                bid_level=bid_level,
+                bid_strain=bid_strain,
+                options=list(passed_opts or []),
+                auction_tokens=list(tokens or []),
+                acting_direction=acting_dir,
+                dealer_actual=dealer_actual,
+                self_suit_lengths=_self_suit_lengths if isinstance(_self_suit_lengths, dict) else None,
+                self_total_points=_self_tp_actual if isinstance(_self_tp_actual, (int, float)) else None,
+            )
             higher_suit_pref_bonus, higher_suit_pref_penalty, higher_suit_pref_reason = _compute_equal_length_higher_suit_adjustment(
                 bid_text=bid1,
                 bid_level_local=bid_level,
@@ -23413,6 +23560,7 @@ def handle_ai_model_advanced_path(
                     + responder_major_pref_bonus
                     + opener_major_pref_bonus
                     + major_raise_over_1n_bonus
+                    + competitive_major_raise_bonus
                     + nt_preference_bonus
                     + nt_over_minor_bonus
                     + higher_suit_pref_bonus
@@ -23436,6 +23584,7 @@ def handle_ai_model_advanced_path(
                     + responder_major_pref_penalty
                     + opener_major_pref_penalty
                     + major_raise_over_1n_penalty
+                    + competitive_major_raise_penalty
                     + minor_nt_detour_penalty
                     + nt_over_minor_penalty
                     + higher_suit_pref_penalty
@@ -23485,6 +23634,8 @@ def handle_ai_model_advanced_path(
                             ScoreTerm("opener_major_pref_penalty", -float(opener_major_pref_penalty), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("major_raise_over_1n_bonus", float(major_raise_over_1n_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("major_raise_over_1n_penalty", -float(major_raise_over_1n_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("competitive_major_raise_bonus", float(competitive_major_raise_bonus), InformationClass.SELF_HAND),
+                            ScoreTerm("competitive_major_raise_penalty", -float(competitive_major_raise_penalty), InformationClass.SELF_HAND),
                             ScoreTerm("nt_preference_bonus", float(nt_preference_bonus), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("minor_nt_detour_penalty", -float(minor_nt_detour_penalty), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("nt_over_minor_bonus", float(nt_over_minor_bonus), InformationClass.SELF_HAND),
@@ -23536,6 +23687,8 @@ def handle_ai_model_advanced_path(
                             ScoreTerm("opener_major_pref_penalty", -float(opener_major_pref_penalty), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("major_raise_over_1n_bonus", float(major_raise_over_1n_bonus), InformationClass.SELF_HAND),
                             ScoreTerm("major_raise_over_1n_penalty", -float(major_raise_over_1n_penalty), InformationClass.SELF_HAND),
+                            ScoreTerm("competitive_major_raise_bonus", float(competitive_major_raise_bonus), InformationClass.SELF_HAND),
+                            ScoreTerm("competitive_major_raise_penalty", -float(competitive_major_raise_penalty), InformationClass.SELF_HAND),
                             ScoreTerm("nt_preference_bonus", float(nt_preference_bonus), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("minor_nt_detour_penalty", -float(minor_nt_detour_penalty), InformationClass.PUBLIC_AUCTION),
                             ScoreTerm("nt_over_minor_bonus", float(nt_over_minor_bonus), InformationClass.SELF_HAND),
@@ -23682,6 +23835,9 @@ def handle_ai_model_advanced_path(
                     "major_raise_over_1n_bonus": round(float(major_raise_over_1n_bonus), 2),
                     "major_raise_over_1n_penalty": round(float(major_raise_over_1n_penalty), 2),
                     "major_raise_over_1n_reason": major_raise_over_1n_reason,
+                    "competitive_major_raise_bonus": round(float(competitive_major_raise_bonus), 2),
+                    "competitive_major_raise_penalty": round(float(competitive_major_raise_penalty), 2),
+                    "competitive_major_raise_reason": competitive_major_raise_reason,
                     "higher_suit_pref_bonus": round(float(higher_suit_pref_bonus), 2),
                     "higher_suit_pref_penalty": round(float(higher_suit_pref_penalty), 2),
                     "higher_suit_pref_reason": higher_suit_pref_reason,

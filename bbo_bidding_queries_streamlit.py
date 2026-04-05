@@ -7989,7 +7989,7 @@ def render_ai_model_batch_arena():
                 "seed": int(seed),
                 "deals_processed": len(results),
                 "imp_running_total": imp_running,
-                "auction_error_summary": _ba_summary_df.to_dict("records"),
+                "auction_error_summary": _ba_summary_df.to_dicts(),
                 "worst_deals": _worst_deals_summary,
                 "deals": _batch_debug_entries,
             }
@@ -8457,16 +8457,16 @@ def _render_batch_results_df(
     summary_df = build_auction_error_summary_df(results)
 
     def _render_summary() -> list[dict[str, Any]]:
-        if summary_df.empty:
+        if summary_df.is_empty():
             return []
         st.markdown("#### Auction Error Summary")
         return render_aggrid(
-            summary_df,
+            summary_df.to_pandas(),
             key=f"{aggrid_key}_auction_error_summary",
             table_name="auction_error_summary",
             show_sql_expander=False,
             update_on=["selectionChanged", "cellClicked"],
-            height=calc_grid_height(len(summary_df), max_height=320),
+            height=calc_grid_height(summary_df.height, max_height=320),
         )
 
     def _matches_summary_row(result_row: dict[str, Any], summary_row: dict[str, Any]) -> bool:

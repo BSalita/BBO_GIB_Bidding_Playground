@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import pandas as pd
+import polars as pl
 
 from bbo_bidding_queries_lib import get_ai_contract
 from plugins.bbo_handlers_common import dedup_par_contracts, ev_list_for_par_contracts
@@ -516,12 +516,12 @@ def add_auction_error_taxonomy_to_row(
     return enriched
 
 
-def build_auction_error_summary_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
+def build_auction_error_summary_df(rows: list[dict[str, Any]]) -> pl.DataFrame:
     if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    if "Final_Error_Family" not in df.columns:
-        return pd.DataFrame()
+        return pl.DataFrame()
+    if not any("Final_Error_Family" in row for row in rows if isinstance(row, dict)):
+        return pl.DataFrame()
+
     alias_map = {
         "IMP_Diff": ["Par_IMP_Diff", "imp_diff"],
         "EV_Diff": ["ev_diff"],
@@ -537,58 +537,79 @@ def build_auction_error_summary_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "Par_EV_Best": ["par_ev_best"],
         "Par_Benchmark": ["par_benchmark"],
     }
-    for canonical, aliases in alias_map.items():
-        if canonical not in df.columns:
-            for alias in aliases:
-                if alias in df.columns:
-                    df[canonical] = df[alias]
-                    break
-    for col in ["IMP_Diff", "EV_Diff", "EV_IMP_Diff", "IMP_Loss", "EV_Loss"]:
-        if col not in df.columns:
-            df[col] = 0.0
-    df["Error_Type"] = df["Final_Error_Family"].fillna("other")
-    severity = df.get("Error_Severity")
-    if severity is not None:
-        sev_text = severity.fillna("")
-        df.loc[sev_text.astype(str).str.len() > 0, "Error_Type"] = (
-            df.loc[sev_text.astype(str).str.len() > 0, "Final_Error_Family"].astype(str)
-            + "_"
-            + sev_text[sev_text.astype(str).str.len() > 0].astype(str)
-        )
-    for col in ["IMP_Diff", "EV_Diff", "EV_IMP_Diff", "IMP_Loss", "EV_Loss", "Luck_Swing", "Par_EV_Best", "Par_Benchmark"]:
+    numeric_cols = ["IMP_Diff", "EV_Diff", "EV_IMP_Diff", "IMP_Loss", "EV_Loss", "Luck_Swing", "Par_EV_Best", "Par_Benchmark"]
+    bool_cols = ["Overbid_Luck", "Underbid_Luck", "Is_Error"]
+    required_str_cols = ["Final_Error_Family", "Decision_Error_Family", "Error_Severity"]
+
+    normalized_rows: list[dict[str, Any]] = []
+    for src in rows:
+        if not isinstance(src, dict):
+            continue
+        row = dict(src)
+        if "Final_Error_Family" not in row:
+            continue
+        for canonical, aliases in alias_map.items():
+            if canonical not in row:
+                for alias in aliases:
+                    if alias in row:
+                        row[canonical] = row.get(alias)
+                        break
+        for col in ["IMP_Diff", "EV_Diff", "EV_IMP_Diff", "IMP_Loss", "EV_Loss"]:
+            row.setdefault(col, 0.0)
+        for col in required_str_cols:
+            row.setdefault(col, None)
+        severity_text = "" if row.get("Error_Severity") is None else str(row.get("Error_Severity")).strip()
+        final_family = "other" if row.get("Final_Error_Family") is None else str(row.get("Final_Error_Family"))
+        row["Error_Type"] = f"{final_family}_{severity_text}" if severity_text else final_family
+        normalized_rows.append(row)
+
+    if not normalized_rows:
+        return pl.DataFrame()
+
+    df = pl.from_dicts(normalized_rows)
+    casts: list[pl.Expr] = []
+    for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["Overbid_Luck", "Underbid_Luck", "Is_Error"]:
+            casts.append(pl.col(col).cast(pl.Float64, strict=False))
+    for col in bool_cols:
         if col in df.columns:
-            df[col] = df[col].fillna(False).astype(bool)
+            casts.append(pl.col(col).cast(pl.Boolean, strict=False).fill_null(False))
+    for col in required_str_cols + ["Error_Type"]:
+        if col in df.columns:
+            casts.append(pl.col(col).cast(pl.Utf8, strict=False))
+    if casts:
+        df = df.with_columns(casts)
+
     grouped = (
-        df.groupby(["Error_Type", "Final_Error_Family", "Error_Severity", "Decision_Error_Family"], dropna=False)
+        df.group_by(["Error_Type", "Final_Error_Family", "Error_Severity", "Decision_Error_Family"], maintain_order=True)
         .agg(
-            Boards=("Error_Type", "size"),
-            Error_Boards=("Is_Error", "sum"),
-            IMP_Diff_Total=("IMP_Diff", "sum"),
-            IMP_Diff_Mean=("IMP_Diff", "mean"),
-            IMP_Loss_Total=("IMP_Loss", "sum"),
-            EV_Diff_Total=("EV_Diff", "sum"),
-            EV_Diff_Mean=("EV_Diff", "mean"),
-            EV_Loss_Total=("EV_Loss", "sum"),
-            EV_IMP_Diff_Total=("EV_IMP_Diff", "sum"),
-            Worst_IMP_Diff=("IMP_Diff", "min"),
-            Overbid_Luck_Boards=("Overbid_Luck", "sum"),
-            Underbid_Luck_Boards=("Underbid_Luck", "sum"),
-            Avg_Luck_Swing=("Luck_Swing", "mean"),
-            Avg_Par_EV_Best=("Par_EV_Best", "mean"),
-            Avg_Par_Benchmark=("Par_Benchmark", "mean"),
+            pl.len().alias("Boards"),
+            pl.col("Is_Error").sum().alias("Error_Boards"),
+            pl.col("IMP_Diff").sum().alias("IMP_Diff_Total"),
+            pl.col("IMP_Diff").mean().alias("IMP_Diff_Mean"),
+            pl.col("IMP_Loss").sum().alias("IMP_Loss_Total"),
+            pl.col("EV_Diff").sum().alias("EV_Diff_Total"),
+            pl.col("EV_Diff").mean().alias("EV_Diff_Mean"),
+            pl.col("EV_Loss").sum().alias("EV_Loss_Total"),
+            pl.col("EV_IMP_Diff").sum().alias("EV_IMP_Diff_Total"),
+            pl.col("IMP_Diff").min().alias("Worst_IMP_Diff"),
+            pl.col("Overbid_Luck").sum().alias("Overbid_Luck_Boards"),
+            pl.col("Underbid_Luck").sum().alias("Underbid_Luck_Boards"),
+            pl.col("Luck_Swing").mean().alias("Avg_Luck_Swing"),
+            pl.col("Par_EV_Best").mean().alias("Avg_Par_EV_Best"),
+            pl.col("Par_Benchmark").mean().alias("Avg_Par_Benchmark"),
         )
-        .reset_index()
-    )
-    boards_denom = grouped["Boards"].replace(0, pd.NA)
-    grouped["Overbid_Luck_%"] = (grouped["Overbid_Luck_Boards"] / boards_denom * 100.0).round(1)
-    grouped["Underbid_Luck_%"] = (grouped["Underbid_Luck_Boards"] / boards_denom * 100.0).round(1)
-    grouped["Priority_Score"] = grouped["IMP_Loss_Total"].fillna(0.0) * 1000.0 + grouped["EV_Loss_Total"].fillna(0.0)
-    grouped = grouped.sort_values(
-        by=["Priority_Score", "IMP_Loss_Total", "Boards"],
-        ascending=[False, False, False],
-        kind="stable",
+        .with_columns(
+            pl.when(pl.col("Boards") > 0)
+            .then((pl.col("Overbid_Luck_Boards") / pl.col("Boards") * 100.0).round(1))
+            .otherwise(None)
+            .alias("Overbid_Luck_%"),
+            pl.when(pl.col("Boards") > 0)
+            .then((pl.col("Underbid_Luck_Boards") / pl.col("Boards") * 100.0).round(1))
+            .otherwise(None)
+            .alias("Underbid_Luck_%"),
+            (pl.col("IMP_Loss_Total").fill_null(0.0) * 1000.0 + pl.col("EV_Loss_Total").fill_null(0.0)).alias("Priority_Score"),
+        )
+        .sort(by=["Priority_Score", "IMP_Loss_Total", "Boards"], descending=[True, True, True])
     )
     return grouped
