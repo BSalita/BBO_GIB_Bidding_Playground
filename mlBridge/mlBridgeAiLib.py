@@ -947,14 +947,20 @@ def validate_dataframe_dtypes(
     mismatches = []
     conversions_needed = []
     
-    # Treat String/Utf8/Categorical as equivalent since they're processed identically
-    string_like_types = {'String', 'Utf8', 'Categorical'}
-    
+    # Treat String/Utf8/Categorical/Enum as equivalent — all encode to the same
+    # integer-id pathway downstream, so a column emitted as Enum at data-prep
+    # time should compare-equal to a Categorical reference in the on-disk schema.
+    string_like_types = {'String', 'Utf8', 'Categorical', 'Enum'}
+
     def normalize_dtype_str(dtype_str: str) -> str:
-        """Normalize dtype string by stripping categorical ordering specs."""
+        """Normalize dtype string by stripping categorical/enum ordering & vocab specs."""
         # Strip out ordering='physical' or ordering='lexical' from Categorical types
         if dtype_str.startswith('Categorical'):
             return 'Categorical'
+        # Enum's repr is "Enum(categories=[...])"; collapse to plain "Enum" so two
+        # equivalent enums (or an Enum vs Categorical) compare as the same dtype.
+        if dtype_str.startswith('Enum'):
+            return 'Enum'
         return dtype_str
     
     for col, expected_dtype_str in expected_dtypes.items():
@@ -1064,8 +1070,10 @@ def validate_training_dataframe_dtypes(
         dtype = df_schema[col]
         dtype_str = str(dtype)
         
-        # Features should be numeric, boolean, categorical, or string (for categoricals)
-        if not any(t in dtype_str for t in ['Float', 'Int', 'UInt', 'Boolean', 'Categorical', 'String', 'Utf8', 'Date']):
+        # Features should be numeric, boolean, categorical, enum, or string (for categoricals).
+        # `Enum` is the streaming-safe categorical that acbl_prediction_data.py emits
+        # (see TODO.md "Training pipeline does not understand pl.Enum natively").
+        if not any(t in dtype_str for t in ['Float', 'Int', 'UInt', 'Boolean', 'Categorical', 'Enum', 'String', 'Utf8', 'Date']):
             issues.append(f"Feature {col} has unsupported dtype: {dtype_str}")
     
     # Check target column
@@ -1316,31 +1324,28 @@ def build_categorical_tensor(
         # Ensure we get a proper Series, not an expression
         col_data = df.select(col).to_series()
         dtype_str = str(col_data.dtype)
-        
-        # Handle String columns by converting to string first, then mapping
-        if dtype_str in ['String', 'Utf8']:
-            # Convert nulls to string representation for checking
-            col_data = col_data.fill_null("__NULL__")
-        
-        # Check for unknown categories before mapping
+
+        # Reserved index for unknowns/nulls (matches cat_dims_from_schema: cardinality + 1)
+        unknown_idx = len(mapping)
+        has_nulls = col_data.null_count() > 0
+
+        # Check for unknown non-null categories before mapping
         unique_values = set(str(v) for v in col_data.unique().to_list() if v is not None)
         known_categories = set(mapping.keys())
         unknown_categories = unique_values - known_categories
-        
+
         if unknown_categories:
             raise ValueError(
                 f"Unknown categories found in column '{col}': {sorted(unknown_categories)}. "
                 f"Known categories from training: {sorted(known_categories)}. "
                 f"This indicates a mismatch between training and inference data."
             )
-        
-        # Map categories to indices (no default since we've verified all are known)
-        mapped = (
-            col_data
-            .replace_strict(mapping, return_dtype=pl.Int64)
-            .to_numpy()
-            .astype(np.int64)
-        )
+
+        # Map categories to indices, then assign unknown_idx to nulls
+        mapped_series = col_data.replace_strict(mapping, return_dtype=pl.Int64)
+        if has_nulls:
+            mapped_series = mapped_series.fill_null(unknown_idx)
+        mapped = mapped_series.to_numpy().astype(np.int64)
         cat_arrays.append(mapped)
     if not cat_arrays:
         return None
@@ -1495,7 +1500,11 @@ def generate_and_save_schema_core(
     def _is_date_dtype(dt: Any) -> bool:
         return dt in (pl.Date, pl.Datetime)
     def _is_categorical_dtype(dt: Any) -> bool:
-        return dt == pl.Categorical
+        # pl.Enum is a fixed-vocabulary categorical (streaming-safe). Treat it
+        # the same as pl.Categorical for feature classification — both encode
+        # to integer ids downstream.
+        enum_t = getattr(pl, 'Enum', None)
+        return dt == pl.Categorical or (enum_t is not None and isinstance(dt, enum_t))
     
     # Blacklist patterns for columns to exclude (supports regex patterns)
     if blacklist_patterns is None:
@@ -1504,9 +1513,15 @@ def generate_and_save_schema_core(
             r'player_name_[nesw]', # Specific player name columns
             r'declarer_name',      # Declarer name column
             r'^is_(train|val|test)_set$',  # Split indicator columns (metadata)
+            # Raw ID columns: act as time/venue proxies, not deal signal.
+            # event_id/session_id ranked top-10 in first-layer importance for
+            # the 2026-07 club classifiers (see acbl/RESULTS.md). The
+            # DROP_PATTERNS in acbl_prediction_data.py only drop String
+            # columns, so club's numeric IDs slip through to training --
+            # exclude them here at schema time instead.
+            r'^(event_id|session_id|group_id|session_number)$',
             # Add more regex patterns as needed:
             # r'^id$',             # Exact match for 'id' column
-            # r'.*_id$',           # Any column ending with '_id'
             # r'^temp_.*',         # Any column starting with 'temp_'
         ]
     
@@ -1852,6 +1867,7 @@ def _train_model_core(
     verbose: bool = False,
     cat_feature_info: Optional[Dict[str, int]] = None,
     save_model: bool = True,
+    early_stop_patience: int = 0,
 ) -> Tuple[Any, pathlib.Path, Dict[str, Any]]:
     """
     Purpose:
@@ -1908,9 +1924,14 @@ def _train_model_core(
     best_val = None
     train_samples_total = 0
     val_samples_total = 0
+    epochs_since_improve = 0
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    best_epoch = 0
+    epochs_run = 0
 
     training_start_time = time.time()
-    print(f"▶ Training for {epochs} epoch(s)...")
+    es_msg = f" (early stop patience={early_stop_patience})" if (early_stop_patience and validation_iterator_fn) else ""
+    print(f"▶ Training for {epochs} epoch(s){es_msg}...")
 
     for epoch in range(epochs):
         epoch_start = time.time()
@@ -1921,13 +1942,23 @@ def _train_model_core(
 
         vloss = vsamp = None
         val_pred_mean = val_pred_std = None
+        improved = False
         val_iter = validation_iterator_fn() if validation_iterator_fn else None
         if val_iter is not None:
             vtot, vcnt, val_pred_mean, val_pred_std = eval_one_epoch_with_stats(model, val_iter, loss_fn, device_t, y_range)
             vloss = vtot / max(1, vcnt)
             vsamp = vcnt
             val_samples_total = vcnt
-            best_val = vloss if (best_val is None or vloss < best_val) else best_val
+            if best_val is None or vloss < best_val:
+                best_val = vloss
+                improved = True
+                epochs_since_improve = 0
+                best_epoch = epoch + 1
+                if early_stop_patience and early_stop_patience > 0:
+                    # Snapshot best weights so we can restore them after stopping.
+                    best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                epochs_since_improve += 1
 
         if verbose or not validation_iterator_fn:
             line = format_epoch_line_with_stats(epoch, epochs, train_loss, vloss, tcount, vsamp or 0, val_pred_mean, val_pred_std)
@@ -1935,7 +1966,26 @@ def _train_model_core(
             line += f", time={epoch_dur:.1f}s"
             if isinstance(device_t, torch.device) and device_t.type == 'cuda':
                 line += f", gpu_mem={torch.cuda.memory_allocated()/1e9:.2f}/{torch.cuda.memory_reserved()/1e9:.2f}GB"
+            if vloss is not None and improved:
+                line += " *best*"
             print(line)
+
+        epochs_run = epoch + 1
+        if (
+            early_stop_patience and early_stop_patience > 0
+            and validation_iterator_fn is not None
+            and epochs_since_improve >= early_stop_patience
+        ):
+            print(f"⏹ Early stop at epoch {epochs_run}: no val_loss improvement for {epochs_since_improve} epoch(s); best={best_val:.6f} @ epoch {best_epoch}")
+            break
+
+    # Restore best weights if we tracked them
+    if best_state_dict is not None and validation_iterator_fn is not None:
+        try:
+            model.load_state_dict({k: v.to(device_t) for k, v in best_state_dict.items()})
+            print(f"✅ Restored best-val weights from epoch {best_epoch} (val_loss={best_val:.6f})")
+        except Exception as e:
+            print(f"⚠️ Failed to restore best weights: {e}")
 
     training_time = time.time() - training_start_time
 
@@ -1949,7 +1999,7 @@ def _train_model_core(
             print(f"✅ Training completed in {training_time:.1f}s")
 
     stats = make_training_stats(
-        total_epochs=epochs,
+        total_epochs=epochs_run or epochs,
         best_val_loss=best_val,
         training_time=training_time,
         train_samples=train_samples_total,
@@ -2605,6 +2655,7 @@ def create_torch_shards(
                 col_series
                 .cast(pl.Utf8)
                 .replace_strict(mapping, default=unknown_idx, return_dtype=pl.Int64)
+                .fill_null(unknown_idx)
                 .to_numpy()
                 .astype(np.int64)
             )
@@ -3147,6 +3198,7 @@ def train_model_regression_from_shards(
     weight_decay: float = 1e-4,
     verbose: bool = False,
     save_model: bool = True,
+    early_stop_patience: int = 0,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
     # Validate schema and target
     y_name = schema.get('target_column')
@@ -3230,6 +3282,7 @@ def train_model_regression_from_shards(
         verbose=verbose,
         cat_feature_info=cat_feature_info,
         save_model=save_model,
+        early_stop_patience=early_stop_patience,
     )
 
 
@@ -3246,6 +3299,8 @@ def train_model_from_shards(
     weight_decay: float = 1e-4,  # Will be adjusted for classification
     verbose: bool = False,
     save_model: bool = True,
+    early_stop_patience: int = 0,
+    class_weights: Optional[List[float]] = None,
 ):
     """
     Train model from shards using schema parameters.
@@ -3279,6 +3334,7 @@ def train_model_from_shards(
             weight_decay=weight_decay,
             verbose=verbose,
             save_model=save_model,
+            early_stop_patience=early_stop_patience,
         )
     else:
         # Auto-adjust parameters for classification
@@ -3298,6 +3354,8 @@ def train_model_from_shards(
             weight_decay=classification_weight_decay,
             verbose=verbose,
             save_model=save_model,
+            early_stop_patience=early_stop_patience,
+            class_weights=class_weights,
         )
 
 
@@ -3315,6 +3373,8 @@ def train_classification_from_iterator(
     use_amp: bool = True,
     seed: Optional[int] = None,
     verbose: bool = False,
+    early_stop_patience: int = 0,
+    class_weights: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     """
     Train a classification model using iterator functions for data loading.
@@ -3349,7 +3409,27 @@ def train_classification_from_iterator(
             print(f"[GPU] Initial memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = torch.nn.CrossEntropyLoss()
+    if class_weights is not None and len(class_weights) == num_classes:
+        cw_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device_t)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=cw_tensor)
+        if verbose:
+            cw_arr = np.asarray(class_weights, dtype=np.float32)
+            print(f"[CLS] Using class-weighted CE: n_classes={num_classes}, "
+                  f"weight min={cw_arr.min():.3f} max={cw_arr.max():.3f} mean={cw_arr.mean():.3f}")
+    else:
+        if class_weights is not None:
+            print(f"[CLS] Ignoring class_weights (len={len(class_weights)} != num_classes={num_classes})")
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+    best_val_loss: Optional[float] = None
+    epochs_since_improve = 0
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    best_epoch = 0
+    epochs_run = 0
+    stopped_early = False
+
+    if verbose and early_stop_patience and val_iterator_fn is not None:
+        print(f"[CLS] Early stopping enabled: patience={early_stop_patience}")
 
     model.train()
     for epoch in range(epochs):
@@ -3389,28 +3469,62 @@ def train_classification_from_iterator(
             with torch.no_grad():
                 preds = torch.argmax(logits, dim=-1)
                 correct += (preds == yb).sum().item()
+        train_loss = total_loss / max(1, total_count)
+        train_acc = correct / max(1, total_count)
+        epoch_dur = time.time() - epoch_start
+
+        # Always run per-epoch validation when val iterator is available so early stopping works.
+        epoch_val_loss: Optional[float] = None
+        improved = False
+        if val_iterator_fn is not None:
+            model.eval()
+            with torch.no_grad():
+                val_loss_sum, val_count, val_acc, val_conf_mean, val_conf_std = eval_classification_with_stats(
+                    model, val_iterator_fn(), loss_fn, device_t
+                )
+                epoch_val_loss = val_loss_sum / max(1, val_count)
+            model.train()
+            if best_val_loss is None or epoch_val_loss < best_val_loss:
+                best_val_loss = epoch_val_loss
+                improved = True
+                epochs_since_improve = 0
+                best_epoch = epoch + 1
+                if early_stop_patience and early_stop_patience > 0:
+                    best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                epochs_since_improve += 1
+        else:
+            val_acc = val_count = val_conf_mean = val_conf_std = None
+
         if verbose:
-            train_loss = total_loss/max(1,total_count)
-            train_acc = correct/max(1,total_count)
-            epoch_dur = time.time() - epoch_start
-            
-            # Enhanced logging for classification
             line = f"Epoch {epoch+1}/{epochs}, train_loss={train_loss:.6f}, train_acc={train_acc:.4f}, time={epoch_dur:.1f}s"
-            
-            # Add validation stats if available (per-epoch validation)
-            if val_iterator_fn is not None:
-                model.eval()
-                with torch.no_grad():
-                    val_loss, val_count, val_acc, val_conf_mean, val_conf_std = eval_classification_with_stats(
-                        model, val_iterator_fn(), loss_fn, device_t
-                    )
-                    val_loss = val_loss / max(1, val_count)
-                    line += f", val_loss={val_loss:.6f}, val_acc={val_acc:.4f}, val_samples={val_count}"
-                    if val_conf_mean is not None and val_conf_std is not None:
-                        line += f", val_conf_mean={val_conf_mean:.4f}, val_conf_std={val_conf_std:.4f}"
-                model.train()  # Switch back to training mode
-            
+            if epoch_val_loss is not None:
+                line += f", val_loss={epoch_val_loss:.6f}, val_acc={val_acc:.4f}, val_samples={val_count}"
+                if val_conf_mean is not None and val_conf_std is not None:
+                    line += f", val_conf_mean={val_conf_mean:.4f}, val_conf_std={val_conf_std:.4f}"
+                if improved:
+                    line += " *best*"
             print(line)
+
+        epochs_run = epoch + 1
+        if (
+            early_stop_patience and early_stop_patience > 0
+            and val_iterator_fn is not None
+            and epochs_since_improve >= early_stop_patience
+        ):
+            print(f"[CLS] ⏹ Early stop at epoch {epochs_run}: no val_loss improvement for "
+                  f"{epochs_since_improve} epoch(s); best={best_val_loss:.6f} @ epoch {best_epoch}")
+            stopped_early = True
+            break
+
+    # Restore best weights if we tracked them
+    if best_state_dict is not None and val_iterator_fn is not None:
+        try:
+            model.load_state_dict({k: v.to(device_t) for k, v in best_state_dict.items()})
+            if verbose:
+                print(f"[CLS] ✅ Restored best-val weights from epoch {best_epoch} (val_loss={best_val_loss:.6f})")
+        except Exception as e:
+            print(f"[CLS] ⚠️ Failed to restore best weights: {e}")
 
     val_metrics: Optional[Dict[str, float]] = None
     if val_iterator_fn is not None:
@@ -3456,6 +3570,8 @@ def train_model_classification_from_shards(
     seed: Optional[int] = None,
     verbose: bool = False,
     save_model: bool = True,
+    early_stop_patience: int = 0,
+    class_weights: Optional[List[float]] = None,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
     """
     Train a classifier from shard files created by create_torch_shards.
@@ -3547,6 +3663,8 @@ def train_model_classification_from_shards(
         use_amp=use_amp,
         seed=seed,
         verbose=verbose,
+        early_stop_patience=early_stop_patience,
+        class_weights=class_weights,
     )
 
     # Save model if requested
@@ -5043,21 +5161,64 @@ def analyze_prediction_results_regression(
                             print(f"⚠️  Plotting failed: {plot_error}")
                         analysis_results['plot_error'] = str(plot_error)
 
-                # Generate conclusion
+                # Generate conclusion based on data quality AND real prediction quality.
+                # "Valid predictions %" alone is just a sanity check that the inference pipeline
+                # produced non-null outputs — it does not measure model quality. Combine it with
+                # the variance ratio (pred_std/actual_std) and MAE to gate the banner honestly.
                 data_quality_good = valid_count >= len(results_df) * 0.8
                 analysis_results['data_quality_good'] = data_quality_good
 
+                actual_std = actual_stats['std']
+                pred_std = pred_stats['std']
+                variance_ratio = (pred_std / actual_std) if actual_std and actual_std > 0 else float('nan')
+                analysis_results['variance_ratio'] = variance_ratio
+
+                # Quality bands for the variance ratio (closer to 1.0 is better):
+                #   <0.3 severe underfit, 0.3-0.5 moderate underfit, 0.5-1.2 healthy, >1.2 likely overfit
+                if not np.isfinite(variance_ratio):
+                    variance_label = "unknown"
+                elif variance_ratio < 0.3:
+                    variance_label = "severe underfit"
+                elif variance_ratio < 0.5:
+                    variance_label = "moderate underfit"
+                elif variance_ratio <= 1.2:
+                    variance_label = "healthy"
+                else:
+                    variance_label = "possibly overfit"
+                analysis_results['variance_label'] = variance_label
+
+                # MAE bands are target-scale-dependent. For a target on roughly [0,1] (e.g. Pct_NS)
+                # MAE under 0.20 is solid, 0.20-0.30 is mediocre, >0.30 is poor.
+                # Use actual_std as a unit-free proxy when target scale is unknown.
+                mae = error_stats['mae']
+                mae_vs_std = (mae / actual_std) if actual_std and actual_std > 0 else float('nan')
+                analysis_results['mae_vs_std'] = mae_vs_std
+
+                model_quality_good = (
+                    data_quality_good
+                    and np.isfinite(variance_ratio)
+                    and variance_ratio >= 0.5
+                    and (not np.isfinite(mae_vs_std) or mae_vs_std <= 1.0)
+                )
+                analysis_results['model_quality_good'] = model_quality_good
+
                 if verbose:
                     print(f"\n🎯 CONCLUSION:")
-                    if data_quality_good:
-                        print(f"✅ The model is working well!")
-                        print(f"✅ Good data quality: {valid_count:,}/{len(results_df):,} valid predictions ({valid_count/len(results_df)*100:.1f}%)")
-                        print(f"✅ Prediction variance: {pred_stats['std']:.6f}")
-                        print(f"✅ Error rates: MAE = {error_stats['mae']:.6f}")
+                    print(f"   Data validity: {valid_count:,}/{len(results_df):,} ({valid_count/len(results_df)*100:.1f}%) — pipeline check, not accuracy")
+                    print(f"   Variance ratio (pred_std/actual_std): {variance_ratio:.3f} → {variance_label}")
+                    print(f"   MAE: {mae:.6f}  (MAE/actual_std = {mae_vs_std:.3f})")
+                    if not data_quality_good:
+                        print(f"   ⚠️  Data quality issue: {nan_count_pred:,} null predictions need investigation")
+                    if model_quality_good:
+                        print(f"   ✅ Model quality looks healthy.")
+                    elif data_quality_good and np.isfinite(variance_ratio) and variance_ratio < 0.3:
+                        print(f"   ⚠️  Model is severely underfitting — predictions collapse near the mean.")
+                    elif data_quality_good and np.isfinite(variance_ratio) and variance_ratio < 0.5:
+                        print(f"   ⚠️  Model is moderately underfitting — needs more capacity, less regularization, or better features.")
+                    elif data_quality_good and np.isfinite(variance_ratio) and variance_ratio > 1.2:
+                        print(f"   ⚠️  Predicted variance exceeds actual — possible overfit or target leakage.")
                     else:
-                        print(f"⚠️  Model has data quality issues:")
-                        print(f"⚠️  Only {valid_count:,}/{len(results_df):,} valid predictions ({valid_count/len(results_df)*100:.1f}%)")
-                        print(f"⚠️  {nan_count_pred:,} NaN predictions need investigation")
+                        print(f"   ⚠️  Model quality is below threshold (see metrics above).")
 
             else:
                 error_msg = "No valid prediction pairs found!"
@@ -5279,7 +5440,14 @@ def _create_classification_plots(y_true, y_pred, confusion_matrix, labels, per_c
         ax2.set_ylabel('Frequency')
         ax2.legend()
         plt.tight_layout()
-        plt.show()
+        # Non-blocking display: a plain plt.show() here stalled unattended
+        # pipeline runs until the figure window was manually closed
+        # (observed 2026-07-11 during acbl_prediction_train.py).
+        try:
+            plt.show(block=False)
+            plt.pause(0.001)
+        except TypeError:
+            plt.show()
 
 
 def analyze_prediction_results_classification(
@@ -5408,6 +5576,15 @@ def analyze_prediction_results_classification(
                 hits += 1
         topk_accuracy = hits / max(1, total)
 
+    # Compare against the majority-class baseline so we know the model adds signal.
+    n_classes = len(labels)
+    valid_truths = [t for t in y_true if t is not None]
+    baseline_acc = 0.0
+    if valid_truths:
+        from collections import Counter
+        majority_label, majority_count = Counter(valid_truths).most_common(1)[0]
+        baseline_acc = majority_count / len(valid_truths)
+
     # Print results if verbose
     if verbose:
         print("=== Classification Analysis Results ===")
@@ -5417,8 +5594,22 @@ def analyze_prediction_results_classification(
         print(f"Macro F1: {macro_f1:.4f}")
         if topk_accuracy is not None:
             print(f"Top-k Accuracy: {topk_accuracy:.4f}")
-        print(f"Number of Classes: {len(labels)}")
+        print(f"Number of Classes: {n_classes}")
         print(f"Total Samples: {len(y_true)}")
+        # Honest banner: compare against majority-class baseline (lower bound for "useful")
+        # and a uniform-random baseline (1/n_classes) for context.
+        random_acc = 1.0 / max(1, n_classes)
+        lift_over_majority = accuracy - baseline_acc
+        print(f"\n🎯 CONCLUSION:")
+        print(f"   Majority-class baseline accuracy: {baseline_acc:.4f}")
+        print(f"   Random-guess baseline accuracy:   {random_acc:.4f}")
+        print(f"   Lift over majority baseline:      {lift_over_majority:+.4f}")
+        if accuracy >= baseline_acc + 0.05 and macro_f1 >= 0.20:
+            print(f"   ✅ Model is meaningfully better than majority-class baseline.")
+        elif accuracy <= baseline_acc + 0.005:
+            print(f"   ⚠️  Model is no better than always predicting the majority class.")
+        else:
+            print(f"   ⚠️  Model adds limited signal over the majority-class baseline.")
 
     # Create plots if requested
     if create_plots:
@@ -5443,6 +5634,8 @@ def analyze_prediction_results_classification(
         'per_class': per_class,
         'confusion_matrix': cm,
         'topk_accuracy': topk_accuracy,
+        'baseline_accuracy': baseline_acc,
+        'lift_over_majority': accuracy - baseline_acc,
     }
 
 
@@ -5475,14 +5668,40 @@ def display_feature_importances_regression(
     categorical_feature_cols = schema.get('categorical_feature_cols', [])
     cat_feature_info = schema.get('cat_feature_info', {})
 
-    # Compute expected embedding output dims
-    emb_dims = {col: (min(50, int(cat_feature_info.get(col, 0)) // 2) if int(cat_feature_info.get(col, 0)) > 0 else 0)
-                for col in categorical_feature_cols}
-    expected_input_dim = len(numerical_feature_cols) + sum(emb_dims.values())
-
     # Load state dict and find first 2D weight
     state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
     weight_candidates = [(k, v) for k, v in state_dict.items() if torch.is_tensor(v) and v.ndim == 2]
+
+    # Auto-detect feature-handling style: regression-style models use learned embeddings
+    # (state_dict has 'embeddings.*.weight' keys), while the classification trainer concats
+    # raw categorical ints as floats (one column per categorical feature).
+    embedding_weight_keys = [k for k in state_dict.keys() if k.startswith('embeddings.') and k.endswith('.weight')]
+    uses_embeddings = len(embedding_weight_keys) > 0
+
+    if uses_embeddings:
+        # Derive embedding output dims directly from the checkpoint to avoid drift between
+        # schema-computed cardinalities and what the model was actually trained with.
+        def _emb_idx(name: str) -> int:
+            try:
+                return int(name.split('.')[1])
+            except Exception:
+                return 0
+        embedding_weight_keys.sort(key=_emb_idx)
+        emb_dim_list: List[int] = []
+        for k in embedding_weight_keys:
+            w = state_dict[k]
+            if torch.is_tensor(w) and w.ndim == 2:
+                emb_dim_list.append(int(w.shape[1]))
+        # Pad/truncate to align with the schema's categorical column ordering
+        while len(emb_dim_list) < len(categorical_feature_cols):
+            emb_dim_list.append(0)
+        emb_dim_list = emb_dim_list[:len(categorical_feature_cols)]
+        emb_dims = {col: dim for col, dim in zip(categorical_feature_cols, emb_dim_list)}
+        expected_input_dim = len(numerical_feature_cols) + sum(emb_dim_list)
+    else:
+        # Direct-concat style (classification path): one input per categorical feature
+        emb_dims = {col: 1 for col in categorical_feature_cols}
+        expected_input_dim = len(numerical_feature_cols) + len(categorical_feature_cols)
 
     first_key, first_weight = None, None
     for preferred in ('layers.0.weight', 'model.0.weight'):
@@ -5508,10 +5727,14 @@ def display_feature_importances_regression(
 
     # Build feature names expanded to embedding dims, then align to in_features
     expanded_embed_names = []
-    for col in categorical_feature_cols:
-        d = emb_dims.get(col, 0)
-        if d > 0:
-            expanded_embed_names.extend([f"_EMBEDDED_CAT_{col}_{i}" for i in range(d)])
+    if uses_embeddings:
+        for col in categorical_feature_cols:
+            d = emb_dims.get(col, 0)
+            if d > 0:
+                expanded_embed_names.extend([f"_EMBEDDED_CAT_{col}_{i}" for i in range(d)])
+    else:
+        # Direct concat: each categorical column contributes one input named after itself
+        expanded_embed_names = [f"_CAT_{col}" for col in categorical_feature_cols]
     feature_names = numerical_feature_cols + expanded_embed_names
 
     if len(feature_names) < in_features:

@@ -1,5 +1,222 @@
+import time
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+
+import requests
 import polars as pl
 from endplay.types import Deal # only used to correct and validate pbns. pbn == Deal(pbn).to_pbn()
+
+# ----------------------------------------------------------------------------------
+# FFBridge API client (shared by ffbridge-postmortem and Elo_Ratings via junctions)
+# ----------------------------------------------------------------------------------
+#
+# Streamlit-free by design: apps layer their own session-state, caching, and UI
+# error reporting on top.
+#
+# Backends:
+# - Classic (api.ffbridge.fr/api/v1): the pre-2026 API. Currently returns 503 for
+#   most endpoints; kept for when/if it comes back.
+# - Lancelot (api-lancelot.ffbridge.fr): the API behind www.ffbridge.fr. Public
+#   endpoints (rankings, scores, session lists) need no auth; person/user endpoints
+#   need a Firebase bearer token.
+#
+# ID semantics (Lancelot):
+# - id: Lancelot person id (used by lineup/team player records)
+# - migrationId: the Classic API person_id
+# - ffbId: the FFBridge license number
+#
+# Endpoint gotchas discovered empirically (see FFBRIDGE_LANCELOT_API.md):
+# - /persons/search: the 'search' param is silently ignored; use 'name' or 'ffbId'.
+# - /results/search: the competition-type filter param is 'competitionType'.
+# - /results/teams/{t}/session/{s}/scores: lineup players expose id/migrationId only
+#   (no ffbId), and startTableNumber is null; get table numbers from the ranking.
+
+CLASSIC_API_BASE = "https://api.ffbridge.fr/api/v1"
+LANCELOT_API_BASE = "https://api-lancelot.ffbridge.fr"
+
+# Public Firebase web API key used by www.ffbridge.fr's SPA for password sign-in.
+FIREBASE_API_KEY = "AIzaSyBjiLwewyM5PhXhfDSir5Cxvut0Yg4lYFQ"
+FIREBASE_SIGNIN_URL = (
+    f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+)
+
+DEFAULT_API_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "origin": "https://www.ffbridge.fr",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
+
+# Lancelot simultaneous-series id -> migration (Classic series) id.
+LANCELOT_TO_MIGRATION = {
+    1: 3,     # Rondes de France
+    2: 4,     # Trophées du Voyage
+    3: 5,     # Roy René
+    17: 140,  # Amour du Bridge
+    25: 384,  # Simultanet
+    27: 386,  # Simultané Octopus
+    47: 604,  # Atout Simultané
+    62: 868,  # Festival des Simultanés
+}
+MIGRATION_TO_LANCELOT = {v: k for k, v in LANCELOT_TO_MIGRATION.items()}
+
+
+def classic_api_url(path: str) -> str:
+    """Build a Classic API URL from a path (leading slash optional)."""
+    return f"{CLASSIC_API_BASE}/{path.lstrip('/')}"
+
+
+def lancelot_api_url(path: str) -> str:
+    """Build a Lancelot API URL from a path (leading slash optional)."""
+    return f"{LANCELOT_API_BASE}/{path.lstrip('/')}"
+
+
+def normalize_club_code(code: Any) -> str:
+    """Normalize club codes (e.g. Lancelot simultaneousId) by stripping leading zeros."""
+    if code is None:
+        return ""
+    s = str(code).strip()
+    if not s or s.lower() == 'none':
+        return ""
+    norm = s.lstrip('0')
+    return norm if norm else '0'
+
+
+def lancelot_get(
+    path: str,
+    *,
+    token: Optional[str] = None,
+    params: Optional[Dict] = None,
+    session: Optional[requests.Session] = None,
+    timeout: float = 30,
+    rate_limit_delay: float = 0.0,
+    retry_on_429: bool = True,
+    verbose: bool = False,
+) -> Any:
+    """GET a Lancelot API path and return parsed JSON. Raises on HTTP errors.
+
+    Args:
+        path: path portion, leading slash optional (e.g. 'persons/search?name=x')
+        token: Lancelot bearer token for authenticated endpoints
+        params: optional query params dict (alternative to inlining them in path)
+        session: optional requests.Session to reuse connections
+        timeout: request timeout in seconds
+        rate_limit_delay: sleep this many seconds before the request (bulk politeness)
+        retry_on_429: on HTTP 429, wait 5s and retry once
+    """
+    url = lancelot_api_url(path)
+    headers = dict(DEFAULT_API_HEADERS)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if rate_limit_delay > 0:
+        time.sleep(rate_limit_delay)
+    if verbose:
+        print(f"[Lancelot] GET {url}", flush=True)
+    getter = session.get if session is not None else requests.get
+    response = getter(url, headers=headers, params=params, timeout=timeout)
+    if response.status_code == 429 and retry_on_429:
+        if verbose:
+            print(f"[Lancelot] HTTP 429, retrying in 5s: {url}", flush=True)
+        time.sleep(5)
+        response = getter(url, headers=headers, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def probe_ffbridge_health(timeout: float = 3) -> Dict[str, Dict[str, Any]]:
+    """Probe both backends and report {'classic'|'lancelot': {'ok': bool, 'detail': str}}.
+
+    A 401/403 still means the service is up (endpoint just wants auth); 5xx means down.
+    """
+    health = {}
+    probes = {
+        'classic': classic_api_url('clubs'),
+        'lancelot': lancelot_api_url('public/version'),
+    }
+    for source, url in probes.items():
+        try:
+            response = requests.get(url, timeout=timeout)
+            health[source] = {
+                'ok': response.status_code < 500,
+                'detail': f"HTTP {response.status_code}",
+            }
+        except requests.exceptions.RequestException as e:
+            health[source] = {'ok': False, 'detail': type(e).__name__}
+    return health
+
+
+def firebase_sign_in(email: str, password: str, timeout: float = 15) -> str:
+    """Sign in to FFBridge's Firebase auth and return a fresh Lancelot bearer token (idToken).
+
+    This is the same flow the www.ffbridge.fr SPA uses. Raises on failure.
+    """
+    response = requests.post(
+        FIREBASE_SIGNIN_URL,
+        json={"returnSecureToken": True, "email": email, "password": password, "clientType": "CLIENT_TYPE_WEB"},
+        headers={"content-type": "application/json", "origin": "https://www.ffbridge.fr"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()['idToken']
+
+
+def get_persons_me(token: str) -> Dict[str, Any]:
+    """Return the logged-in person record (id, migrationId, ffbId, names, ...)."""
+    return lancelot_get('persons/me', token=token)
+
+
+def get_easi_token(token: str) -> Optional[str]:
+    """Derive an EASI token (used by the Classic API) from a valid Lancelot session."""
+    easi_token = lancelot_get('users/me/easi-token', token=token)
+    if isinstance(easi_token, dict):
+        easi_token = easi_token.get('token') or easi_token.get('easi_token')
+    return easi_token
+
+
+def search_persons(query: str, token: str) -> List[Dict[str, Any]]:
+    """Search persons by license number or name; returns the raw items list.
+
+    Numeric queries use the ffbId param (exact license lookup); everything else uses
+    the name param. The documented 'search' param is ignored by the API and returns
+    unrelated rows, so it is never used.
+    """
+    q = (query or '').strip()
+    if q.isdigit():
+        json_data = lancelot_get(f"persons/search?ffbId={q.lstrip('0') or q}", token=token)
+    else:
+        json_data = lancelot_get(f"persons/search?name={quote(q)}", token=token)
+    return json_data.get('items', [])
+
+
+def get_session_ranking(session_id: int, token: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]:
+    """Ranking for a session: one entry per team with players, scores, tableNumber, simultaneousId."""
+    return lancelot_get(f"results/sessions/{session_id}/ranking", token=token, **kwargs)
+
+
+def get_team_session_scores(team_id: int, session_id: int, token: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]:
+    """Board-level scores for a team in a session (PBN deals, lineups, score frequencies)."""
+    return lancelot_get(f"results/teams/{team_id}/session/{session_id}/scores", token=token, **kwargs)
+
+
+def get_session_simultaneous_ids(session_id: int, token: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]:
+    """Clubs (id, ffbCode, label) that participated in a simultaneous session."""
+    return lancelot_get(f"results/sessions/{session_id}/simultaneousIds", token=token, **kwargs)
+
+
+def get_simultaneous_sessions_page(
+    lancelot_series_id: int,
+    page: int = 1,
+    per_page: int = 80,
+    token: Optional[str] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """One page of sessions for a simultaneous series; returns {'items': [...], 'pagination': {...}}."""
+    return lancelot_get(
+        f"competitions/simultaneous/{lancelot_series_id}/sessions",
+        params={"currentPage": page, "maxPerPage": per_page},
+        token=token,
+        **kwargs,
+    )
+
 
 iVulToVul_d = { # todo: make enum?
     0:'None',
@@ -475,10 +692,12 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
                     pl.col('contract').str.replace('NT', 'N').str.slice(2), # double
                     pl.col('declarer'),
                 ]))
-            .when(pl.col('contract').eq('PASS'))
+            .when(pl.col('contract').str.to_uppercase().str.starts_with('PASS')) # e.g. 'PASS' or 'passe' or 'PASSE'
             .then(pl.lit('PASS'))
             .otherwise(None) # catch all for invalid contracts.
             .alias('Contract'),
+        # 'O' (Ouest) guards against French direction notation; the data is normally English N/E/S/W.
+        pl.col('declarer').replace('O', 'W').alias('Declarer'),
         pl.when(pl.col('result').str.starts_with('+'))
             .then(pl.col('result').str.slice(1))  # Remove '+'
             .when(pl.col('result').str.starts_with('-'))
@@ -490,6 +709,8 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
         # although this may be an issue for director adjustments. Creating new columns (Score_NS and Score_EW) with opposite signs.
         pl.when(pl.col('nsScore').str.contains(r'^\d+$'))
             .then(pl.col('nsScore'))
+            .when(pl.col('nsScore').str.to_uppercase().str.starts_with('PASS') | pl.col('ewScore').str.to_uppercase().str.starts_with('PASS'))
+            .then(pl.lit('0'))
             .when(pl.col('ewScore').str.contains(r'^\d+$'))
             .then('-'+pl.col('ewScore'))
             .otherwise(pl.lit(None))
@@ -497,6 +718,8 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
             .alias('Score_NS'),
         pl.when(pl.col('ewScore').str.contains(r'^\d+$'))
             .then(pl.col('ewScore'))
+            .when(pl.col('nsScore').str.to_uppercase().str.starts_with('PASS') | pl.col('ewScore').str.to_uppercase().str.starts_with('PASS'))
+            .then(pl.lit('0'))
             .when(pl.col('nsScore').str.contains(r'^\d+$'))
             .then('-'+pl.col('nsScore'))
             .otherwise(pl.lit(None))
@@ -515,14 +738,16 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
         (pl.col('lineup_eastPlayer_firstName')+pl.lit(' ')+pl.col('lineup_eastPlayer_lastName')).alias('Player_Name_E'),
         (pl.col('lineup_southPlayer_firstName')+pl.lit(' ')+pl.col('lineup_southPlayer_lastName')).alias('Player_Name_S'),
         (pl.col('lineup_westPlayer_firstName')+pl.lit(' ')+pl.col('lineup_westPlayer_lastName')).alias('Player_Name_W'),
-        pl.col('lineup_northPlayer_id'),
-        pl.col('lineup_eastPlayer_id'),
-        pl.col('lineup_southPlayer_id'),
-        pl.col('lineup_westPlayer_id'),
-        pl.col('lineup_northPlayer_ffbId').cast(pl.String).alias('Player_ID_N'),
-        pl.col('lineup_eastPlayer_ffbId').cast(pl.String).alias('Player_ID_E'),
-        pl.col('lineup_southPlayer_ffbId').cast(pl.String).alias('Player_ID_S'),
-        pl.col('lineup_westPlayer_ffbId').cast(pl.String).alias('Player_ID_W'),
+        # Lancelot person ids (the scores endpoint no longer returns ffbId per lineup player).
+        # Cast through Int64 because pandas normalization makes these float when nulls exist (sitouts).
+        pl.col('lineup_northPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('lineup_northPlayer_id'),
+        pl.col('lineup_eastPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('lineup_eastPlayer_id'),
+        pl.col('lineup_southPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('lineup_southPlayer_id'),
+        pl.col('lineup_westPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('lineup_westPlayer_id'),
+        pl.col('lineup_northPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('Player_ID_N'),
+        pl.col('lineup_eastPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('Player_ID_E'),
+        pl.col('lineup_southPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('Player_ID_S'),
+        pl.col('lineup_westPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('Player_ID_W'),
         pl.col('lineup_segment_game_homeTeam_id').alias('team_id_home'),
         pl.col('lineup_segment_game_homeTeam_section').alias('section_id_home'),
         pl.col('lineup_segment_game_homeTeam_orientation').alias('Pair_Direction_Home'),
@@ -580,10 +805,24 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
     #assert df['Pair_Number_NS'].is_not_null().all()
     #assert df['Pair_Number_EW'].is_not_null().all()
 
+    def _expand_scores(x):
+        # substitute None for adjusted scores (begin with %); PASSE/passe are French pass-outs.
+        expanded = []
+        for score_ns, score_ew, freq in zip(x['Scores_List_NS'], x['Scores_List_EW'], x['Score_Freq_List']):
+            if '%' in score_ns or '%' in score_ew:
+                value = None
+            elif score_ns.upper().startswith('PASS') or score_ew.upper().startswith('PASS'):
+                value = 0
+            elif len(score_ns):
+                value = int(score_ns)
+            else:
+                value = int('-' + score_ew)
+            expanded.extend([value] * freq)
+        return expanded
+
     df = df.with_columns(
         pl.struct(['Scores_List_NS', 'Scores_List_EW', 'Score_Freq_List'])
-            # substitute None for adjusted scores (begin with %).
-            .map_elements(lambda x: [None if '%' in score_ns or '%' in score_ew else 0 if score_ns == 'PASS' or score_ew == 'PASS' else int(score_ns) if len(score_ns) else int('-'+score_ew) for score_ns, score_ew, freq in zip(x['Scores_List_NS'], x['Scores_List_EW'], x['Score_Freq_List']) for _ in range(freq)],return_dtype=pl.List(pl.Int16))
+            .map_elements(_expand_scores, return_dtype=pl.List(pl.Int16))
             .alias('Expanded_Scores_List')
     )
     df = df.with_columns(

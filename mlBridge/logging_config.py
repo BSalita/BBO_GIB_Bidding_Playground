@@ -5,6 +5,7 @@ Provides consistent logging with timestamp, function name, and log level.
 
 import logging
 import inspect
+import time
 from datetime import datetime
 from functools import wraps
 import sys
@@ -123,3 +124,43 @@ def init_project_logging(log_file=None, level=logging.INFO):
         level: Default logging level
     """
     return setup_logger('ml_bridge', level=level, log_file=log_file)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-script timing banners
+# ---------------------------------------------------------------------------
+# Used by acbl_*.py (and any other pipeline entry-point) to print a uniform
+# Started/Ended/elapsed banner so consolidated chain logs are easy to scan and
+# grep. Plain print()s on purpose: pipeline scripts often run before
+# init_project_logging() is configured, and the banners need to land on stdout
+# regardless of root-logger state.
+#
+# Usage at the top of `if __name__ == "__main__":`
+#     from mlBridge import print_started, print_ended
+#     program_start_time = print_started()
+#     ...
+#     print_ended(program_start_time)
+#
+# For scripts that wrap their work in try/except, put print_ended() in the
+# finally clause so a crashed run still logs how long it ran before failing.
+
+def print_started(label: str = "Started") -> float:
+    """Print 'Started: <timestamp>' and return the start time as a float."""
+    t0 = time.time()
+    print(f"{label}: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t0))}",
+          flush=True)
+    return t0
+
+
+def print_ended(t0: float, label: str = "Ended") -> float:
+    """Print 'Ended: <timestamp>' and 'Program elapsed time: ...' then return the elapsed seconds."""
+    t1 = time.time()
+    elapsed = t1 - t0
+    print(f"{label}:   {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t1))}",
+          flush=True)
+    print(
+        f"Program elapsed time: {elapsed:.1f}s "
+        f"({elapsed/60:.1f}min, {elapsed/3600:.2f}h)",
+        flush=True,
+    )
+    return elapsed
