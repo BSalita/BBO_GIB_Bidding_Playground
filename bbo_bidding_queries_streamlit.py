@@ -43,6 +43,11 @@ import re
 from typing import Any, Dict, List, Literal, Optional, Set
 from urllib.parse import quote, unquote, urljoin, urlparse
 
+_APP_DIR = pathlib.Path(__file__).resolve().parent
+for _p in (_APP_DIR, _APP_DIR / 'mlBridge', _APP_DIR / 'streamlitlib'):
+    if _p.is_dir() and str(_p) not in sys.path:
+        sys.path.append(str(_p))
+
 import plotly.graph_objects as go  # type: ignore[import-not-found]
 import mlBridge.mlBridgeLib as mlBridgeLib
 
