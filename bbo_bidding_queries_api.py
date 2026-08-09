@@ -1,4 +1,4 @@
-"""
+﻿"""
 Main FastAPI server for BBO bidding queries.
 
 This service loads bidding data (bt_seat1_df and deal_df), exposes HTTP
@@ -74,6 +74,33 @@ from pydantic import BaseModel
 from endplay.types import Deal, Vul, Player
 from endplay.dds import calc_dd_table, par
 
+
+_APP_DIR = pathlib.Path(__file__).resolve().parent
+_SRC_DIR = _APP_DIR.parent
+_REQUIRED_LIBS = ('mlBridge', 'streamlitlib', 'chatlib')
+_resolved_libs = []
+for _name in _REQUIRED_LIBS:
+    _local, _sibling = _APP_DIR / _name, _SRC_DIR / _name
+    if _local.is_dir():
+        _resolved_libs.append(_local)
+    elif _sibling.is_dir():
+        _resolved_libs.append(_sibling)
+    else:
+        raise FileNotFoundError(f"{_name} not found at {_local} or {_sibling}")
+# Package root for import mlBridge.*; lib dirs first for legacy import streamlitlib/acbllib.
+for _p in (_SRC_DIR, _APP_DIR):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.append(_s)
+for _p in _resolved_libs:
+    _s = str(_p)
+    if _p.name == 'mlBridge':
+        if _s not in sys.path:
+            sys.path.append(_s)  # logging_config and friends
+    else:
+        if _s in sys.path:
+            sys.path.remove(_s)
+        sys.path.insert(0, _s)
 from mlBridge.mlBridgeBiddingLib import (
     DIRECTIONS,
     load_deal_df,
@@ -527,7 +554,7 @@ print(f"dataPath: {dataPath} (exists)")
 
 exec_plan_file = dataPath.joinpath("bbo_bt_execution_plan_data.pkl")
 # Use source deals file (16M rows) instead of CPU-pipeline matches file (10K rows)
-# Deal→BT mapping comes from bbo_deal_to_bt_verified.parquet (GPU pipeline output)
+# Dealâ†’BT mapping comes from bbo_deal_to_bt_verified.parquet (GPU pipeline output)
 bbo_mldf_augmented_file = dataPath.joinpath("bbo_mldf_augmented.parquet")
 bt_seat1_file = dataPath.joinpath("bbo_bt_compiled.parquet")  # Pre-compiled BT with learned rules baked in
 bt_augmented_file = dataPath.joinpath("bbo_bt_augmented.parquet")  # Full bidding table (all seats/prefixes)
@@ -541,7 +568,7 @@ auction_criteria_file = dataPath.joinpath("bbo_custom_auction_criteria.csv")
 new_rules_file = dataPath.joinpath("bbo_bt_new_rules.parquet")
 # Precomputed deal-to-BT verified index (GPU pipeline output, optional)
 deal_to_bt_verified_file = dataPath.joinpath("bbo_deal_to_bt_verified.parquet")
-# Optional: precomputed deal_idx -> Par_Indexes (subset of verified deal→BT matches)
+# Optional: precomputed deal_idx -> Par_Indexes (subset of verified dealâ†’BT matches)
 deal_to_bt_par_verified_file = dataPath.joinpath("bbo_deal_to_bt_par_verified.parquet")
 bt_trick_dist_file = dataPath.joinpath("bt_trick_dist_gpu_v1.parquet")
 bt_hand_profile_file = dataPath.joinpath("bt_hand_profile_gpu_v1.parquet")
@@ -1081,7 +1108,7 @@ class StatusResponse(BaseModel):
     bt_df_rows: Optional[int] = None
     deal_df_rows: Optional[int] = None
     loading_step: Optional[str] = None  # Current loading step
-    loaded_files: Optional[Dict[str, Any]] = None  # File name -> info string (e.g., "1,234 rows × 45 cols (100.5 MB)")
+    loaded_files: Optional[Dict[str, Any]] = None  # File name -> info string (e.g., "1,234 rows Ã— 45 cols (100.5 MB)")
 
 
 def _format_bytes(size_bytes: int | float) -> str:
@@ -1166,7 +1193,7 @@ def _file_sig(path: pathlib.Path) -> Dict[str, Any]:
         raise FileNotFoundError(f"Required source file not found: {path}")
     st = path.stat()
     return {
-        "path": path.name,  # filename only – portable across machines
+        "path": path.name,  # filename only â€“ portable across machines
         "size": int(st.st_size),
         "mtime": float(st.st_mtime),
         "sha256": _sha256_file(path),
@@ -1706,7 +1733,7 @@ class CriticalMistakeAnalysisRequest(BaseModel):
 
 
 class DealMatchedBTSampleRequest(BaseModel):
-    """Sample BT rows that match a specific deal using the GPU-verified deal→BT index."""
+    """Sample BT rows that match a specific deal using the GPU-verified dealâ†’BT index."""
     # Primary key used by criteria bitmaps and deal_to_bt indices (row position in deals file).
     deal_row_idx: int
     # Optional deal `index` (user-facing). If provided, server maps it to deal_row_idx using
@@ -1898,7 +1925,7 @@ def _build_additional_deal_columns() -> List[str]:
         for suit in ["C", "D", "H", "S"]:
             additional_cols.append(f"SL_{direction}_{suit}")
 
-    # Add raw DD trick columns (4 directions × 5 strains = 20 columns)
+    # Add raw DD trick columns (4 directions Ã— 5 strains = 20 columns)
     # Format: DD_{direction}_{strain} e.g. DD_N_C, DD_E_S
     for direction in DIRECTIONS_LIST:
         for strain in DD_SCORE_STRAINS:
@@ -2213,7 +2240,7 @@ def _heavy_init() -> None:
         # Get total row count for display (when using --deal-rows)
         if _cli_deal_rows:
             total_rows = pq.read_metadata(bbo_mldf_augmented_file).num_rows
-            row_info = f"{deal_df.height:,} of {total_rows:,} rows × {deal_df.width} cols in {elapsed_deal:.1f}s"
+            row_info = f"{deal_df.height:,} of {total_rows:,} rows Ã— {deal_df.width} cols in {elapsed_deal:.1f}s"
         else:
             row_info = _format_file_info(df=deal_df, file_path=bbo_mldf_augmented_file, elapsed_secs=elapsed_deal)
         _update_loading_status(3, "Building criteria bitmaps...", "deal_df", row_info)
@@ -2819,7 +2846,7 @@ def _heavy_init() -> None:
         # from the consolidated bbo_bt_ev_gpu.py pipeline.  No separate file load needed.
         bt_ev_stats_df: Optional[pl.DataFrame] = bt_stats_df if bt_stats_df is not None else None
         if bt_ev_stats_df is not None:
-            print(f"[init] bt_ev_stats_df: reusing bt_stats_df ({bt_ev_stats_df.height:,} rows × {bt_ev_stats_df.width} cols)")
+            print(f"[init] bt_ev_stats_df: reusing bt_stats_df ({bt_ev_stats_df.height:,} rows Ã— {bt_ev_stats_df.width} cols)")
         else:
             print("[init] WARNING: bt_ev_stats_df unavailable (bt_stats_df not loaded)")
 
@@ -2832,7 +2859,7 @@ def _heavy_init() -> None:
                 t0_tqd = time.perf_counter()
                 bt_trick_dist_df = pl.read_parquet(bt_trick_dist_file)
                 print(
-                    f"[init] bt_trick_dist_df: {bt_trick_dist_df.height:,} rows × {bt_trick_dist_df.width} cols "
+                    f"[init] bt_trick_dist_df: {bt_trick_dist_df.height:,} rows Ã— {bt_trick_dist_df.width} cols "
                     f"in {(time.perf_counter() - t0_tqd):.1f}s"
                 )
             else:
@@ -2842,7 +2869,7 @@ def _heavy_init() -> None:
                 t0_thp = time.perf_counter()
                 bt_hand_profile_df = pl.read_parquet(bt_hand_profile_file)
                 print(
-                    f"[init] bt_hand_profile_df: {bt_hand_profile_df.height:,} rows × {bt_hand_profile_df.width} cols "
+                    f"[init] bt_hand_profile_df: {bt_hand_profile_df.height:,} rows Ã— {bt_hand_profile_df.width} cols "
                     f"in {(time.perf_counter() - t0_thp):.1f}s"
                 )
             else:
@@ -2852,7 +2879,7 @@ def _heavy_init() -> None:
                 t0_tqq = time.perf_counter()
                 bt_trick_quality_df = pl.read_parquet(bt_trick_quality_file)
                 print(
-                    f"[init] bt_trick_quality_df: {bt_trick_quality_df.height:,} rows × {bt_trick_quality_df.width} cols "
+                    f"[init] bt_trick_quality_df: {bt_trick_quality_df.height:,} rows Ã— {bt_trick_quality_df.width} cols "
                     f"in {(time.perf_counter() - t0_tqq):.1f}s"
                 )
             else:
@@ -2995,7 +3022,7 @@ def _heavy_init() -> None:
             bt_parquet_file=bt_seat1_file,  # type: ignore[call-arg]
         )
         elapsed_openings = time.perf_counter() - t0_openings
-        bt_openings_info = f"{bt_openings_df.height:,} rows × {bt_openings_df.width} cols in {elapsed_openings:.1f}s"
+        bt_openings_info = f"{bt_openings_df.height:,} rows Ã— {bt_openings_df.width} cols in {elapsed_openings:.1f}s"
         _update_loading_status(6, "Preparing to serve...", "bt_openings", bt_openings_info)
         _log_memory("after process_opening_bids")
 
@@ -3066,8 +3093,8 @@ def _heavy_init() -> None:
             STATE["custom_category_override_stats"] = custom_category_override_stats
             STATE["available_criteria_names"] = available_criteria_names
             STATE["new_rules_df"] = new_rules_df
-            STATE["deal_to_bt_index_df"] = deal_to_bt_index_df  # Precomputed deal→[bt_indices] DataFrame (or None)
-            STATE["deal_to_bt_par_index_df"] = deal_to_bt_par_index_df  # Precomputed deal→Par_Indexes (or None)
+            STATE["deal_to_bt_index_df"] = deal_to_bt_index_df  # Precomputed dealâ†’[bt_indices] DataFrame (or None)
+            STATE["deal_to_bt_par_index_df"] = deal_to_bt_par_index_df  # Precomputed dealâ†’Par_Indexes (or None)
             STATE["bt_ev_stats_df"] = bt_ev_stats_df  # Precomputed Avg_EV/Avg_Par per bt_index per seat (or None)
             STATE["bt_trick_dist_df"] = bt_trick_dist_df
             STATE["bt_hand_profile_df"] = bt_hand_profile_df
