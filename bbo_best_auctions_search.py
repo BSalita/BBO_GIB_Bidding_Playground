@@ -881,7 +881,7 @@ class SearchEngine:
                 return int(pos)
             return None
         else:
-            res = self.loader.deal_df.with_row_count().filter(pl.col("index") == deal_index)
+            res = self.loader.deal_df.with_row_index("row_nr").filter(pl.col("index") == deal_index)
             if res.height == 0:
                 return None
             return int(res.get_column("row_nr")[0])
