@@ -4521,7 +4521,7 @@ def execute_sql(req: ExecuteSQLRequest) -> Dict[str, Any]:
                 limited_sql = f"SELECT * FROM ({sql}) AS _subq LIMIT {req.max_rows}"
             else:
                 limited_sql = sql
-            result = DUCKDB_CONN.execute(limited_sql).pl()
+            result = DUCKDB_CONN.sql(limited_sql).pl()
         
         elapsed_ms = (time.time() - t0) * 1000
         print(f"[execute-sql] {result.height} rows in {format_elapsed(elapsed_ms)}")

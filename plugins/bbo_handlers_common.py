@@ -1374,7 +1374,7 @@ def join_deals_with_bt_via_index(
                         WHERE bt_index IN ({in_list})
                     """
                     try:
-                        agg_df = conn.execute(query).pl()
+                        agg_df = conn.sql(query).pl()
                     finally:
                         conn.close()
                     if agg_df.height > 0:

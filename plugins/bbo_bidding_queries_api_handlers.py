@@ -1527,7 +1527,7 @@ def _get_next_bt_rows_for_parent(state: Dict[str, Any], parent_bt_index: int) ->
             FROM read_parquet('{file_path}')
             WHERE bt_index IN ({in_list})
         """
-        idx_df = conn.execute(q).pl()
+        idx_df = conn.sql(q).pl()
     finally:
         conn.close()
 
@@ -2688,7 +2688,7 @@ def handle_random_auction_sequences(
         """
         conn = duckdb.connect(":memory:")
         try:
-            sampled_df = conn.execute(query).pl()
+            sampled_df = conn.sql(query).pl()
         finally:
             conn.close()
         
@@ -2735,7 +2735,7 @@ def handle_random_auction_sequences(
             """
             conn = duckdb.connect(":memory:")
             try:
-                sampled_partial = conn.execute(query).pl()
+                sampled_partial = conn.sql(query).pl()
             finally:
                 conn.close()
         else:
@@ -11668,7 +11668,7 @@ def handle_contract_ev_deals(
                 FROM read_parquet('{file_path}')
                 WHERE bt_index IN ({in_list})
             """
-            idx_df = conn.execute(q).pl()
+            idx_df = conn.sql(q).pl()
         finally:
             conn.close()
 
@@ -12658,7 +12658,7 @@ def _handle_list_next_bids_walk_fallback(
         import duckdb
         conn = duckdb.connect(":memory:")
         try:
-            next_bid_rows = conn.execute(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count, next_bid_indices FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})").pl()
+            next_bid_rows = conn.sql(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count, next_bid_indices FROM read_parquet('{file_path}') WHERE bt_index IN ({in_list})").pl()
         finally: conn.close()
 
     # 4. Enrichment with criteria (Prefer in-memory Expr to avoid heavy DuckDB hits)
@@ -12877,7 +12877,7 @@ def _handle_resolve_auction_path_fallback(
         in_list = ", ".join(str(idx) for idx in curr_indices)
         import duckdb
         conn = duckdb.connect(":memory:")
-        try: meta_df = conn.execute(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count FROM read_parquet('{bt_parquet_file or ''}') WHERE bt_index IN ({in_list})").pl()
+        try: meta_df = conn.sql(f"SELECT bt_index, Auction, candidate_bid, is_completed_auction, Expr, matching_deal_count FROM read_parquet('{bt_parquet_file or ''}') WHERE bt_index IN ({in_list})").pl()
         finally: conn.close()
 
     # Load Agg_Expr (Prefer in-memory Expr to avoid heavy DuckDB hits)
